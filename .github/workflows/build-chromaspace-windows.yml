@@ -1,0 +1,110 @@
+name: Build Chromaspace Windows
+
+on:
+  workflow_call:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build-windows:
+    env:
+      CUBE_VERSION: v1.0.0
+      ZIP_NAME: Chromaspace_v1.0.0_windows_x86_64_portable.zip
+      ARTIFACT_NAME: Chromaspace-v1.0.0-windows-x86_64
+
+    runs-on: windows-2022
+
+    defaults:
+      run:
+        shell: powershell
+        working-directory: source
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Ensure local OFX SDK is available
+        run: |
+          if (!(Test-Path "ofx-sdk/include/ofxImageEffect.h")) {
+            if (Test-Path "ofx-sdk") {
+              Remove-Item "ofx-sdk" -Recurse -Force
+            }
+            git clone --depth 1 https://github.com/AcademySoftwareFoundation/openfx.git "ofx-sdk"
+          }
+
+      - name: Locate Visual Studio developer command prompt
+        run: |
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
+          if (!(Test-Path $vswhere)) {
+            throw "vswhere.exe was not found at $vswhere"
+          }
+          $installationPath = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $installationPath) {
+            throw "Unable to locate a Visual Studio installation with C++ tools."
+          }
+          $vsDevCmd = Join-Path $installationPath "Common7\Tools\VsDevCmd.bat"
+          if (!(Test-Path $vsDevCmd)) {
+            throw "VsDevCmd.bat was not found at $vsDevCmd"
+          }
+          "VSDEVCMD=$vsDevCmd" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Detect preinstalled Ninja
+        id: detect_ninja
+        run: |
+          $ninja = Get-Command ninja -ErrorAction SilentlyContinue
+          if ($null -ne $ninja) {
+            "has_ninja=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+            & ninja --version
+          } else {
+            "has_ninja=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          }
+
+      - name: Install Ninja
+        if: steps.detect_ninja.outputs.has_ninja != 'true'
+        run: choco install ninja --no-progress -y
+
+      - name: Prepare Meson virtualenv
+        run: |
+          py -m venv .meson-venv
+          .\.meson-venv\Scripts\python -m pip install --upgrade pip
+          .\.meson-venv\Scripts\python -m pip install meson
+          $venvPython = (Resolve-Path ".\.meson-venv\Scripts\python.exe").Path
+          $venvScripts = Split-Path $venvPython
+          "PYTHON_EXE=$venvPython" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          $venvScripts | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Configure
+        run: |
+          cmd /c "call ""$env:VSDEVCMD"" -arch=x64 -host_arch=x64 && cmake -S . -B build-win -G Ninja -DCMAKE_BUILD_TYPE=Release -DPython3_EXECUTABLE=""$env:PYTHON_EXE"" -DCHROMASPACE_USE_BUNDLED_TEXT_DEPS=ON"
+
+      - name: Build
+        run: |
+          cmd /c "call ""$env:VSDEVCMD"" -arch=x64 -host_arch=x64 && cmake --build build-win --config Release"
+
+      - name: Verify bundle outputs
+        run: |
+          if (-not (Select-String -Path "build-win/CMakeCache.txt" -Pattern "CHROMASPACE_TEXT_DEPS_PROVIDER:INTERNAL=bundled" -Quiet)) {
+            throw "Bundled Chromaspace text deps were not used"
+          }
+          if (!(Test-Path "bundle/Chromaspace.ofx.bundle/Contents/Win64/Chromaspace.ofx")) {
+            throw "Missing Windows plugin binary"
+          }
+          if (!(Test-Path "bundle/Chromaspace.ofx.bundle/Contents/Win64/Chromaspace_CubeViewer.exe")) {
+            throw "Missing Windows cube viewer binary"
+          }
+          if (!(Test-Path "bundle/Chromaspace.ofx.bundle/Contents/Win64/OpenSans-Regular.ttf")) {
+            throw "Missing bundled font asset"
+          }
+
+      - name: Package Windows portable bundle
+        run: |
+          if (Test-Path "..\\..\\$env:ZIP_NAME") { Remove-Item "..\\..\\$env:ZIP_NAME" -Force }
+          Compress-Archive -Path "bundle/Chromaspace.ofx.bundle" -DestinationPath "..\\..\\$env:ZIP_NAME" -CompressionLevel Optimal
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: ${{ env.ZIP_NAME }}

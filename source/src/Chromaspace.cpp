@@ -1,0 +1,4638 @@
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cmath>
+#include <condition_variable>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <limits>
+#include <optional>
+#include <random>
+#include <array>
+#include <sstream>
+#include <string>
+#include <thread>
+#include <utility>
+#include <vector>
+
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <shellapi.h>
+#else
+#include <cerrno>
+#include <csignal>
+#include <dlfcn.h>
+#include <fcntl.h>
+#include <spawn.h>
+#include <sys/select.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <unistd.h>
+extern char **environ;
+#endif
+
+#if defined(__APPLE__)
+#include <OpenGL/gl.h>
+#else
+#include <GL/gl.h>
+#endif
+
+#include "ofxKeySyms.h"
+#include "ofxsImageEffect.h"
+#include "ofxsInteract.h"
+#include "ofxsMultiThread.h"
+#include "ofxsParam.h"
+#include "color/ColorManagement.h"
+
+#if defined(CHROMASPACE_HAS_CUDA)
+#include <cuda_runtime_api.h>
+#endif
+
+#if defined(CHROMASPACE_HAS_OPENCL)
+#ifndef CL_TARGET_OPENCL_VERSION
+#define CL_TARGET_OPENCL_VERSION 120
+#endif
+#if __has_include(<CL/cl.h>)
+#include <CL/cl.h>
+#else
+#include <OpenCL/cl.h>
+#endif
+#endif
+
+#if defined(__APPLE__)
+#include "metal/ChromaspaceMetal.h"
+#endif
+
+namespace {
+
+using namespace OFX;
+
+constexpr const char* kPluginIdentifier = "com.moazelgabry.chromaspace";
+constexpr const char* kPluginGrouping = "Moaz Elgabry";
+constexpr int kPluginVersionMajor = 1;
+constexpr int kPluginVersionMinor = 0;
+constexpr const char* kPluginVersionLabel = "v1.0.0";
+constexpr const char* kPluginName = "Chromaspace";
+constexpr const char* kWebsiteUrl = "https://moazelgabry.com";
+constexpr const char* kReleasesUrl = "https://github.com/MoazElgabry/ME_OFX/releases";
+constexpr const char* kIssueUrl = "https://github.com/MoazElgabry/ME_OFX/issues";
+
+std::string cubeViewerLogPath() {
+#if defined(_WIN32)
+  const char* localAppData = std::getenv("LOCALAPPDATA");
+  if (localAppData && localAppData[0] != '\0') {
+    return (std::filesystem::path(localAppData) / "Chromaspace.log").string();
+  }
+  return "Chromaspace.log";
+#elif defined(__APPLE__)
+  const char* home = std::getenv("HOME");
+  if (!home || home[0] == '\0') return "/tmp/Chromaspace.log";
+  return (std::filesystem::path(home) / "Library" / "Logs" / "Chromaspace.log").string();
+#else
+  const char* home = std::getenv("HOME");
+  if (!home || home[0] == '\0') return "/tmp/Chromaspace.log";
+  return (std::filesystem::path(home) / ".cache" / "Chromaspace.log").string();
+#endif
+}
+
+std::string parentDir(const std::string& path) {
+  const size_t p = path.find_last_of("/\\");
+  if (p == std::string::npos) return std::string();
+  return path.substr(0, p);
+}
+
+std::string filenameOnly(const std::string& path) {
+  const size_t p = path.find_last_of("/\\");
+  if (p == std::string::npos) return path;
+  return path.substr(p + 1);
+}
+
+std::string joinPath(const std::string& a, const std::string& b) {
+  if (a.empty()) return b;
+  const char last = a.back();
+  if (last == '/' || last == '\\') return a + b;
+#if defined(_WIN32)
+  return a + "\\" + b;
+#else
+  return a + "/" + b;
+#endif
+}
+
+bool isAbsolutePath(const std::string& p) {
+  if (p.empty()) return false;
+#if defined(_WIN32)
+  if (p.size() >= 2 && std::isalpha(static_cast<unsigned char>(p[0])) && p[1] == ':') return true;
+  if (p.size() >= 2 && p[0] == '\\' && p[1] == '\\') return true;
+  return false;
+#else
+  return p[0] == '/';
+#endif
+}
+
+bool fileExistsForLaunch(const std::string& p) {
+  if (p.empty()) return false;
+#if defined(_WIN32)
+  const DWORD attrs = GetFileAttributesA(p.c_str());
+  if (attrs == INVALID_FILE_ATTRIBUTES) return false;
+  return (attrs & FILE_ATTRIBUTE_DIRECTORY) == 0;
+#else
+  return ::access(p.c_str(), X_OK) == 0;
+#endif
+}
+
+std::string findBundleRootFromModule(const std::string& modulePath) {
+  std::string current = parentDir(modulePath);
+  while (!current.empty()) {
+    const std::string name = filenameOnly(current);
+    if (name.size() >= 11 && name.find(".ofx.bundle") != std::string::npos) {
+      return current;
+    }
+    const std::string next = parentDir(current);
+    if (next == current) break;
+    current = next;
+  }
+  return std::string();
+}
+
+std::string pluginModulePath() {
+#if defined(_WIN32)
+  HMODULE module = nullptr;
+  if (!GetModuleHandleExA(
+          GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+          reinterpret_cast<LPCSTR>(&pluginModulePath),
+          &module)) {
+    return std::string();
+  }
+  char buf[MAX_PATH] = {0};
+  const DWORD n = GetModuleFileNameA(module, buf, static_cast<DWORD>(sizeof(buf)));
+  if (n == 0 || n >= sizeof(buf)) return std::string();
+  return std::string(buf, n);
+#else
+  Dl_info info{};
+  if (dladdr(reinterpret_cast<void*>(&pluginModulePath), &info) == 0 || info.dli_fname == nullptr) {
+    return std::string();
+  }
+  return std::string(info.dli_fname);
+#endif
+}
+
+bool cubeViewerDebugEnabled() {
+  const char* direct = std::getenv("CHROMASPACE_DEBUG_LOG");
+  if (direct && direct[0] != '\0' && std::strcmp(direct, "0") != 0) return true;
+  return false;
+}
+
+void cubeViewerDebugLog(const std::string& msg) {
+  if (!cubeViewerDebugEnabled()) return;
+  const std::string path = cubeViewerLogPath();
+  std::error_code ec;
+  const auto parent = std::filesystem::path(path).parent_path();
+  if (!parent.empty()) {
+    std::filesystem::create_directories(parent, ec);
+  }
+  FILE* f = std::fopen(path.c_str(), "a");
+  if (!f) return;
+  std::fprintf(f, "[Chromaspace] %s\n", msg.c_str());
+  std::fclose(f);
+}
+
+struct PendingMessage {
+  std::string reason;
+  std::string payload;
+  bool valid = false;
+};
+
+struct CachedCloud {
+  std::string payload;
+  std::string paramHash;
+  std::string quality;
+  std::string sourceId;
+  std::string settingsKey;
+  uint64_t contentHash = 0;
+  int resolution = 25;
+  int sourceWidth = 0;
+  int sourceHeight = 0;
+  bool valid = false;
+};
+
+struct CloudBuildResult {
+  std::string payload;
+  std::string paramHash;
+  std::string quality;
+  uint64_t contentHash = 0;
+  int resolution = 25;
+  int sourceWidth = 0;
+  int sourceHeight = 0;
+  bool success = false;
+};
+
+// Identity-plot recognition was previously implemented here as a heuristic gate for
+// "Use Identity Plot". It has been intentionally removed from processing so that
+// Chromaspace always treats the toggle as an explicit user decision.
+
+struct OverlayStripData {
+  int x1 = 0;
+  int y1 = 0;
+  int width = 0;
+  int height = 0;
+  std::vector<float> pixels;
+};
+
+struct ViewerProbeResult {
+  bool ok = false;
+  bool visible = true;
+  bool iconified = false;
+  bool focused = true;
+};
+
+bool sameViewerProbeState(const ViewerProbeResult& a, const ViewerProbeResult& b) {
+  return a.ok == b.ok && a.visible == b.visible && a.iconified == b.iconified && a.focused == b.focused;
+}
+
+enum class VolumeSlicingMode {
+  HueSectors = 0,
+  LassoRegion = 1,
+};
+
+struct LassoPointNorm {
+  float xNorm = 0.0f;
+  float yNorm = 0.0f;
+};
+
+struct LassoStroke {
+  bool subtract = false;
+  std::vector<LassoPointNorm> points;
+};
+
+struct LassoRegionState {
+  uint64_t revision = 0;
+  std::vector<LassoStroke> strokes;
+
+  bool empty() const {
+    return strokes.empty();
+  }
+};
+
+std::vector<std::string> splitString(const std::string& text, char delimiter) {
+  std::vector<std::string> parts;
+  std::string current;
+  for (const char c : text) {
+    if (c == delimiter) {
+      parts.push_back(current);
+      current.clear();
+    } else {
+      current.push_back(c);
+    }
+  }
+  parts.push_back(current);
+  return parts;
+}
+
+std::string formatSerializedFloat(float value) {
+  char buffer[32];
+  const int n = std::snprintf(buffer, sizeof(buffer), "%.6f", static_cast<double>(value));
+  return n > 0 ? std::string(buffer, static_cast<size_t>(n)) : std::string("0");
+}
+
+bool parseUint64(const std::string& text, uint64_t* value) {
+  if (!value) return false;
+  char* end = nullptr;
+  const unsigned long long parsed = std::strtoull(text.c_str(), &end, 10);
+  if (!end || *end != '\0') return false;
+  *value = static_cast<uint64_t>(parsed);
+  return true;
+}
+
+bool parseIntStrict(const std::string& text, int* value) {
+  if (!value) return false;
+  char* end = nullptr;
+  const long parsed = std::strtol(text.c_str(), &end, 10);
+  if (!end || *end != '\0') return false;
+  *value = static_cast<int>(parsed);
+  return true;
+}
+
+bool parseFloatStrict(const std::string& text, float* value) {
+  if (!value) return false;
+  char* end = nullptr;
+  const float parsed = std::strtof(text.c_str(), &end);
+  if (!end || *end != '\0') return false;
+  *value = parsed;
+  return true;
+}
+
+std::string serializeLassoRegionState(const LassoRegionState& state) {
+  std::ostringstream oss;
+  oss << "v1|" << state.revision;
+  for (const auto& stroke : state.strokes) {
+    oss << "|" << (stroke.subtract ? 's' : 'a') << "," << stroke.points.size();
+    for (const auto& point : stroke.points) {
+      oss << "," << formatSerializedFloat(point.xNorm)
+          << "," << formatSerializedFloat(point.yNorm);
+    }
+  }
+  return oss.str();
+}
+
+LassoRegionState parseLassoRegionState(const std::string& serialized) {
+  LassoRegionState state{};
+  if (serialized.empty()) return state;
+  const auto records = splitString(serialized, '|');
+  if (records.size() < 2 || records[0] != "v1") return state;
+  if (!parseUint64(records[1], &state.revision)) return LassoRegionState{};
+  for (size_t i = 2; i < records.size(); ++i) {
+    const auto fields = splitString(records[i], ',');
+    if (fields.size() < 2 || fields[0].size() != 1) return LassoRegionState{};
+    int pointCount = 0;
+    if (!parseIntStrict(fields[1], &pointCount) || pointCount < 3) return LassoRegionState{};
+    if (fields.size() != static_cast<size_t>(2 + pointCount * 2)) return LassoRegionState{};
+    LassoStroke stroke{};
+    stroke.subtract = (fields[0][0] == 's' || fields[0][0] == 'S');
+    stroke.points.reserve(static_cast<size_t>(pointCount));
+    for (int pointIndex = 0; pointIndex < pointCount; ++pointIndex) {
+      float xNorm = 0.0f;
+      float yNorm = 0.0f;
+      if (!parseFloatStrict(fields[2 + pointIndex * 2], &xNorm) ||
+          !parseFloatStrict(fields[3 + pointIndex * 2], &yNorm)) {
+        return LassoRegionState{};
+      }
+      stroke.points.push_back({std::clamp(xNorm, 0.0f, 1.0f), std::clamp(yNorm, 0.0f, 1.0f)});
+    }
+    state.strokes.push_back(std::move(stroke));
+  }
+  return state;
+}
+
+bool pointInPolygonNormalized(const std::vector<LassoPointNorm>& polygon, double xNorm, double yNorm) {
+  if (polygon.size() < 3) return false;
+  bool inside = false;
+  const size_t count = polygon.size();
+  for (size_t i = 0, j = count - 1; i < count; j = i++) {
+    const double xi = polygon[i].xNorm;
+    const double yi = polygon[i].yNorm;
+    const double xj = polygon[j].xNorm;
+    const double yj = polygon[j].yNorm;
+    const bool intersects = ((yi > yNorm) != (yj > yNorm)) &&
+                            (xNorm < (xj - xi) * (yNorm - yi) / ((yj - yi) + 1e-12) + xi);
+    if (intersects) inside = !inside;
+  }
+  return inside;
+}
+
+bool lassoRegionContainsPoint(const LassoRegionState& state, double xNorm, double yNorm) {
+  bool inside = false;
+  for (const auto& stroke : state.strokes) {
+    if (!pointInPolygonNormalized(stroke.points, xNorm, yNorm)) continue;
+    inside = !stroke.subtract;
+  }
+  return inside;
+}
+
+#if defined(_WIN32)
+HANDLE openViewerPipeHandle(const std::string& pipe) {
+  for (int attempt = 0; attempt < 12; ++attempt) {
+    HANDLE pipeHandle = CreateFileA(pipe.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (pipeHandle != INVALID_HANDLE_VALUE) {
+      DWORD mode = PIPE_READMODE_BYTE;
+      SetNamedPipeHandleState(pipeHandle, &mode, nullptr, nullptr);
+      return pipeHandle;
+    }
+    const DWORD err = GetLastError();
+    if (err != ERROR_PIPE_BUSY) {
+      cubeViewerDebugLog(std::string("CreateFile failed err=") + std::to_string(err));
+      return INVALID_HANDLE_VALUE;
+    }
+    if (!WaitNamedPipeA(pipe.c_str(), 150)) {
+      cubeViewerDebugLog(std::string("WaitNamedPipe timeout err=") + std::to_string(GetLastError()));
+      break;
+    }
+  }
+  return INVALID_HANDLE_VALUE;
+}
+#endif
+
+inline float clamp01(float v) {
+  return v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
+}
+
+// Sampling presets stay intentionally sparse because the viewer shows a cloud, not a full voxel volume.
+// These values are the baseline lattice sizes that the rest of the quality heuristics build from.
+int qualityResolutionForIndex(int q) {
+  switch (q) {
+    case 0: return 25;
+    case 1: return 41;
+    default: return 57;
+  }
+}
+
+// Point-count budgets are lower than full cube sizes so interactive updates remain usable at host playback rates.
+int qualityPointCountForIndex(int q, bool previewMode) {
+  (void)previewMode;
+  switch (q) {
+    case 0: return 30000;
+    case 1: return 60000;
+    default: return 110000;
+  }
+}
+
+int clampOverlayCubeSize(int size) {
+  return std::max(4, std::min(65, size));
+}
+
+double scaleFactorForIndex(int idx) {
+  switch (idx) {
+    case 0: return 0.25;
+    case 1: return 0.50;
+    case 2: return 0.75;
+    default: return 1.00;
+  }
+}
+
+const char* scaleLabelForIndex(int idx) {
+  switch (idx) {
+    case 0: return "25%";
+    case 1: return "50%";
+    case 2: return "75%";
+    default: return "100%";
+  }
+}
+
+// Overlay size 25 acts as "Auto": resolve to something that visually fills the solid while respecting
+// the current quality/scale point budget instead of blindly forcing a dense identity cube every time.
+int resolvedOverlayCubeSize(int requestedSize, int qualityIndex, int scaleIndex) {
+  const int clampedRequested = clampOverlayCubeSize(requestedSize);
+  if (clampedRequested != 25) return clampedRequested;
+  const double scaleFactor = scaleFactorForIndex(scaleIndex);
+  const int pointBudget = std::max(512, static_cast<int>(std::lround(
+      static_cast<double>(qualityPointCountForIndex(qualityIndex, false)) * scaleFactor * scaleFactor)));
+  const int budgetLimited = std::max(4, static_cast<int>(std::floor(std::cbrt(static_cast<double>(pointBudget)))));
+  return clampOverlayCubeSize(std::min(qualityResolutionForIndex(qualityIndex), budgetLimited));
+}
+
+float identityStripCellWidth(int imageWidth, int cubeSize) {
+  return cubeSize <= 0 ? 1.0f : std::max(1.0f, static_cast<float>(imageWidth) / static_cast<float>(cubeSize));
+}
+
+// Stage: map the synthetic draw-on-image strip into image-space bands.
+// The cube always occupies the bottom band; the optional ramp sits directly above it.
+bool computeIdentityStripLayout(const OfxRectI& bounds,
+                                int cubeSize,
+                                bool overlayRamp,
+                                int* stripHeight,
+                                int* cubeY1,
+                                int* cubeY2,
+                                int* rampY1,
+                                int* rampY2) {
+  const int imageWidth = bounds.x2 - bounds.x1;
+  const int imageHeight = bounds.y2 - bounds.y1;
+  if (imageWidth <= 0 || imageHeight <= 0 || cubeSize <= 0) return false;
+  const float cellWidth = identityStripCellWidth(imageWidth, cubeSize);
+  const int strip = std::max(1, static_cast<int>(std::lround(cellWidth)));
+  const int totalStripHeight = std::min(imageHeight, strip * (overlayRamp ? 2 : 1));
+  const int baseY1 = bounds.y1;
+  const int baseY2 = std::min(bounds.y2, baseY1 + totalStripHeight);
+  if (overlayRamp) {
+    if (cubeY1) *cubeY1 = baseY1;
+    if (cubeY2) *cubeY2 = std::min(baseY2, baseY1 + strip);
+    if (rampY1) *rampY1 = std::min(baseY2, baseY1 + strip);
+    if (rampY2) *rampY2 = std::min(baseY2, baseY1 + strip * 2);
+  } else {
+    if (rampY1) *rampY1 = baseY1;
+    if (rampY2) *rampY2 = baseY1;
+    if (cubeY1) *cubeY1 = baseY1;
+    if (cubeY2) *cubeY2 = baseY2;
+  }
+  if (stripHeight) *stripHeight = strip;
+  return (cubeY1 == nullptr || cubeY2 == nullptr || *cubeY2 > *cubeY1);
+}
+
+const char* qualityLabelForIndex(int q) {
+  switch (q) {
+    case 0: return "Low";
+    case 1: return "Medium";
+    default: return "High";
+  }
+}
+
+float clampf(float v, float lo, float hi) {
+  return v < lo ? lo : (v > hi ? hi : v);
+}
+
+int getSamplingModeValue(int index, int fallback = 0) {
+  return index < 0 || index > 2 ? fallback : index;
+}
+
+int getPointShapeValue(int index, int fallback = 0) {
+  return index < 0 || index > 1 ? fallback : index;
+}
+
+const char* pointShapeLabelForIndex(int index) {
+  switch (getPointShapeValue(index)) {
+    case 1: return "Square";
+    default: return "Circle";
+  }
+}
+
+const char* samplingModeLabelForIndex(int index) {
+  switch (getSamplingModeValue(index)) {
+    case 1: return "Stratified";
+    case 2: return "Random";
+    default: return "Balanced";
+  }
+}
+
+// Larger splats need fewer points to stay readable, while smaller splats need a denser cloud to avoid thinning out.
+// The exponent keeps the compensation gentle rather than making point size feel like a hidden quality control.
+float derivedDensityScaleForPointSize(double pointSize) {
+  const float size = clampf(static_cast<float>(pointSize), 0.35f, 1.0f);
+  return clampf(std::pow(0.6f / size, 0.6f), 0.85f, 1.3f);
+}
+
+double halton(uint32_t index, uint32_t base) {
+  double f = 1.0;
+  double r = 0.0;
+  while (index > 0) {
+    f /= static_cast<double>(base);
+    r += f * static_cast<double>(index % base);
+    index /= base;
+  }
+  return r;
+}
+
+uint32_t hash32(uint32_t v) {
+  v ^= v >> 16;
+  v *= 0x7feb352dU;
+  v ^= v >> 15;
+  v *= 0x846ca68bU;
+  v ^= v >> 16;
+  return v;
+}
+
+double unitHash01(uint32_t v) {
+  return static_cast<double>(hash32(v)) / static_cast<double>(0xffffffffU);
+}
+
+enum class SlicePlotModeKind {
+  Rgb = 0,
+  Hsl = 1,
+  Hsv = 2,
+  Chen = 3,
+  RgbToCone = 4,
+  JpConical = 5,
+  NormCone = 6,
+  Reuleaux = 7,
+};
+
+struct SliceSelectionSpec {
+  SlicePlotModeKind plotMode = SlicePlotModeKind::Rgb;
+  bool showOverflow = false;
+  bool normConeNormalized = true;
+  bool enabled = false;
+  bool cubeSliceRed = true;
+  bool cubeSliceGreen = false;
+  bool cubeSliceBlue = false;
+  bool cubeSliceCyan = false;
+  bool cubeSliceYellow = false;
+  bool cubeSliceMagenta = false;
+};
+
+struct NormalizedBounds {
+  double x1 = 0.0;
+  double y1 = 0.0;
+  double x2 = 1.0;
+  double y2 = 1.0;
+  bool valid = false;
+};
+
+float wrapHue01(float h) {
+  h = std::fmod(h, 1.0f);
+  if (h < 0.0f) h += 1.0f;
+  return h;
+}
+
+float rawRgbHue01(float r, float g, float b, float cMax, float delta) {
+  if (delta <= 1e-6f) return 0.0f;
+  float h = 0.0f;
+  if (cMax == r) {
+    h = std::fmod((g - b) / delta, 6.0f);
+  } else if (cMax == g) {
+    h = ((b - r) / delta) + 2.0f;
+  } else {
+    h = ((r - g) / delta) + 4.0f;
+  }
+  return wrapHue01(h / 6.0f);
+}
+
+void rgbToChenSlice(float r, float g, float b, bool allowOverflow, float* outHue, float* outChroma, float* outLight) {
+  constexpr float kTau = 6.28318530717958647692f;
+  if (!allowOverflow) {
+    r = clamp01(r);
+    g = clamp01(g);
+    b = clamp01(b);
+  }
+  const float rotX = r * 0.81649658f + g * -0.40824829f + b * -0.40824829f;
+  const float rotY = r * 0.0f + g * 0.70710678f + b * -0.70710678f;
+  const float rotZ = r * 0.57735027f + g * 0.57735027f + b * 0.57735027f;
+  const float azimuth = std::atan2(rotY, rotX);
+  const float radius = std::sqrt(rotX * rotX + rotY * rotY + rotZ * rotZ);
+  const float wrappedHue = azimuth < 0.0f ? azimuth + kTau : azimuth;
+  const float polar = std::atan2(std::sqrt(rotX * rotX + rotY * rotY), rotZ);
+  *outHue = wrappedHue / kTau;
+  *outChroma = polar * 1.0467733744265997f;
+  *outLight = radius * 0.5773502691896258f;
+}
+
+void rgbToNormConeCoordsSlice(float r, float g, float b, bool normalized, bool allowOverflow, float* outHue, float* outChroma, float* outValue) {
+  constexpr float kTau = 6.28318530717958647692f;
+  constexpr float kSphericalMax = 0.9553166181245093f;
+  const float maxRgb = std::max(r, std::max(g, b));
+  const float rotX = 0.81649658093f * r - 0.40824829046f * g - 0.40824829046f * b;
+  const float rotY = 0.70710678118f * g - 0.70710678118f * b;
+  const float rotZ = 0.57735026919f * (r + g + b);
+  float hue = std::atan2(rotY, rotX) / kTau;
+  if (hue < 0.0f) hue += 1.0f;
+  const float chromaRadius = std::sqrt(rotX * rotX + rotY * rotY);
+  const float polar = std::atan2(chromaRadius, rotZ);
+  float chroma = polar / kSphericalMax;
+  if (normalized) {
+    const float angle = hue * kTau - 0.52359877559829887308f;
+    const float cosPolar = std::cos(polar);
+    const float safeCos = std::abs(cosPolar) > 1e-6f ? cosPolar : (cosPolar < 0.0f ? -1e-6f : 1e-6f);
+    const float cone = (std::sin(polar) / safeCos) / std::sqrt(2.0f);
+    const float sinTerm = clampf(std::sin(3.0f * angle), -1.0f, 1.0f);
+    const float chromaGain = 1.0f / (2.0f * std::cos(std::acos(sinTerm) / 3.0f));
+    chroma = chromaGain > 1e-6f ? cone / chromaGain : 0.0f;
+    if (allowOverflow && chroma < 0.0f) {
+      chroma = -chroma;
+      hue += 0.5f;
+      if (hue >= 1.0f) hue -= 1.0f;
+    }
+  }
+  *outHue = hue;
+  *outChroma = allowOverflow ? std::max(chroma, 0.0f) : clamp01(chroma);
+  *outValue = allowOverflow ? maxRgb : clamp01(maxRgb);
+}
+
+void rgbToRgbConeSlice(float r, float g, float b, float* outMagnitude, float* outHue, float* outPolar) {
+  constexpr float kTau = 6.28318530717958647692f;
+  constexpr float kPolarMax = 0.9553166181245093f;
+  r = clamp01(r);
+  g = clamp01(g);
+  b = clamp01(b);
+  const float rotX = 0.81649658093f * r - 0.40824829046f * g - 0.40824829046f * b;
+  const float rotY = 0.70710678118f * g - 0.70710678118f * b;
+  const float rotZ = 0.57735026919f * (r + g + b);
+  const float radius = std::sqrt(rotX * rotX + rotY * rotY + rotZ * rotZ);
+  float hue = std::atan2(rotY, rotX);
+  if (hue < 0.0f) hue += kTau;
+  const float polar = std::atan2(std::sqrt(rotX * rotX + rotY * rotY), rotZ);
+  *outMagnitude = clamp01(radius * 0.576f);
+  *outHue = hue / kTau;
+  *outPolar = clamp01(polar / kPolarMax);
+}
+
+void rgbToJpConicalSlice(float r, float g, float b, bool allowOverflow, float* outMagnitude, float* outHue, float* outPolar) {
+  constexpr float kPi = 3.14159265358979323846f;
+  constexpr float kTau = 6.28318530717958647692f;
+  constexpr float kPolarMax = 0.9553166181245093f;
+  const float kAsinInvSqrt2 = std::asin(1.0f / std::sqrt(2.0f));
+  const float kAsinInvSqrt3 = std::asin(1.0f / std::sqrt(3.0f));
+  const float kHueCoef1 = 1.0f / (2.0f - (kAsinInvSqrt2 / kAsinInvSqrt3));
+  if (!allowOverflow) {
+    r = clamp01(r);
+    g = clamp01(g);
+    b = clamp01(b);
+  }
+  const float rotX = 0.81649658093f * r - 0.40824829046f * g - 0.40824829046f * b;
+  const float rotY = 0.70710678118f * g - 0.70710678118f * b;
+  const float rotZ = 0.57735026919f * (r + g + b);
+  const float radius = std::sqrt(rotX * rotX + rotY * rotY + rotZ * rotZ);
+  float hue = std::atan2(rotY, rotX);
+  if (hue < 0.0f) hue += kTau;
+  const float polar = std::atan2(std::sqrt(rotX * rotX + rotY * rotY), rotZ);
+  const float huecoef2 = 2.0f * polar * std::sin((2.0f * kPi / 3.0f) - std::fmod(hue, kPi / 3.0f)) / std::sqrt(3.0f);
+  const float huemag = ((std::acos(std::cos(3.0f * hue + kPi))) / (kPi * kHueCoef1) + ((kAsinInvSqrt2 / kAsinInvSqrt3) - 1.0f)) * huecoef2;
+  const float satmag = std::sin(huemag + kAsinInvSqrt3);
+  float magnitude = radius * satmag;
+  if (allowOverflow && magnitude < 0.0f) {
+    magnitude = -magnitude;
+    hue += kPi;
+    if (hue >= kTau) hue -= kTau;
+  }
+  *outMagnitude = allowOverflow ? magnitude : clamp01(magnitude);
+  *outHue = hue / kTau;
+  *outPolar = allowOverflow ? std::max(polar / kPolarMax, 0.0f) : clamp01(polar / kPolarMax);
+}
+
+void rgbToReuleauxSlice(float r, float g, float b, bool allowOverflow, float* outHue, float* outSat, float* outValue) {
+  constexpr float kPi = 3.14159265358979323846f;
+  constexpr float kTau = 6.28318530717958647692f;
+  constexpr float kMaxSat = 1.41421356237f;
+  if (!allowOverflow) {
+    r = clamp01(r);
+    g = clamp01(g);
+    b = clamp01(b);
+  }
+  const float rotX = 0.33333333333f * (2.0f * r - g - b) * 0.70710678118f;
+  const float rotY = (g - b) * 0.40824829046f;
+  const float rotZ = (r + g + b) / 3.0f;
+  float hue = kPi - std::atan2(rotY, -rotX);
+  if (hue < 0.0f) hue += kTau;
+  if (hue >= kTau) hue = std::fmod(hue, kTau);
+  float sat = std::fabs(rotZ) <= 1e-6f ? 0.0f : std::hypot(rotX, rotY) / rotZ;
+  if (allowOverflow && sat < 0.0f) {
+    sat = -sat;
+    hue += kPi;
+    if (hue >= kTau) hue -= kTau;
+  }
+  *outHue = hue / kTau;
+  *outSat = allowOverflow ? sat / kMaxSat : clampf(sat / kMaxSat, 0.0f, 1.0f);
+  *outValue = allowOverflow ? std::max(r, std::max(g, b)) : clamp01(std::max(r, std::max(g, b)));
+}
+
+bool volumeSliceContainsPoint(const SliceSelectionSpec& spec, float r, float g, float b) {
+  const bool anyRegionSelected = spec.cubeSliceRed || spec.cubeSliceGreen || spec.cubeSliceBlue ||
+                                 spec.cubeSliceCyan || spec.cubeSliceYellow || spec.cubeSliceMagenta;
+  if (!spec.enabled) return true;
+  if (!anyRegionSelected) return false;
+  if (spec.plotMode == SlicePlotModeKind::Rgb) {
+    constexpr float kEps = 1e-6f;
+    const auto ge = [&](float a, float c) { return a + kEps >= c; };
+    if (spec.cubeSliceRed && ge(r, g) && ge(g, b)) return true;
+    if (spec.cubeSliceYellow && ge(g, r) && ge(r, b)) return true;
+    if (spec.cubeSliceGreen && ge(g, b) && ge(b, r)) return true;
+    if (spec.cubeSliceCyan && ge(b, g) && ge(g, r)) return true;
+    if (spec.cubeSliceBlue && ge(b, r) && ge(r, g)) return true;
+    if (spec.cubeSliceMagenta && ge(r, b) && ge(b, g)) return true;
+    return false;
+  }
+
+  float hue = 0.0f;
+  bool hueDefined = false;
+  switch (spec.plotMode) {
+    case SlicePlotModeKind::Hsl:
+    case SlicePlotModeKind::Hsv: {
+      const float cMax = std::max(r, std::max(g, b));
+      const float cMin = std::min(r, std::min(g, b));
+      const float delta = cMax - cMin;
+      if (delta > 1e-6f) {
+        hue = rawRgbHue01(r, g, b, cMax, delta);
+        hueDefined = true;
+      }
+      break;
+    }
+    case SlicePlotModeKind::Chen: {
+      float chroma = 0.0f;
+      float light = 0.0f;
+      rgbToChenSlice(r, g, b, spec.showOverflow, &hue, &chroma, &light);
+      hueDefined = chroma > 1e-6f;
+      break;
+    }
+    case SlicePlotModeKind::RgbToCone: {
+      float magnitude = 0.0f;
+      float polar = 0.0f;
+      rgbToRgbConeSlice(r, g, b, &magnitude, &hue, &polar);
+      hueDefined = magnitude > 1e-6f && polar > 1e-6f;
+      break;
+    }
+    case SlicePlotModeKind::JpConical: {
+      float magnitude = 0.0f;
+      float polar = 0.0f;
+      rgbToJpConicalSlice(r, g, b, spec.showOverflow, &magnitude, &hue, &polar);
+      hueDefined = magnitude > 1e-6f && polar > 1e-6f;
+      break;
+    }
+    case SlicePlotModeKind::NormCone: {
+      float chroma = 0.0f;
+      float value = 0.0f;
+      rgbToNormConeCoordsSlice(r, g, b, spec.normConeNormalized, spec.showOverflow, &hue, &chroma, &value);
+      hueDefined = chroma > 1e-6f;
+      break;
+    }
+    case SlicePlotModeKind::Reuleaux: {
+      float sat = 0.0f;
+      float value = 0.0f;
+      rgbToReuleauxSlice(r, g, b, spec.showOverflow, &hue, &sat, &value);
+      hueDefined = sat > 1e-6f;
+      break;
+    }
+    case SlicePlotModeKind::Rgb:
+    default:
+      break;
+  }
+  if (!hueDefined) return false;
+  const float wrappedHue = wrapHue01(hue);
+  const int sector = static_cast<int>(std::floor((wrappedHue + (1.0f / 12.0f)) * 6.0f)) % 6;
+  switch (sector) {
+    case 0: return spec.cubeSliceRed;
+    case 1: return spec.cubeSliceYellow;
+    case 2: return spec.cubeSliceGreen;
+    case 3: return spec.cubeSliceCyan;
+    case 4: return spec.cubeSliceBlue;
+    case 5: return spec.cubeSliceMagenta;
+    default: return false;
+  }
+}
+
+bool computeLassoSamplingBounds(const LassoRegionState& state, NormalizedBounds* out) {
+  if (!out || state.strokes.empty()) return false;
+  double minX = 1.0;
+  double minY = 1.0;
+  double maxX = 0.0;
+  double maxY = 0.0;
+  bool sawPoint = false;
+  for (const auto& stroke : state.strokes) {
+    for (const auto& point : stroke.points) {
+      minX = std::min(minX, static_cast<double>(point.xNorm));
+      minY = std::min(minY, static_cast<double>(point.yNorm));
+      maxX = std::max(maxX, static_cast<double>(point.xNorm));
+      maxY = std::max(maxY, static_cast<double>(point.yNorm));
+      sawPoint = true;
+    }
+  }
+  if (!sawPoint) return false;
+  out->x1 = std::clamp(minX, 0.0, 1.0);
+  out->y1 = std::clamp(minY, 0.0, 1.0);
+  out->x2 = std::clamp(std::max(maxX, out->x1 + 1e-6), 0.0, 1.0);
+  out->y2 = std::clamp(std::max(maxY, out->y1 + 1e-6), 0.0, 1.0);
+  out->valid = out->x2 > out->x1 && out->y2 > out->y1;
+  return out->valid;
+}
+
+// Identity-plot recognition math used to live here. It is intentionally disabled so
+// the downstream instance no longer tries to infer whether the strip is "valid enough".
+
+uint64_t fnv1a64(const std::string& s) {
+  uint64_t hash = 1469598103934665603ull;
+  for (unsigned char c : s) {
+    hash ^= static_cast<uint64_t>(c);
+    hash *= 1099511628211ull;
+  }
+  return hash;
+}
+
+std::string jsonEscape(const std::string& s) {
+  std::string out;
+  out.reserve(s.size() + 8);
+  for (char c : s) {
+    switch (c) {
+      case '\\': out += "\\\\"; break;
+      case '"': out += "\\\""; break;
+      case '\n': out += "\\n"; break;
+      case '\r': out += "\\r"; break;
+      case '\t': out += "\\t"; break;
+      default: out += c; break;
+    }
+  }
+  return out;
+}
+
+bool extractJsonStringField(const std::string& json, const std::string& key, std::string* out) {
+  if (!out) return false;
+  const std::string token = "\"" + key + "\":\"";
+  const size_t start = json.find(token);
+  if (start == std::string::npos) return false;
+  std::string value;
+  bool escaped = false;
+  for (size_t i = start + token.size(); i < json.size(); ++i) {
+    const char c = json[i];
+    if (escaped) {
+      value.push_back(c);
+      escaped = false;
+      continue;
+    }
+    if (c == '\\') {
+      escaped = true;
+      continue;
+    }
+    if (c == '"') {
+      *out = value;
+      return true;
+    }
+    value.push_back(c);
+  }
+  return false;
+}
+
+std::string cubeViewerPipeName() {
+  const char* env = std::getenv("CHROMASPACE_PIPE");
+  if (env && env[0] != '\0') return std::string(env);
+#if defined(_WIN32)
+  return "\\\\.\\pipe\\Chromaspace";
+#else
+  return "/tmp/chromaspace.sock";
+#endif
+}
+
+std::string viewerExecutableName() {
+#if defined(_WIN32)
+  return "Chromaspace_CubeViewer.exe";
+#else
+  return "Chromaspace_CubeViewer";
+#endif
+}
+
+std::string supportString(const std::string& label, const std::string& value) {
+  return label + ": " + value;
+}
+
+void openUrl(const std::string& url) {
+#if defined(_WIN32)
+  ShellExecuteA(nullptr, "open", url.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+#elif defined(__APPLE__)
+  pid_t pid = 0;
+  const char* argv[] = {"open", url.c_str(), nullptr};
+  posix_spawnp(&pid, "open", nullptr, nullptr, const_cast<char* const*>(argv), environ);
+#else
+  pid_t pid = 0;
+  const char* argv[] = {"xdg-open", url.c_str(), nullptr};
+  posix_spawnp(&pid, "xdg-open", nullptr, nullptr, const_cast<char* const*>(argv), environ);
+#endif
+}
+
+class ChromaspaceEffect : public ImageEffect {
+ public:
+  friend class ChromaspaceOverlayInteract;
+
+  explicit ChromaspaceEffect(OfxImageEffectHandle handle)
+      : ImageEffect(handle) {
+    dstClip_ = fetchClip(kOfxImageEffectOutputClipName);
+    srcClip_ = fetchClip(kOfxImageEffectSimpleSourceClipName);
+
+    cubeViewerLive_ = getBoolValue("cubeViewerLive", 0.0, true);
+    cubeViewerQuality_ = getChoiceValue("cubeViewerQuality", 0.0, 0);
+    cubeViewerRequested_ = false;
+    cubeViewerConnected_ = false;
+    cubeViewerWindowUsable_ = false;
+    senderId_ = buildSenderId();
+    setStatusLabel("Disconnected");
+    flushStatusLabelToHost();
+    updateDrawOnImageModeUi(0.0);
+    syncIdentityOverlayGroupOpenState(0.0);
+    updateCircularHslToggleVisibility(0.0);
+    updateCircularHsvToggleVisibility(0.0);
+    updateNormConeToggleVisibility(0.0);
+  }
+
+  ~ChromaspaceEffect() override {
+    stopStatusThread();
+    stopIoWorker();
+    cubeViewerRequested_ = false;
+  }
+
+  void getClipPreferences(ClipPreferencesSetter& clipPreferences) override {
+    clipPreferences.setOutputFrameVarying(true);
+  }
+
+  void syncPrivateData(void) override {
+    flushStatusLabelToHost();
+    updateDrawOnImageModeUi(0.0);
+    syncIdentityOverlayGroupOpenState(0.0);
+    updateCircularHslToggleVisibility(0.0);
+    updateCircularHsvToggleVisibility(0.0);
+    updateNormConeToggleVisibility(0.0);
+    ImageEffect::syncPrivateData();
+  }
+
+  void render(const RenderArguments& args) override {
+    flushStatusLabelToHost();
+    syncIdentityOverlayGroupOpenState(args.time);
+    std::unique_ptr<Image> dst(dstClip_->fetchImage(args.time));
+    if (!dst) return;
+    std::unique_ptr<Image> src(srcClip_->fetchImage(args.time));
+    const bool drawOnImageMode = currentDrawOnImageMode(args.time);
+    const auto renderNow = std::chrono::steady_clock::now();
+    const std::string settingsKey = currentCloudSettingsKey(args.time);
+    const std::string sourceId = currentSourceIdentifier(src.get());
+    const bool needCloudWork = !drawOnImageMode && cubeViewerRequested_ && cubeViewerLive_;
+    const bool previewMode = shouldUseInteractivePreview(renderNow);
+    const bool firstHandoff = cubeViewerInputCloudRefreshPending_;
+    const bool steadyState = shouldEmitSteadyStateCloud(args.time, sourceId, settingsKey, previewMode);
+    const bool needCloud = needCloudWork && (firstHandoff || steadyState);
+    lastRenderSeenAt_ = renderNow;
+    if (!drawOnImageMode && cubeViewerRequested_ && !cubeViewerConnected_) {
+      pushParamsUpdate(args.time, "render/connect");
+    }
+    std::unique_ptr<Image> cloudSrc;
+    if (needCloud && srcClip_ != nullptr) {
+      const OfxRectD rod = srcClip_->getRegionOfDefinition(args.time);
+      cloudSrc.reset(srcClip_->fetchImage(args.time, rod));
+      if (!cloudSrc) {
+        cubeViewerDebugLog("Failed to fetch full-source image for cloud build; falling back to render-window source.");
+      }
+    }
+    Image* cloudImage = cloudSrc ? cloudSrc.get() : src.get();
+    const std::string cloudSourceId = currentSourceIdentifier(cloudImage);
+    CloudBuildResult built{};
+    OverlayStripData overlay{};
+    const bool haveOverlay = drawOnImageMode && buildIdentityOverlayStripData(dst->getBounds(), args.renderWindow, args.time, &overlay);
+
+    // Stage 1: draw-on-image mode is a passthrough render with an optional synthetic strip burn-in.
+    if (drawOnImageMode) {
+      if (tryRenderGpuBackends(src.get(), dst.get(), args, false, false, nullptr, haveOverlay ? &overlay : nullptr)) {
+        return;
+      }
+      copySourceToDestination(src.get(), dst.get(), args.renderWindow);
+      if (haveOverlay) {
+        applyIdentityOverlayToDestination(dst.get(), args.renderWindow, args.time);
+      }
+      return;
+    }
+
+    // Stage 2: plot mode keeps the image untouched and only builds viewer cloud payloads.
+    if (!drawOnImageMode && tryRenderGpuBackends(cloudImage, dst.get(), args, needCloud, previewMode, &built, nullptr)) {
+      bool cloudChanged = false;
+      const std::string effectiveSettingsKey = currentCloudSettingsKey(args.time);
+      if (built.success && promoteBuiltCloud(built, cloudSourceId, effectiveSettingsKey, &cloudChanged)) {
+        if (cloudChanged) {
+          enqueueCloudMessage(built.payload, firstHandoff ? "first-handoff/render" : "steady-state/render");
+        }
+        lastCloudTime_ = args.time;
+        lastCloudBuiltAt_ = std::chrono::steady_clock::now();
+        lastCloudSourceId_ = cloudSourceId;
+        lastCloudSettingsKey_ = effectiveSettingsKey;
+        cubeViewerInputCloudRefreshPending_ = false;
+        if (cloudChanged) {
+          setStatusLabel("Updating");
+        }
+      } else if (built.success && firstHandoff) {
+        (void)trySendCachedCloud(args.time, "first-handoff/rejected-smaller-source");
+      }
+      return;
+    }
+
+    copySourceToDestination(src.get(), dst.get(), args.renderWindow);
+    if (!needCloud || !cloudImage) return;
+
+    built = buildInputCloudPayload(cloudImage, args.time, previewMode);
+    if (!built.success) return;
+    bool cloudChanged = false;
+    const std::string effectiveSettingsKey = currentCloudSettingsKey(args.time);
+    if (!promoteBuiltCloud(built, cloudSourceId, effectiveSettingsKey, &cloudChanged)) {
+      if (firstHandoff) {
+        (void)trySendCachedCloud(args.time, "first-handoff/rejected-smaller-source");
+      }
+      return;
+    }
+
+    if (cloudChanged) {
+      enqueueCloudMessage(built.payload, firstHandoff ? "first-handoff/render" : "steady-state/render");
+    }
+    lastCloudTime_ = args.time;
+    lastCloudBuiltAt_ = std::chrono::steady_clock::now();
+    lastCloudSourceId_ = cloudSourceId;
+    lastCloudSettingsKey_ = effectiveSettingsKey;
+    cubeViewerInputCloudRefreshPending_ = false;
+    if (cloudChanged) {
+      setStatusLabel("Updating");
+    }
+  }
+
+  void changedParam(const InstanceChangedArgs& args, const std::string& paramName) override {
+    flushStatusLabelToHost();
+    if (paramName == "openCubeViewer") {
+      cubeViewerDebugLog("changedParam(openCubeViewer)");
+      openCubeViewerSession(args.time);
+      return;
+    }
+    if (paramName == "closeCubeViewer") {
+      cubeViewerDebugLog("changedParam(closeCubeViewer)");
+      closeCubeViewerSession();
+      return;
+    }
+    if (paramName == "cubeViewerModeToggle") {
+      const bool nextDrawOnImage = !currentDrawOnImageMode(args.time);
+      if (auto* p = fetchBooleanParam("cubeViewerDrawOnImageEnabled")) {
+        p->setValue(nextDrawOnImage);
+      }
+      if (nextDrawOnImage) {
+        if (auto* p = fetchBooleanParam("cubeViewerIdentityOverlayEnabledDraw")) {
+          p->setValue(true);
+        }
+      }
+      cubeViewerDebugLog(std::string("changedParam(cubeViewerModeToggle) -> ") + (nextDrawOnImage ? "draw-on-image" : "plot"));
+      updateDrawOnImageModeUi(args.time);
+      updateCircularHslToggleVisibility(args.time);
+      updateCircularHsvToggleVisibility(args.time);
+      setGroupOpenState("grp_cube_viewer_identity_overlay", nextDrawOnImage);
+      updateNormConeToggleVisibility(args.time);
+      invalidateCubeViewerCloudState();
+      if (cubeViewerRequested_) {
+        pushParamsUpdate(args.time, "cubeViewerModeToggle");
+      }
+      return;
+    }
+    if (paramName == "cubeViewerLive") {
+      cubeViewerLive_ = getBoolValue("cubeViewerLive", args.time, true);
+      cubeViewerDebugLog(std::string("changedParam(cubeViewerLive) -> ") + (cubeViewerLive_ ? "1" : "0"));
+      if (cubeViewerRequested_) {
+        pushParamsUpdate(args.time, "cubeViewerLive");
+      }
+      return;
+    }
+    if (paramName == "cubeViewerQuality") {
+      cubeViewerQuality_ = getChoiceValue("cubeViewerQuality", args.time, 0);
+      cubeViewerDebugLog(std::string("changedParam(cubeViewerQuality) -> ") + qualityLabelForIndex(cubeViewerQuality_));
+      resolveOverlaySizeParamIfAuto(args.time);
+      invalidateCubeViewerCloudState();
+      if (cubeViewerRequested_) {
+        pushParamsUpdate(args.time, "cubeViewerQuality");
+      }
+      return;
+    }
+    if (paramName == "cubeViewerScale") {
+      cubeViewerDebugLog(std::string("changedParam(cubeViewerScale) -> ") +
+                         scaleLabelForIndex(getChoiceValue("cubeViewerScale", args.time, 3)));
+      resolveOverlaySizeParamIfAuto(args.time);
+      invalidateCubeViewerCloudState();
+      if (cubeViewerRequested_) {
+        pushParamsUpdate(args.time, "cubeViewerScale");
+      }
+      return;
+    }
+    if (paramName == "cubeViewerPointSize") {
+      cubeViewerDebugLog(std::string("changedParam(cubeViewerPointSize) -> ") +
+                         std::to_string(getDoubleValue("cubeViewerPointSize", args.time, 1.4)));
+      if (cubeViewerRequested_) {
+        pushParamsUpdate(args.time, "cubeViewerPointSize");
+      }
+      return;
+    }
+    if (paramName == "cubeViewerSamplingMode") {
+      cubeViewerDebugLog(std::string("changedParam(cubeViewerSamplingMode) -> ") +
+                         samplingModeLabelForIndex(getChoiceValue("cubeViewerSamplingMode", args.time, 0)));
+      invalidateCubeViewerCloudState();
+      if (cubeViewerRequested_) {
+        pushParamsUpdate(args.time, "cubeViewerSamplingMode");
+      }
+      return;
+    }
+    if (paramName == "cubeViewerOccupancyGuidedFill") {
+      cubeViewerDebugLog(std::string("changedParam(cubeViewerOccupancyGuidedFill) -> ") +
+                         (getBoolValue("cubeViewerOccupancyGuidedFill", args.time, false) ? "1" : "0"));
+      invalidateCubeViewerCloudState();
+      if (cubeViewerRequested_) {
+        pushParamsUpdate(args.time, "cubeViewerOccupancyGuidedFill");
+      }
+      return;
+    }
+    if (paramName == "cubeViewerPointShape") {
+      cubeViewerDebugLog(std::string("changedParam(cubeViewerPointShape) -> ") +
+                         pointShapeLabelForIndex(getChoiceValue("cubeViewerPointShape", args.time, 0)));
+      if (cubeViewerRequested_) {
+        pushParamsUpdate(args.time, "cubeViewerPointShape");
+      }
+      return;
+    }
+    if (paramName == "cubeViewerShowOverflow") {
+      cubeViewerDebugLog(std::string("changedParam(cubeViewerShowOverflow) -> ") +
+                         (getBoolValue("cubeViewerShowOverflow", args.time, false) ? "1" : "0"));
+      updateDrawOnImageModeUi(args.time);
+      invalidateCubeViewerCloudState();
+      if (cubeViewerRequested_) {
+        pushParamsUpdate(args.time, "cubeViewerShowOverflow");
+        (void)trySendCachedCloud(args.time, "cubeViewerShowOverflow");
+      }
+      return;
+    }
+    if (paramName == "cubeViewerHighlightOverflow") {
+      cubeViewerDebugLog(std::string("changedParam(cubeViewerHighlightOverflow) -> ") +
+                         (getBoolValue("cubeViewerHighlightOverflow", args.time, true) ? "1" : "0"));
+      syncShowOverflowSupport(args.time);
+      if (cubeViewerRequested_) {
+        pushParamsUpdate(args.time, "cubeViewerHighlightOverflow");
+        (void)trySendCachedCloud(args.time, "cubeViewerHighlightOverflow");
+      }
+      return;
+    }
+    if (paramName == "cubeViewerLassoRegionMode") {
+      cubeViewerDebugLog(std::string("changedParam(cubeViewerLassoRegionMode) -> ") +
+                         (currentLassoRegionSlicingEnabled(args.time) ? "1" : "0"));
+      syncCubeSlicingUi(args.time);
+      invalidateCubeViewerCloudState();
+      if (cubeViewerRequested_) {
+        pushParamsUpdate(args.time, "cubeViewerLassoRegionMode");
+      }
+      redrawOverlays();
+      return;
+    }
+    if (paramName == "cubeViewerSliceRed" || paramName == "cubeViewerSliceGreen" ||
+        paramName == "cubeViewerSliceBlue" || paramName == "cubeViewerSliceCyan" ||
+        paramName == "cubeViewerSliceYellow" || paramName == "cubeViewerSliceMagenta") {
+      cubeViewerDebugLog(std::string("changedParam(") + paramName + ") -> " +
+                         (getBoolValue(paramName, args.time, true) ? "1" : "0"));
+      syncCubeSlicingUi(args.time);
+      invalidateCubeViewerCloudState();
+      if (cubeViewerRequested_) {
+        pushParamsUpdate(args.time, paramName);
+        (void)trySendCachedCloud(args.time, paramName);
+      }
+      return;
+    }
+    if (paramName == "cubeViewerLassoOperation") {
+      cubeViewerDebugLog(std::string("changedParam(cubeViewerLassoOperation) -> ") +
+                         (currentLassoSubtractOperation(args.time) ? "subtract" : "add"));
+      redrawOverlays();
+      return;
+    }
+    if (paramName == "cubeViewerLassoUndo") {
+      undoLassoRegionStroke(args.time, "cubeViewerLassoUndo");
+      return;
+    }
+    if (paramName == "cubeViewerLassoReset") {
+      resetLassoRegion(args.time, "cubeViewerLassoReset");
+      return;
+    }
+    if (paramName == "cubeViewerLassoData") {
+      if (!suppressLassoDataChangedHandling_) {
+        syncLassoDataChange(args.time, "cubeViewerLassoData");
+      }
+      return;
+    }
+    if (paramName == "cubeViewerOverflowHighlightColor") {
+      if (cubeViewerRequested_) {
+        pushParamsUpdate(args.time, "cubeViewerOverflowHighlightColor");
+        (void)trySendCachedCloud(args.time, "cubeViewerOverflowHighlightColor");
+      }
+      return;
+    }
+    if (paramName == "cubeViewerBackgroundColor") {
+      if (cubeViewerRequested_) {
+        pushParamsUpdate(args.time, "cubeViewerBackgroundColor");
+      }
+      return;
+    }
+    if (paramName == "cubeViewerOnTop") {
+      cubeViewerDebugLog(std::string("changedParam(cubeViewerOnTop) -> ") +
+                         (getBoolValue("cubeViewerOnTop", args.time, true) ? "1" : "0"));
+      if (cubeViewerRequested_) {
+        pushParamsUpdate(args.time, "cubeViewerOnTop");
+      }
+      return;
+    }
+    if (paramName == "cubeViewerIdentityOverlayEnabled") {
+      cubeViewerDebugLog(std::string("changedParam(cubeViewerIdentityOverlayEnabled) -> ") +
+                         (getBoolValue("cubeViewerIdentityOverlayEnabled", args.time, false) ? "1" : "0"));
+      updateDrawOnImageModeUi(args.time);
+      if (cubeViewerRequested_) {
+        pushParamsUpdate(args.time, "cubeViewerIdentityOverlayEnabled");
+      }
+      return;
+    }
+    if (paramName == "cubeViewerIdentityOverlaySize") {
+      const int requested = getIntValue("cubeViewerIdentityOverlaySize", args.time, 29);
+      const int qualityIndex = getChoiceValue("cubeViewerQuality", args.time, cubeViewerQuality_);
+      const int scaleIndex = getChoiceValue("cubeViewerScale", args.time, 3);
+      const int resolved = currentDrawOnImageMode(args.time)
+                               ? clampOverlayCubeSize(requested)
+                               : resolvedOverlayCubeSize(requested, qualityIndex, scaleIndex);
+      cubeViewerDebugLog(std::string("changedParam(cubeViewerIdentityOverlaySize) -> requested=") +
+                         std::to_string(requested) + " resolved=" + std::to_string(resolved));
+      if (cubeViewerRequested_) {
+        pushParamsUpdate(args.time, "cubeViewerIdentityOverlaySize");
+      }
+      return;
+    }
+    if (paramName == "cubeViewerIdentityOverlayRamp") {
+      cubeViewerDebugLog(std::string("changedParam(cubeViewerIdentityOverlayRamp) -> ") +
+                         (getBoolValue("cubeViewerIdentityOverlayRamp", args.time, false) ? "1" : "0"));
+      if (cubeViewerRequested_) {
+        pushParamsUpdate(args.time, "cubeViewerIdentityOverlayRamp");
+      }
+      return;
+    }
+    if (paramName == "cubeViewerIdentityOverlayEnabledDraw") {
+      const bool enabled = getBoolValue("cubeViewerIdentityOverlayEnabledDraw", args.time, false);
+      cubeViewerDebugLog(std::string("changedParam(cubeViewerIdentityOverlayEnabledDraw) -> ") +
+                         (enabled ? "1" : "0"));
+      updateDrawOnImageModeUi(args.time);
+      if (cubeViewerRequested_) {
+        pushParamsUpdate(args.time, "cubeViewerIdentityOverlayEnabledDraw");
+      }
+      return;
+    }
+    if (paramName == "cubeViewerIdentityOverlayRampDraw") {
+      const bool enabled = getBoolValue("cubeViewerIdentityOverlayRampDraw", args.time, false);
+      cubeViewerDebugLog(std::string("changedParam(cubeViewerIdentityOverlayRampDraw) -> ") +
+                         (enabled ? "1" : "0"));
+      updateDrawOnImageModeUi(args.time);
+      if (cubeViewerRequested_) {
+        pushParamsUpdate(args.time, "cubeViewerIdentityOverlayRampDraw");
+      }
+      return;
+    }
+    if (paramName == "cubeViewerSampleDrawnCubeOnly") {
+      const bool useInstance1 = getBoolValue("cubeViewerSampleDrawnCubeOnly", args.time, false);
+      cubeViewerDebugLog(std::string("changedParam(cubeViewerSampleDrawnCubeOnly) -> ") +
+                         (useInstance1 ? "1" : "0"));
+      if (!useInstance1 && !getBoolValue("cubeViewerReadGrayRamp", args.time, false)) {
+        if (auto* p = fetchBooleanParam("cubeViewerShowIdentityOnly")) p->setValue(false);
+      }
+      updateDrawOnImageModeUi(args.time);
+      invalidateCubeViewerCloudState();
+      if (cubeViewerRequested_) {
+        pushParamsUpdate(args.time, "cubeViewerSampleDrawnCubeOnly");
+      }
+      return;
+    }
+    if (paramName == "cubeViewerReadGrayRamp") {
+      const bool readGrayRamp = getBoolValue("cubeViewerReadGrayRamp", args.time, false);
+      cubeViewerDebugLog(std::string("changedParam(cubeViewerReadGrayRamp) -> ") +
+                         (readGrayRamp ? "1" : "0"));
+      if (!readGrayRamp && !getBoolValue("cubeViewerSampleDrawnCubeOnly", args.time, false)) {
+        if (auto* p = fetchBooleanParam("cubeViewerShowIdentityOnly")) p->setValue(false);
+      }
+      updateDrawOnImageModeUi(args.time);
+      invalidateCubeViewerCloudState();
+      if (cubeViewerRequested_) {
+        pushParamsUpdate(args.time, "cubeViewerReadGrayRamp");
+      }
+      return;
+    }
+    if (paramName == "cubeViewerShowIdentityOnly") {
+      cubeViewerDebugLog(std::string("changedParam(cubeViewerShowIdentityOnly) -> ") +
+                         (getBoolValue("cubeViewerShowIdentityOnly", args.time, false) ? "1" : "0"));
+      invalidateCubeViewerCloudState();
+      if (cubeViewerRequested_) {
+        pushParamsUpdate(args.time, "cubeViewerShowIdentityOnly");
+      }
+      return;
+    }
+    if (paramName == "cubeViewerSampleDrawnCubeSize") {
+      const int requested = getIntValue("cubeViewerSampleDrawnCubeSize", args.time, 29);
+      const int qualityIndex = getChoiceValue("cubeViewerQuality", args.time, cubeViewerQuality_);
+      const int scaleIndex = getChoiceValue("cubeViewerScale", args.time, 3);
+      const int resolved = clampOverlayCubeSize(requested);
+      cubeViewerDebugLog(std::string("changedParam(cubeViewerSampleDrawnCubeSize) -> requested=") +
+                         std::to_string(requested) + " resolved=" + std::to_string(resolved));
+      invalidateCubeViewerCloudState();
+      if (cubeViewerRequested_) {
+        pushParamsUpdate(args.time, "cubeViewerSampleDrawnCubeSize");
+      }
+      return;
+    }
+    if (paramName == "cubeViewerPlotModel") {
+      const std::string plotMode = currentPlotMode(args.time);
+      cubeViewerDebugLog(std::string("changedParam(cubeViewerPlotModel) -> ") + plotMode);
+      updateDrawOnImageModeUi(args.time);
+      syncShowOverflowSupport(args.time);
+      syncCubeSlicingUi(args.time);
+      updateCircularHslToggleVisibility(args.time);
+      updateCircularHsvToggleVisibility(args.time);
+      updateNormConeToggleVisibility(args.time);
+      invalidateCubeViewerCloudState();
+      if (cubeViewerRequested_) {
+        pushParamsUpdate(args.time, "cubeViewerPlotModel");
+        (void)trySendCachedCloud(args.time, "cubeViewerPlotModel");
+      }
+      return;
+    }
+    if (paramName == "cubeViewerCircularHsl") {
+      cubeViewerDebugLog(std::string("changedParam(cubeViewerCircularHsl) -> ") +
+                         (getBoolValue("cubeViewerCircularHsl", args.time, false) ? "1" : "0"));
+      invalidateCubeViewerCloudState();
+      if (cubeViewerRequested_) {
+        pushParamsUpdate(args.time, "cubeViewerCircularHsl");
+        (void)trySendCachedCloud(args.time, "cubeViewerCircularHsl");
+      }
+      return;
+    }
+    if (paramName == "cubeViewerCircularHsv") {
+      cubeViewerDebugLog(std::string("changedParam(cubeViewerCircularHsv) -> ") +
+                         (getBoolValue("cubeViewerCircularHsv", args.time, false) ? "1" : "0"));
+      invalidateCubeViewerCloudState();
+      if (cubeViewerRequested_) {
+        pushParamsUpdate(args.time, "cubeViewerCircularHsv");
+        (void)trySendCachedCloud(args.time, "cubeViewerCircularHsv");
+      }
+      return;
+    }
+    if (paramName == "cubeViewerNormConeNormalized") {
+      cubeViewerDebugLog(std::string("changedParam(cubeViewerNormConeNormalized) -> ") +
+                         (getBoolValue("cubeViewerNormConeNormalized", args.time, true) ? "1" : "0"));
+      invalidateCubeViewerCloudState();
+      if (cubeViewerRequested_) {
+        pushParamsUpdate(args.time, "cubeViewerNormConeNormalized");
+        (void)trySendCachedCloud(args.time, "cubeViewerNormConeNormalized");
+      }
+      return;
+    }
+    if (paramName == "cubeViewerChromaticityInputPrimaries" ||
+        paramName == "cubeViewerChromaticityInputTransfer" ||
+        paramName == "cubeViewerChromaticityReferenceBasis" ||
+        paramName == "cubeViewerChromaticityOverlayPrimaries") {
+      cubeViewerDebugLog(std::string("changedParam(") + paramName + ")");
+      invalidateCubeViewerCloudState();
+      if (cubeViewerRequested_) {
+        pushParamsUpdate(args.time, paramName);
+        (void)trySendCachedCloud(args.time, paramName);
+      }
+      return;
+    }
+    if (paramName == "cubeViewerChromaticityPlanckianLocus") {
+      cubeViewerDebugLog(std::string("changedParam(") + paramName + ")");
+      if (cubeViewerRequested_) {
+        pushParamsUpdate(args.time, paramName);
+      }
+      return;
+    }
+    if (paramName == "supportWebsite") {
+      openUrl(kWebsiteUrl);
+      return;
+    }
+    if (paramName == "supportLatestReleases") {
+      openUrl(kReleasesUrl);
+      return;
+    }
+    if (paramName == "supportReportIssue") {
+      openUrl(kIssueUrl);
+      return;
+    }
+  }
+
+ private:
+  Clip* dstClip_ = nullptr;
+  Clip* srcClip_ = nullptr;
+
+  std::mutex stateMutex_;
+  std::mutex ioMutex_;
+  std::condition_variable ioCv_;
+  std::thread ioThread_;
+  std::thread statusThread_;
+  bool ioStop_ = false;
+  bool statusStop_ = false;
+  PendingMessage pendingParams_;
+  PendingMessage pendingCloud_;
+  std::atomic<bool> cloudQueuedOrInFlight_{false};
+  std::atomic<int64_t> lastViewerTransportActivityMs_{0};
+  std::mutex statusMutex_;
+  std::string pendingStatusText_;
+  bool statusDirty_ = false;
+
+  std::string senderId_;
+  std::atomic<uint64_t> seqCounter_{1};
+  bool cubeViewerRequested_ = false;
+  bool cubeViewerConnected_ = false;
+  bool cubeViewerWindowUsable_ = false;
+  bool cubeViewerLive_ = true;
+  int cubeViewerQuality_ = 0;
+  bool cubeViewerInputCloudRefreshPending_ = false;
+  bool suppressLassoDataChangedHandling_ = false;
+  CachedCloud cachedCloud_;
+  double lastCloudTime_ = std::numeric_limits<double>::quiet_NaN();
+  std::chrono::steady_clock::time_point lastCloudBuiltAt_{};
+  std::chrono::steady_clock::time_point lastRenderSeenAt_{};
+  std::chrono::steady_clock::time_point previewModeUntil_{};
+  std::chrono::steady_clock::time_point lastHeartbeatAt_{};
+  ViewerProbeResult lastLoggedHeartbeatProbe_{};
+  bool hasLoggedHeartbeatProbe_ = false;
+  std::string lastCloudSourceId_;
+  std::string lastCloudSettingsKey_;
+  std::string statusCache_;
+  std::vector<float> stageSrc_;
+  std::mutex stageMutex_;
+  std::string buildSenderId() const {
+    const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+    std::ostringstream oss;
+    oss << "cube-" << now << "-" << std::this_thread::get_id();
+    return oss.str();
+  }
+
+  // Cloud caching prefers newer or equivalent builds, but rejects regressions where a smaller source image
+  // would overwrite a more complete cloud for the same settings.
+  bool shouldAcceptBuiltCloudLocked(
+      const CloudBuildResult& built,
+      const std::string& sourceId,
+      const std::string& settingsKey,
+      std::string* reason) const {
+    if (!built.success || built.sourceWidth <= 0 || built.sourceHeight <= 0) {
+      if (reason) *reason = "invalid-build";
+      return false;
+    }
+    if (!cachedCloud_.valid) {
+      if (reason) *reason = "cache-empty";
+      return true;
+    }
+    if (cachedCloud_.quality != built.quality || cachedCloud_.resolution != built.resolution) {
+      if (reason) *reason = "quality-changed";
+      return true;
+    }
+    if (cachedCloud_.sourceId != sourceId || cachedCloud_.settingsKey != settingsKey) {
+      if (reason) *reason = "source-changed";
+      return true;
+    }
+    if (cachedCloud_.contentHash != 0 && built.contentHash != 0 && cachedCloud_.contentHash == built.contentHash) {
+      if (reason) *reason = "unchanged-content";
+      return false;
+    }
+    const int cachedPixels = cachedCloud_.sourceWidth * cachedCloud_.sourceHeight;
+    const int builtPixels = built.sourceWidth * built.sourceHeight;
+    if (cachedPixels > 0 && builtPixels < cachedPixels) {
+      if (reason) *reason = "smaller-source";
+      return false;
+    }
+    if (reason) *reason = "same-or-larger-source";
+    return true;
+  }
+
+  // Promote a freshly built cloud into the reusable cache only after the settings/source checks above agree
+  // that it is the best representation of the current state.
+  bool promoteBuiltCloud(
+      const CloudBuildResult& built,
+      const std::string& sourceId,
+      const std::string& settingsKey,
+      bool* changed = nullptr) {
+    std::lock_guard<std::mutex> lock(stateMutex_);
+    std::string decisionReason;
+    if (!shouldAcceptBuiltCloudLocked(built, sourceId, settingsKey, &decisionReason)) {
+      if (changed) *changed = false;
+      cubeViewerDebugLog(std::string("Rejected cloud payload: reason=") + decisionReason +
+                         " built=" + std::to_string(built.sourceWidth) + "x" + std::to_string(built.sourceHeight) +
+                         " cached=" + std::to_string(cachedCloud_.sourceWidth) + "x" + std::to_string(cachedCloud_.sourceHeight) +
+                         " quality=" + built.quality +
+                         " res=" + std::to_string(built.resolution));
+      return decisionReason == "unchanged-content";
+    }
+    cachedCloud_.payload = built.payload;
+    cachedCloud_.paramHash = built.paramHash;
+    cachedCloud_.quality = built.quality;
+    cachedCloud_.sourceId = sourceId;
+    cachedCloud_.settingsKey = settingsKey;
+    cachedCloud_.contentHash = built.contentHash;
+    cachedCloud_.resolution = built.resolution;
+    cachedCloud_.sourceWidth = built.sourceWidth;
+    cachedCloud_.sourceHeight = built.sourceHeight;
+    cachedCloud_.valid = true;
+    if (changed) *changed = true;
+    cubeViewerDebugLog(std::string("Accepted cloud payload: reason=") + decisionReason +
+                       " source=" + std::to_string(built.sourceWidth) + "x" + std::to_string(built.sourceHeight) +
+                       " quality=" + built.quality +
+                       " res=" + std::to_string(built.resolution));
+    return true;
+  }
+
+  void copySourceToDestination(Image* src, Image* dst, const OfxRectI& renderWindow) {
+    const int width = renderWindow.x2 - renderWindow.x1;
+    if (!src) {
+      for (int y = renderWindow.y1; y < renderWindow.y2; ++y) {
+        float* dstPix = reinterpret_cast<float*>(dst->getPixelAddress(renderWindow.x1, y));
+        if (!dstPix) continue;
+        std::fill(dstPix, dstPix + width * 4, 0.0f);
+      }
+      return;
+    }
+
+    for (int y = renderWindow.y1; y < renderWindow.y2; ++y) {
+      float* dstPix = reinterpret_cast<float*>(dst->getPixelAddress(renderWindow.x1, y));
+      const float* srcPix = reinterpret_cast<const float*>(src->getPixelAddress(renderWindow.x1, y));
+      if (!dstPix || !srcPix) continue;
+      std::memcpy(dstPix, srcPix, static_cast<size_t>(width) * 4u * sizeof(float));
+    }
+  }
+
+  // Stage: synthesize the image-space strip used by draw-on-image mode.
+  // This is the shared contract that downstream "sample drawn cube only" reads back.
+  bool buildIdentityOverlayStripData(const OfxRectI& bounds, const OfxRectI& renderWindow, double time, OverlayStripData* out) {
+    if (!out || !getBoolValue("cubeViewerDrawOnImageEnabled", time, false)) return false;
+    if (!currentIdentityOverlayEnabled(time)) return false;
+    const int imageWidth = bounds.x2 - bounds.x1;
+    const int imageHeight = bounds.y2 - bounds.y1;
+    if (imageWidth <= 0 || imageHeight <= 0) return false;
+    const bool overlayRamp = currentIdentityOverlayRamp(time);
+    const int requestedSize = getIntValue("cubeViewerSampleDrawnCubeSize", time, 29);
+    const int cubeSize = clampOverlayCubeSize(requestedSize);
+    const int denom = std::max(1, cubeSize - 1);
+    const float cellWidth = identityStripCellWidth(imageWidth, cubeSize);
+    int stripHeight = 0;
+    int cubeY1 = 0;
+    int cubeY2 = 0;
+    int rampY1 = 0;
+    int rampY2 = 0;
+    if (!computeIdentityStripLayout(bounds, cubeSize, overlayRamp, &stripHeight, &cubeY1, &cubeY2, &rampY1, &rampY2)) return false;
+    const int drawY1 = std::max(renderWindow.y1, bounds.y1);
+    const int drawY2 = std::min(renderWindow.y2, overlayRamp ? rampY2 : cubeY2);
+    if (drawY1 >= drawY2) return false;
+    OverlayStripData overlay{};
+    overlay.x1 = renderWindow.x1;
+    overlay.y1 = drawY1;
+    overlay.width = renderWindow.x2 - renderWindow.x1;
+    overlay.height = drawY2 - drawY1;
+    if (overlay.width <= 0 || overlay.height <= 0) return false;
+    overlay.pixels.assign(static_cast<size_t>(overlay.width) * static_cast<size_t>(overlay.height) * 4u, 0.0f);
+    for (int y = drawY1; y < drawY2; ++y) {
+      float* row = overlay.pixels.data() + static_cast<size_t>(y - drawY1) * static_cast<size_t>(overlay.width) * 4u;
+      const bool inRampBand = overlayRamp && y >= rampY1 && y < rampY2;
+      const bool inCubeBand = y >= cubeY1 && y < cubeY2;
+      if (!inRampBand && !inCubeBand) continue;
+      for (int x = renderWindow.x1; x < renderWindow.x2; ++x) {
+        float r = 0.0f;
+        float g = 0.0f;
+        float b = 0.0f;
+        if (inRampBand) {
+          const float t = imageWidth <= 1 ? 0.0f
+                                          : static_cast<float>(x - bounds.x1) / static_cast<float>(std::max(1, imageWidth - 1));
+          r = g = b = clamp01(t);
+        } else {
+          const float localX = static_cast<float>(x - bounds.x1);
+          const int blueIndex = std::clamp(static_cast<int>(std::floor(localX / cellWidth)), 0, denom);
+          const float layerStart = static_cast<float>(blueIndex) * cellWidth;
+          const float layerOffset = localX - layerStart;
+          r = cellWidth <= 1.0f ? 0.0f : clamp01(layerOffset / std::max(1.0f, cellWidth - 1.0f));
+          const int cubeBandY = y - cubeY1;
+          g = stripHeight <= 1 ? 1.0f
+                               : clamp01(static_cast<float>(cubeBandY) / static_cast<float>(std::max(1, stripHeight - 1)));
+          b = static_cast<float>(blueIndex) / static_cast<float>(denom);
+        }
+        float* px = row + static_cast<size_t>(x - renderWindow.x1) * 4u;
+        px[0] = r;
+        px[1] = g;
+        px[2] = b;
+        px[3] = 1.0f;
+      }
+    }
+    *out = std::move(overlay);
+    return true;
+  }
+
+  void applyIdentityOverlayToDestination(Image* dst, const OfxRectI& renderWindow, double time) {
+    if (!dst) return;
+    OverlayStripData overlay{};
+    if (!buildIdentityOverlayStripData(dst->getBounds(), renderWindow, time, &overlay)) return;
+    const size_t packedRowBytes = static_cast<size_t>(overlay.width) * 4u * sizeof(float);
+    for (int rowIndex = 0; rowIndex < overlay.height; ++rowIndex) {
+      float* row = reinterpret_cast<float*>(dst->getPixelAddress(overlay.x1, overlay.y1 + rowIndex));
+      if (!row) continue;
+      const float* src = overlay.pixels.data() + static_cast<size_t>(rowIndex) * static_cast<size_t>(overlay.width) * 4u;
+      std::memcpy(row, src, packedRowBytes);
+    }
+  }
+
+  bool ensureStageBuffer(size_t pixelCount) {
+    std::lock_guard<std::mutex> lock(stageMutex_);
+    const size_t needed = pixelCount * 4u;
+    if (stageSrc_.size() < needed) {
+      stageSrc_.assign(needed, 0.0f);
+    }
+    return true;
+  }
+
+  float* stageSrcPtr() {
+    return stageSrc_.empty() ? nullptr : stageSrc_.data();
+  }
+
+  bool getBoolValue(const std::string& name, double time, bool fallback) {
+    if (auto* p = fetchBooleanParam(name)) {
+      bool value = fallback;
+      p->getValueAtTime(time, value);
+      return value;
+    }
+    return fallback;
+  }
+
+  int getChoiceValue(const std::string& name, double time, int fallback) {
+    if (auto* p = fetchChoiceParam(name)) {
+      int value = fallback;
+      p->getValueAtTime(time, value);
+      return value;
+    }
+    return fallback;
+  }
+
+  double getDoubleValue(const std::string& name, double time, double fallback) {
+    if (auto* p = fetchDoubleParam(name)) {
+      double value = fallback;
+      p->getValueAtTime(time, value);
+      return value;
+    }
+    return fallback;
+  }
+
+  std::array<double, 3> getRGBValue(const std::string& name, double time, const std::array<double, 3>& fallback) {
+    if (auto* p = fetchRGBParam(name)) {
+      double r = fallback[0];
+      double g = fallback[1];
+      double b = fallback[2];
+      p->getValueAtTime(time, r, g, b);
+      return {r, g, b};
+    }
+    return fallback;
+  }
+
+  int getIntValue(const std::string& name, double time, int fallback) {
+    if (auto* p = fetchIntParam(name)) {
+      int value = fallback;
+      p->getValueAtTime(time, value);
+      return value;
+    }
+    return fallback;
+  }
+
+  void setStatusLabel(const std::string& text) {
+    bool changed = false;
+    {
+      std::lock_guard<std::mutex> lock(statusMutex_);
+      if (pendingStatusText_ != text) {
+        pendingStatusText_ = text;
+        statusDirty_ = true;
+        changed = true;
+      }
+    }
+    if (changed) {
+      cubeViewerDebugLog(std::string("Viewer status -> ") + text);
+    }
+  }
+
+  void flushStatusLabelToHost() {
+    std::string text;
+    {
+      std::lock_guard<std::mutex> lock(statusMutex_);
+      if (!statusDirty_) return;
+      text = pendingStatusText_;
+      statusDirty_ = false;
+    }
+    if (statusCache_ == text) return;
+    statusCache_ = text;
+    if (auto* p = fetchStringParam("cubeViewerStatus")) p->setValue(text);
+  }
+
+  void resolveOverlaySizeParamIfAuto(double time) {
+    if (currentDrawOnImageMode(time)) return;
+    auto* p = fetchIntParam("cubeViewerIdentityOverlaySize");
+    if (!p) return;
+    int requested = 25;
+    p->getValueAtTime(time, requested);
+    if (clampOverlayCubeSize(requested) != 25) return;
+    const int qualityIndex = getChoiceValue("cubeViewerQuality", time, cubeViewerQuality_);
+    const int scaleIndex = getChoiceValue("cubeViewerScale", time, 3);
+    const int resolved = resolvedOverlayCubeSize(requested, qualityIndex, scaleIndex);
+    if (resolved != requested) {
+      p->setValue(resolved);
+    }
+  }
+
+  std::string currentSourceMode(double time) {
+    (void)time;
+    return "input";
+  }
+
+  bool currentIdentityOverlayEnabled(double time) {
+    return currentDrawOnImageMode(time)
+               ? getBoolValue("cubeViewerIdentityOverlayEnabledDraw", time, false)
+               : getBoolValue("cubeViewerIdentityOverlayEnabled", time, false);
+  }
+
+  bool currentIdentityOverlayRamp(double time) {
+    return currentDrawOnImageMode(time)
+               ? getBoolValue("cubeViewerIdentityOverlayRampDraw", time, false)
+               : getBoolValue("cubeViewerIdentityOverlayRamp", time, false);
+  }
+
+  std::string currentPlotMode(double time) {
+    switch (getChoiceValue("cubeViewerPlotModel", time, 0)) {
+      case 1: return "hsl";
+      case 2: return "hsv";
+      case 3: return "chen";
+      case 4: return "norm_cone";
+      case 5: return "jp_conical";
+      case 6: return "reuleaux";
+      case 7: return "chromaticity";
+      default: return "rgb";
+    }
+  }
+
+  bool currentChromaticityPlotMode(double time) {
+    return !currentDrawOnImageMode(time) && currentPlotMode(time) == "chromaticity";
+  }
+
+  bool currentDrawOnImageMode(double time) {
+    return getBoolValue("cubeViewerDrawOnImageEnabled", time, false);
+  }
+
+  bool currentUseInstance1Requested(double time) {
+    return !currentDrawOnImageMode(time) &&
+           (getBoolValue("cubeViewerSampleDrawnCubeOnly", time, false) ||
+            getBoolValue("cubeViewerReadGrayRamp", time, false));
+  }
+
+  bool currentUseInstance1(double time) {
+    return currentUseInstance1Requested(time);
+  }
+
+  bool currentReadIdentityPlot(double time) {
+    return !currentDrawOnImageMode(time) && getBoolValue("cubeViewerSampleDrawnCubeOnly", time, false);
+  }
+
+  bool currentReadGrayRamp(double time) {
+    return !currentDrawOnImageMode(time) && getBoolValue("cubeViewerReadGrayRamp", time, false);
+  }
+
+  bool currentShowIdentityOnly(double time) {
+    return currentUseInstance1(time) && getBoolValue("cubeViewerShowIdentityOnly", time, false);
+  }
+
+  bool currentOccupancyGuidedFill(double time) {
+    return !currentDrawOnImageMode(time) && getBoolValue("cubeViewerOccupancyGuidedFill", time, false);
+  }
+
+  bool currentShowOverflow(double time) {
+    return !currentDrawOnImageMode(time) &&
+            (currentPlotMode(time) == "rgb" || currentPlotMode(time) == "hsl" ||
+             currentPlotMode(time) == "hsv" || currentPlotMode(time) == "chen" ||
+             currentPlotMode(time) == "jp_conical" || currentPlotMode(time) == "reuleaux" ||
+             currentPlotMode(time) == "chromaticity") &&
+           getBoolValue("cubeViewerShowOverflow", time, false);
+  }
+
+  bool currentCircularHsl(double time) {
+    return !currentDrawOnImageMode(time) &&
+           currentPlotMode(time) == "hsl" &&
+           getBoolValue("cubeViewerCircularHsl", time, false);
+  }
+
+  bool currentCircularHsv(double time) {
+    return !currentDrawOnImageMode(time) &&
+           currentPlotMode(time) == "hsv" &&
+           getBoolValue("cubeViewerCircularHsv", time, false);
+  }
+
+  VolumeSlicingMode currentVolumeSlicingMode(double time) {
+    return getBoolValue("cubeViewerLassoRegionMode", time, false)
+               ? VolumeSlicingMode::LassoRegion
+               : VolumeSlicingMode::HueSectors;
+  }
+
+  bool currentCubeSlicingSupported(double time) {
+    return !currentDrawOnImageMode(time);
+  }
+
+  bool currentHueSectorSlicingAllowed(double time) {
+    return currentCubeSlicingSupported(time) && !currentChromaticityPlotMode(time);
+  }
+
+  bool currentVolumeSlicingEnabled(double time) {
+    if (!currentCubeSlicingSupported(time)) return false;
+    if (getBoolValue("cubeViewerLassoRegionMode", time, false)) return true;
+    return currentHueSectorSlicingAllowed(time) && anyCubeSliceRegionSelected(time);
+  }
+
+  bool currentHueSectorSlicingEnabled(double time) {
+    return currentHueSectorSlicingAllowed(time) &&
+           currentVolumeSlicingEnabled(time) &&
+           currentVolumeSlicingMode(time) == VolumeSlicingMode::HueSectors;
+  }
+
+  bool currentLassoRegionSlicingEnabled(double time) {
+    return currentVolumeSlicingEnabled(time) &&
+           currentVolumeSlicingMode(time) == VolumeSlicingMode::LassoRegion;
+  }
+
+  bool anyCubeSliceRegionSelected(double time) {
+    return getBoolValue("cubeViewerSliceRed", time, false) ||
+           getBoolValue("cubeViewerSliceGreen", time, false) ||
+           getBoolValue("cubeViewerSliceBlue", time, false) ||
+           getBoolValue("cubeViewerSliceCyan", time, false) ||
+           getBoolValue("cubeViewerSliceYellow", time, false) ||
+           getBoolValue("cubeViewerSliceMagenta", time, false);
+  }
+
+  SliceSelectionSpec currentHueSectorSliceSpec(double time) {
+    SliceSelectionSpec spec{};
+    const std::string plotMode = currentPlotMode(time);
+    if (plotMode == "hsl") {
+      spec.plotMode = SlicePlotModeKind::Hsl;
+    } else if (plotMode == "hsv") {
+      spec.plotMode = SlicePlotModeKind::Hsv;
+    } else if (plotMode == "chen") {
+      spec.plotMode = SlicePlotModeKind::Chen;
+    } else if (plotMode == "rgb_to_cone") {
+      spec.plotMode = SlicePlotModeKind::RgbToCone;
+    } else if (plotMode == "jp_conical") {
+      spec.plotMode = SlicePlotModeKind::JpConical;
+    } else if (plotMode == "norm_cone") {
+      spec.plotMode = SlicePlotModeKind::NormCone;
+    } else if (plotMode == "reuleaux") {
+      spec.plotMode = SlicePlotModeKind::Reuleaux;
+    } else {
+      spec.plotMode = SlicePlotModeKind::Rgb;
+    }
+    spec.showOverflow = currentShowOverflow(time);
+    spec.normConeNormalized = getBoolValue("cubeViewerNormConeNormalized", time, true);
+    spec.enabled = currentHueSectorSlicingEnabled(time);
+    spec.cubeSliceRed = getBoolValue("cubeViewerSliceRed", time, true);
+    spec.cubeSliceGreen = getBoolValue("cubeViewerSliceGreen", time, false);
+    spec.cubeSliceBlue = getBoolValue("cubeViewerSliceBlue", time, false);
+    spec.cubeSliceCyan = getBoolValue("cubeViewerSliceCyan", time, false);
+    spec.cubeSliceYellow = getBoolValue("cubeViewerSliceYellow", time, false);
+    spec.cubeSliceMagenta = getBoolValue("cubeViewerSliceMagenta", time, false);
+    return spec;
+  }
+
+  int currentChromaticityInputPrimariesChoice(double time) {
+    return std::clamp(getChoiceValue("cubeViewerChromaticityInputPrimaries", time,
+                                     WorkshopColor::primariesChoiceIndex(
+                                         WorkshopColor::ColorPrimariesId::DavinciWideGamut)),
+                      0, static_cast<int>(WorkshopColor::primariesCount()) - 1);
+  }
+
+  int currentChromaticityInputTransferChoice(double time) {
+    return std::clamp(getChoiceValue("cubeViewerChromaticityInputTransfer", time,
+                                     WorkshopColor::transferFunctionChoiceIndex(
+                                         WorkshopColor::TransferFunctionId::DavinciIntermediate)),
+                      0, static_cast<int>(WorkshopColor::transferFunctionCount()) - 1);
+  }
+
+  int currentChromaticityReferenceBasisChoice(double time) {
+    return std::clamp(getChoiceValue("cubeViewerChromaticityReferenceBasis", time, 0), 0, 1);
+  }
+
+  int currentChromaticityOverlayPrimariesChoice(double time) {
+    return std::clamp(getChoiceValue("cubeViewerChromaticityOverlayPrimaries", time,
+                                     WorkshopColor::overlayPrimariesChoiceIndex(
+                                         true, WorkshopColor::ColorPrimariesId::Rec709)),
+                      0, static_cast<int>(WorkshopColor::primariesCount()));
+  }
+
+  bool currentChromaticityPlanckianLocusEnabled(double time) {
+    return getBoolValue("cubeViewerChromaticityPlanckianLocus", time, true);
+  }
+
+  std::string getStringValue(const std::string& name, double time, const std::string& fallback) {
+    if (auto* p = fetchStringParam(name)) {
+      std::string value;
+      p->getValueAtTime(time, value);
+      return value;
+    }
+    return fallback;
+  }
+
+  LassoRegionState currentLassoRegionState(double time) {
+    return parseLassoRegionState(getStringValue("cubeViewerLassoData", time, ""));
+  }
+
+  OfxRectD currentLassoImageRect(double time) {
+    if (srcClip_) {
+      const OfxRectD rod = srcClip_->getRegionOfDefinition(time);
+      if (rod.x2 > rod.x1 && rod.y2 > rod.y1) return rod;
+    }
+    return OfxRectD{0.0, 0.0, 1.0, 1.0};
+  }
+
+  bool currentLassoSubtractOperation(double time) {
+    return getChoiceValue("cubeViewerLassoOperation", time, 0) == 1;
+  }
+
+  std::string currentVolumeSlicingModeLabel(double time) {
+    return currentVolumeSlicingMode(time) == VolumeSlicingMode::LassoRegion ? "lasso" : "hue";
+  }
+
+  void applyLassoRegionState(double time, const LassoRegionState& state, const std::string& reason) {
+    const std::string serialized = serializeLassoRegionState(state);
+    if (getStringValue("cubeViewerLassoData", time, "") == serialized) return;
+    if (auto* p = fetchStringParam("cubeViewerLassoData")) {
+      suppressLassoDataChangedHandling_ = true;
+      p->setValue(serialized);
+      suppressLassoDataChangedHandling_ = false;
+    }
+    cubeViewerDebugLog(std::string("Applied lasso region state: reason=") + reason +
+                       " revision=" + std::to_string(state.revision) +
+                       " strokes=" + std::to_string(state.strokes.size()));
+    syncCubeSlicingUi(time);
+    invalidateCubeViewerCloudState();
+    if (cubeViewerRequested_) {
+      pushParamsUpdate(time, reason);
+    }
+    redrawOverlays();
+  }
+
+  void undoLassoRegionStroke(double time, const std::string& reason) {
+    LassoRegionState state = currentLassoRegionState(time);
+    if (state.strokes.empty()) return;
+    state.strokes.pop_back();
+    ++state.revision;
+    applyLassoRegionState(time, state, reason);
+  }
+
+  void resetLassoRegion(double time, const std::string& reason) {
+    LassoRegionState state{};
+    state.revision = currentLassoRegionState(time).revision + 1;
+    applyLassoRegionState(time, state, reason);
+  }
+
+  bool commitLassoStroke(double time, const std::vector<OfxPointD>& points, bool subtract, const std::string& reason) {
+    if (!currentLassoRegionSlicingEnabled(time) || points.size() < 3) return false;
+    const OfxRectD rect = currentLassoImageRect(time);
+    const double width = std::max(1e-6, rect.x2 - rect.x1);
+    const double height = std::max(1e-6, rect.y2 - rect.y1);
+    LassoStroke stroke{};
+    stroke.subtract = subtract;
+    stroke.points.reserve(points.size());
+    for (const auto& point : points) {
+      const float xNorm = std::clamp(static_cast<float>((point.x - rect.x1) / width), 0.0f, 1.0f);
+      const float yNorm = std::clamp(static_cast<float>((point.y - rect.y1) / height), 0.0f, 1.0f);
+      if (!stroke.points.empty()) {
+        const auto& last = stroke.points.back();
+        if (std::fabs(last.xNorm - xNorm) < 1e-5f && std::fabs(last.yNorm - yNorm) < 1e-5f) continue;
+      }
+      stroke.points.push_back({xNorm, yNorm});
+    }
+    if (stroke.points.size() < 3) return false;
+    LassoRegionState state = currentLassoRegionState(time);
+    ++state.revision;
+    state.strokes.push_back(std::move(stroke));
+    applyLassoRegionState(time, state, reason);
+    return true;
+  }
+
+  void syncLassoDataChange(double time, const std::string& reason) {
+    const LassoRegionState state = currentLassoRegionState(time);
+    cubeViewerDebugLog(std::string("Lasso region changed: reason=") + reason +
+                       " revision=" + std::to_string(state.revision) +
+                       " strokes=" + std::to_string(state.strokes.size()));
+    syncCubeSlicingUi(time);
+    invalidateCubeViewerCloudState();
+    if (cubeViewerRequested_) {
+      pushParamsUpdate(time, reason);
+    }
+    redrawOverlays();
+  }
+
+  void syncCubeSlicingUi(double time) {
+    const bool supported = currentCubeSlicingSupported(time);
+    const bool hueSectorAllowed = currentHueSectorSlicingAllowed(time);
+    const bool lassoSelected = supported && getBoolValue("cubeViewerLassoRegionMode", time, false);
+    const bool lassoMode = supported && currentVolumeSlicingMode(time) == VolumeSlicingMode::LassoRegion;
+    const bool hueOptionsVisible = supported && hueSectorAllowed && !lassoSelected;
+    setParamVisibility(fetchGroupParam("grp_cube_viewer_slicing"), supported);
+    setParamVisibility(fetchBooleanParam("cubeViewerLassoRegionMode"), supported);
+    setParamVisibility(fetchBooleanParam("cubeViewerSliceRed"), hueOptionsVisible);
+    setParamVisibility(fetchBooleanParam("cubeViewerSliceGreen"), hueOptionsVisible);
+    setParamVisibility(fetchBooleanParam("cubeViewerSliceBlue"), hueOptionsVisible);
+    setParamVisibility(fetchBooleanParam("cubeViewerSliceCyan"), hueOptionsVisible);
+    setParamVisibility(fetchBooleanParam("cubeViewerSliceYellow"), hueOptionsVisible);
+    setParamVisibility(fetchBooleanParam("cubeViewerSliceMagenta"), hueOptionsVisible);
+    setParamVisibility(fetchChoiceParam("cubeViewerLassoOperation"), lassoMode);
+    setParamVisibility(fetchPushButtonParam("cubeViewerLassoUndo"), lassoMode);
+    setParamVisibility(fetchPushButtonParam("cubeViewerLassoReset"), lassoMode);
+  }
+
+  void syncShowOverflowSupport(double time) {
+    const bool drawOnImage = currentDrawOnImageMode(time);
+    const std::string plotMode = currentPlotMode(time);
+    const bool supported = !drawOnImage &&
+                            (plotMode == "rgb" || plotMode == "hsl" ||
+                             plotMode == "hsv" || plotMode == "chen" ||
+                             plotMode == "jp_conical" || plotMode == "reuleaux" ||
+                             plotMode == "chromaticity");
+    const bool showOverflow = supported && getBoolValue("cubeViewerShowOverflow", time, false);
+    if (auto* p = fetchBooleanParam("cubeViewerShowOverflow")) {
+      if (!supported) {
+        bool current = false;
+        p->getValueAtTime(time, current);
+        if (current) p->setValue(false);
+      }
+      p->setIsSecret(drawOnImage);
+      p->setEnabled(supported);
+    }
+    if (auto* p = fetchBooleanParam("cubeViewerHighlightOverflow")) {
+      p->setIsSecret(!showOverflow);
+      p->setEnabled(showOverflow);
+    }
+    if (auto* p = fetchRGBParam("cubeViewerOverflowHighlightColor")) {
+      p->setIsSecret(true);
+      p->setEnabled(false);
+    }
+    if (auto* p = fetchRGBParam("cubeViewerBackgroundColor")) {
+      p->setIsSecret(true);
+      p->setEnabled(false);
+    }
+  }
+
+  void setParamVisibility(Param* param, bool visible) {
+    if (!param) return;
+    param->setIsSecret(!visible);
+    param->setEnabled(visible);
+  }
+
+  void setGroupOpenState(const std::string& name, bool open) {
+    auto* effectSuite = const_cast<OfxImageEffectSuiteV1*>(
+        reinterpret_cast<const OfxImageEffectSuiteV1*>(fetchSuite(kOfxImageEffectSuite, 1, true)));
+    auto* paramSuite = const_cast<OfxParameterSuiteV1*>(
+        reinterpret_cast<const OfxParameterSuiteV1*>(fetchSuite(kOfxParameterSuite, 1, true)));
+    auto* propSuite = const_cast<OfxPropertySuiteV1*>(
+        reinterpret_cast<const OfxPropertySuiteV1*>(fetchSuite(kOfxPropertySuite, 1, true)));
+    if (!effectSuite || !paramSuite || !propSuite) return;
+    OfxParamSetHandle paramSetHandle = nullptr;
+    if (effectSuite->getParamSet(getHandle(), &paramSetHandle) != kOfxStatOK || !paramSetHandle) return;
+    OfxParamHandle paramHandle = nullptr;
+    OfxPropertySetHandle propHandle = nullptr;
+    if (paramSuite->paramGetHandle(paramSetHandle, name.c_str(), &paramHandle, &propHandle) != kOfxStatOK || !propHandle) return;
+    propSuite->propSetInt(propHandle, kOfxParamPropGroupOpen, 0, open ? 1 : 0);
+  }
+
+  void syncIdentityOverlayGroupOpenState(double time) {
+    // Resolve can re-render repeatedly while a slider is being dragged.
+    // Only force this group open for workflows that must keep it visible,
+    // and avoid forcing it closed during normal interactive edits.
+    if (currentDrawOnImageMode(time) || currentUseInstance1(time)) {
+      setGroupOpenState("grp_cube_viewer_identity_overlay", true);
+    }
+  }
+
+  void updateDrawOnImageModeUi(double time) {
+    const bool drawOnImage = currentDrawOnImageMode(time);
+    const bool overlayEnabled = currentIdentityOverlayEnabled(time);
+    const bool useInstance1Requested = currentUseInstance1Requested(time);
+    const bool useInstance1 = currentUseInstance1(time);
+    const bool readIdentityPlot = currentReadIdentityPlot(time);
+    const bool readGrayRamp = currentReadGrayRamp(time);
+    const bool chromaticityMode = currentChromaticityPlotMode(time);
+    if (drawOnImage || useInstance1Requested) {
+      setGroupOpenState("grp_cube_viewer_identity_overlay", true);
+    }
+    if (auto* drawCube = fetchBooleanParam("cubeViewerIdentityOverlayEnabled")) {
+      drawCube->setLabel("Fill Volume");
+    }
+    if (auto* drawCubeProxy = fetchBooleanParam("cubeViewerIdentityOverlayEnabledDraw")) {
+      drawCubeProxy->setLabel("Generate Identity Plot");
+    }
+    if (auto* overlaySize = fetchIntParam("cubeViewerIdentityOverlaySize")) {
+      overlaySize->setLabel("Fill Resolution");
+    }
+    if (auto* grayRamp = fetchBooleanParam("cubeViewerIdentityOverlayRamp")) {
+      grayRamp->setLabel("Overlay Gray Ramp");
+    }
+    if (auto* grayRampProxy = fetchBooleanParam("cubeViewerIdentityOverlayRampDraw")) {
+      grayRampProxy->setLabel("Draw Gray Ramp");
+    }
+    if (auto* note = fetchStringParam("cubeViewerIdentityOverlayNote")) {
+      note->setIsSecret(drawOnImage);
+      note->setEnabled(false);
+    }
+    if (auto* toggle = fetchPushButtonParam("cubeViewerModeToggle")) {
+      toggle->setLabel(drawOnImage ? "Switch to 3D Viewer" : "Switch to Identity Generator");
+    }
+    setParamVisibility(fetchPushButtonParam("openCubeViewer"), !drawOnImage);
+    setParamVisibility(fetchChoiceParam("cubeViewerPlotModel"), !drawOnImage);
+    syncShowOverflowSupport(time);
+    syncCubeSlicingUi(time);
+    setParamVisibility(fetchPushButtonParam("closeCubeViewer"), !drawOnImage);
+    setParamVisibility(fetchBooleanParam("cubeViewerLive"), !drawOnImage);
+    setParamVisibility(fetchBooleanParam("cubeViewerOnTop"), !drawOnImage);
+    setParamVisibility(fetchChoiceParam("cubeViewerQuality"), !drawOnImage);
+    setParamVisibility(fetchChoiceParam("cubeViewerScale"), !drawOnImage);
+    setParamVisibility(fetchDoubleParam("cubeViewerPointSize"), !drawOnImage);
+    setParamVisibility(fetchChoiceParam("cubeViewerPointShape"), !drawOnImage);
+    setParamVisibility(fetchChoiceParam("cubeViewerSamplingMode"), !drawOnImage);
+    setParamVisibility(fetchBooleanParam("cubeViewerOccupancyGuidedFill"), !drawOnImage);
+    if (auto* status = fetchStringParam("cubeViewerStatus")) {
+      status->setIsSecret(drawOnImage);
+      status->setEnabled(false);
+    }
+    setParamVisibility(fetchBooleanParam("cubeViewerCircularHsl"),
+                       !drawOnImage && currentPlotMode(time) == "hsl");
+    setParamVisibility(fetchBooleanParam("cubeViewerCircularHsv"),
+                       !drawOnImage && currentPlotMode(time) == "hsv");
+    setParamVisibility(fetchBooleanParam("cubeViewerNormConeNormalized"),
+                       !drawOnImage && currentPlotMode(time) == "norm_cone");
+    setParamVisibility(fetchGroupParam("grp_cube_viewer_chromaticity_cm"),
+                       !drawOnImage && chromaticityMode);
+    setParamVisibility(fetchBooleanParam("cubeViewerChromaticityPlanckianLocus"),
+                       !drawOnImage && chromaticityMode);
+    setParamVisibility(fetchChoiceParam("cubeViewerChromaticityInputPrimaries"),
+                       !drawOnImage && chromaticityMode);
+    setParamVisibility(fetchChoiceParam("cubeViewerChromaticityInputTransfer"),
+                       !drawOnImage && chromaticityMode);
+    setParamVisibility(fetchChoiceParam("cubeViewerChromaticityReferenceBasis"),
+                       !drawOnImage && chromaticityMode);
+    setParamVisibility(fetchChoiceParam("cubeViewerChromaticityOverlayPrimaries"),
+                       !drawOnImage && chromaticityMode);
+    setParamVisibility(fetchBooleanParam("cubeViewerIdentityOverlayEnabled"), !drawOnImage);
+    setParamVisibility(fetchBooleanParam("cubeViewerIdentityOverlayEnabledDraw"), drawOnImage);
+    setParamVisibility(fetchBooleanParam("cubeViewerIdentityOverlayRampDraw"), drawOnImage && overlayEnabled);
+    setParamVisibility(fetchIntParam("cubeViewerIdentityOverlaySize"), !drawOnImage && overlayEnabled);
+    setParamVisibility(fetchBooleanParam("cubeViewerIdentityOverlayRamp"), !drawOnImage && overlayEnabled);
+    setParamVisibility(fetchBooleanParam("cubeViewerSampleDrawnCubeOnly"), !drawOnImage);
+    setParamVisibility(fetchBooleanParam("cubeViewerReadGrayRamp"), !drawOnImage);
+    setParamVisibility(fetchIntParam("cubeViewerSampleDrawnCubeSize"),
+                       drawOnImage ? overlayEnabled : (readIdentityPlot || readGrayRamp));
+    setParamVisibility(fetchBooleanParam("cubeViewerShowIdentityOnly"), !drawOnImage && (useInstance1 || readGrayRamp));
+    setParamVisibility(fetchGroupParam("grp_cube_viewer"), !drawOnImage);
+    setParamVisibility(fetchGroupParam("grp_cube_viewer_identity_overlay"), true);
+    setParamVisibility(fetchGroupParam("grp_support_root"), true);
+    cubeViewerDebugLog(std::string("Draw-on-image UI state -> ") + (drawOnImage ? "draw" : "plot"));
+  }
+
+  void updateNormConeToggleVisibility(double time) {
+    const bool visible = !currentDrawOnImageMode(time) && currentPlotMode(time) == "norm_cone";
+    if (auto* p = fetchBooleanParam("cubeViewerNormConeNormalized")) {
+      p->setIsSecret(!visible);
+      p->setEnabled(visible);
+    }
+  }
+
+  void updateCircularHslToggleVisibility(double time) {
+    const bool visible = !currentDrawOnImageMode(time) && currentPlotMode(time) == "hsl";
+    if (auto* p = fetchBooleanParam("cubeViewerCircularHsl")) {
+      p->setIsSecret(!visible);
+      p->setEnabled(visible);
+    }
+  }
+
+  void updateCircularHsvToggleVisibility(double time) {
+    const bool visible = !currentDrawOnImageMode(time) && currentPlotMode(time) == "hsv";
+    if (auto* p = fetchBooleanParam("cubeViewerCircularHsv")) {
+      p->setIsSecret(!visible);
+      p->setEnabled(visible);
+    }
+  }
+
+  void invalidateCubeViewerCloudState() {
+    cubeViewerInputCloudRefreshPending_ = true;
+    lastCloudTime_ = std::numeric_limits<double>::quiet_NaN();
+    lastCloudBuiltAt_ = std::chrono::steady_clock::time_point{};
+    lastCloudSourceId_.clear();
+    lastCloudSettingsKey_.clear();
+    {
+      std::lock_guard<std::mutex> lock(stateMutex_);
+      cachedCloud_ = CachedCloud{};
+    }
+  }
+
+  std::string currentQualityLabel(double time) {
+    return qualityLabelForIndex(getChoiceValue("cubeViewerQuality", time, cubeViewerQuality_));
+  }
+
+  // This key is the contract between the OFX instance and the external viewer. Any setting that changes
+  // how the cloud should be interpreted must be represented here so stale clouds can be rejected safely.
+  std::string currentCloudSettingsKey(double time) {
+    const int qualityIndex = getChoiceValue("cubeViewerQuality", time, cubeViewerQuality_);
+    const int samplingMode = getSamplingModeValue(getChoiceValue("cubeViewerSamplingMode", time, 0));
+    const int scaleIndex = getChoiceValue("cubeViewerScale", time, 3);
+    const bool occupancyFill = currentOccupancyGuidedFill(time);
+    const bool useInstance1 = currentUseInstance1(time);
+    const bool readIdentityPlot = currentReadIdentityPlot(time);
+    const bool readGrayRamp = currentReadGrayRamp(time);
+    const bool showIdentityOnly = currentShowIdentityOnly(time);
+    const int sampleDrawnCubeRequestedSize = getIntValue("cubeViewerSampleDrawnCubeSize", time, 29);
+    const int sampleDrawnCubeResolvedSize = clampOverlayCubeSize(sampleDrawnCubeRequestedSize);
+    const std::string plotMode = currentPlotMode(time);
+    const bool showOverflow = currentShowOverflow(time);
+    const bool highlightOverflow = showOverflow && getBoolValue("cubeViewerHighlightOverflow", time, true);
+    const bool circularHsl = currentCircularHsl(time);
+    const bool circularHsv = currentCircularHsv(time);
+    const bool normConeNormalized = getBoolValue("cubeViewerNormConeNormalized", time, true);
+    const int chromaticityInputPrimaries = currentChromaticityInputPrimariesChoice(time);
+    const int chromaticityInputTransfer = currentChromaticityInputTransferChoice(time);
+    const int chromaticityReferenceBasis = currentChromaticityReferenceBasisChoice(time);
+    const int chromaticityOverlayPrimaries = currentChromaticityOverlayPrimariesChoice(time);
+    const bool volumeSlicingEnabled = currentVolumeSlicingEnabled(time);
+    const bool cubeSlicingEnabled = currentHueSectorSlicingEnabled(time);
+    const std::string slicingMode = currentVolumeSlicingModeLabel(time);
+    const bool lassoRegionEmpty = currentLassoRegionState(time).empty();
+    const std::string lassoData = getStringValue("cubeViewerLassoData", time, "");
+    const auto overflowColor = getRGBValue("cubeViewerOverflowHighlightColor", time, {1.0, 0.0, 0.0});
+    const auto backgroundColor = getRGBValue("cubeViewerBackgroundColor", time, {0.08, 0.08, 0.09});
+    std::ostringstream oss;
+    oss << "quality=" << qualityLabelForIndex(qualityIndex)
+        << "|resolution=" << qualityResolutionForIndex(qualityIndex)
+        << "|sampling=" << samplingModeLabelForIndex(samplingMode)
+        << "|occupancyFill=" << (occupancyFill ? 1 : 0)
+        << "|scale=" << scaleLabelForIndex(scaleIndex)
+        << "|plotMode=" << plotMode
+         << "|circularHsl=" << (circularHsl ? 1 : 0)
+         << "|circularHsv=" << (circularHsv ? 1 : 0)
+         << "|normConeNormalized=" << (normConeNormalized ? 1 : 0)
+         << "|chromaticityInputPrimaries=" << chromaticityInputPrimaries
+         << "|chromaticityInputTransfer=" << chromaticityInputTransfer
+         << "|chromaticityReferenceBasis=" << chromaticityReferenceBasis
+         << "|chromaticityOverlayPrimaries=" << chromaticityOverlayPrimaries
+         << "|showOverflow=" << (showOverflow ? 1 : 0)
+         << "|highlightOverflow=" << (highlightOverflow ? 1 : 0)
+         << "|volumeSlicingEnabled=" << (volumeSlicingEnabled ? 1 : 0)
+         << "|volumeSlicingMode=" << slicingMode
+         << "|cubeSlicingEnabled=" << (cubeSlicingEnabled ? 1 : 0)
+         << "|sliceRed=" << (getBoolValue("cubeViewerSliceRed", time, true) ? 1 : 0)
+         << "|sliceGreen=" << (getBoolValue("cubeViewerSliceGreen", time, false) ? 1 : 0)
+         << "|sliceBlue=" << (getBoolValue("cubeViewerSliceBlue", time, false) ? 1 : 0)
+         << "|sliceCyan=" << (getBoolValue("cubeViewerSliceCyan", time, false) ? 1 : 0)
+         << "|sliceYellow=" << (getBoolValue("cubeViewerSliceYellow", time, false) ? 1 : 0)
+         << "|sliceMagenta=" << (getBoolValue("cubeViewerSliceMagenta", time, false) ? 1 : 0)
+         << "|lassoHash=" << fnv1a64(lassoData)
+         << "|overflowColor=" << overflowColor[0] << "," << overflowColor[1] << "," << overflowColor[2]
+         << "|backgroundColor=" << backgroundColor[0] << "," << backgroundColor[1] << "," << backgroundColor[2]
+         << "|drawMode=" << (currentDrawOnImageMode(time) ? 1 : 0)
+        << "|useInstance1=" << (useInstance1 ? 1 : 0)
+         << "|showIdentityOnly=" << (showIdentityOnly ? 1 : 0)
+         << "|readIdentityPlot=" << (readIdentityPlot ? 1 : 0)
+         << "|readGrayRamp=" << (readGrayRamp ? 1 : 0)
+         << "|sampleDrawnCubeSize=" << sampleDrawnCubeResolvedSize;
+    return oss.str();
+  }
+
+  std::string currentSourceIdentifier(Image* img) {
+    if (!img) return {};
+    const std::string& uniqueId = img->getUniqueIdentifier();
+    return uniqueId;
+  }
+
+  // Params payloads describe how the viewer should interpret any subsequent cloud payloads and overlays.
+  // The viewer applies params first, then only accepts clouds whose settings key matches this snapshot.
+  std::string buildParamsPayload(double time) {
+    const uint64_t seq = seqCounter_.fetch_add(1, std::memory_order_relaxed);
+    const int qualityIndex = getChoiceValue("cubeViewerQuality", time, cubeViewerQuality_);
+    const int samplingMode = getSamplingModeValue(getChoiceValue("cubeViewerSamplingMode", time, 0));
+    const int scaleIndex = getChoiceValue("cubeViewerScale", time, 3);
+    const bool occupancyFill = currentOccupancyGuidedFill(time);
+    const int pointShape = getPointShapeValue(getChoiceValue("cubeViewerPointShape", time, 0));
+    const int resolution = qualityResolutionForIndex(qualityIndex);
+    const bool onTop = getBoolValue("cubeViewerOnTop", time, true);
+    const double pointSize = getDoubleValue("cubeViewerPointSize", time, 1.4);
+    const double pointDensity = derivedDensityScaleForPointSize(pointSize);
+    const std::string sourceMode = currentSourceMode(time);
+    const std::string plotMode = currentPlotMode(time);
+    const bool circularHsl = currentCircularHsl(time);
+    const bool circularHsv = currentCircularHsv(time);
+    const bool normConeNormalized = getBoolValue("cubeViewerNormConeNormalized", time, true);
+    const int chromaticityInputPrimaries = currentChromaticityInputPrimariesChoice(time);
+    const int chromaticityInputTransfer = currentChromaticityInputTransferChoice(time);
+    const int chromaticityReferenceBasis = currentChromaticityReferenceBasisChoice(time);
+    const int chromaticityOverlayPrimaries = currentChromaticityOverlayPrimariesChoice(time);
+    const bool chromaticityPlanckianLocus = currentChromaticityPlanckianLocusEnabled(time);
+    const bool overlayEnabled = currentIdentityOverlayEnabled(time);
+    const bool overlayRamp = currentIdentityOverlayRamp(time);
+    const bool showOverflow = currentShowOverflow(time);
+    const bool highlightOverflow = showOverflow && getBoolValue("cubeViewerHighlightOverflow", time, true);
+    const bool volumeSlicingEnabled = currentVolumeSlicingEnabled(time);
+    const bool cubeSlicingEnabled = currentHueSectorSlicingEnabled(time);
+    const std::string slicingMode = currentVolumeSlicingModeLabel(time);
+    const bool lassoRegionEmpty = currentLassoRegionState(time).empty();
+    const auto overflowColor = getRGBValue("cubeViewerOverflowHighlightColor", time, {1.0, 0.0, 0.0});
+    const auto backgroundColor = getRGBValue("cubeViewerBackgroundColor", time, {0.08, 0.08, 0.09});
+    const bool drawOnImageMode = currentDrawOnImageMode(time);
+    const int overlayRequestedSize = drawOnImageMode
+                                         ? getIntValue("cubeViewerSampleDrawnCubeSize", time, 29)
+                                         : getIntValue("cubeViewerIdentityOverlaySize", time, 29);
+    const int overlayResolvedSize = drawOnImageMode
+                                        ? clampOverlayCubeSize(overlayRequestedSize)
+                                        : resolvedOverlayCubeSize(overlayRequestedSize, qualityIndex, scaleIndex);
+    const bool overlayAuto = !drawOnImageMode && clampOverlayCubeSize(overlayRequestedSize) == 25;
+    const std::string cloudSettingsKey = currentCloudSettingsKey(time);
+    std::ostringstream oss;
+    oss << "{\"type\":\"params\",\"seq\":" << seq
+        << ",\"senderId\":\"" << jsonEscape(senderId_) << "\""
+        << ",\"sourceMode\":\"" << sourceMode << "\""
+        << ",\"plotMode\":\"" << plotMode << "\""
+        << ",\"circularHsl\":" << (circularHsl ? 1 : 0)
+        << ",\"circularHsv\":" << (circularHsv ? 1 : 0)
+        << ",\"cloudSettingsKey\":\"" << jsonEscape(cloudSettingsKey) << "\""
+        << ",\"normConeNormalized\":" << (normConeNormalized ? 1 : 0)
+        << ",\"chromaticityInputPrimaries\":" << chromaticityInputPrimaries
+        << ",\"chromaticityInputTransfer\":" << chromaticityInputTransfer
+        << ",\"chromaticityReferenceBasis\":" << chromaticityReferenceBasis
+        << ",\"chromaticityOverlayPrimaries\":" << chromaticityOverlayPrimaries
+        << ",\"chromaticityPlanckianLocus\":" << (chromaticityPlanckianLocus ? 1 : 0)
+        << ",\"alwaysOnTop\":" << (onTop ? 1 : 0)
+        << ",\"quality\":\"" << qualityLabelForIndex(qualityIndex) << "\""
+        << ",\"sampling\":\"" << samplingModeLabelForIndex(samplingMode) << "\""
+        << ",\"occupancyFill\":" << (occupancyFill ? 1 : 0)
+        << ",\"scale\":\"" << scaleLabelForIndex(scaleIndex) << "\""
+        << ",\"pointShape\":\"" << pointShapeLabelForIndex(pointShape) << "\""
+        << ",\"resolution\":" << resolution
+        << ",\"pointSize\":" << pointSize
+        << ",\"pointDensity\":" << pointDensity
+        << ",\"showOverflow\":" << (showOverflow ? 1 : 0)
+        << ",\"highlightOverflow\":" << (highlightOverflow ? 1 : 0)
+        << ",\"volumeSlicingEnabled\":" << (volumeSlicingEnabled ? 1 : 0)
+        << ",\"volumeSlicingMode\":\"" << slicingMode << "\""
+        << ",\"lassoRegionEmpty\":" << (lassoRegionEmpty ? 1 : 0)
+        << ",\"cubeSlicingEnabled\":" << (cubeSlicingEnabled ? 1 : 0)
+        << ",\"cubeSliceRed\":" << (getBoolValue("cubeViewerSliceRed", time, true) ? 1 : 0)
+        << ",\"cubeSliceGreen\":" << (getBoolValue("cubeViewerSliceGreen", time, false) ? 1 : 0)
+        << ",\"cubeSliceBlue\":" << (getBoolValue("cubeViewerSliceBlue", time, false) ? 1 : 0)
+        << ",\"cubeSliceCyan\":" << (getBoolValue("cubeViewerSliceCyan", time, false) ? 1 : 0)
+        << ",\"cubeSliceYellow\":" << (getBoolValue("cubeViewerSliceYellow", time, false) ? 1 : 0)
+        << ",\"cubeSliceMagenta\":" << (getBoolValue("cubeViewerSliceMagenta", time, false) ? 1 : 0)
+        << ",\"overflowHighlightColorR\":" << overflowColor[0]
+        << ",\"overflowHighlightColorG\":" << overflowColor[1]
+        << ",\"overflowHighlightColorB\":" << overflowColor[2]
+        << ",\"viewerBackgroundColorR\":" << backgroundColor[0]
+        << ",\"viewerBackgroundColorG\":" << backgroundColor[1]
+        << ",\"viewerBackgroundColorB\":" << backgroundColor[2]
+        << ",\"identityOverlayEnabled\":" << (overlayEnabled ? 1 : 0)
+        << ",\"identityOverlayRamp\":" << (overlayRamp ? 1 : 0)
+        << ",\"identityOverlayAuto\":" << (overlayAuto ? 1 : 0)
+        << ",\"identityOverlayRequestedSize\":" << clampOverlayCubeSize(overlayRequestedSize)
+        << ",\"identityOverlaySize\":" << overlayResolvedSize
+        << ",\"version\":\"" << kPluginVersionLabel << "\"}\n";
+    cubeViewerDebugLog(std::string("Built params payload: sourceMode=") + sourceMode +
+                        " plotMode=" + plotMode +
+                        " circularHsl=" + (circularHsl ? "1" : "0") +
+                        " circularHsv=" + (circularHsv ? "1" : "0") +
+                        " normConeNormalized=" + (normConeNormalized ? "1" : "0") +
+                         " quality=" + qualityLabelForIndex(qualityIndex) +
+                         " sampling=" + samplingModeLabelForIndex(samplingMode) +
+                         " occupancyFill=" + (occupancyFill ? "1" : "0") +
+                         " scale=" + scaleLabelForIndex(scaleIndex) +
+                         " pointShape=" + pointShapeLabelForIndex(pointShape) +
+                         " res=" + std::to_string(resolution) +
+                          " pointSize=" + std::to_string(pointSize) +
+                          " pointDensity=" + std::to_string(pointDensity) +
+                           " showOverflow=" + (showOverflow ? "1" : "0") +
+                           " highlightOverflow=" + (highlightOverflow ? "1" : "0") +
+                          " volumeSlicing=" + (volumeSlicingEnabled ? "1" : "0") +
+                          " slicingMode=" + slicingMode +
+                          " lassoEmpty=" + (lassoRegionEmpty ? "1" : "0") +
+                          " cloudKey=" + cloudSettingsKey +
+                          " overlay=" + (overlayEnabled ? "1" : "0") +
+                         " overlayRamp=" + (overlayRamp ? "1" : "0") +
+                        " overlayReq=" + std::to_string(clampOverlayCubeSize(overlayRequestedSize)) +
+                        " overlayRes=" + std::to_string(overlayResolvedSize) +
+                        " onTop=" + (onTop ? "1" : "0"));
+    return oss.str();
+  }
+
+  std::string buildInputCloudJson(
+      const std::string& points,
+      const std::string& paramHash,
+      const std::string& settingsKey,
+      int resolution,
+      int qualityIndex) {
+    const uint64_t seq = seqCounter_.fetch_add(1, std::memory_order_relaxed);
+    std::ostringstream oss;
+    oss << "{\"type\":\"input_cloud\",\"seq\":" << seq
+        << ",\"senderId\":\"" << jsonEscape(senderId_) << "\""
+        << ",\"quality\":\"" << qualityLabelForIndex(qualityIndex) << "\""
+        << ",\"resolution\":" << resolution
+        << ",\"paramHash\":\"" << jsonEscape(paramHash) << "\""
+        << ",\"settingsKey\":\"" << jsonEscape(settingsKey) << "\""
+        << ",\"points\":\"" << jsonEscape(points) << "\"}\n";
+    return oss.str();
+  }
+
+  float sampledChannelValue(float value, bool preserveOverflow) const {
+    return preserveOverflow ? value : clamp01(value);
+  }
+
+  void appendCloudPointSample(std::string* pts, bool* first, float r, float g, float b) const {
+    if (!pts || !first) return;
+    if (!*first) pts->push_back(';');
+    *first = false;
+    char sample[96];
+    const int n = std::snprintf(sample, sizeof(sample), "%.6f %.6f %.6f %.6f %.6f %.6f", r, g, b, r, g, b);
+    if (n > 0) pts->append(sample, static_cast<size_t>(n));
+  }
+
+  int occupancyBinIndex(float r, float g, float b, bool preserveOverflow) const {
+    constexpr int kCoreBins = 16;
+    constexpr int kOverflowBinsPerAxis = kCoreBins + 2;
+    const auto toBin = [preserveOverflow, kCoreBins, kOverflowBinsPerAxis](float v) -> int {
+      if (!preserveOverflow) {
+        const float clamped = clamp01(v);
+        return std::clamp(static_cast<int>(std::floor(clamped * static_cast<float>(kCoreBins))), 0, kCoreBins - 1);
+      }
+      if (v < 0.0f) return 0;
+      if (v > 1.0f) return kOverflowBinsPerAxis - 1;
+      return 1 + std::clamp(static_cast<int>(std::floor(v * static_cast<float>(kCoreBins))), 0, kCoreBins - 1);
+    };
+    const int binsPerAxis = preserveOverflow ? kOverflowBinsPerAxis : kCoreBins;
+    const int ri = toBin(r);
+    const int gi = toBin(g);
+    const int bi = toBin(b);
+    return (ri * binsPerAxis + gi) * binsPerAxis + bi;
+  }
+
+  template <typename FetchPixelFn>
+  CloudBuildResult buildInputCloudPayloadFromWholeImageSamples(
+      int width,
+      int height,
+      double time,
+      bool previewMode,
+      FetchPixelFn&& fetchPixel) {
+    CloudBuildResult out;
+    if (width <= 0 || height <= 0) return out;
+
+    struct OccupancyCandidate {
+      float r = 0.0f;
+      float g = 0.0f;
+      float b = 0.0f;
+      int bin = 0;
+      int binRank = 0;
+      uint32_t tie = 0;
+    };
+
+    const int qualityIndex = getChoiceValue("cubeViewerQuality", time, cubeViewerQuality_);
+    const int samplingMode = getSamplingModeValue(getChoiceValue("cubeViewerSamplingMode", time, 0));
+    const int scaleIndex = getChoiceValue("cubeViewerScale", time, 3);
+    const double scaleFactor = scaleFactorForIndex(scaleIndex);
+    const int resolution = qualityResolutionForIndex(qualityIndex);
+    const bool preserveOverflow = currentShowOverflow(time);
+    const bool occupancyFill = currentOccupancyGuidedFill(time);
+    const bool lassoFiltering = currentLassoRegionSlicingEnabled(time);
+    const LassoRegionState lassoState = currentLassoRegionState(time);
+    const SliceSelectionSpec hueSliceSpec = currentHueSectorSliceSpec(time);
+    NormalizedBounds lassoBounds{};
+    const bool haveLassoBounds = lassoFiltering && computeLassoSamplingBounds(lassoState, &lassoBounds);
+    const bool lassoRegionEmpty = lassoFiltering && lassoState.empty();
+    const bool anyHueRegionSelected = hueSliceSpec.cubeSliceRed || hueSliceSpec.cubeSliceGreen ||
+                                      hueSliceSpec.cubeSliceBlue || hueSliceSpec.cubeSliceCyan ||
+                                      hueSliceSpec.cubeSliceYellow || hueSliceSpec.cubeSliceMagenta;
+    const bool noHueRegionSelected = hueSliceSpec.enabled && !anyHueRegionSelected;
+    const bool selectionImpossible = lassoRegionEmpty || noHueRegionSelected;
+    const int scaledWidth = std::max(1, static_cast<int>(std::lround(static_cast<double>(width) * scaleFactor)));
+    const int scaledHeight = std::max(1, static_cast<int>(std::lround(static_cast<double>(height) * scaleFactor)));
+    const int pointCount = std::max(512, static_cast<int>(std::lround(
+        static_cast<double>(qualityPointCountForIndex(qualityIndex, previewMode)) * scaleFactor * scaleFactor)));
+    const int selectionRetryMultiplier = lassoFiltering ? 32 : (hueSliceSpec.enabled ? 12 : 1);
+    const int maxPrimaryAttempts = selectionImpossible
+                                       ? 0
+                                       : (selectionRetryMultiplier <= 1
+                                              ? pointCount
+                                              : std::min(std::max(pointCount * selectionRetryMultiplier, pointCount + 4096),
+                                                         previewMode ? 750000 : 3000000));
+    std::string pts;
+    pts.reserve(static_cast<size_t>(pointCount) * 52u);
+    bool first = true;
+    const int occupancyBinsPerAxis = preserveOverflow ? 18 : 16;
+    std::vector<int> occupancy(static_cast<size_t>(occupancyBinsPerAxis * occupancyBinsPerAxis * occupancyBinsPerAxis), 0);
+    int primaryAttempts = 0;
+    int primaryAccepted = 0;
+
+    auto remapSelectionCoordinate = [](double t, double start, double end) {
+      return start + (end - start) * t;
+    };
+    auto sampleUvForAttempt = [&](int attemptIndex, double* outU, double* outV) {
+      double u = 0.0;
+      double v = 0.0;
+      switch (samplingMode) {
+        case 1: {
+          const int grid = std::max(1, static_cast<int>(std::ceil(std::sqrt(static_cast<double>(pointCount)))));
+          const int gx = attemptIndex % grid;
+          const int gy = attemptIndex / grid;
+          const double jitterX = unitHash01(static_cast<uint32_t>(attemptIndex * 2 + 1));
+          const double jitterY = unitHash01(static_cast<uint32_t>(attemptIndex * 2 + 2));
+          u = (static_cast<double>(gx) + jitterX) / static_cast<double>(grid);
+          v = (static_cast<double>(gy) + jitterY) / static_cast<double>(grid);
+          break;
+        }
+        case 2:
+          u = unitHash01(static_cast<uint32_t>(attemptIndex * 2 + 11));
+          v = unitHash01(static_cast<uint32_t>(attemptIndex * 2 + 37));
+          break;
+        default: {
+          const int grid = std::max(1, static_cast<int>(std::ceil(std::sqrt(static_cast<double>(pointCount)))));
+          const int gx = attemptIndex % grid;
+          const int gy = attemptIndex / grid;
+          u = (static_cast<double>(gx) + 0.5) / static_cast<double>(grid);
+          v = (static_cast<double>(gy) + 0.5) / static_cast<double>(grid);
+          break;
+        }
+      }
+      if (haveLassoBounds) {
+        u = remapSelectionCoordinate(u, lassoBounds.x1, lassoBounds.x2);
+        v = remapSelectionCoordinate(v, lassoBounds.y1, lassoBounds.y2);
+      }
+      *outU = std::clamp(u, 0.0, 1.0);
+      *outV = std::clamp(v, 0.0, 1.0);
+    };
+    auto sampleAcceptedBySelection = [&](int x, int y, float r, float g, float b) {
+      if (lassoFiltering) {
+        const double xNorm = (static_cast<double>(x) + 0.5) / static_cast<double>(width);
+        const double yNorm = (static_cast<double>(y) + 0.5) / static_cast<double>(height);
+        if (!lassoRegionContainsPoint(lassoState, xNorm, yNorm)) return false;
+      }
+      if (hueSliceSpec.enabled && !volumeSliceContainsPoint(hueSliceSpec, r, g, b)) return false;
+      return true;
+    };
+
+    for (int attemptIndex = 0; attemptIndex < maxPrimaryAttempts && primaryAccepted < pointCount; ++attemptIndex) {
+      double u = 0.0;
+      double v = 0.0;
+      sampleUvForAttempt(attemptIndex, &u, &v);
+      ++primaryAttempts;
+      const int sx = std::clamp(static_cast<int>(u * static_cast<double>(scaledWidth - 1)), 0, scaledWidth - 1);
+      const int sy = std::clamp(static_cast<int>(v * static_cast<double>(scaledHeight - 1)), 0, scaledHeight - 1);
+      const int x = std::clamp(static_cast<int>(((static_cast<double>(sx) + 0.5) / static_cast<double>(scaledWidth)) * static_cast<double>(width)), 0, width - 1);
+      const int y = std::clamp(static_cast<int>(((static_cast<double>(sy) + 0.5) / static_cast<double>(scaledHeight)) * static_cast<double>(height)), 0, height - 1);
+      const float* pix = fetchPixel(x, y);
+      if (!pix) continue;
+      const float r = sampledChannelValue(pix[0], preserveOverflow);
+      const float g = sampledChannelValue(pix[1], preserveOverflow);
+      const float b = sampledChannelValue(pix[2], preserveOverflow);
+      if (!sampleAcceptedBySelection(x, y, r, g, b)) continue;
+      appendCloudPointSample(&pts, &first, r, g, b);
+      ++occupancy[occupancyBinIndex(r, g, b, preserveOverflow)];
+      ++primaryAccepted;
+    }
+
+    if (occupancyFill) {
+      const int extraPointCount = std::max(2048, pointCount / (previewMode ? 4 : 2));
+      const int candidateTarget = std::min(std::max(extraPointCount * 3, 8192), previewMode ? 32768 : 131072);
+      const int maxCandidateAttempts = selectionImpossible
+                                           ? 0
+                                           : (selectionRetryMultiplier <= 1
+                                                  ? candidateTarget
+                                                  : std::min(std::max(candidateTarget * selectionRetryMultiplier, candidateTarget + 4096),
+                                                             previewMode ? 750000 : 3000000));
+      std::vector<int> binCandidateRank(occupancy.size(), 0);
+      std::vector<OccupancyCandidate> candidates;
+      candidates.reserve(static_cast<size_t>(candidateTarget));
+      for (int attemptIndex = 0; attemptIndex < maxCandidateAttempts &&
+                                static_cast<int>(candidates.size()) < candidateTarget; ++attemptIndex) {
+        double u = halton(static_cast<uint32_t>(attemptIndex + 1), 2);
+        double v = halton(static_cast<uint32_t>(attemptIndex + 1), 3);
+        if (haveLassoBounds) {
+          u = remapSelectionCoordinate(u, lassoBounds.x1, lassoBounds.x2);
+          v = remapSelectionCoordinate(v, lassoBounds.y1, lassoBounds.y2);
+        }
+        const int sx = std::clamp(static_cast<int>(u * static_cast<double>(scaledWidth - 1)), 0, scaledWidth - 1);
+        const int sy = std::clamp(static_cast<int>(v * static_cast<double>(scaledHeight - 1)), 0, scaledHeight - 1);
+        const int x = std::clamp(static_cast<int>(((static_cast<double>(sx) + 0.5) / static_cast<double>(scaledWidth)) * static_cast<double>(width)), 0, width - 1);
+        const int y = std::clamp(static_cast<int>(((static_cast<double>(sy) + 0.5) / static_cast<double>(scaledHeight)) * static_cast<double>(height)), 0, height - 1);
+        const float* pix = fetchPixel(x, y);
+        if (!pix) continue;
+        const float r = sampledChannelValue(pix[0], preserveOverflow);
+        const float g = sampledChannelValue(pix[1], preserveOverflow);
+        const float b = sampledChannelValue(pix[2], preserveOverflow);
+        if (!sampleAcceptedBySelection(x, y, r, g, b)) continue;
+        const int bin = occupancyBinIndex(r, g, b, preserveOverflow);
+        OccupancyCandidate candidate{};
+        candidate.r = r;
+        candidate.g = g;
+        candidate.b = b;
+        candidate.bin = bin;
+        candidate.binRank = binCandidateRank[bin]++;
+        candidate.tie = static_cast<uint32_t>(attemptIndex);
+        candidates.push_back(candidate);
+      }
+      std::sort(candidates.begin(), candidates.end(), [&](const OccupancyCandidate& a, const OccupancyCandidate& b) {
+        if (occupancy[a.bin] != occupancy[b.bin]) return occupancy[a.bin] < occupancy[b.bin];
+        if (a.binRank != b.binRank) return a.binRank < b.binRank;
+        return a.tie < b.tie;
+      });
+      const int appendCount = std::min<int>(extraPointCount, static_cast<int>(candidates.size()));
+      pts.reserve(pts.size() + static_cast<size_t>(appendCount) * 52u);
+      for (int i = 0; i < appendCount; ++i) {
+        const auto& candidate = candidates[static_cast<size_t>(i)];
+        appendCloudPointSample(&pts, &first, candidate.r, candidate.g, candidate.b);
+      }
+    }
+
+    std::ostringstream hash;
+    hash << width << 'x' << height << ':' << resolution << ':' << qualityLabelForIndex(qualityIndex)
+         << ":sampling=" << samplingModeLabelForIndex(samplingMode)
+         << ":occupancyFill=" << (occupancyFill ? 1 : 0)
+         << ":scale=" << scaleLabelForIndex(scaleIndex);
+    out.paramHash = hash.str();
+    out.contentHash = fnv1a64(pts);
+    out.payload = buildInputCloudJson(pts, out.paramHash, currentCloudSettingsKey(time), resolution, qualityIndex);
+    out.quality = qualityLabelForIndex(qualityIndex);
+    out.resolution = resolution;
+    out.sourceWidth = width;
+    out.sourceHeight = height;
+    out.success = true;
+    cubeViewerDebugLog(std::string("Built whole-image cloud payload: quality=") + out.quality +
+                       " sampling=" + samplingModeLabelForIndex(samplingMode) +
+                       " occupancyFill=" + (occupancyFill ? "1" : "0") +
+                       " lasso=" + (lassoFiltering ? "1" : "0") +
+                       " hueSlice=" + (hueSliceSpec.enabled ? "1" : "0") +
+                       " lassoStrokes=" + std::to_string(lassoState.strokes.size()) +
+                       " attempts=" + std::to_string(primaryAttempts) +
+                       " accepted=" + std::to_string(primaryAccepted) +
+                       " scale=" + scaleLabelForIndex(scaleIndex) +
+                       " res=" + std::to_string(out.resolution) +
+                       " pointBytes=" + std::to_string(pts.size()) +
+                       " hash=" + out.paramHash);
+    return out;
+  }
+
+  CloudBuildResult buildInputCloudPayloadFromIdentityStrip(Image* src, double time) {
+    CloudBuildResult out;
+    if (!src) return out;
+    const OfxRectI bounds = src->getBounds();
+    const int width = bounds.x2 - bounds.x1;
+    const int height = bounds.y2 - bounds.y1;
+    if (width <= 0 || height <= 0) return out;
+    const int qualityIndex = getChoiceValue("cubeViewerQuality", time, cubeViewerQuality_);
+    const bool preserveOverflow = currentShowOverflow(time);
+    const int requestedSize = getIntValue("cubeViewerIdentityOverlaySize", time, 29);
+    const int resolution = clampOverlayCubeSize(requestedSize);
+    int stripHeight = 0;
+    int cubeY1 = 0;
+    int cubeY2 = 0;
+    int rampY1 = 0;
+    int rampY2 = 0;
+    // Identity-strip sampling should remain limited to the cube band. The ramp has its own
+    // dedicated readback path when the user explicitly enables it.
+    if (!computeIdentityStripLayout(bounds, resolution, false, &stripHeight, &cubeY1, &cubeY2, &rampY1, &rampY2)) return out;
+
+    std::string pts;
+    pts.reserve(static_cast<size_t>(width) * static_cast<size_t>(std::max(1, cubeY2 - cubeY1)) * 52u);
+    bool first = true;
+    for (int y = cubeY1; y < cubeY2; ++y) {
+      for (int x = bounds.x1; x < bounds.x2; ++x) {
+        const float* pix = reinterpret_cast<const float*>(src->getPixelAddress(x, y));
+        if (!pix) continue;
+        const float r = sampledChannelValue(pix[0], preserveOverflow);
+        const float g = sampledChannelValue(pix[1], preserveOverflow);
+        const float b = sampledChannelValue(pix[2], preserveOverflow);
+        if (!first) pts.push_back(';');
+        first = false;
+        char sample[96];
+        const int n = std::snprintf(sample, sizeof(sample), "%.6f %.6f %.6f %.6f %.6f %.6f", r, g, b, r, g, b);
+        if (n > 0) pts.append(sample, static_cast<size_t>(n));
+      }
+    }
+    if (pts.empty()) return out;
+    std::ostringstream hash;
+    hash << width << 'x' << height << ':' << resolution << ':' << qualityLabelForIndex(qualityIndex)
+         << ":identity-strip=1";
+    out.paramHash = hash.str();
+    out.contentHash = fnv1a64(pts);
+    out.payload = buildInputCloudJson(pts, out.paramHash, currentCloudSettingsKey(time), resolution, qualityIndex);
+    out.quality = qualityLabelForIndex(qualityIndex);
+    out.resolution = resolution;
+    out.sourceWidth = width;
+    out.sourceHeight = height;
+    out.success = true;
+    cubeViewerDebugLog(std::string("Built input cloud from identity strip: res=") + std::to_string(resolution) +
+                       " stripHeight=" + std::to_string(stripHeight));
+    return out;
+  }
+
+  // Stage: convert the drawn strip back into a cube lattice for downstream plotting.
+  // We sample the intended cube lattice, not every strip pixel, so the requested size stays meaningful.
+  template <typename FetchPixelFn>
+  CloudBuildResult buildInputCloudPayloadFromDrawnCubeSamples(
+      int width,
+      int height,
+      double time,
+      FetchPixelFn&& fetchPixel) {
+    CloudBuildResult out;
+    if (width <= 0 || height <= 0) return out;
+    const int qualityIndex = getChoiceValue("cubeViewerQuality", time, cubeViewerQuality_);
+    const bool preserveOverflow = currentShowOverflow(time);
+    const int requestedSize = getIntValue("cubeViewerSampleDrawnCubeSize", time, 29);
+    const int resolution = clampOverlayCubeSize(requestedSize);
+    const OfxRectI bounds{0, 0, width, height};
+    int stripHeight = 0;
+    int cubeY1 = 0;
+    int cubeY2 = 0;
+    int rampY1 = 0;
+    int rampY2 = 0;
+    // The cube-strip readback is deliberately isolated from the ramp contract.
+    // Even if a ramp exists elsewhere in the strip, this concentrated sampler should only
+    // reconstruct the cube lattice from the cube band itself.
+    if (!computeIdentityStripLayout(bounds, resolution, false, &stripHeight, &cubeY1, &cubeY2, &rampY1, &rampY2)) return out;
+    const int denom = std::max(1, resolution - 1);
+    const float cellWidth = identityStripCellWidth(width, resolution);
+    std::vector<float> samples;
+    samples.reserve(static_cast<size_t>(resolution) * static_cast<size_t>(resolution) * static_cast<size_t>(resolution) * 3u);
+    std::string pts;
+    pts.reserve(static_cast<size_t>(resolution) * static_cast<size_t>(resolution) * static_cast<size_t>(resolution) * 52u);
+    bool first = true;
+    for (int bz = 0; bz < resolution; ++bz) {
+      const float layerStart = static_cast<float>(bz) * cellWidth;
+      for (int gy = 0; gy < resolution; ++gy) {
+        const int y = cubeY1 + std::clamp(static_cast<int>(std::lround(
+            (static_cast<double>(gy) / static_cast<double>(denom)) * static_cast<double>(std::max(0, stripHeight - 1)))), 0, std::max(0, stripHeight - 1));
+        for (int rx = 0; rx < resolution; ++rx) {
+          const float localX = layerStart +
+                               (cellWidth <= 1.0f
+                                    ? 0.0f
+                                    : static_cast<float>(rx) / static_cast<float>(denom) * std::max(0.0f, cellWidth - 1.0f));
+          const int x = std::clamp(static_cast<int>(std::lround(localX)), 0, width - 1);
+          const float* pix = fetchPixel(x, y);
+          if (!pix) continue;
+          const float r = sampledChannelValue(pix[0], preserveOverflow);
+          const float g = sampledChannelValue(pix[1], preserveOverflow);
+          const float b = sampledChannelValue(pix[2], preserveOverflow);
+          samples.push_back(r);
+          samples.push_back(g);
+          samples.push_back(b);
+          if (!first) pts.push_back(';');
+          first = false;
+          char sample[96];
+          const int n = std::snprintf(sample, sizeof(sample), "%.6f %.6f %.6f %.6f %.6f %.6f", r, g, b, r, g, b);
+          if (n > 0) pts.append(sample, static_cast<size_t>(n));
+        }
+      }
+    }
+    if (pts.empty()) return out;
+    std::ostringstream hash;
+    hash << width << 'x' << height << ':' << resolution << ':' << qualityLabelForIndex(qualityIndex)
+         << ":drawn-cube=1";
+    out.paramHash = hash.str();
+    out.contentHash = fnv1a64(pts);
+    out.payload = buildInputCloudJson(pts, out.paramHash, currentCloudSettingsKey(time), resolution, qualityIndex);
+    out.quality = qualityLabelForIndex(qualityIndex);
+    out.resolution = resolution;
+    out.sourceWidth = width;
+    out.sourceHeight = height;
+    out.success = true;
+    cubeViewerDebugLog(std::string("Built input cloud from drawn cube lattice: res=") + std::to_string(resolution) +
+                       " stripHeight=" + std::to_string(stripHeight) +
+                       " pointCount=" + std::to_string((pts.empty() ? 0 : (resolution * resolution * resolution))));
+    return out;
+  }
+
+  template <typename FetchPixelFn>
+  CloudBuildResult buildInputCloudPayloadFromDrawnRampSamples(
+      int width,
+      int height,
+      double time,
+      FetchPixelFn&& fetchPixel) {
+    CloudBuildResult out;
+    if (width <= 0 || height <= 0) return out;
+    const int qualityIndex = getChoiceValue("cubeViewerQuality", time, cubeViewerQuality_);
+    const bool expectRamp = currentReadGrayRamp(time) || currentIdentityOverlayRamp(time);
+    if (!expectRamp) return out;
+    const bool preserveOverflow = currentShowOverflow(time);
+    const int requestedSize = getIntValue("cubeViewerSampleDrawnCubeSize", time, 29);
+    const int resolution = clampOverlayCubeSize(requestedSize);
+    const OfxRectI bounds{0, 0, width, height};
+    int stripHeight = 0;
+    int cubeY1 = 0;
+    int cubeY2 = 0;
+    int rampY1 = 0;
+    int rampY2 = 0;
+    if (!computeIdentityStripLayout(bounds, resolution, true, &stripHeight, &cubeY1, &cubeY2, &rampY1, &rampY2)) return out;
+    if (rampY2 <= rampY1) return out;
+    std::string pts;
+    const int rampHeight = std::max(0, rampY2 - rampY1);
+    // Gray-ramp readback only needs to cover the full horizontal extent and enough vertical repeats
+    // to keep the achromatic line visibly thick. Sampling every ramp pixel is unnecessarily heavy
+    // because each row encodes the same grayscale gradient.
+    // For the ramp, connectedness matters more than aggressive decimation.
+    // Keep full horizontal coverage so the achromatic line reads continuous,
+    // and control thickness mainly by limiting how many ramp rows we read.
+    const int sampleCols = width;
+    const int sampleRows = std::min(rampHeight, std::max(4, std::min(8, resolution / 8 + 2)));
+    pts.reserve(static_cast<size_t>(sampleCols) * static_cast<size_t>(std::max(1, sampleRows)) * 52u);
+    bool first = true;
+    int sampleCount = 0;
+    const int colDenom = std::max(1, sampleCols - 1);
+    const int rowDenom = std::max(1, sampleRows - 1);
+    for (int rowIndex = 0; rowIndex < sampleRows; ++rowIndex) {
+      const int y = rampY1 + std::clamp(static_cast<int>(std::lround(
+          (static_cast<double>(rowIndex) / static_cast<double>(rowDenom)) * static_cast<double>(std::max(0, rampHeight - 1)))),
+          0, std::max(0, rampHeight - 1));
+      for (int colIndex = 0; colIndex < sampleCols; ++colIndex) {
+        const int x = std::clamp(static_cast<int>(std::lround(
+            (static_cast<double>(colIndex) / static_cast<double>(colDenom)) * static_cast<double>(std::max(0, width - 1)))),
+            0, std::max(0, width - 1));
+        const float* pix = fetchPixel(x, y);
+        if (!pix) continue;
+        const float r = sampledChannelValue(pix[0], preserveOverflow);
+        const float g = sampledChannelValue(pix[1], preserveOverflow);
+        const float b = sampledChannelValue(pix[2], preserveOverflow);
+        if (!first) pts.push_back(';');
+        first = false;
+        char sample[96];
+        const int n = std::snprintf(sample, sizeof(sample), "%.6f %.6f %.6f %.6f %.6f %.6f", r, g, b, r, g, b);
+        if (n > 0) pts.append(sample, static_cast<size_t>(n));
+        ++sampleCount;
+      }
+    }
+    if (pts.empty()) return out;
+    std::ostringstream hash;
+    hash << width << 'x' << height << ':' << resolution << ':' << qualityLabelForIndex(qualityIndex)
+         << ":drawn-ramp=1";
+    out.paramHash = hash.str();
+    out.contentHash = fnv1a64(pts);
+    out.payload = buildInputCloudJson(pts, out.paramHash, currentCloudSettingsKey(time), resolution, qualityIndex);
+    out.quality = qualityLabelForIndex(qualityIndex);
+    out.resolution = resolution;
+    out.sourceWidth = width;
+    out.sourceHeight = height;
+    out.success = true;
+    cubeViewerDebugLog(std::string("Built input cloud from drawn gray ramp: samples=") + std::to_string(sampleCount) +
+                       " cols=" + std::to_string(sampleCols) +
+                       " rows=" + std::to_string(sampleRows) +
+                       " rampBand=" + std::to_string(rampY1) + "-" + std::to_string(rampY2));
+    return out;
+  }
+
+  CloudBuildResult buildInputCloudPayloadFromDrawnCubeImage(Image* src, double time) {
+    const OfxRectI bounds = src->getBounds();
+    const int width = bounds.x2 - bounds.x1;
+    const int height = bounds.y2 - bounds.y1;
+    return buildInputCloudPayloadFromDrawnCubeSamples(width, height, time, [&](int x, int y) -> const float* {
+      return src ? reinterpret_cast<const float*>(src->getPixelAddress(bounds.x1 + x, bounds.y1 + y)) : nullptr;
+    });
+  }
+
+  CloudBuildResult buildInputCloudPayloadFromDrawnRampImage(Image* src, double time) {
+    const OfxRectI bounds = src->getBounds();
+    const int width = bounds.x2 - bounds.x1;
+    const int height = bounds.y2 - bounds.y1;
+    return buildInputCloudPayloadFromDrawnRampSamples(width, height, time, [&](int x, int y) -> const float* {
+      return src ? reinterpret_cast<const float*>(src->getPixelAddress(bounds.x1 + x, bounds.y1 + y)) : nullptr;
+    });
+  }
+
+  CloudBuildResult buildInputCloudPayloadFromDrawnCubeBuffer(
+      const float* srcBase,
+      size_t srcRowBytes,
+      int width,
+      int height,
+      double time) {
+    return buildInputCloudPayloadFromDrawnCubeSamples(width, height, time, [&](int x, int y) -> const float* {
+      if (!srcBase) return nullptr;
+      const char* rowBase = reinterpret_cast<const char*>(srcBase) + static_cast<size_t>(y) * srcRowBytes;
+      return reinterpret_cast<const float*>(rowBase) + static_cast<size_t>(x) * 4u;
+    });
+  }
+
+  CloudBuildResult buildInputCloudPayloadFromDrawnRampBuffer(
+      const float* srcBase,
+      size_t srcRowBytes,
+      int width,
+      int height,
+      double time) {
+    return buildInputCloudPayloadFromDrawnRampSamples(width, height, time, [&](int x, int y) -> const float* {
+      if (!srcBase) return nullptr;
+      const char* rowBase = reinterpret_cast<const char*>(srcBase) + static_cast<size_t>(y) * srcRowBytes;
+      return reinterpret_cast<const float*>(rowBase) + static_cast<size_t>(x) * 4u;
+    });
+  }
+
+  CloudBuildResult combineInstance1AndImageClouds(
+      const CloudBuildResult& identity,
+      const CloudBuildResult& image,
+      double time) {
+    if (!identity.success) return image;
+    if (!image.success) return identity;
+
+    std::string identityPoints;
+    std::string imagePoints;
+    if (!extractJsonStringField(identity.payload, "points", &identityPoints) ||
+        !extractJsonStringField(image.payload, "points", &imagePoints)) {
+      return image;
+    }
+
+    std::string mergedPoints = identityPoints;
+    if (!mergedPoints.empty() && !imagePoints.empty()) mergedPoints.push_back(';');
+    mergedPoints += imagePoints;
+
+    const int qualityIndex = getChoiceValue("cubeViewerQuality", time, cubeViewerQuality_);
+    CloudBuildResult out{};
+    out.paramHash = image.paramHash + "+instance1=" + std::to_string(identity.resolution);
+    out.contentHash = fnv1a64(mergedPoints);
+    out.payload = buildInputCloudJson(mergedPoints, out.paramHash, currentCloudSettingsKey(time), image.resolution, qualityIndex);
+    out.quality = qualityLabelForIndex(qualityIndex);
+    out.resolution = image.resolution;
+    out.sourceWidth = std::max(identity.sourceWidth, image.sourceWidth);
+    out.sourceHeight = std::max(identity.sourceHeight, image.sourceHeight);
+    out.success = true;
+    cubeViewerDebugLog(std::string("Built combined instance-1 cloud: identityRes=") + std::to_string(identity.resolution) +
+                       " imageRes=" + std::to_string(image.resolution) +
+                       " mergedBytes=" + std::to_string(mergedPoints.size()));
+    return out;
+  }
+
+  CloudBuildResult buildEmptyInstance1Cloud(double time, int width, int height, const std::string& tag) {
+    const int qualityIndex = getChoiceValue("cubeViewerQuality", time, cubeViewerQuality_);
+    const int resolution = qualityResolutionForIndex(qualityIndex);
+    CloudBuildResult out{};
+    out.paramHash = std::string("instance1-empty:") + tag;
+    out.contentHash = fnv1a64(std::string{});
+    out.payload = buildInputCloudJson("", out.paramHash, currentCloudSettingsKey(time), resolution, qualityIndex);
+    out.quality = qualityLabelForIndex(qualityIndex);
+    out.resolution = resolution;
+    out.sourceWidth = width;
+    out.sourceHeight = height;
+    out.success = true;
+    return out;
+  }
+
+  CloudBuildResult buildInputCloudPayloadFromWholeImage(Image* src, double time, bool previewMode) {
+    CloudBuildResult out;
+    if (!src) return out;
+    const OfxRectI bounds = src->getBounds();
+    const int width = bounds.x2 - bounds.x1;
+    const int height = bounds.y2 - bounds.y1;
+    return buildInputCloudPayloadFromWholeImageSamples(width, height, time, previewMode, [&](int x, int y) -> const float* {
+      return reinterpret_cast<const float*>(src->getPixelAddress(bounds.x1 + x, bounds.y1 + y));
+    });
+  }
+
+  CloudBuildResult buildInputCloudPayloadFromWholeImageBuffer(
+      const float* srcBase,
+      size_t srcRowBytes,
+      int width,
+      int height,
+      double time,
+      bool previewMode) {
+    return buildInputCloudPayloadFromWholeImageSamples(width, height, time, previewMode, [&](int x, int y) -> const float* {
+      if (!srcBase) return nullptr;
+      const char* rowBase = reinterpret_cast<const char*>(srcBase) + static_cast<size_t>(y) * srcRowBytes;
+      return reinterpret_cast<const float*>(rowBase) + static_cast<size_t>(x) * 4u;
+    });
+  }
+
+  // Stage: sample the current image into the serialized point-cloud transport format.
+  // Normal plot mode samples the whole image; drawn-cube mode routes into the strip-specific sampler above.
+  CloudBuildResult buildInputCloudPayload(Image* src, double time, bool previewMode) {
+    if (currentUseInstance1Requested(time)) {
+      CloudBuildResult stripCloud{};
+      if (currentReadIdentityPlot(time)) {
+        stripCloud = buildInputCloudPayloadFromDrawnCubeImage(src, time);
+      }
+      if (currentReadGrayRamp(time)) {
+        CloudBuildResult ramp = buildInputCloudPayloadFromDrawnRampImage(src, time);
+        stripCloud = stripCloud.success ? combineInstance1AndImageClouds(stripCloud, ramp, time) : ramp;
+      }
+      if (!stripCloud.success) {
+        if (currentShowIdentityOnly(time) && src) {
+          const OfxRectI bounds = src->getBounds();
+          return buildEmptyInstance1Cloud(time, bounds.x2 - bounds.x1, bounds.y2 - bounds.y1, "image");
+        }
+        return buildInputCloudPayloadFromWholeImage(src, time, previewMode);
+      }
+      if (currentShowIdentityOnly(time)) return stripCloud;
+      CloudBuildResult image = buildInputCloudPayloadFromWholeImage(src, time, previewMode);
+      return combineInstance1AndImageClouds(stripCloud, image, time);
+    }
+    return buildInputCloudPayloadFromWholeImage(src, time, previewMode);
+  }
+
+  // GPU readbacks and CPU images share the same cloud-build rules; this path just swaps pixel access.
+  CloudBuildResult buildInputCloudPayloadFromBuffer(
+      const float* srcBase,
+      size_t srcRowBytes,
+      int width,
+      int height,
+      double time,
+      bool previewMode) {
+    if (currentUseInstance1Requested(time)) {
+      CloudBuildResult stripCloud{};
+      if (currentReadIdentityPlot(time)) {
+        stripCloud = buildInputCloudPayloadFromDrawnCubeBuffer(srcBase, srcRowBytes, width, height, time);
+      }
+      if (currentReadGrayRamp(time)) {
+        CloudBuildResult ramp = buildInputCloudPayloadFromDrawnRampBuffer(srcBase, srcRowBytes, width, height, time);
+        stripCloud = stripCloud.success ? combineInstance1AndImageClouds(stripCloud, ramp, time) : ramp;
+      }
+      if (!stripCloud.success) {
+        if (currentShowIdentityOnly(time)) {
+          return buildEmptyInstance1Cloud(time, width, height, "buffer");
+        }
+        return buildInputCloudPayloadFromWholeImageBuffer(srcBase, srcRowBytes, width, height, time, previewMode);
+      }
+      if (currentShowIdentityOnly(time)) return stripCloud;
+      CloudBuildResult image = buildInputCloudPayloadFromWholeImageBuffer(srcBase, srcRowBytes, width, height, time, previewMode);
+      return combineInstance1AndImageClouds(stripCloud, image, time);
+    }
+    return buildInputCloudPayloadFromWholeImageBuffer(srcBase, srcRowBytes, width, height, time, previewMode);
+  }
+
+  bool fullSourceDimensions(Image* src, int* width, int* height, int* x1, int* y1) {
+    if (!src || !width || !height || !x1 || !y1) return false;
+    const OfxRectI bounds = src->getBounds();
+    const int w = bounds.x2 - bounds.x1;
+    const int h = bounds.y2 - bounds.y1;
+    if (w <= 0 || h <= 0) return false;
+    *width = w;
+    *height = h;
+    *x1 = bounds.x1;
+    *y1 = bounds.y1;
+    return true;
+  }
+
+#if defined(CHROMASPACE_HAS_CUDA)
+  bool renderCUDAHostBuffers(
+      Image* src,
+      Image* dst,
+      const RenderArguments& args,
+      bool needCloud,
+      bool previewMode,
+      CloudBuildResult* built,
+      const OverlayStripData* overlay) {
+    if (!args.isEnabledCudaRender || args.pCudaStream == nullptr || !src || !dst) return false;
+    const void* srcRaw = src->getPixelData();
+    void* dstRaw = dst->getPixelData();
+    if (!srcRaw || !dstRaw) return false;
+
+    const int renderWidth = args.renderWindow.x2 - args.renderWindow.x1;
+    const int renderHeight = args.renderWindow.y2 - args.renderWindow.y1;
+    const size_t packedRowBytes = static_cast<size_t>(renderWidth) * 4u * sizeof(float);
+    size_t srcRowBytes = static_cast<size_t>(std::abs(src->getRowBytes()));
+    size_t dstRowBytes = static_cast<size_t>(std::abs(dst->getRowBytes()));
+    if (srcRowBytes == 0) srcRowBytes = packedRowBytes;
+    if (dstRowBytes == 0) dstRowBytes = packedRowBytes;
+    if (srcRowBytes < packedRowBytes || dstRowBytes < packedRowBytes) return false;
+
+    const size_t offset =
+        static_cast<size_t>(args.renderWindow.y1) * srcRowBytes + static_cast<size_t>(args.renderWindow.x1) * 4u * sizeof(float);
+    const size_t dstOffset =
+        static_cast<size_t>(args.renderWindow.y1) * dstRowBytes + static_cast<size_t>(args.renderWindow.x1) * 4u * sizeof(float);
+    const char* srcBytes = reinterpret_cast<const char*>(srcRaw) + offset;
+    char* dstBytes = reinterpret_cast<char*>(dstRaw) + dstOffset;
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(args.pCudaStream);
+
+    if (cudaMemcpy2DAsync(dstBytes, dstRowBytes, srcBytes, srcRowBytes, packedRowBytes, static_cast<size_t>(renderHeight),
+                          cudaMemcpyDeviceToDevice, stream) != cudaSuccess) {
+      return false;
+    }
+
+    if (overlay != nullptr && overlay->width > 0 && overlay->height > 0 && !overlay->pixels.empty()) {
+      const size_t overlayPackedRowBytes = static_cast<size_t>(overlay->width) * 4u * sizeof(float);
+      const size_t overlayDstOffset =
+          static_cast<size_t>(overlay->y1) * dstRowBytes + static_cast<size_t>(overlay->x1) * 4u * sizeof(float);
+      char* overlayDstBytes = reinterpret_cast<char*>(dstRaw) + overlayDstOffset;
+      if (cudaMemcpy2DAsync(overlayDstBytes,
+                            dstRowBytes,
+                            overlay->pixels.data(),
+                            overlayPackedRowBytes,
+                            overlayPackedRowBytes,
+                            static_cast<size_t>(overlay->height),
+                            cudaMemcpyHostToDevice,
+                            stream) != cudaSuccess) {
+        return false;
+      }
+    }
+
+    if (!needCloud) return true;
+
+    // Stage: GPU render path still stages a full-source readback when the viewer needs a cloud payload.
+    int fullWidth = 0;
+    int fullHeight = 0;
+    int fullX1 = 0;
+    int fullY1 = 0;
+    if (!fullSourceDimensions(src, &fullWidth, &fullHeight, &fullX1, &fullY1)) return false;
+    const size_t fullPackedRowBytes = static_cast<size_t>(fullWidth) * 4u * sizeof(float);
+    const size_t fullOffset =
+        static_cast<size_t>(fullY1) * srcRowBytes + static_cast<size_t>(fullX1) * 4u * sizeof(float);
+    const char* fullSrcBytes = reinterpret_cast<const char*>(srcRaw) + fullOffset;
+    if (!ensureStageBuffer(static_cast<size_t>(fullWidth) * static_cast<size_t>(fullHeight))) return false;
+    float* readback = stageSrcPtr();
+    if (!readback) return false;
+    if (cudaMemcpy2DAsync(readback,
+                          fullPackedRowBytes,
+                          fullSrcBytes,
+                          srcRowBytes,
+                          fullPackedRowBytes,
+                          static_cast<size_t>(fullHeight),
+                          cudaMemcpyDeviceToHost,
+                          stream) != cudaSuccess) {
+      return false;
+    }
+    if (cudaStreamSynchronize(stream) != cudaSuccess) return false;
+    if (built != nullptr) {
+      *built = buildInputCloudPayloadFromBuffer(readback, fullPackedRowBytes, fullWidth, fullHeight, args.time, previewMode);
+    }
+    return true;
+  }
+#endif
+
+#if defined(CHROMASPACE_HAS_OPENCL)
+  bool renderOpenCLHostBuffers(
+      Image* src,
+      Image* dst,
+      const RenderArguments& args,
+      bool needCloud,
+      bool previewMode,
+      CloudBuildResult* built,
+      const OverlayStripData* overlay) {
+    if (!args.isEnabledOpenCLRender || args.pOpenCLCmdQ == nullptr || !src || !dst) return false;
+    const int renderWidth = args.renderWindow.x2 - args.renderWindow.x1;
+    const int renderHeight = args.renderWindow.y2 - args.renderWindow.y1;
+    const size_t packedRowBytes = static_cast<size_t>(renderWidth) * 4u * sizeof(float);
+    const size_t srcRowBytes = static_cast<size_t>(std::abs(src->getRowBytes()));
+    const size_t dstRowBytes = static_cast<size_t>(std::abs(dst->getRowBytes()));
+    cl_command_queue queue = reinterpret_cast<cl_command_queue>(args.pOpenCLCmdQ);
+    if (queue == nullptr) return false;
+
+    const size_t bufferOffset =
+        static_cast<size_t>(args.renderWindow.y1) * srcRowBytes + static_cast<size_t>(args.renderWindow.x1) * 4u * sizeof(float);
+    const size_t dstBufferOffset =
+        static_cast<size_t>(args.renderWindow.y1) * dstRowBytes + static_cast<size_t>(args.renderWindow.x1) * 4u * sizeof(float);
+
+    if (src->getPixelData() != nullptr && dst->getPixelData() != nullptr && srcRowBytes >= packedRowBytes && dstRowBytes >= packedRowBytes) {
+      cl_mem srcBuffer = reinterpret_cast<cl_mem>(src->getPixelData());
+      cl_mem dstBuffer = reinterpret_cast<cl_mem>(dst->getPixelData());
+      const size_t srcOrigin[3] = {bufferOffset, 0, 0};
+      const size_t dstOrigin[3] = {dstBufferOffset, 0, 0};
+      const size_t region[3] = {packedRowBytes, static_cast<size_t>(renderHeight), 1};
+      if (clEnqueueCopyBufferRect(queue, srcBuffer, dstBuffer, srcOrigin, dstOrigin, region, srcRowBytes, 0, dstRowBytes, 0, 0,
+                                  nullptr, nullptr) != CL_SUCCESS) {
+        return false;
+      }
+      if (overlay != nullptr && overlay->width > 0 && overlay->height > 0 && !overlay->pixels.empty()) {
+        const size_t overlayPackedRowBytes = static_cast<size_t>(overlay->width) * 4u * sizeof(float);
+        const size_t hostOrigin[3] = {0, 0, 0};
+        const size_t overlayDstOrigin[3] = {
+            static_cast<size_t>(overlay->y1) * dstRowBytes + static_cast<size_t>(overlay->x1) * 4u * sizeof(float), 0, 0};
+        const size_t overlayRegion[3] = {overlayPackedRowBytes, static_cast<size_t>(overlay->height), 1};
+        if (clEnqueueWriteBufferRect(queue, dstBuffer, CL_TRUE, overlayDstOrigin, hostOrigin, overlayRegion, dstRowBytes, 0,
+                                     overlayPackedRowBytes, 0, overlay->pixels.data(), 0, nullptr, nullptr) != CL_SUCCESS) {
+          return false;
+        }
+      }
+      if (!needCloud) return true;
+      int fullWidth = 0;
+      int fullHeight = 0;
+      int fullX1 = 0;
+      int fullY1 = 0;
+      if (!fullSourceDimensions(src, &fullWidth, &fullHeight, &fullX1, &fullY1)) return false;
+      const size_t fullPackedRowBytes = static_cast<size_t>(fullWidth) * 4u * sizeof(float);
+      const size_t fullBufferOffset =
+          static_cast<size_t>(fullY1) * srcRowBytes + static_cast<size_t>(fullX1) * 4u * sizeof(float);
+      const size_t fullSrcOrigin[3] = {fullBufferOffset, 0, 0};
+      const size_t fullRegion[3] = {fullPackedRowBytes, static_cast<size_t>(fullHeight), 1};
+      if (!ensureStageBuffer(static_cast<size_t>(fullWidth) * static_cast<size_t>(fullHeight))) return false;
+      float* readback = stageSrcPtr();
+      if (!readback) return false;
+      const size_t hostOrigin[3] = {0, 0, 0};
+      if (clEnqueueReadBufferRect(queue, srcBuffer, CL_TRUE, fullSrcOrigin, hostOrigin, fullRegion, srcRowBytes, 0, fullPackedRowBytes, 0, readback, 0,
+                                  nullptr, nullptr) != CL_SUCCESS) {
+        return false;
+      }
+      if (built != nullptr) {
+        *built = buildInputCloudPayloadFromBuffer(readback, fullPackedRowBytes, fullWidth, fullHeight, args.time, previewMode);
+      }
+      return true;
+    }
+
+    if (src->getOpenCLImage() != nullptr && dst->getOpenCLImage() != nullptr) {
+      cl_mem srcImage = reinterpret_cast<cl_mem>(src->getOpenCLImage());
+      cl_mem dstImage = reinterpret_cast<cl_mem>(dst->getOpenCLImage());
+      const size_t origin[3] = {static_cast<size_t>(args.renderWindow.x1), static_cast<size_t>(args.renderWindow.y1), 0};
+      const size_t dstOrigin[3] = {static_cast<size_t>(args.renderWindow.x1), static_cast<size_t>(args.renderWindow.y1), 0};
+      const size_t region[3] = {static_cast<size_t>(renderWidth), static_cast<size_t>(renderHeight), 1};
+      if (clEnqueueCopyImage(queue, srcImage, dstImage, origin, dstOrigin, region, 0, nullptr, nullptr) != CL_SUCCESS) {
+        return false;
+      }
+      if (overlay != nullptr && overlay->width > 0 && overlay->height > 0 && !overlay->pixels.empty()) {
+        const size_t overlayPackedRowBytes = static_cast<size_t>(overlay->width) * 4u * sizeof(float);
+        const size_t overlayOrigin[3] = {static_cast<size_t>(overlay->x1), static_cast<size_t>(overlay->y1), 0};
+        const size_t overlayRegion[3] = {static_cast<size_t>(overlay->width), static_cast<size_t>(overlay->height), 1};
+        if (clEnqueueWriteImage(queue, dstImage, CL_TRUE, overlayOrigin, overlayRegion, overlayPackedRowBytes, 0,
+                                overlay->pixels.data(), 0, nullptr, nullptr) != CL_SUCCESS) {
+          return false;
+        }
+      }
+      if (!needCloud) return true;
+      int fullWidth = 0;
+      int fullHeight = 0;
+      int fullX1 = 0;
+      int fullY1 = 0;
+      if (!fullSourceDimensions(src, &fullWidth, &fullHeight, &fullX1, &fullY1)) return false;
+      const size_t fullPackedRowBytes = static_cast<size_t>(fullWidth) * 4u * sizeof(float);
+      const size_t fullOrigin[3] = {static_cast<size_t>(fullX1), static_cast<size_t>(fullY1), 0};
+      const size_t fullRegion[3] = {static_cast<size_t>(fullWidth), static_cast<size_t>(fullHeight), 1};
+      if (!ensureStageBuffer(static_cast<size_t>(fullWidth) * static_cast<size_t>(fullHeight))) return false;
+      float* readback = stageSrcPtr();
+      if (!readback) return false;
+      if (clEnqueueReadImage(queue, srcImage, CL_TRUE, fullOrigin, fullRegion, fullPackedRowBytes, 0, readback, 0, nullptr, nullptr) != CL_SUCCESS) {
+        return false;
+      }
+      if (built != nullptr) {
+        *built = buildInputCloudPayloadFromBuffer(readback, fullPackedRowBytes, fullWidth, fullHeight, args.time, previewMode);
+      }
+      return true;
+    }
+
+    return false;
+  }
+#endif
+
+  bool tryRenderGpuBackends(
+      Image* src,
+      Image* dst,
+      const RenderArguments& args,
+      bool needCloud,
+      bool previewMode,
+      CloudBuildResult* built,
+      const OverlayStripData* overlay) {
+#if defined(CHROMASPACE_HAS_CUDA)
+    if (renderCUDAHostBuffers(src, dst, args, needCloud, previewMode, built, overlay)) return true;
+#endif
+#if defined(__APPLE__)
+    if (src && dst && args.isEnabledMetalRender && args.pMetalCmdQ != nullptr && src->getPixelData() != nullptr &&
+        dst->getPixelData() != nullptr) {
+      const int renderWidth = args.renderWindow.x2 - args.renderWindow.x1;
+      const int renderHeight = args.renderWindow.y2 - args.renderWindow.y1;
+      const size_t packedRowBytes = static_cast<size_t>(renderWidth) * 4u * sizeof(float);
+      size_t srcRowBytes = static_cast<size_t>(std::abs(src->getRowBytes()));
+      size_t dstRowBytes = static_cast<size_t>(std::abs(dst->getRowBytes()));
+      if (srcRowBytes == 0) srcRowBytes = packedRowBytes;
+      if (dstRowBytes == 0) dstRowBytes = packedRowBytes;
+      if (!needCloud) {
+        if (ChromaspaceMetal::copyHostBuffers(src->getPixelData(),
+                                                 dst->getPixelData(),
+                                                 renderWidth,
+                                                 renderHeight,
+                                                 srcRowBytes,
+                                                 dstRowBytes,
+                                                 args.renderWindow.x1,
+                                                 args.renderWindow.y1,
+                                                 args.pMetalCmdQ,
+                                                 overlay != nullptr ? overlay->pixels.data() : nullptr,
+                                                 overlay != nullptr ? overlay->x1 : 0,
+                                                 overlay != nullptr ? overlay->y1 : 0,
+                                                 overlay != nullptr ? overlay->width : 0,
+                                                 overlay != nullptr ? overlay->height : 0)) {
+          return true;
+        }
+      } else {
+        int fullWidth = 0;
+        int fullHeight = 0;
+        int fullX1 = 0;
+        int fullY1 = 0;
+        if (!fullSourceDimensions(src, &fullWidth, &fullHeight, &fullX1, &fullY1)) return false;
+        const size_t fullPackedRowBytes = static_cast<size_t>(fullWidth) * 4u * sizeof(float);
+        if (!ensureStageBuffer(static_cast<size_t>(fullWidth) * static_cast<size_t>(fullHeight))) return false;
+        float* readback = stageSrcPtr();
+        if (!readback) return false;
+        if (ChromaspaceMetal::copyHostBuffersReadback(src->getPixelData(),
+                                                         dst->getPixelData(),
+                                                         fullWidth,
+                                                         fullHeight,
+                                                         srcRowBytes,
+                                                         dstRowBytes,
+                                                         fullX1,
+                                                         fullY1,
+                                                         args.pMetalCmdQ,
+                                                         readback,
+                                                         fullPackedRowBytes)) {
+          if (built != nullptr) {
+            *built = buildInputCloudPayloadFromBuffer(readback, fullPackedRowBytes, fullWidth, fullHeight, args.time, previewMode);
+          }
+          return true;
+        }
+      }
+    }
+#endif
+#if defined(CHROMASPACE_HAS_OPENCL)
+    if (renderOpenCLHostBuffers(src, dst, args, needCloud, previewMode, built, overlay)) return true;
+#endif
+    return false;
+  }
+
+  bool shouldUseInteractivePreview(std::chrono::steady_clock::time_point now) {
+    (void)now;
+    return false;
+  }
+
+  int steadyStateCloudIntervalMs(bool previewMode) const {
+    (void)previewMode;
+    switch (cubeViewerQuality_) {
+      case 0: return 20;
+      case 1: return 32;
+      default: return 48;
+    }
+  }
+
+  bool shouldEmitSteadyStateCloud(double time, const std::string& sourceId, const std::string& settingsKey, bool previewMode) {
+    if (!cubeViewerRequested_ || !cubeViewerLive_) return false;
+    if (cubeViewerInputCloudRefreshPending_) return false;
+    if (cloudQueuedOrInFlight_.load(std::memory_order_relaxed)) return false;
+    if (!settingsKey.empty() && settingsKey != lastCloudSettingsKey_) return true;
+    if (!sourceId.empty() && sourceId != lastCloudSourceId_) return true;
+    const auto now = std::chrono::steady_clock::now();
+    if (lastCloudBuiltAt_ == std::chrono::steady_clock::time_point{}) return true;
+    const auto elapsedMs =
+        std::chrono::duration_cast<std::chrono::milliseconds>(now - lastCloudBuiltAt_).count();
+    if (currentUseInstance1(time)) {
+      // The two-instance workflow is intentionally downstream-facing: graphs such as layer mixers can
+      // change the incoming pixels without providing a host image identifier change that we can trust.
+      // Keep this mode on a more eager steady-state refresh policy instead of waiting for a weaker sourceId signal.
+      return elapsedMs >= 16;
+    }
+    return elapsedMs >= steadyStateCloudIntervalMs(previewMode);
+  }
+
+  int64_t monotonicNowMs() const {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+  }
+
+  void markViewerTransportActivity() {
+    lastViewerTransportActivityMs_.store(monotonicNowMs(), std::memory_order_relaxed);
+  }
+
+  void startIoWorker() {
+    if (ioThread_.joinable()) return;
+    ioStop_ = false;
+    ioThread_ = std::thread([this]() { ioWorkerLoop(); });
+  }
+
+  void stopIoWorker() {
+    {
+      std::lock_guard<std::mutex> lock(ioMutex_);
+      ioStop_ = true;
+    }
+    ioCv_.notify_all();
+    if (ioThread_.joinable()) ioThread_.join();
+  }
+
+  void startStatusThread() {
+    if (statusThread_.joinable()) return;
+    statusStop_ = false;
+    statusThread_ = std::thread([this]() { statusLoop(); });
+  }
+
+  void stopStatusThread() {
+    statusStop_ = true;
+    if (statusThread_.joinable()) statusThread_.join();
+  }
+
+  void releaseViewerRuntimeResources() {
+    {
+      std::lock_guard<std::mutex> lock(ioMutex_);
+      pendingParams_ = PendingMessage{};
+      pendingCloud_ = PendingMessage{};
+      cloudQueuedOrInFlight_.store(false, std::memory_order_relaxed);
+    }
+    lastViewerTransportActivityMs_.store(0, std::memory_order_relaxed);
+    {
+      std::lock_guard<std::mutex> lock(stageMutex_);
+      stageSrc_.clear();
+      stageSrc_.shrink_to_fit();
+    }
+  }
+
+  void markViewerInactive(const std::string& reason) {
+    cubeViewerRequested_ = false;
+    cubeViewerConnected_ = false;
+    cubeViewerWindowUsable_ = false;
+    cubeViewerInputCloudRefreshPending_ = false;
+    lastCloudBuiltAt_ = std::chrono::steady_clock::time_point{};
+    lastHeartbeatAt_ = std::chrono::steady_clock::time_point{};
+    lastCloudSourceId_.clear();
+    lastCloudSettingsKey_.clear();
+    releaseViewerRuntimeResources();
+    setStatusLabel("Disconnected");
+    cubeViewerDebugLog(reason);
+  }
+
+  void statusLoop() {
+    int failedProbeCount = 0;
+    while (!statusStop_) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(200));
+      if (statusStop_) break;
+      if (!cubeViewerRequested_) {
+        failedProbeCount = 0;
+        continue;
+      }
+
+      ViewerProbeResult probe = probeViewer();
+      if (!probe.ok) {
+        const bool hadViewerSession = cubeViewerConnected_ || cubeViewerWindowUsable_ ||
+                                      lastHeartbeatAt_ != std::chrono::steady_clock::time_point{};
+        const auto now = std::chrono::steady_clock::now();
+        const auto msSinceHeartbeat = lastHeartbeatAt_ == std::chrono::steady_clock::time_point{}
+                                          ? std::chrono::milliseconds::max().count()
+                                          : std::chrono::duration_cast<std::chrono::milliseconds>(now - lastHeartbeatAt_).count();
+        const int64_t lastTransportActivityMs = lastViewerTransportActivityMs_.load(std::memory_order_relaxed);
+        const int64_t msSinceTransportActivity =
+            lastTransportActivityMs > 0 ? (monotonicNowMs() - lastTransportActivityMs)
+                                        : std::numeric_limits<int64_t>::max();
+        const bool transportBusy = cloudQueuedOrInFlight_.load(std::memory_order_relaxed) ||
+                                   msSinceTransportActivity < 3000;
+        if (hadViewerSession && transportBusy) {
+          failedProbeCount = 0;
+          setStatusLabel(cubeViewerLive_ ? "Updating" : "Connecting...");
+          cubeViewerDebugLog("Viewer probe deferred while transport is still active.");
+          continue;
+        }
+
+        ++failedProbeCount;
+        cubeViewerConnected_ = false;
+        cubeViewerWindowUsable_ = false;
+        if (hadViewerSession && failedProbeCount >= 5 && msSinceHeartbeat >= 1000) {
+          markViewerInactive("Viewer closed or unreachable; auto-disconnecting.");
+          failedProbeCount = 0;
+          continue;
+        }
+        if (failedProbeCount == 1 || failedProbeCount % 10 == 0) {
+          cubeViewerDebugLog(hadViewerSession
+                                 ? std::string("Viewer probe failed after connection; retrying. count=") + std::to_string(failedProbeCount)
+                                 : "Viewer probe failed while connecting; retrying.");
+        }
+        setStatusLabel("Connecting...");
+        continue;
+      }
+
+      failedProbeCount = 0;
+      cubeViewerConnected_ = true;
+      cubeViewerWindowUsable_ = probe.visible && !probe.iconified;
+      lastHeartbeatAt_ = std::chrono::steady_clock::now();
+      if (!probe.visible || probe.iconified) {
+        markViewerInactive(probe.iconified ? "Viewer minimized; auto-disconnecting."
+                                           : "Viewer hidden; auto-disconnecting.");
+        continue;
+      }
+
+      setStatusLabel(cubeViewerLive_ ? "Updating" : "Connected");
+    }
+  }
+
+  void enqueueParamsMessage(const std::string& payload, const std::string& reason) {
+    markViewerTransportActivity();
+    {
+      std::lock_guard<std::mutex> lock(ioMutex_);
+      pendingParams_.payload = payload;
+      pendingParams_.reason = reason;
+      pendingParams_.valid = true;
+    }
+    cubeViewerDebugLog(std::string("Queued params payload bytes=") + std::to_string(payload.size()) +
+                       " reason=" + reason);
+    ioCv_.notify_one();
+  }
+
+  void enqueueCloudMessage(const std::string& payload, const std::string& reason) {
+    markViewerTransportActivity();
+    {
+      std::lock_guard<std::mutex> lock(ioMutex_);
+      pendingCloud_.payload = payload;
+      pendingCloud_.reason = reason;
+      pendingCloud_.valid = true;
+      cloudQueuedOrInFlight_.store(true, std::memory_order_relaxed);
+    }
+    cubeViewerDebugLog(std::string("Queued cloud payload bytes=") + std::to_string(payload.size()) +
+                       " reason=" + reason);
+    ioCv_.notify_one();
+  }
+
+  // Cached clouds are only reusable when the viewer-facing interpretation is unchanged.
+  // This keeps reconnect/refresh fast without letting old strip/cloud states leak into new modes.
+  bool trySendCachedCloud(double time, const std::string& reason) {
+    std::lock_guard<std::mutex> lock(stateMutex_);
+    if (!cachedCloud_.valid) {
+      cubeViewerDebugLog(std::string("Cached cloud miss: reason=") + reason);
+      return false;
+    }
+    const int qualityIndex = getChoiceValue("cubeViewerQuality", time, cubeViewerQuality_);
+    const int resolution = qualityResolutionForIndex(qualityIndex);
+    const std::string settingsKey = currentCloudSettingsKey(time);
+    if (cachedCloud_.resolution != resolution ||
+        cachedCloud_.quality != qualityLabelForIndex(qualityIndex) ||
+        cachedCloud_.settingsKey != settingsKey) {
+      cubeViewerDebugLog(std::string("Cached cloud stale for current settings: reason=") + reason);
+      return false;
+    }
+    enqueueCloudMessage(cachedCloud_.payload, reason + "/cached");
+    cubeViewerInputCloudRefreshPending_ = false;
+    cubeViewerDebugLog(std::string("Cached cloud queued: reason=") + reason +
+                       " quality=" + cachedCloud_.quality +
+                       " res=" + std::to_string(cachedCloud_.resolution));
+    return true;
+  }
+
+  // All viewer IPC runs on a worker thread so host renders never block on named-pipe/socket latency.
+  // The worker coalesces the latest params/cloud payloads and retries transient connection failures.
+  void ioWorkerLoop() {
+    for (;;) {
+      PendingMessage params;
+      PendingMessage cloud;
+      {
+        std::unique_lock<std::mutex> lock(ioMutex_);
+        ioCv_.wait(lock, [this] { return ioStop_ || pendingParams_.valid || pendingCloud_.valid; });
+        if (ioStop_) break;
+        if (pendingParams_.valid) {
+          params = pendingParams_;
+          pendingParams_.valid = false;
+        }
+        if (pendingCloud_.valid) {
+          cloud = pendingCloud_;
+          pendingCloud_.valid = false;
+        }
+      }
+      if (params.valid) {
+        cubeViewerDebugLog(std::string("Sending params payload bytes=") + std::to_string(params.payload.size()) +
+                           " reason=" + params.reason);
+        if (sendViewerMessageWithRetry(params.payload, false)) {
+          markViewerTransportActivity();
+          cubeViewerConnected_ = true;
+          cubeViewerWindowUsable_ = true;
+          setStatusLabel(cubeViewerLive_ ? "Updating" : "Connected");
+          cubeViewerDebugLog("Params payload send succeeded.");
+        } else {
+          cubeViewerDebugLog("Params payload send failed.");
+        }
+      }
+      if (cloud.valid) {
+        cubeViewerDebugLog(std::string("Sending cloud payload bytes=") + std::to_string(cloud.payload.size()) +
+                           " reason=" + cloud.reason);
+        if (sendViewerMessageWithRetry(cloud.payload, true)) {
+          markViewerTransportActivity();
+          cubeViewerConnected_ = true;
+          cubeViewerWindowUsable_ = true;
+          setStatusLabel("Updating");
+          cubeViewerDebugLog("Cloud payload send succeeded.");
+        } else {
+          cubeViewerConnected_ = false;
+          cubeViewerWindowUsable_ = false;
+          cubeViewerDebugLog("Cloud payload send failed.");
+        }
+        cloudQueuedOrInFlight_.store(false, std::memory_order_relaxed);
+      }
+    }
+  }
+
+  bool sendViewerMessageWithRetry(const std::string& payload, bool isCloud) {
+    const auto retrySleep = cubeViewerConnected_ ? std::chrono::milliseconds(25)
+                                                 : std::chrono::milliseconds(60);
+    const auto retryBudget = cubeViewerConnected_ ? std::chrono::milliseconds(180)
+                                                  : std::chrono::milliseconds(4500);
+    const auto deadline = std::chrono::steady_clock::now() + retryBudget;
+    int attempt = 1;
+    for (;;) {
+      if (sendViewerMessage(payload)) return true;
+      const auto now = std::chrono::steady_clock::now();
+      if (now >= deadline) break;
+      cubeViewerDebugLog(std::string(isCloud ? "Cloud" : "Params") +
+                         " payload send retry " + std::to_string(attempt) +
+                         " budgetMs=" + std::to_string(
+                             std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count()));
+      ++attempt;
+      std::this_thread::sleep_for(retrySleep);
+    }
+    cubeViewerDebugLog(std::string(isCloud ? "Cloud" : "Params") +
+                       " payload send exhausted retry budget after attempts=" + std::to_string(attempt));
+    return false;
+  }
+
+  bool sendViewerMessage(const std::string& payload) {
+#if defined(_WIN32)
+    const std::string pipe = cubeViewerPipeName();
+    HANDLE pipeHandle = openViewerPipeHandle(pipe);
+    if (pipeHandle == INVALID_HANDLE_VALUE) return false;
+    DWORD totalWritten = 0;
+    BOOL ok = TRUE;
+    while (totalWritten < payload.size()) {
+      DWORD chunkWritten = 0;
+      const DWORD remaining = static_cast<DWORD>(std::min<size_t>(payload.size() - totalWritten, 1u << 20));
+      ok = WriteFile(pipeHandle, payload.data() + totalWritten, remaining, &chunkWritten, nullptr);
+      if (!ok || chunkWritten == 0) break;
+      totalWritten += chunkWritten;
+    }
+    CloseHandle(pipeHandle);
+    return ok && totalWritten == payload.size();
+#else
+    const std::string sock = cubeViewerPipeName();
+    const int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) return false;
+    sockaddr_un addr{};
+    addr.sun_family = AF_UNIX;
+    std::snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", sock.c_str());
+    if (::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+      cubeViewerDebugLog(std::string("socket connect failed errno=") + std::to_string(errno));
+      ::close(fd);
+      return false;
+    }
+    size_t total = 0;
+    while (total < payload.size()) {
+      const ssize_t sent = ::send(fd, payload.data() + total, payload.size() - total, MSG_NOSIGNAL);
+      if (sent <= 0) {
+        cubeViewerDebugLog(std::string("socket send failed after ") + std::to_string(total) + "/" +
+                           std::to_string(payload.size()) + " errno=" + std::to_string(errno));
+        ::close(fd);
+        return false;
+      }
+      total += static_cast<size_t>(sent);
+    }
+    ::close(fd);
+    return true;
+#endif
+  }
+
+  // Heartbeats are a lightweight liveness and window-state probe used before launching or reconnecting.
+  // They let the plugin reuse the existing singleton viewer instead of spawning duplicates.
+  ViewerProbeResult probeViewer() {
+    ViewerProbeResult result;
+    const uint64_t seq = seqCounter_.fetch_add(1, std::memory_order_relaxed);
+    std::ostringstream payload;
+    payload << "{\"type\":\"heartbeat\",\"seq\":" << seq
+            << ",\"senderId\":\"" << jsonEscape(senderId_) << "\"}\n";
+
+#if defined(_WIN32)
+    const std::string pipe = cubeViewerPipeName();
+    HANDLE pipeHandle = openViewerPipeHandle(pipe);
+    if (pipeHandle == INVALID_HANDLE_VALUE) return result;
+    DWORD written = 0;
+    if (!WriteFile(pipeHandle, payload.str().data(), static_cast<DWORD>(payload.str().size()), &written, nullptr)) {
+      CloseHandle(pipeHandle);
+      return result;
+    }
+    char buffer[256] = {};
+    DWORD read = 0;
+    if (!ReadFile(pipeHandle, buffer, sizeof(buffer) - 1, &read, nullptr)) {
+      CloseHandle(pipeHandle);
+      return result;
+    }
+    CloseHandle(pipeHandle);
+    std::string reply(buffer, buffer + read);
+#else
+    const std::string sock = cubeViewerPipeName();
+    const int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) return result;
+    timeval tv{};
+    tv.tv_sec = 0;
+    tv.tv_usec = 100000;
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    sockaddr_un addr{};
+    addr.sun_family = AF_UNIX;
+    std::snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", sock.c_str());
+    if (::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+      cubeViewerDebugLog(std::string("heartbeat connect failed errno=") + std::to_string(errno));
+      ::close(fd);
+      return result;
+    }
+    const std::string msg = payload.str();
+    size_t total = 0;
+    while (total < msg.size()) {
+      const ssize_t sent = ::send(fd, msg.data() + total, msg.size() - total, MSG_NOSIGNAL);
+      if (sent <= 0) {
+        cubeViewerDebugLog(std::string("heartbeat send failed after ") + std::to_string(total) + "/" +
+                           std::to_string(msg.size()) + " errno=" + std::to_string(errno));
+        ::close(fd);
+        return result;
+      }
+      total += static_cast<size_t>(sent);
+    }
+    char buffer[256] = {};
+    const ssize_t r = ::recv(fd, buffer, sizeof(buffer) - 1, 0);
+    ::close(fd);
+    if (r <= 0) return result;
+    std::string reply(buffer, buffer + r);
+#endif
+    result.ok = reply.find("\"type\":\"heartbeat_ack\"") != std::string::npos;
+    result.visible = reply.find("\"visible\":0") == std::string::npos;
+    result.iconified = reply.find("\"iconified\":1") != std::string::npos;
+    result.focused = reply.find("\"focused\":0") == std::string::npos;
+    if (result.ok && (!hasLoggedHeartbeatProbe_ || !sameViewerProbeState(result, lastLoggedHeartbeatProbe_))) {
+      cubeViewerDebugLog(std::string("Heartbeat ok visible=") + (result.visible ? "1" : "0") +
+                         " iconified=" + (result.iconified ? "1" : "0") +
+                         " focused=" + (result.focused ? "1" : "0"));
+      lastLoggedHeartbeatProbe_ = result;
+      hasLoggedHeartbeatProbe_ = true;
+    }
+    return result;
+  }
+
+  // Opening a session means "ensure a usable viewer exists, then mark this OFX instance as active."
+  // Reuse is preferred over relaunch so repeated connect/refresh actions stay within the single-viewer rule.
+  void openCubeViewerSession(double time) {
+    startIoWorker();
+    startStatusThread();
+    ViewerProbeResult existing = probeViewer();
+    if (existing.ok) {
+      cubeViewerDebugLog("Reusing already running viewer instance.");
+      const uint64_t seq = seqCounter_.fetch_add(1, std::memory_order_relaxed);
+      std::ostringstream payload;
+      payload << "{\"type\":\"bring_to_front\",\"seq\":" << seq
+              << ",\"senderId\":\"" << jsonEscape(senderId_) << "\"}\n";
+      (void)sendViewerMessage(payload.str());
+    } else {
+      launchViewerProcess();
+    }
+    cubeViewerRequested_ = true;
+    markViewerTransportActivity();
+    cubeViewerConnected_ = existing.ok;
+    cubeViewerWindowUsable_ = existing.ok ? (existing.visible && !existing.iconified) : true;
+    cubeViewerInputCloudRefreshPending_ = true;
+    lastCloudBuiltAt_ = std::chrono::steady_clock::time_point{};
+    lastHeartbeatAt_ = existing.ok ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    {
+      std::lock_guard<std::mutex> lock(ioMutex_);
+      pendingCloud_.valid = false;
+      cloudQueuedOrInFlight_.store(false, std::memory_order_relaxed);
+    }
+    pushParamsUpdate(time, "openCubeViewer");
+    (void)trySendCachedCloud(time, "openCubeViewer");
+    setStatusLabel(existing.ok ? (cubeViewerLive_ ? "Updating" : "Connected") : "Connecting...");
+    cubeViewerDebugLog("Cube viewer session opened.");
+  }
+
+  void closeCubeViewerSession() {
+    cubeViewerRequested_ = false;
+    cubeViewerConnected_ = false;
+    cubeViewerWindowUsable_ = false;
+    cubeViewerInputCloudRefreshPending_ = false;
+    lastCloudBuiltAt_ = std::chrono::steady_clock::time_point{};
+    lastHeartbeatAt_ = std::chrono::steady_clock::time_point{};
+    lastCloudSourceId_.clear();
+    lastCloudSettingsKey_.clear();
+    releaseViewerRuntimeResources();
+    setStatusLabel("Disconnected");
+    cubeViewerDebugLog("Cube viewer session closed.");
+  }
+
+  void pushParamsUpdate(double time, const std::string& reason) {
+    if (!cubeViewerRequested_) return;
+    enqueueParamsMessage(buildParamsPayload(time), reason);
+  }
+
+  std::vector<std::string> viewerExecutableCandidates() const {
+    std::vector<std::string> out;
+    const std::string exeName = viewerExecutableName();
+    const std::string modulePath = pluginModulePath();
+    const std::string moduleDir = parentDir(modulePath);
+    const std::string bundleRoot = findBundleRootFromModule(modulePath);
+    const char* envOverride = std::getenv("CHROMASPACE_EXE");
+    if (envOverride && envOverride[0] != '\0') {
+      const std::string envPath(envOverride);
+      out.push_back(envPath);
+      if (!isAbsolutePath(envPath) && !moduleDir.empty()) out.push_back(joinPath(moduleDir, envPath));
+    }
+    if (!bundleRoot.empty()) {
+#if defined(_WIN32)
+      out.push_back(joinPath(joinPath(joinPath(bundleRoot, "Contents"), "Win64"), exeName));
+#elif defined(__APPLE__)
+      out.push_back(joinPath(joinPath(joinPath(bundleRoot, "Contents"), "MacOS"), exeName));
+#else
+      out.push_back(joinPath(joinPath(joinPath(bundleRoot, "Contents"), "Linux-x86-64"), exeName));
+#endif
+    }
+    if (!moduleDir.empty()) {
+      out.push_back(joinPath(moduleDir, exeName));
+      const std::string contentsDir = parentDir(moduleDir);
+      if (!contentsDir.empty()) {
+        out.push_back(joinPath(contentsDir, exeName));
+        out.push_back(joinPath(joinPath(contentsDir, "Resources"), exeName));
+      }
+    }
+    const std::string cwdCandidate = joinPath(std::filesystem::current_path().string(), exeName);
+    out.push_back(cwdCandidate);
+    out.push_back(exeName);
+    std::vector<std::string> unique;
+    for (const auto& candidate : out) {
+      if (candidate.empty()) continue;
+      if (std::find(unique.begin(), unique.end(), candidate) == unique.end()) {
+        unique.push_back(candidate);
+      }
+    }
+    return unique;
+  }
+
+  // Launch tries bundle-relative paths first so installed OFX bundles work without manual viewer setup,
+  // then falls back to cwd/PATH-style candidates for workshop and local build workflows.
+  void launchViewerProcess() {
+    const auto candidates = viewerExecutableCandidates();
+    std::ostringstream attempted;
+#if defined(_WIN32)
+    for (const auto& candidate : candidates) {
+      const bool literalCandidate = candidate == std::string(viewerExecutableName());
+      if (!literalCandidate && !fileExistsForLaunch(candidate)) {
+        attempted << (attempted.tellp() > 0 ? "; " : "") << candidate;
+        continue;
+      }
+      cubeViewerDebugLog(std::string("Launching viewer from: ") + candidate);
+      STARTUPINFOA si{};
+      PROCESS_INFORMATION pi{};
+      si.cb = sizeof(si);
+      std::string cmdLine = "\"" + candidate + "\"";
+      const BOOL ok = CreateProcessA(
+          nullptr,
+          cmdLine.data(),
+          nullptr,
+          nullptr,
+          FALSE,
+          CREATE_NEW_PROCESS_GROUP,
+          nullptr,
+          literalCandidate ? nullptr : parentDir(candidate).c_str(),
+          &si,
+          &pi);
+      if (ok == TRUE) {
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+        cubeViewerDebugLog(std::string("CreateProcess succeeded: ") + candidate);
+        return;
+      }
+      attempted << (attempted.tellp() > 0 ? "; " : "") << candidate << " (err=" << GetLastError() << ")";
+    }
+    cubeViewerDebugLog(std::string("Viewer launch failed. attempted: ") + attempted.str());
+    setStatusLabel("Viewer launch failed");
+#else
+    for (const auto& candidate : candidates) {
+      const bool literalCandidate = candidate == std::string(viewerExecutableName());
+      if (!literalCandidate && !fileExistsForLaunch(candidate)) {
+        attempted << (attempted.tellp() > 0 ? "; " : "") << candidate;
+        continue;
+      }
+      cubeViewerDebugLog(std::string("Launching viewer from: ") + candidate);
+      pid_t pid = 0;
+      const std::string exe = candidate;
+      char* const argv[] = {const_cast<char*>(exe.c_str()), nullptr};
+      const int spawnErr = posix_spawn(&pid, exe.c_str(), nullptr, nullptr, argv, environ);
+      if (spawnErr == 0) {
+        cubeViewerDebugLog(std::string("posix_spawn succeeded: ") + candidate);
+        return;
+      }
+      attempted << (attempted.tellp() > 0 ? "; " : "") << candidate << " (err=" << spawnErr << ")";
+    }
+    cubeViewerDebugLog(std::string("Viewer launch failed. attempted: ") + attempted.str());
+    setStatusLabel("Viewer launch failed");
+#endif
+  }
+};
+
+class ChromaspaceOverlayInteract : public OFX::OverlayInteract {
+ public:
+  ChromaspaceOverlayInteract(OfxInteractHandle handle, OFX::ImageEffect* effect)
+      : OFX::OverlayInteract(handle)
+      , effect_(static_cast<ChromaspaceEffect*>(effect)) {}
+
+  bool draw(const OFX::DrawArgs& args) override {
+    if (!effect_ || !effect_->currentLassoRegionSlicingEnabled(args.time)) {
+      cancelActiveStroke();
+      return false;
+    }
+
+    const OfxRectD rect = effect_->currentLassoImageRect(args.time);
+    const LassoRegionState state = effect_->currentLassoRegionState(args.time);
+
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glLineWidth(2.0f);
+
+    for (const auto& stroke : state.strokes) {
+      drawCommittedStroke(stroke, rect);
+    }
+    if (!activeStroke_.empty()) {
+      drawActiveStroke(rect);
+    }
+    return !state.strokes.empty() || !activeStroke_.empty();
+  }
+
+  bool penDown(const OFX::PenArgs& args) override {
+    if (!effect_ || !effect_->currentLassoRegionSlicingEnabled(args.time)) {
+      cancelActiveStroke();
+      return false;
+    }
+    const OfxPointD clampedPoint = clampPenToImage(args.penPosition, effect_->currentLassoImageRect(args.time));
+    if (shiftHeld_) {
+      cancelActiveStroke();
+      effect_->resetLassoRegion(args.time, "cubeViewerLassoReset/shift-click");
+      effect_->redrawOverlays();
+      return true;
+    }
+    cancelActiveStroke();
+    strokeActive_ = true;
+    strokeSubtract_ = altHeld_ || effect_->currentLassoSubtractOperation(args.time);
+    appendActivePoint(clampedPoint, args, true);
+    effect_->redrawOverlays();
+    return true;
+  }
+
+  bool penMotion(const OFX::PenArgs& args) override {
+    if (!strokeActive_ || !effect_ || !effect_->currentLassoRegionSlicingEnabled(args.time)) return false;
+    appendActivePoint(clampPenToImage(args.penPosition, effect_->currentLassoImageRect(args.time)), args, false);
+    effect_->redrawOverlays();
+    return true;
+  }
+
+  bool penUp(const OFX::PenArgs& args) override {
+    if (!strokeActive_ || !effect_) return false;
+    appendActivePoint(clampPenToImage(args.penPosition, effect_->currentLassoImageRect(args.time)), args, true);
+    const std::vector<OfxPointD> stroke = activeStroke_;
+    const bool subtract = strokeSubtract_;
+    cancelActiveStroke();
+    effect_->redrawOverlays();
+    if (stroke.size() < 3) return true;
+    effect_->commitLassoStroke(args.time, stroke, subtract, "cubeViewerLassoData/interact");
+    return true;
+  }
+
+  bool keyDown(const OFX::KeyArgs& args) override {
+    if (!effect_ || !effect_->currentLassoRegionSlicingEnabled(args.time)) return false;
+    if (args.keySymbol == kOfxKey_Control_L || args.keySymbol == kOfxKey_Control_R) {
+      controlHeld_ = true;
+      return false;
+    }
+    if (args.keySymbol == kOfxKey_Alt_L || args.keySymbol == kOfxKey_Alt_R) {
+      altHeld_ = true;
+      if (strokeActive_) {
+        strokeSubtract_ = true;
+        effect_->redrawOverlays();
+      }
+      return strokeActive_;
+    }
+    if (args.keySymbol == kOfxKey_Shift_L || args.keySymbol == kOfxKey_Shift_R) {
+      shiftHeld_ = true;
+      return false;
+    }
+    if (args.keySymbol == kOfxKey_Escape) {
+      if (!strokeActive_) return false;
+      cancelActiveStroke();
+      effect_->redrawOverlays();
+      return true;
+    }
+    if (args.keySymbol == kOfxKey_BackSpace || args.keySymbol == kOfxKey_Delete) {
+      effect_->undoLassoRegionStroke(args.time, "cubeViewerLassoUndo/key");
+      return true;
+    }
+    return false;
+  }
+
+  bool keyUp(const OFX::KeyArgs& args) override {
+    if (args.keySymbol == kOfxKey_Control_L || args.keySymbol == kOfxKey_Control_R) {
+      controlHeld_ = false;
+      return false;
+    }
+    if (args.keySymbol == kOfxKey_Alt_L || args.keySymbol == kOfxKey_Alt_R) {
+      altHeld_ = false;
+      if (strokeActive_ && effect_) {
+        strokeSubtract_ = effect_->currentLassoSubtractOperation(args.time);
+        effect_->redrawOverlays();
+        return true;
+      }
+      return false;
+    }
+    if (args.keySymbol != kOfxKey_Shift_L && args.keySymbol != kOfxKey_Shift_R) return false;
+    shiftHeld_ = false;
+    if (strokeActive_ && effect_) {
+      return false;
+    }
+    return false;
+  }
+
+ private:
+  ChromaspaceEffect* effect_ = nullptr;
+  bool strokeActive_ = false;
+  bool strokeSubtract_ = false;
+  bool shiftHeld_ = false;
+  bool controlHeld_ = false;
+  bool altHeld_ = false;
+  std::vector<OfxPointD> activeStroke_;
+
+  void cancelActiveStroke() {
+    strokeActive_ = false;
+    strokeSubtract_ = false;
+    activeStroke_.clear();
+  }
+
+  OfxPointD clampPenToImage(const OfxPointD& penPosition, const OfxRectD& rect) const {
+    return OfxPointD{
+        std::clamp(penPosition.x, rect.x1, rect.x2),
+        std::clamp(penPosition.y, rect.y1, rect.y2),
+    };
+  }
+
+  void appendActivePoint(const OfxPointD& point, const OFX::PenArgs& args, bool force) {
+    if (activeStroke_.empty()) {
+      activeStroke_.push_back(point);
+      return;
+    }
+    const auto& last = activeStroke_.back();
+    const double dx = point.x - last.x;
+    const double dy = point.y - last.y;
+    const double minDistance = std::max(args.pixelScale.x, args.pixelScale.y) * 2.0;
+    if (!force && (dx * dx + dy * dy) < (minDistance * minDistance)) return;
+    activeStroke_.push_back(point);
+  }
+
+  static OfxPointD denormalizePoint(const LassoPointNorm& point, const OfxRectD& rect) {
+    return OfxPointD{
+        rect.x1 + static_cast<double>(point.xNorm) * (rect.x2 - rect.x1),
+        rect.y1 + static_cast<double>(point.yNorm) * (rect.y2 - rect.y1),
+    };
+  }
+
+  void drawCommittedStroke(const LassoStroke& stroke, const OfxRectD& rect) const {
+    if (stroke.points.size() < 3) return;
+    const float fillR = stroke.subtract ? 0.95f : 0.15f;
+    const float fillG = stroke.subtract ? 0.20f : 0.85f;
+    const float fillB = stroke.subtract ? 0.15f : 0.95f;
+    const float lineR = stroke.subtract ? 1.00f : 0.35f;
+    const float lineG = stroke.subtract ? 0.50f : 1.00f;
+    const float lineB = stroke.subtract ? 0.30f : 1.00f;
+    glColor4f(fillR, fillG, fillB, 0.12f);
+    glBegin(GL_POLYGON);
+    for (const auto& point : stroke.points) {
+      const OfxPointD denorm = denormalizePoint(point, rect);
+      glVertex2d(denorm.x, denorm.y);
+    }
+    glEnd();
+    glColor4f(lineR, lineG, lineB, 0.95f);
+    glBegin(GL_LINE_LOOP);
+    for (const auto& point : stroke.points) {
+      const OfxPointD denorm = denormalizePoint(point, rect);
+      glVertex2d(denorm.x, denorm.y);
+    }
+    glEnd();
+  }
+
+  void drawActiveStroke(const OfxRectD& rect) const {
+    if (activeStroke_.empty()) return;
+    const float lineR = strokeSubtract_ ? 1.00f : 0.95f;
+    const float lineG = strokeSubtract_ ? 0.55f : 0.95f;
+    const float lineB = strokeSubtract_ ? 0.30f : 0.20f;
+    glColor4f(lineR, lineG, lineB, 1.0f);
+    glBegin(activeStroke_.size() >= 3 ? GL_LINE_LOOP : GL_LINE_STRIP);
+    for (const auto& point : activeStroke_) {
+      const OfxPointD clamped = clampPenToImage(point, rect);
+      glVertex2d(clamped.x, clamped.y);
+    }
+    glEnd();
+  }
+};
+
+class ChromaspaceOverlayDescriptor
+    : public OFX::DefaultEffectOverlayDescriptor<ChromaspaceOverlayDescriptor, ChromaspaceOverlayInteract> {};
+
+class ChromaspaceFactory : public PluginFactoryHelper<ChromaspaceFactory> {
+ public:
+  ChromaspaceFactory()
+      : PluginFactoryHelper<ChromaspaceFactory>(kPluginIdentifier, kPluginVersionMajor, kPluginVersionMinor) {}
+
+  void load() override {}
+  void unload() override {}
+
+  void describe(ImageEffectDescriptor& d) override {
+    static const std::string nameWithVersion = std::string(kPluginName) + " " + kPluginVersionLabel;
+    d.setLabels(nameWithVersion.c_str(), nameWithVersion.c_str(), nameWithVersion.c_str());
+    d.setPluginGrouping(kPluginGrouping);
+    d.setPluginDescription("Standalone 3D cube viewer for plotting the input image as a point cloud.");
+    d.getPropertySet().propSetString(kOfxPropIcon, "", 0, false);
+    d.getPropertySet().propSetString(kOfxPropIcon, "com.moazelgabry.chromaspace.png", 1, false);
+    d.addSupportedContext(eContextFilter);
+    d.addSupportedBitDepth(eBitDepthFloat);
+    d.setSingleInstance(false);
+    d.setSupportsTiles(false);
+    d.setSupportsMultiResolution(false);
+    d.setTemporalClipAccess(false);
+    d.setOverlayInteractDescriptor(new ChromaspaceOverlayDescriptor);
+#if defined(CHROMASPACE_HAS_CUDA)
+    d.setSupportsCudaRender(true);
+    d.setSupportsCudaStream(true);
+#endif
+#if defined(__APPLE__)
+    d.setSupportsMetalRender(true);
+#endif
+#if defined(CHROMASPACE_HAS_OPENCL)
+    d.setSupportsOpenCLBuffersRender(true);
+    d.setSupportsOpenCLImagesRender(true);
+#endif
+  }
+
+  void describeInContext(ImageEffectDescriptor& d, ContextEnum) override {
+    ClipDescriptor* src = d.defineClip(kOfxImageEffectSimpleSourceClipName);
+    src->addSupportedComponent(ePixelComponentRGBA);
+    src->setTemporalClipAccess(false);
+    src->setSupportsTiles(false);
+
+    ClipDescriptor* dst = d.defineClip(kOfxImageEffectOutputClipName);
+    dst->addSupportedComponent(ePixelComponentRGBA);
+    dst->setSupportsTiles(false);
+
+    auto tooltipFor = [](const std::string& name) -> const char* {
+      static const std::map<std::string, const char*> kHints = {
+          {"openCubeViewer", "Open the standalone 3D cube viewer."},
+          {"closeCubeViewer", "Disconnect this OFX instance from the viewer without closing the external window."},
+          {"cubeViewerLive", "When enabled, changes update the viewer continuously."},
+          {"cubeViewerOnTop", "Keep the external viewer above the host application."},
+          {"cubeViewerQuality", "Viewer sampling density for the 3D cube (Low=25^3, about 45k points; Medium=41^3, about 90k points; High=57^3, about 180k points)."},
+          {"cubeViewerScale", "Scales the sampled image domain used for cube generation to lighten processing. 100% keeps full size, while lower values reduce cloud-build work."},
+          {"cubeViewerPointSize", "Makes points larger or smaller and automatically adjusts point density in the opposite direction to keep the cloud readable."},
+          {"cubeViewerSamplingMode", "Balanced uses a deterministic lattice for stable coverage, Stratified adds jitter for cleaner coverage, and Random gives a noisier organic scatter."},
+          {"cubeViewerOccupancyGuidedFill", "Adds a second occupancy-guided pass after the normal image sampler so sparsely occupied RGB regions receive more support and the plot reads denser without switching to the instance-1 workflow."},
+          {"cubeViewerPointShape", "Choose whether points are rendered as circular or square splats in the viewer."},
+          {"cubeViewerShowOverflow", "Cube, HSL, HSV, Chen, JP-Conical, and Reuleaux plot modes: allow points outside the nominal guide bounds so out-of-range transforms remain visible instead of being clamped back into the model."},
+          {"cubeViewerHighlightOverflow", "When enabled, color out-of-bound plot points with a dedicated highlight color."},
+          {"cubeViewerCircularHsl", "For HSL only: switch from the default HSL bicone view to a circular cylindrical HSL view with hue as angle, saturation as radius, and lightness as height. When overflow is enabled, out-of-range RGB values are converted with the raw HSL formula so useful out-of-bound cylindrical points remain visible."},
+          {"cubeViewerCircularHsv", "For HSV only: switch from the default Smith hexcone view to a circular cylindrical HSV view with hue as angle, saturation as radius, and value as height."},
+          {"cubeViewerLassoRegionMode", "When enabled, Volume Slicing uses a drawn lasso region on the image instead of the hue-sector filters."},
+          {"cubeViewerSliceRed", "Show only the red sector. In Cube mode this is the red-dominant tetrahedral region; in the other plot models it is the red-centered hue sector."},
+          {"cubeViewerSliceGreen", "Show only the green sector. In Cube mode this is the green-dominant tetrahedral region; in the other plot models it is the green-centered hue sector."},
+          {"cubeViewerSliceBlue", "Show only the blue sector. In Cube mode this is the blue-dominant tetrahedral region; in the other plot models it is the blue-centered hue sector."},
+          {"cubeViewerSliceCyan", "Show only the cyan sector. In Cube mode this is the blue-over-green tetrahedral region; in the other plot models it is the cyan-centered hue sector."},
+          {"cubeViewerSliceYellow", "Show only the yellow sector. In Cube mode this is the green-over-red tetrahedral region; in the other plot models it is the yellow-centered hue sector."},
+          {"cubeViewerSliceMagenta", "Show only the magenta sector. In Cube mode this is the red-over-blue tetrahedral region; in the other plot models it is the magenta-centered hue sector."},
+          {"cubeViewerLassoOperation", "When Volume Slicing is in Lasso Region mode, choose whether the next stroke adds to the selection or subtracts from it. Shortcut: hold Alt while drawing for a temporary subtract stroke."},
+          {"cubeViewerLassoUndo", "Remove the most recently committed lasso stroke."},
+          {"cubeViewerLassoReset", "Clear the current lasso region so you can draw a fresh selection. Shortcut: Shift+left click on the image."},
+          {"cubeViewerOverflowHighlightColor", "Choose the color used to highlight out-of-bound plot points."},
+          {"cubeViewerBackgroundColor", "Choose the viewer background color used behind the 3D plot."},
+{"cubeViewerIdentityOverlayEnabled", "Enable the synthetic identity plot reference for the current mode so you can compare or pass a known solid through the pipeline."},
+{"cubeViewerIdentityOverlaySize", "Controls fill-volume density in the 3D viewer from 4 to 65. Higher values create a denser synthetic volume."},
+          {"cubeViewerIdentityOverlayRamp", "Adds a linear 0..1 neutral ramp to the identity overlay so luma appears as a grayscale diagonal through the 3D plot."},
+          {"cubeViewerIdentityOverlayNote", "For this to work you need to use another instance in generate mode Upstream"},
+          {"cubeViewerSampleDrawnCubeOnly", "Enable this on a downstream instance when an earlier instance is generating the identity plot strip into the image. The downstream plot will read that strip and combine its dense identity-solid sampling with the normal whole-image sampling."},
+          {"cubeViewerReadGrayRamp", "Enable this on a downstream instance to add a dedicated concentrated readback of the gray ramp band from the identity plot strip."},
+          {"cubeViewerShowIdentityOnly", "Only available when using the identity plot from instance 1. When enabled, the downstream plot reads only the drawn identity strip and skips the normal whole-image cloud, so you see just the transformed identity data."},
+{"cubeViewerSampleDrawnCubeSize", "Sets the identity-strip resolution from 4 to 65. In the identity generator this controls the generated strip density, and in a downstream instance it should match instance 1 so the strip can be decoded correctly."},
+{"cubeViewerModeToggle", "Switch between the 3D viewer and the identity generator. The identity generator burns the identity strip into the image and hides plot-only controls."},
+          {"cubeViewerPlotModel", "Choose which 3D color geometry is used to plot the current signal: RGB cube, HSL bicone or circular HSL, HSV hexcone or circular HSV, Chen, Norm-Cone, JP-Conical, Reuleaux, or Chromaticity xyY."},
+          {"cubeViewerNormConeNormalized", "For Norm-Cone only: when enabled, use the normalized cone chroma from JP's DCTL; when disabled, use the raw spherical chroma variant instead."},
+          {"cubeViewerChromaticityInputPrimaries", "Choose the assumed input primaries used to convert incoming RGB into XYZ before plotting chromaticity xyY."},
+          {"cubeViewerChromaticityInputTransfer", "Choose the assumed input transfer function used to decode incoming RGB to linear light before chromaticity conversion."},
+          {"cubeViewerChromaticityReferenceBasis", "Plot chromaticity coordinates relative to the CIE standard observer basis or the selected input observer basis."},
+          {"cubeViewerChromaticityOverlayPrimaries", "Choose which gamut triangle to overlay on the chromaticity plot, or set None to hide the overlay triangle."},
+          {"cubeViewerChromaticityPlanckianLocus", "Show the Planckian locus overlay and Kelvin labels in chromaticity mode."},
+          {"cubeViewerStatus", "Connection state for the external cube viewer."},
+      };
+      auto it = kHints.find(name);
+      return it == kHints.end() ? nullptr : it->second;
+    };
+
+    auto* cubeViewerSource = d.defineChoiceParam("cubeViewerSource");
+    cubeViewerSource->appendOption("Input Image");
+    cubeViewerSource->setDefault(0);
+    cubeViewerSource->setIsSecret(true);
+
+    auto* cubeViewerPlotModel = d.defineChoiceParam("cubeViewerPlotModel");
+    cubeViewerPlotModel->setLabel("Plot Model");
+    cubeViewerPlotModel->appendOption("Cube");
+    cubeViewerPlotModel->appendOption("HSL");
+    cubeViewerPlotModel->appendOption("HSV");
+    cubeViewerPlotModel->appendOption("Chen");
+    cubeViewerPlotModel->appendOption("Norm-Cone");
+    cubeViewerPlotModel->appendOption("JP-Conical");
+    cubeViewerPlotModel->appendOption("Reuleaux");
+    cubeViewerPlotModel->appendOption("Chromaticity");
+    cubeViewerPlotModel->setDefault(0);
+    if (const char* hint = tooltipFor("cubeViewerPlotModel")) cubeViewerPlotModel->setHint(hint);
+
+    auto* openCubeViewer = d.definePushButtonParam("openCubeViewer");
+    openCubeViewer->setLabel("Open 3D Viewer");
+    if (const char* hint = tooltipFor("openCubeViewer")) openCubeViewer->setHint(hint);
+
+    auto* cubeViewerCircularHsl = d.defineBooleanParam("cubeViewerCircularHsl");
+    cubeViewerCircularHsl->setLabel("Circular HSL");
+    cubeViewerCircularHsl->setDefault(false);
+    cubeViewerCircularHsl->setIsSecret(true);
+    cubeViewerCircularHsl->setEnabled(false);
+    if (const char* hint = tooltipFor("cubeViewerCircularHsl")) cubeViewerCircularHsl->setHint(hint);
+
+    auto* cubeViewerCircularHsv = d.defineBooleanParam("cubeViewerCircularHsv");
+    cubeViewerCircularHsv->setLabel("Circular HSV");
+    cubeViewerCircularHsv->setDefault(false);
+    cubeViewerCircularHsv->setIsSecret(true);
+    cubeViewerCircularHsv->setEnabled(false);
+    if (const char* hint = tooltipFor("cubeViewerCircularHsv")) cubeViewerCircularHsv->setHint(hint);
+
+    auto* cubeViewerNormConeNormalized = d.defineBooleanParam("cubeViewerNormConeNormalized");
+    cubeViewerNormConeNormalized->setLabel("Normalized Chroma");
+    cubeViewerNormConeNormalized->setDefault(true);
+    cubeViewerNormConeNormalized->setIsSecret(true);
+    cubeViewerNormConeNormalized->setEnabled(false);
+    if (const char* hint = tooltipFor("cubeViewerNormConeNormalized")) cubeViewerNormConeNormalized->setHint(hint);
+
+    auto* cubeViewerShowOverflow = d.defineBooleanParam("cubeViewerShowOverflow");
+    cubeViewerShowOverflow->setLabel("Show Overflow");
+    cubeViewerShowOverflow->setDefault(false);
+    if (const char* hint = tooltipFor("cubeViewerShowOverflow")) cubeViewerShowOverflow->setHint(hint);
+
+    auto* cubeViewerHighlightOverflow = d.defineBooleanParam("cubeViewerHighlightOverflow");
+    cubeViewerHighlightOverflow->setLabel("Highlight Overflow");
+    cubeViewerHighlightOverflow->setDefault(true);
+    if (const char* hint = tooltipFor("cubeViewerHighlightOverflow")) cubeViewerHighlightOverflow->setHint(hint);
+
+    auto* cubeViewerIdentityOverlayEnabled = d.defineBooleanParam("cubeViewerIdentityOverlayEnabled");
+    cubeViewerIdentityOverlayEnabled->setLabel("Fill Volume");
+    cubeViewerIdentityOverlayEnabled->setDefault(false);
+    if (const char* hint = tooltipFor("cubeViewerIdentityOverlayEnabled")) cubeViewerIdentityOverlayEnabled->setHint(hint);
+
+    auto* cubeViewerIdentityOverlaySize = d.defineIntParam("cubeViewerIdentityOverlaySize");
+    cubeViewerIdentityOverlaySize->setLabel("Fill Resolution");
+    cubeViewerIdentityOverlaySize->setDefault(29);
+    cubeViewerIdentityOverlaySize->setRange(4, 65);
+    cubeViewerIdentityOverlaySize->setDisplayRange(4, 65);
+    if (const char* hint = tooltipFor("cubeViewerIdentityOverlaySize")) cubeViewerIdentityOverlaySize->setHint(hint);
+
+    auto* cubeViewerIdentityOverlayRamp = d.defineBooleanParam("cubeViewerIdentityOverlayRamp");
+    cubeViewerIdentityOverlayRamp->setLabel("Linear Gray Ramp");
+    cubeViewerIdentityOverlayRamp->setDefault(false);
+    if (const char* hint = tooltipFor("cubeViewerIdentityOverlayRamp")) cubeViewerIdentityOverlayRamp->setHint(hint);
+
+    auto* cubeViewerChromaticityPlanckianLocus = d.defineBooleanParam("cubeViewerChromaticityPlanckianLocus");
+    cubeViewerChromaticityPlanckianLocus->setLabel("Planckian Locus");
+    cubeViewerChromaticityPlanckianLocus->setDefault(true);
+    if (const char* hint = tooltipFor("cubeViewerChromaticityPlanckianLocus")) cubeViewerChromaticityPlanckianLocus->setHint(hint);
+
+    auto* grpCubeViewerChromaticityCm = d.defineGroupParam("grp_cube_viewer_chromaticity_cm");
+    grpCubeViewerChromaticityCm->setLabel("Chromaticity Color Management");
+    grpCubeViewerChromaticityCm->setOpen(true);
+    grpCubeViewerChromaticityCm->setEnabled(false);
+
+    auto* cubeViewerChromaticityInputPrimaries = d.defineChoiceParam("cubeViewerChromaticityInputPrimaries");
+    cubeViewerChromaticityInputPrimaries->setLabel("Input Primaries");
+    for (std::size_t i = 0; i < WorkshopColor::primariesCount(); ++i) {
+      cubeViewerChromaticityInputPrimaries->appendOption(WorkshopColor::primariesDefinition(i).label);
+    }
+    cubeViewerChromaticityInputPrimaries->setDefault(
+        WorkshopColor::primariesChoiceIndex(WorkshopColor::ColorPrimariesId::Rec709));
+    cubeViewerChromaticityInputPrimaries->setParent(*grpCubeViewerChromaticityCm);
+    if (const char* hint = tooltipFor("cubeViewerChromaticityInputPrimaries")) cubeViewerChromaticityInputPrimaries->setHint(hint);
+
+    auto* cubeViewerChromaticityInputTransfer = d.defineChoiceParam("cubeViewerChromaticityInputTransfer");
+    cubeViewerChromaticityInputTransfer->setLabel("Input Transfer");
+    for (std::size_t i = 0; i < WorkshopColor::transferFunctionCount(); ++i) {
+      cubeViewerChromaticityInputTransfer->appendOption(WorkshopColor::transferFunctionDefinition(i).label);
+    }
+    cubeViewerChromaticityInputTransfer->setDefault(
+        WorkshopColor::transferFunctionChoiceIndex(WorkshopColor::TransferFunctionId::Gamma24));
+    cubeViewerChromaticityInputTransfer->setParent(*grpCubeViewerChromaticityCm);
+    if (const char* hint = tooltipFor("cubeViewerChromaticityInputTransfer")) cubeViewerChromaticityInputTransfer->setHint(hint);
+
+    auto* cubeViewerChromaticityReferenceBasis = d.defineChoiceParam("cubeViewerChromaticityReferenceBasis");
+    cubeViewerChromaticityReferenceBasis->setLabel("Reference Basis");
+    cubeViewerChromaticityReferenceBasis->appendOption("CIE Standard Observer");
+    cubeViewerChromaticityReferenceBasis->appendOption("Input Observer");
+    cubeViewerChromaticityReferenceBasis->setDefault(0);
+    cubeViewerChromaticityReferenceBasis->setParent(*grpCubeViewerChromaticityCm);
+    if (const char* hint = tooltipFor("cubeViewerChromaticityReferenceBasis")) cubeViewerChromaticityReferenceBasis->setHint(hint);
+
+    auto* cubeViewerChromaticityOverlayPrimaries = d.defineChoiceParam("cubeViewerChromaticityOverlayPrimaries");
+    cubeViewerChromaticityOverlayPrimaries->setLabel("Overlay Primaries");
+    cubeViewerChromaticityOverlayPrimaries->appendOption("None");
+    for (std::size_t i = 0; i < WorkshopColor::primariesCount(); ++i) {
+      cubeViewerChromaticityOverlayPrimaries->appendOption(WorkshopColor::primariesDefinition(i).label);
+    }
+    cubeViewerChromaticityOverlayPrimaries->setDefault(
+        WorkshopColor::overlayPrimariesChoiceIndex(true, WorkshopColor::ColorPrimariesId::Rec709));
+    cubeViewerChromaticityOverlayPrimaries->setParent(*grpCubeViewerChromaticityCm);
+    if (const char* hint = tooltipFor("cubeViewerChromaticityOverlayPrimaries")) cubeViewerChromaticityOverlayPrimaries->setHint(hint);
+
+    auto* grpCubeViewerSlicing = d.defineGroupParam("grp_cube_viewer_slicing");
+    grpCubeViewerSlicing->setLabel("Volume Slice");
+    grpCubeViewerSlicing->setOpen(false);
+
+    auto* cubeViewerLassoRegionMode = d.defineBooleanParam("cubeViewerLassoRegionMode");
+    cubeViewerLassoRegionMode->setLabel("Lasso Region");
+    cubeViewerLassoRegionMode->setDefault(false);
+    cubeViewerLassoRegionMode->setParent(*grpCubeViewerSlicing);
+    cubeViewerLassoRegionMode->setIsSecret(true);
+    cubeViewerLassoRegionMode->setEnabled(false);
+    if (const char* hint = tooltipFor("cubeViewerLassoRegionMode")) cubeViewerLassoRegionMode->setHint(hint);
+
+    auto* cubeViewerSliceRed = d.defineBooleanParam("cubeViewerSliceRed");
+    cubeViewerSliceRed->setLabel("Red");
+    cubeViewerSliceRed->setDefault(false);
+    cubeViewerSliceRed->setParent(*grpCubeViewerSlicing);
+    if (const char* hint = tooltipFor("cubeViewerSliceRed")) cubeViewerSliceRed->setHint(hint);
+
+    auto* cubeViewerSliceYellow = d.defineBooleanParam("cubeViewerSliceYellow");
+    cubeViewerSliceYellow->setLabel("Yellow");
+    cubeViewerSliceYellow->setDefault(false);
+    cubeViewerSliceYellow->setParent(*grpCubeViewerSlicing);
+    if (const char* hint = tooltipFor("cubeViewerSliceYellow")) cubeViewerSliceYellow->setHint(hint);
+
+    auto* cubeViewerSliceGreen = d.defineBooleanParam("cubeViewerSliceGreen");
+    cubeViewerSliceGreen->setLabel("Green");
+    cubeViewerSliceGreen->setDefault(false);
+    cubeViewerSliceGreen->setParent(*grpCubeViewerSlicing);
+    if (const char* hint = tooltipFor("cubeViewerSliceGreen")) cubeViewerSliceGreen->setHint(hint);
+
+    auto* cubeViewerSliceCyan = d.defineBooleanParam("cubeViewerSliceCyan");
+    cubeViewerSliceCyan->setLabel("Cyan");
+    cubeViewerSliceCyan->setDefault(false);
+    cubeViewerSliceCyan->setParent(*grpCubeViewerSlicing);
+    if (const char* hint = tooltipFor("cubeViewerSliceCyan")) cubeViewerSliceCyan->setHint(hint);
+
+    auto* cubeViewerSliceBlue = d.defineBooleanParam("cubeViewerSliceBlue");
+    cubeViewerSliceBlue->setLabel("Blue");
+    cubeViewerSliceBlue->setDefault(false);
+    cubeViewerSliceBlue->setParent(*grpCubeViewerSlicing);
+    if (const char* hint = tooltipFor("cubeViewerSliceBlue")) cubeViewerSliceBlue->setHint(hint);
+
+    auto* cubeViewerSliceMagenta = d.defineBooleanParam("cubeViewerSliceMagenta");
+    cubeViewerSliceMagenta->setLabel("Magenta");
+    cubeViewerSliceMagenta->setDefault(false);
+    cubeViewerSliceMagenta->setParent(*grpCubeViewerSlicing);
+    if (const char* hint = tooltipFor("cubeViewerSliceMagenta")) cubeViewerSliceMagenta->setHint(hint);
+
+    auto* cubeViewerLassoOperation = d.defineChoiceParam("cubeViewerLassoOperation");
+    cubeViewerLassoOperation->setLabel("Lasso Operation");
+    cubeViewerLassoOperation->appendOption("Add");
+    cubeViewerLassoOperation->appendOption("Subtract");
+    cubeViewerLassoOperation->setDefault(0);
+    cubeViewerLassoOperation->setParent(*grpCubeViewerSlicing);
+    cubeViewerLassoOperation->setIsSecret(true);
+    cubeViewerLassoOperation->setEnabled(false);
+    if (const char* hint = tooltipFor("cubeViewerLassoOperation")) cubeViewerLassoOperation->setHint(hint);
+
+    auto* cubeViewerLassoUndo = d.definePushButtonParam("cubeViewerLassoUndo");
+    cubeViewerLassoUndo->setLabel("Undo Last Stroke");
+    cubeViewerLassoUndo->setParent(*grpCubeViewerSlicing);
+    cubeViewerLassoUndo->setIsSecret(true);
+    cubeViewerLassoUndo->setEnabled(false);
+    if (const char* hint = tooltipFor("cubeViewerLassoUndo")) cubeViewerLassoUndo->setHint(hint);
+
+    auto* cubeViewerLassoReset = d.definePushButtonParam("cubeViewerLassoReset");
+    cubeViewerLassoReset->setLabel("Reset Region");
+    cubeViewerLassoReset->setParent(*grpCubeViewerSlicing);
+    cubeViewerLassoReset->setIsSecret(true);
+    cubeViewerLassoReset->setEnabled(false);
+    if (const char* hint = tooltipFor("cubeViewerLassoReset")) cubeViewerLassoReset->setHint(hint);
+
+    auto* cubeViewerLassoData = d.defineStringParam("cubeViewerLassoData");
+    cubeViewerLassoData->setDefault("");
+    cubeViewerLassoData->setIsSecret(true);
+    cubeViewerLassoData->setEnabled(false);
+    cubeViewerLassoData->setAnimates(false);
+
+    auto* cubeViewerStatus = d.defineStringParam("cubeViewerStatus");
+    cubeViewerStatus->setLabel("Viewer Status");
+    cubeViewerStatus->setStringType(eStringTypeLabel);
+    cubeViewerStatus->setDefault("Disconnected");
+    cubeViewerStatus->setAnimates(false);
+    cubeViewerStatus->setEnabled(false);
+    if (const char* hint = tooltipFor("cubeViewerStatus")) cubeViewerStatus->setHint(hint);
+
+    auto* grpCubeViewerIdentityOverlay = d.defineGroupParam("grp_cube_viewer_identity_overlay");
+    grpCubeViewerIdentityOverlay->setLabel("Identity Plot");
+    grpCubeViewerIdentityOverlay->setOpen(false);
+
+    auto* cubeViewerDrawOnImageEnabled = d.defineBooleanParam("cubeViewerDrawOnImageEnabled");
+    cubeViewerDrawOnImageEnabled->setDefault(false);
+    cubeViewerDrawOnImageEnabled->setIsSecret(true);
+
+    auto* cubeViewerIdentityOverlayNote = d.defineStringParam("cubeViewerIdentityOverlayNote");
+    cubeViewerIdentityOverlayNote->setLabel("Note!");
+    cubeViewerIdentityOverlayNote->setStringType(eStringTypeLabel);
+    cubeViewerIdentityOverlayNote->setDefault("Requires Generator Upstream");
+    cubeViewerIdentityOverlayNote->setAnimates(false);
+    cubeViewerIdentityOverlayNote->setEnabled(false);
+    cubeViewerIdentityOverlayNote->setParent(*grpCubeViewerIdentityOverlay);
+    if (const char* hint = tooltipFor("cubeViewerIdentityOverlayNote")) cubeViewerIdentityOverlayNote->setHint(hint);
+
+    auto* cubeViewerIdentityOverlayEnabledDraw = d.defineBooleanParam("cubeViewerIdentityOverlayEnabledDraw");
+    cubeViewerIdentityOverlayEnabledDraw->setLabel("Generate Identity Plot");
+    cubeViewerIdentityOverlayEnabledDraw->setDefault(false);
+    cubeViewerIdentityOverlayEnabledDraw->setParent(*grpCubeViewerIdentityOverlay);
+    if (const char* hint = tooltipFor("cubeViewerIdentityOverlayEnabled")) cubeViewerIdentityOverlayEnabledDraw->setHint(hint);
+
+    auto* cubeViewerIdentityOverlayRampDraw = d.defineBooleanParam("cubeViewerIdentityOverlayRampDraw");
+    cubeViewerIdentityOverlayRampDraw->setLabel("Draw Gray Ramp");
+    cubeViewerIdentityOverlayRampDraw->setDefault(false);
+    cubeViewerIdentityOverlayRampDraw->setParent(*grpCubeViewerIdentityOverlay);
+    if (const char* hint = tooltipFor("cubeViewerIdentityOverlayRamp")) cubeViewerIdentityOverlayRampDraw->setHint(hint);
+
+    auto* cubeViewerReadGrayRamp = d.defineBooleanParam("cubeViewerReadGrayRamp");
+    cubeViewerReadGrayRamp->setLabel("Read Gray Ramp");
+    cubeViewerReadGrayRamp->setDefault(false);
+    cubeViewerReadGrayRamp->setParent(*grpCubeViewerIdentityOverlay);
+    if (const char* hint = tooltipFor("cubeViewerReadGrayRamp")) cubeViewerReadGrayRamp->setHint(hint);
+
+    auto* cubeViewerSampleDrawnCubeOnly = d.defineBooleanParam("cubeViewerSampleDrawnCubeOnly");
+    cubeViewerSampleDrawnCubeOnly->setLabel("Read Identity Plot");
+    cubeViewerSampleDrawnCubeOnly->setDefault(false);
+    cubeViewerSampleDrawnCubeOnly->setParent(*grpCubeViewerIdentityOverlay);
+    if (const char* hint = tooltipFor("cubeViewerSampleDrawnCubeOnly")) cubeViewerSampleDrawnCubeOnly->setHint(hint);
+
+    auto* cubeViewerShowIdentityOnly = d.defineBooleanParam("cubeViewerShowIdentityOnly");
+    cubeViewerShowIdentityOnly->setLabel("Isolate Identity Data");
+    cubeViewerShowIdentityOnly->setDefault(false);
+    cubeViewerShowIdentityOnly->setParent(*grpCubeViewerIdentityOverlay);
+    if (const char* hint = tooltipFor("cubeViewerShowIdentityOnly")) cubeViewerShowIdentityOnly->setHint(hint);
+
+    auto* cubeViewerSampleDrawnCubeSize = d.defineIntParam("cubeViewerSampleDrawnCubeSize");
+    cubeViewerSampleDrawnCubeSize->setLabel("Resolution");
+    cubeViewerSampleDrawnCubeSize->setDefault(29);
+    cubeViewerSampleDrawnCubeSize->setRange(4, 65);
+    cubeViewerSampleDrawnCubeSize->setDisplayRange(4, 65);
+    cubeViewerSampleDrawnCubeSize->setParent(*grpCubeViewerIdentityOverlay);
+    if (const char* hint = tooltipFor("cubeViewerSampleDrawnCubeSize")) cubeViewerSampleDrawnCubeSize->setHint(hint);
+
+    auto* cubeViewerModeToggle = d.definePushButtonParam("cubeViewerModeToggle");
+    cubeViewerModeToggle->setLabel("Switch to Identity Generator");
+    cubeViewerModeToggle->setParent(*grpCubeViewerIdentityOverlay);
+    if (const char* hint = tooltipFor("cubeViewerModeToggle")) cubeViewerModeToggle->setHint(hint);
+
+    auto* grpCubeViewer = d.defineGroupParam("grp_cube_viewer");
+    grpCubeViewer->setLabel("Settings");
+    grpCubeViewer->setOpen(false);
+
+    cubeViewerStatus->setParent(*grpCubeViewer);
+
+    auto* closeCubeViewer = d.definePushButtonParam("closeCubeViewer");
+    closeCubeViewer->setLabel("Disconnect Viewer");
+    closeCubeViewer->setParent(*grpCubeViewer);
+    if (const char* hint = tooltipFor("closeCubeViewer")) closeCubeViewer->setHint(hint);
+
+    auto* cubeViewerLive = d.defineBooleanParam("cubeViewerLive");
+    cubeViewerLive->setLabel("Live Update Viewer");
+    cubeViewerLive->setDefault(true);
+    cubeViewerLive->setParent(*grpCubeViewer);
+    if (const char* hint = tooltipFor("cubeViewerLive")) cubeViewerLive->setHint(hint);
+
+    auto* cubeViewerOnTop = d.defineBooleanParam("cubeViewerOnTop");
+    cubeViewerOnTop->setLabel("Keep Viewer On Top");
+    cubeViewerOnTop->setDefault(true);
+    cubeViewerOnTop->setParent(*grpCubeViewer);
+    if (const char* hint = tooltipFor("cubeViewerOnTop")) cubeViewerOnTop->setHint(hint);
+
+    auto* cubeViewerQuality = d.defineChoiceParam("cubeViewerQuality");
+    cubeViewerQuality->setLabel("Viewer Quality");
+    cubeViewerQuality->appendOption("Low");
+    cubeViewerQuality->appendOption("Medium");
+    cubeViewerQuality->appendOption("High");
+    cubeViewerQuality->setDefault(0);
+    cubeViewerQuality->setParent(*grpCubeViewer);
+    if (const char* hint = tooltipFor("cubeViewerQuality")) cubeViewerQuality->setHint(hint);
+
+    auto* cubeViewerScale = d.defineChoiceParam("cubeViewerScale");
+    cubeViewerScale->setLabel("Scale");
+    cubeViewerScale->appendOption("25%");
+    cubeViewerScale->appendOption("50%");
+    cubeViewerScale->appendOption("75%");
+    cubeViewerScale->appendOption("100%");
+    cubeViewerScale->setDefault(3);
+    cubeViewerScale->setParent(*grpCubeViewer);
+    if (const char* hint = tooltipFor("cubeViewerScale")) cubeViewerScale->setHint(hint);
+
+    auto* cubeViewerPointSize = d.defineDoubleParam("cubeViewerPointSize");
+    cubeViewerPointSize->setLabel("Point Size");
+    cubeViewerPointSize->setDefault(0.800);
+    cubeViewerPointSize->setRange(0.35, 1.0);
+    cubeViewerPointSize->setDisplayRange(0.35, 1.0);
+    cubeViewerPointSize->setIncrement(0.025);
+    cubeViewerPointSize->setParent(*grpCubeViewer);
+    if (const char* hint = tooltipFor("cubeViewerPointSize")) cubeViewerPointSize->setHint(hint);
+
+    auto* cubeViewerPointShape = d.defineChoiceParam("cubeViewerPointShape");
+    cubeViewerPointShape->setLabel("Point Shape");
+    cubeViewerPointShape->appendOption("Circle");
+    cubeViewerPointShape->appendOption("Square");
+    cubeViewerPointShape->setDefault(0);
+    cubeViewerPointShape->setParent(*grpCubeViewer);
+    if (const char* hint = tooltipFor("cubeViewerPointShape")) cubeViewerPointShape->setHint(hint);
+
+    auto* cubeViewerSamplingMode = d.defineChoiceParam("cubeViewerSamplingMode");
+    cubeViewerSamplingMode->setLabel("Sampling");
+    cubeViewerSamplingMode->appendOption("Balanced");
+    cubeViewerSamplingMode->appendOption("Stratified");
+    cubeViewerSamplingMode->appendOption("Random");
+    cubeViewerSamplingMode->setDefault(0);
+    cubeViewerSamplingMode->setParent(*grpCubeViewer);
+    if (const char* hint = tooltipFor("cubeViewerSamplingMode")) cubeViewerSamplingMode->setHint(hint);
+
+    auto* cubeViewerOccupancyGuidedFill = d.defineBooleanParam("cubeViewerOccupancyGuidedFill");
+    cubeViewerOccupancyGuidedFill->setLabel("Occupancy-guided fill");
+    cubeViewerOccupancyGuidedFill->setDefault(true);
+    cubeViewerOccupancyGuidedFill->setParent(*grpCubeViewer);
+    if (const char* hint = tooltipFor("cubeViewerOccupancyGuidedFill")) cubeViewerOccupancyGuidedFill->setHint(hint);
+
+    auto* cubeViewerOverflowHighlightColor = d.defineRGBParam("cubeViewerOverflowHighlightColor");
+    cubeViewerOverflowHighlightColor->setLabel("Highlight Color");
+    cubeViewerOverflowHighlightColor->setDefault(1.0, 0.0, 0.0);
+    cubeViewerOverflowHighlightColor->setRange(0.0, 0.0, 0.0, 1.0, 1.0, 1.0);
+    cubeViewerOverflowHighlightColor->setDisplayRange(0.0, 0.0, 0.0, 1.0, 1.0, 1.0);
+    cubeViewerOverflowHighlightColor->setIsSecret(true);
+    cubeViewerOverflowHighlightColor->setEnabled(false);
+    if (const char* hint = tooltipFor("cubeViewerOverflowHighlightColor")) cubeViewerOverflowHighlightColor->setHint(hint);
+
+    auto* cubeViewerBackgroundColor = d.defineRGBParam("cubeViewerBackgroundColor");
+    cubeViewerBackgroundColor->setLabel("Viewer Background");
+    cubeViewerBackgroundColor->setDefault(0.08, 0.08, 0.09);
+    cubeViewerBackgroundColor->setRange(0.0, 0.0, 0.0, 1.0, 1.0, 1.0);
+    cubeViewerBackgroundColor->setDisplayRange(0.0, 0.0, 0.0, 1.0, 1.0, 1.0);
+    cubeViewerBackgroundColor->setIsSecret(true);
+    cubeViewerBackgroundColor->setEnabled(false);
+    if (const char* hint = tooltipFor("cubeViewerBackgroundColor")) cubeViewerBackgroundColor->setHint(hint);
+
+    auto* grpSupportRoot = d.defineGroupParam("grp_support_root");
+    grpSupportRoot->setLabel("Support");
+    grpSupportRoot->setOpen(false);
+
+    auto* supportWebsite = d.definePushButtonParam("supportWebsite");
+    supportWebsite->setLabel("Website");
+    supportWebsite->setParent(*grpSupportRoot);
+
+    auto* supportLatestReleases = d.definePushButtonParam("supportLatestReleases");
+    supportLatestReleases->setLabel("Latest Releases");
+    supportLatestReleases->setParent(*grpSupportRoot);
+
+    auto* supportReportIssue = d.definePushButtonParam("supportReportIssue");
+    supportReportIssue->setLabel("Submit an Issue");
+    supportReportIssue->setParent(*grpSupportRoot);
+
+    auto* supportVersion = d.defineStringParam("supportVersion");
+    supportVersion->setLabel("OFX version");
+    supportVersion->setDefault(kPluginVersionLabel);
+    supportVersion->setEnabled(false);
+    supportVersion->setParent(*grpSupportRoot);
+  }
+
+  ImageEffect* createInstance(OfxImageEffectHandle h, ContextEnum) override {
+    return new ChromaspaceEffect(h);
+  }
+};
+
+}  // namespace
+
+void OFX::Plugin::getPluginIDs(OFX::PluginFactoryArray& ids) {
+  static ChromaspaceFactory p;
+  ids.push_back(&p);
+}
+
+
+
+

@@ -1,0 +1,87 @@
+name: Build Chromaspace macOS
+
+on:
+  workflow_call:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build-macos:
+    env:
+      CUBE_VERSION: v1.0.0
+      ZIP_NAME: Chromaspace_v1.0.0_macOS_universal_portable.zip
+      ARTIFACT_NAME: Chromaspace-v1.0.0-macos-universal
+
+    runs-on: macos-14
+
+    defaults:
+      run:
+        shell: bash
+        working-directory: source
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Ensure local OFX SDK is available
+        run: |
+          if [ ! -f "ofx-sdk/include/ofxImageEffect.h" ]; then
+            rm -rf ofx-sdk
+            git clone --depth 1 https://github.com/AcademySoftwareFoundation/openfx.git ofx-sdk
+          fi
+
+      - name: Ensure build tools are available
+        run: |
+          if command -v ninja >/dev/null 2>&1; then
+            ninja --version
+          else
+            brew install ninja
+          fi
+
+      - name: Prepare Meson virtualenv
+        run: |
+          python3 -m venv .meson-venv
+          source .meson-venv/bin/activate
+          python -m pip install --upgrade pip
+          python -m pip install meson
+          echo "PYTHON_EXE=${PWD}/.meson-venv/bin/python" >> "$GITHUB_ENV"
+          echo "${PWD}/.meson-venv/bin" >> "$GITHUB_PATH"
+
+      - name: Configure
+        run: |
+          cmake -S . -B build-mac -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DPython3_EXECUTABLE="${PYTHON_EXE}" \
+            -DCMAKE_OSX_ARCHITECTURES="x86_64;arm64" \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=13.0 \
+            -DCHROMASPACE_FORCE_BUNDLED_GLFW=ON \
+            -DCHROMASPACE_USE_BUNDLED_TEXT_DEPS=ON
+
+      - name: Build
+        run: cmake --build build-mac --config Release
+
+      - name: Verify bundle outputs
+        run: |
+          grep -q "CHROMASPACE_TEXT_DEPS_PROVIDER:INTERNAL=bundled" build-mac/CMakeCache.txt
+          test -f bundle/Chromaspace.ofx.bundle/Contents/MacOS/Chromaspace.ofx
+          test -f bundle/Chromaspace.ofx.bundle/Contents/MacOS/Chromaspace_CubeViewer
+          test -f bundle/Chromaspace.ofx.bundle/Contents/MacOS/OpenSans-Regular.ttf
+          test -f bundle/Chromaspace.ofx.bundle/Contents/Resources/com.moazelgabry.chromaspace.png
+          lipo -archs bundle/Chromaspace.ofx.bundle/Contents/MacOS/Chromaspace.ofx | grep -q "x86_64 arm64"
+          lipo -archs bundle/Chromaspace.ofx.bundle/Contents/MacOS/Chromaspace_CubeViewer | grep -q "x86_64 arm64"
+          otool -l bundle/Chromaspace.ofx.bundle/Contents/MacOS/Chromaspace.ofx | grep -A3 LC_BUILD_VERSION | grep -q "minos 13.0"
+          otool -l bundle/Chromaspace.ofx.bundle/Contents/MacOS/Chromaspace_CubeViewer | grep -A3 LC_BUILD_VERSION | grep -q "minos 13.0"
+
+      - name: Package macOS portable bundle
+        run: |
+          ditto -c -k --sequesterRsrc --keepParent \
+            bundle/Chromaspace.ofx.bundle \
+            ../../${ZIP_NAME}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: ${{ env.ZIP_NAME }}

@@ -1,0 +1,128 @@
+name: Build Chromaspace All Platforms
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - "source/CMakeLists.txt"
+      - "source/cmake/**"
+      - "source/src/**"
+      - "source/tools/**"
+      - "common/**"
+      - "icons/**"
+      - ".github/workflows/build-chromaspace-all-platforms.yml"
+      - ".github/workflows/build-chromaspace-windows.yml"
+      - ".github/workflows/build-chromaspace-macos.yml"
+      - ".github/workflows/build-chromaspace-linux.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    uses: ./.github/workflows/build-chromaspace-windows.yml
+    secrets: inherit
+
+  macos:
+    uses: ./.github/workflows/build-chromaspace-macos.yml
+    secrets: inherit
+
+  linux:
+    uses: ./.github/workflows/build-chromaspace-linux.yml
+    secrets: inherit
+
+  draft-release:
+    name: Create Chromaspace Draft Release
+    needs:
+      - windows
+      - macos
+      - linux
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download platform artifacts
+        uses: actions/download-artifact@v5
+        with:
+          path: artifacts
+
+      - name: Prepare draft release metadata
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          REF_NAME: ${{ github.ref_name }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+
+          latest_json="$(gh api "repos/${REPO}/releases/latest" 2>/dev/null || true)"
+          if [ -n "${latest_json}" ]; then
+            latest_tag="$(printf '%s' "${latest_json}" | python3 -c "import json,sys; print(json.load(sys.stdin).get('tag_name',''))")"
+            latest_name="$(printf '%s' "${latest_json}" | python3 -c "import json,sys; print(json.load(sys.stdin).get('name',''))")"
+            printf '%s' "${latest_json}" | python3 -c "import json,sys; print(json.load(sys.stdin).get('body',''))" > latest_release_body.txt
+          else
+            latest_tag="unreleased"
+            latest_name="Chromaspace"
+            : > latest_release_body.txt
+          fi
+
+          short_sha="${SHA::7}"
+          draft_tag="chromaspace-draft-${RUN_ID}"
+          draft_title="${latest_name} draft (${REF_NAME} ${short_sha})"
+
+          {
+            echo "DRAFT_TAG=${draft_tag}"
+            echo "DRAFT_TITLE=${draft_title}"
+            echo "LATEST_TAG=${latest_tag}"
+            echo "LATEST_NAME=${latest_name}"
+          } >> "$GITHUB_ENV"
+
+      - name: Build draft release notes
+        env:
+          SHA: ${{ github.sha }}
+          ACTOR: ${{ github.actor }}
+          REF_NAME: ${{ github.ref_name }}
+          SERVER_URL: ${{ github.server_url }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+
+          short_sha="${SHA::7}"
+          {
+            echo "Automated draft release for Chromaspace."
+            echo
+            echo "- Base release: ${LATEST_NAME} (${LATEST_TAG})"
+            echo "- Branch: ${REF_NAME}"
+            echo "- Commit: ${short_sha}"
+            echo "- Triggered by: ${ACTOR}"
+            echo "- Workflow run: ${SERVER_URL}/${REPO}/actions/runs/${RUN_ID}"
+            echo
+            if [ -s latest_release_body.txt ]; then
+              echo "## Base Release Notes"
+              echo
+              cat latest_release_body.txt
+              echo
+            fi
+            echo "## Included Artifacts"
+            find artifacts -type f \( -name "*.zip" -o -name "*.tar.gz" \) -printf -- "- %f\n" | sort
+          } > draft_release_notes.md
+
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mapfile -t release_files < <(find artifacts -type f \( -name "*.zip" -o -name "*.tar.gz" \) | sort)
+          if [ "${#release_files[@]}" -eq 0 ]; then
+            echo "No packaged Chromaspace artifacts were found."
+            exit 1
+          fi
+          gh release create "${DRAFT_TAG}" \
+            --draft \
+            --title "${DRAFT_TITLE}" \
+            --notes-file draft_release_notes.md \
+            "${release_files[@]}"

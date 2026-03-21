@@ -1,0 +1,115 @@
+name: Build Chromaspace Linux
+
+on:
+  workflow_call:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build-linux:
+    env:
+      CUBE_VERSION: v1.0.0
+    strategy:
+      fail-fast: false
+      matrix:
+        variant:
+          - id: cuda-opencl-cpu
+            with_cuda: "ON"
+            artifact_name: Chromaspace-v1.0.0-linux-x86_64-cuda-opencl-cpu
+            archive_name: Chromaspace_v1.0.0_linux_x86_64_cuda_opencl_cpu_portable.tar.gz
+
+    runs-on: ubuntu-22.04
+
+    defaults:
+      run:
+        shell: bash
+        working-directory: source
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Ensure local OFX SDK is available
+        run: |
+          if [ ! -f "ofx-sdk/include/ofxImageEffect.h" ]; then
+            rm -rf ofx-sdk
+            git clone --depth 1 https://github.com/AcademySoftwareFoundation/openfx.git ofx-sdk
+          fi
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build g++ python3-pip ocl-icd-opencl-dev libglfw3-dev libgl1-mesa-dev xvfb
+          if [ "${{ matrix.variant.with_cuda }}" = "ON" ]; then
+            sudo apt-get install -y nvidia-cuda-toolkit gcc-10 g++-10
+          fi
+
+      - name: Select CUDA-compatible GNU toolchain
+        if: matrix.variant.with_cuda == 'ON'
+        run: |
+          echo "CC=/usr/bin/gcc-10" >> "$GITHUB_ENV"
+          echo "CXX=/usr/bin/g++-10" >> "$GITHUB_ENV"
+          echo "CUDAHOSTCXX=/usr/bin/g++-10" >> "$GITHUB_ENV"
+
+      - name: Prepare Meson virtualenv
+        run: |
+          python3 -m venv .meson-venv
+          source .meson-venv/bin/activate
+          python -m pip install --upgrade pip
+          python -m pip install meson
+          echo "PYTHON_EXE=${PWD}/.meson-venv/bin/python" >> "$GITHUB_ENV"
+          echo "${PWD}/.meson-venv/bin" >> "$GITHUB_PATH"
+
+      - name: Configure
+        run: |
+          extra_args=()
+          if [ "${{ matrix.variant.with_cuda }}" = "ON" ]; then
+            extra_args+=(
+              -DCMAKE_C_COMPILER=/usr/bin/gcc-10
+              -DCMAKE_CXX_COMPILER=/usr/bin/g++-10
+              -DCMAKE_CUDA_HOST_COMPILER=/usr/bin/g++-10
+            )
+          fi
+          cmake -S . -B build-linux -G Ninja -DCMAKE_BUILD_TYPE=Release -DPython3_EXECUTABLE="${PYTHON_EXE}" -DCHROMASPACE_USE_BUNDLED_TEXT_DEPS=ON "${extra_args[@]}"
+
+      - name: Build
+        run: cmake --build build-linux --config Release -j
+
+      - name: Verify bundle outputs
+        run: |
+          grep -q "CHROMASPACE_TEXT_DEPS_PROVIDER:INTERNAL=bundled" build-linux/CMakeCache.txt
+          test -f bundle/Chromaspace.ofx.bundle/Contents/Linux-x86-64/Chromaspace.ofx
+          test -f bundle/Chromaspace.ofx.bundle/Contents/Linux-x86-64/Chromaspace_CubeViewer
+          test -f bundle/Chromaspace.ofx.bundle/Contents/Linux-x86-64/OpenSans-Regular.ttf
+          chmod +x bundle/Chromaspace.ofx.bundle/Contents/Linux-x86-64/Chromaspace_CubeViewer
+
+      - name: Verify Linux viewer runtime deps and launch
+        run: |
+          viewer="bundle/Chromaspace.ofx.bundle/Contents/Linux-x86-64/Chromaspace_CubeViewer"
+          ldd "$viewer" | tee /tmp/chromaspace_ldd.txt
+          if grep -q "not found" /tmp/chromaspace_ldd.txt; then
+            echo "Unresolved shared libraries in Cube Viewer"
+            exit 1
+          fi
+          set +e
+          timeout 5s xvfb-run -a "$viewer" >/tmp/chromaspace_run.log 2>&1
+          rc=$?
+          set -e
+          if [ "$rc" -ne 124 ]; then
+            echo "Cube Viewer exited early (rc=$rc); expected timeout(124) if launch is healthy."
+            cat /tmp/chromaspace_run.log
+            exit 1
+          fi
+
+      - name: Package Linux portable bundle
+        run: |
+          tar -czf ../../${{ matrix.variant.archive_name }} \
+            -C bundle Chromaspace.ofx.bundle
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ matrix.variant.artifact_name }}
+          path: ${{ matrix.variant.archive_name }}
