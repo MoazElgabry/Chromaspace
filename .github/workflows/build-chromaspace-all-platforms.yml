@@ -152,14 +152,15 @@ jobs:
 
           draft_exists="false"
           skip_release="false"
+          legacy_published_draft_tag="false"
 
           if [ -n "${existing_draft_json}" ]; then
             is_draft="$(printf '%s' "${existing_draft_json}" | python3 -c "import json,sys; print(str(json.load(sys.stdin).get('draft', False)).lower())")"
             if [ "${is_draft}" = "true" ]; then
               draft_exists="true"
             else
-              echo "Release tag ${draft_tag} already exists and is not a draft."
-              exit 1
+              draft_exists="true"
+              legacy_published_draft_tag="true"
             fi
           fi
 
@@ -178,11 +179,13 @@ jobs:
             echo "FINAL_TAG=${final_tag}"
             echo "DRAFT_EXISTS=${draft_exists}"
             echo "SKIP_RELEASE=${skip_release}"
+            echo "LEGACY_PUBLISHED_DRAFT_TAG=${legacy_published_draft_tag}"
           } >> "$GITHUB_ENV"
 
           {
             echo "draft_exists=${draft_exists}"
             echo "skip_release=${skip_release}"
+            echo "legacy_published_draft_tag=${legacy_published_draft_tag}"
           } >> "$GITHUB_OUTPUT"
 
       - name: Build draft release notes
@@ -251,9 +254,16 @@ jobs:
               --clobber \
               "${release_files[@]}"
             {
-              echo "Chromaspace draft release updated."
-              echo
-              echo "- Draft tag: ${DRAFT_TAG}"
+              if [ "${LEGACY_PUBLISHED_DRAFT_TAG}" = "true" ]; then
+                echo "Chromaspace legacy draft-tag release updated."
+                echo
+                echo "- Release tag: ${DRAFT_TAG}"
+                echo "- Note: this tag already existed as a published release, so the workflow reused it instead of failing."
+              else
+                echo "Chromaspace draft release updated."
+                echo
+                echo "- Draft tag: ${DRAFT_TAG}"
+              fi
             } >> "$GITHUB_STEP_SUMMARY"
           else
             gh release create "${DRAFT_TAG}" \
