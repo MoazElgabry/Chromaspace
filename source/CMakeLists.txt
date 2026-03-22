@@ -1,12 +1,12 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(Chromaspace VERSION 1.0.0 LANGUAGES CXX)
-set(CUBE_DISPLAY_VERSION "1.0.0")
+project(Chromaspace VERSION 1.0.1 LANGUAGES CXX)
+set(CUBE_DISPLAY_VERSION "1.0.1")
 set(PLUGIN_BASENAME "Chromaspace")
 set(PLUGIN_IDENTIFIER "com.moazelgabry.chromaspace")
 set(LOCAL_OFX_SDK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/ofx-sdk")
-set(SHARED_ICON_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../icons")
-set(WORKSHOP_COMMON_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../common")
+set(SHARED_ICON_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../icons")
+set(WORKSHOP_COMMON_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../common")
 set(WORKSHOP_COLOR_SOURCES
   "${WORKSHOP_COMMON_DIR}/color/ColorManagement.cpp"
 )
