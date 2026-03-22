@@ -101,13 +101,30 @@ jobs:
         with:
           path: artifacts
 
+      - name: Resolve package version
+        id: version
+        working-directory: source
+        run: |
+          set -euo pipefail
+
+          version="$(grep -Eo 'set\(CUBE_DISPLAY_VERSION "[^"]+"\)' CMakeLists.txt | sed -E 's/.*"([^"]+)".*/\1/' | head -n1)"
+          if [ -z "${version}" ]; then
+            version="$(grep -Eo 'project\([^)]*VERSION [0-9A-Za-z.\-]+' CMakeLists.txt | sed -E 's/.*VERSION ([0-9A-Za-z.\-]+)/\1/' | head -n1)"
+          fi
+          if [ -z "${version}" ]; then
+            echo "Could not determine Chromaspace version from source/CMakeLists.txt"
+            exit 1
+          fi
+          echo "package_version=${version}" >> "$GITHUB_OUTPUT"
+
       - name: Prepare draft release metadata
+        id: draft_meta
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           SHA: ${{ github.sha }}
           REF_NAME: ${{ github.ref_name }}
-          RUN_ID: ${{ github.run_id }}
+          PACKAGE_VERSION: ${{ steps.version.outputs.package_version }}
         run: |
           set -euo pipefail
 
@@ -123,24 +140,57 @@ jobs:
           fi
 
           short_sha="${SHA::7}"
-          draft_tag="chromaspace-draft-${RUN_ID}"
+          draft_tag="chromaspace-draft-v${PACKAGE_VERSION}"
           draft_title="${latest_name} draft (${REF_NAME} ${short_sha})"
+          final_tag="v${PACKAGE_VERSION}"
+
+          existing_draft_json="$(gh api "repos/${REPO}/releases/tags/${draft_tag}" 2>/dev/null || true)"
+          final_release_json="$(gh api "repos/${REPO}/releases/tags/${final_tag}" 2>/dev/null || true)"
+
+          draft_exists="false"
+          skip_release="false"
+
+          if [ -n "${existing_draft_json}" ]; then
+            is_draft="$(printf '%s' "${existing_draft_json}" | python3 -c "import json,sys; print(str(json.load(sys.stdin).get('draft', False)).lower())")"
+            if [ "${is_draft}" = "true" ]; then
+              draft_exists="true"
+            else
+              echo "Release tag ${draft_tag} already exists and is not a draft."
+              exit 1
+            fi
+          fi
+
+          if [ -n "${final_release_json}" ]; then
+            final_is_draft="$(printf '%s' "${final_release_json}" | python3 -c "import json,sys; print(str(json.load(sys.stdin).get('draft', False)).lower())")"
+            if [ "${final_is_draft}" != "true" ]; then
+              skip_release="true"
+            fi
+          fi
 
           {
             echo "DRAFT_TAG=${draft_tag}"
             echo "DRAFT_TITLE=${draft_title}"
             echo "LATEST_TAG=${latest_tag}"
             echo "LATEST_NAME=${latest_name}"
+            echo "FINAL_TAG=${final_tag}"
+            echo "DRAFT_EXISTS=${draft_exists}"
+            echo "SKIP_RELEASE=${skip_release}"
           } >> "$GITHUB_ENV"
 
+          {
+            echo "draft_exists=${draft_exists}"
+            echo "skip_release=${skip_release}"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Build draft release notes
+        if: steps.draft_meta.outputs.skip_release != 'true'
         env:
           SHA: ${{ github.sha }}
           ACTOR: ${{ github.actor }}
           REF_NAME: ${{ github.ref_name }}
           SERVER_URL: ${{ github.server_url }}
           REPO: ${{ github.repository }}
-          RUN_ID: ${{ github.run_id }}
+          PACKAGE_VERSION: ${{ steps.version.outputs.package_version }}
         run: |
           set -euo pipefail
 
@@ -148,11 +198,12 @@ jobs:
           {
             echo "Automated draft release for Chromaspace."
             echo
+            echo "- Version: ${PACKAGE_VERSION}"
             echo "- Base release: ${LATEST_NAME} (${LATEST_TAG})"
             echo "- Branch: ${REF_NAME}"
             echo "- Commit: ${short_sha}"
             echo "- Triggered by: ${ACTOR}"
-            echo "- Workflow run: ${SERVER_URL}/${REPO}/actions/runs/${RUN_ID}"
+            echo "- Workflow run: ${SERVER_URL}/${REPO}/actions/runs/${{ github.run_id }}"
             echo
             if [ -s latest_release_body.txt ]; then
               echo "## Base Release Notes"
@@ -164,7 +215,17 @@ jobs:
             find artifacts -type f \( -name "*.zip" -o -name "*.tar.gz" \) -exec basename {} \; | sed 's/^/- /' | sort
           } > draft_release_notes.md
 
-      - name: Create draft release
+      - name: Skip draft release because version is already published
+        if: steps.draft_meta.outputs.skip_release == 'true'
+        run: |
+          {
+            echo "Chromaspace draft release skipped cleanly."
+            echo
+            echo "A published release already exists for ${FINAL_TAG}."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Create or update draft release
+        if: steps.draft_meta.outputs.skip_release != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -174,8 +235,28 @@ jobs:
             echo "No packaged Chromaspace artifacts were found."
             exit 1
           fi
-          gh release create "${DRAFT_TAG}" \
-            --draft \
-            --title "${DRAFT_TITLE}" \
-            --notes-file draft_release_notes.md \
-            "${release_files[@]}"
+
+          if [ "${DRAFT_EXISTS}" = "true" ]; then
+            gh release edit "${DRAFT_TAG}" \
+              --title "${DRAFT_TITLE}" \
+              --notes-file draft_release_notes.md
+            gh release upload "${DRAFT_TAG}" \
+              --clobber \
+              "${release_files[@]}"
+            {
+              echo "Chromaspace draft release updated."
+              echo
+              echo "- Draft tag: ${DRAFT_TAG}"
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            gh release create "${DRAFT_TAG}" \
+              --draft \
+              --title "${DRAFT_TITLE}" \
+              --notes-file draft_release_notes.md \
+              "${release_files[@]}"
+            {
+              echo "Chromaspace draft release created."
+              echo
+              echo "- Draft tag: ${DRAFT_TAG}"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
