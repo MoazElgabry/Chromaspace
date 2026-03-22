@@ -20,7 +20,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
         with:
-          fetch-depth: 2
+          fetch-depth: 0
 
       - name: Decide whether Chromaspace should build
         id: changes
@@ -30,7 +30,11 @@ jobs:
         run: |
           set -euo pipefail
 
-          if [ -z "${BEFORE}" ] || [ "${BEFORE}" = "0000000000000000000000000000000000000000" ]; then
+          if [ -n "${BEFORE}" ] && [ "${BEFORE}" != "0000000000000000000000000000000000000000" ]; then
+            git fetch --no-tags --prune --depth=1 origin "${BEFORE}" || true
+          fi
+
+          if [ -z "${BEFORE}" ] || [ "${BEFORE}" = "0000000000000000000000000000000000000000" ] || ! git cat-file -e "${BEFORE}^{commit}" 2>/dev/null; then
             changed_files="$(git ls-files)"
           else
             changed_files="$(git diff --name-only "${BEFORE}" "${AFTER}")"
