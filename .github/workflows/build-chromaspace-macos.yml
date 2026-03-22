@@ -23,17 +23,7 @@ jobs:
       - name: Resolve package version
         id: version
         run: |
-          version="$(python3 - <<'PY'
-import pathlib, re
-text = pathlib.Path("CMakeLists.txt").read_text(encoding="utf-8")
-match = re.search(r'set\(CUBE_DISPLAY_VERSION\s+"([^"]+)"\)', text)
-if not match:
-    match = re.search(r'project\([^\)]*VERSION\s+([0-9A-Za-z.\-]+)', text)
-if not match:
-    raise SystemExit("Could not determine Chromaspace version from source/CMakeLists.txt")
-print(match.group(1))
-PY
-)"
+          version="$(python3 -c 'import pathlib,re; text=pathlib.Path("CMakeLists.txt").read_text(encoding="utf-8"); match=re.search(r''set\(CUBE_DISPLAY_VERSION\s+\"([^\"]+)\"\)'', text) or re.search(r''project\([^\)]*VERSION\s+([0-9A-Za-z.\-]+)'', text); print(match.group(1) if match else (_ for _ in ()).throw(SystemExit("Could not determine Chromaspace version from source/CMakeLists.txt")))' )"
           echo "package_version=${version}" >> "$GITHUB_OUTPUT"
           echo "zip_name=Chromaspace_v${version}_macOS_universal_portable.zip" >> "$GITHUB_OUTPUT"
           echo "artifact_name=Chromaspace-v${version}-macos-universal" >> "$GITHUB_OUTPUT"
