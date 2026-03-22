@@ -9,11 +9,6 @@ on:
 
 jobs:
   build-macos:
-    env:
-      CUBE_VERSION: v1.0.0
-      ZIP_NAME: Chromaspace_v1.0.0_macOS_universal_portable.zip
-      ARTIFACT_NAME: Chromaspace-v1.0.0-macos-universal
-
     runs-on: macos-14
 
     defaults:
@@ -24,6 +19,24 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v5
+
+      - name: Resolve package version
+        id: version
+        run: |
+          version="$(python3 - <<'PY'
+import pathlib, re
+text = pathlib.Path("CMakeLists.txt").read_text(encoding="utf-8")
+match = re.search(r'set\(CUBE_DISPLAY_VERSION\s+"([^"]+)"\)', text)
+if not match:
+    match = re.search(r'project\([^\)]*VERSION\s+([0-9A-Za-z.\-]+)', text)
+if not match:
+    raise SystemExit("Could not determine Chromaspace version from source/CMakeLists.txt")
+print(match.group(1))
+PY
+)"
+          echo "package_version=${version}" >> "$GITHUB_OUTPUT"
+          echo "zip_name=Chromaspace_v${version}_macOS_universal_portable.zip" >> "$GITHUB_OUTPUT"
+          echo "artifact_name=Chromaspace-v${version}-macos-universal" >> "$GITHUB_OUTPUT"
 
       - name: Ensure local OFX SDK is available
         run: |
@@ -76,12 +89,13 @@ jobs:
 
       - name: Package macOS portable bundle
         run: |
+          zip_name="${{ steps.version.outputs.zip_name }}"
           ditto -c -k --sequesterRsrc --keepParent \
             bundle/Chromaspace.ofx.bundle \
-            ../../${ZIP_NAME}
+            ../../${zip_name}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v6
         with:
-          name: ${{ env.ARTIFACT_NAME }}
-          path: ${{ env.ZIP_NAME }}
+          name: ${{ steps.version.outputs.artifact_name }}
+          path: ${{ steps.version.outputs.zip_name }}

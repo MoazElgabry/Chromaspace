@@ -5,41 +5,94 @@ on:
   push:
     branches:
       - main
-    paths:
-      - "source/CMakeLists.txt"
-      - "source/cmake/**"
-      - "source/src/**"
-      - "source/tools/**"
-      - "common/**"
-      - "icons/**"
-      - ".github/workflows/build-chromaspace-all-platforms.yml"
-      - ".github/workflows/build-chromaspace-windows.yml"
-      - ".github/workflows/build-chromaspace-macos.yml"
-      - ".github/workflows/build-chromaspace-linux.yml"
 
 permissions:
   contents: write
 
 jobs:
+  detect-changes:
+    name: Detect build-relevant changes
+    runs-on: ubuntu-latest
+    outputs:
+      should_build: ${{ steps.changes.outputs.should_build }}
+      changed_files: ${{ steps.changes.outputs.changed_files }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 2
+
+      - name: Decide whether Chromaspace should build
+        id: changes
+        env:
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${BEFORE}" ] || [ "${BEFORE}" = "0000000000000000000000000000000000000000" ]; then
+            changed_files="$(git ls-files)"
+          else
+            changed_files="$(git diff --name-only "${BEFORE}" "${AFTER}")"
+          fi
+
+          printf '%s\n' "${changed_files}" > changed_files.txt
+
+          if grep -Eq '^(source/CMakeLists\.txt|source/cmake/|source/src/|source/tools/|common/|icons/|\.github/workflows/build-chromaspace-(all-platforms|windows|macos|linux)\.yml)' changed_files.txt; then
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          {
+            echo "changed_files<<EOF"
+            cat changed_files.txt
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Summarize decision
+        run: |
+          if [ "${{ steps.changes.outputs.should_build }}" = "true" ]; then
+            {
+              echo "Chromaspace build will run."
+              echo
+              echo "Relevant changes were detected in:"
+              printf '%s\n' "${{ steps.changes.outputs.changed_files }}"
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            {
+              echo "Chromaspace build skipped cleanly."
+              echo
+              echo "No build-relevant changes were detected."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
   windows:
+    needs: detect-changes
+    if: github.event_name == 'workflow_dispatch' || needs.detect-changes.outputs.should_build == 'true'
     uses: ./.github/workflows/build-chromaspace-windows.yml
     secrets: inherit
 
   macos:
+    needs: detect-changes
+    if: github.event_name == 'workflow_dispatch' || needs.detect-changes.outputs.should_build == 'true'
     uses: ./.github/workflows/build-chromaspace-macos.yml
     secrets: inherit
 
   linux:
+    needs: detect-changes
+    if: github.event_name == 'workflow_dispatch' || needs.detect-changes.outputs.should_build == 'true'
     uses: ./.github/workflows/build-chromaspace-linux.yml
     secrets: inherit
 
   draft-release:
     name: Create Chromaspace Draft Release
     needs:
+      - detect-changes
       - windows
       - macos
       - linux
-    if: github.event_name == 'push'
+    if: github.event_name == 'push' && needs.detect-changes.outputs.should_build == 'true'
     runs-on: ubuntu-latest
 
     steps:

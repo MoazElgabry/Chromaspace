@@ -9,11 +9,6 @@ on:
 
 jobs:
   build-windows:
-    env:
-      CUBE_VERSION: v1.0.0
-      ZIP_NAME: Chromaspace_v1.0.0_windows_x86_64_portable.zip
-      ARTIFACT_NAME: Chromaspace-v1.0.0-windows-x86_64
-
     runs-on: windows-2022
 
     defaults:
@@ -24,6 +19,21 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v5
+
+      - name: Resolve package version
+        id: version
+        run: |
+          $cmake = Get-Content "CMakeLists.txt" -Raw
+          if ($cmake -match 'set\(CUBE_DISPLAY_VERSION\s+"([^"]+)"\)') {
+            $version = $Matches[1]
+          } elseif ($cmake -match 'project\([^\)]*VERSION\s+([0-9A-Za-z\.\-]+)') {
+            $version = $Matches[1]
+          } else {
+            throw "Could not determine Chromaspace version from source/CMakeLists.txt"
+          }
+          "package_version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "zip_name=Chromaspace_v${version}_windows_x86_64_portable.zip" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "artifact_name=Chromaspace-v${version}-windows-x86_64" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
       - name: Ensure local OFX SDK is available
         run: |
@@ -100,11 +110,12 @@ jobs:
 
       - name: Package Windows portable bundle
         run: |
-          if (Test-Path "..\\..\\$env:ZIP_NAME") { Remove-Item "..\\..\\$env:ZIP_NAME" -Force }
-          Compress-Archive -Path "bundle/Chromaspace.ofx.bundle" -DestinationPath "..\\..\\$env:ZIP_NAME" -CompressionLevel Optimal
+          $zipName = "${{ steps.version.outputs.zip_name }}"
+          if (Test-Path "..\\..\\$zipName") { Remove-Item "..\\..\\$zipName" -Force }
+          Compress-Archive -Path "bundle/Chromaspace.ofx.bundle" -DestinationPath "..\\..\\$zipName" -CompressionLevel Optimal
 
       - name: Upload artifact
         uses: actions/upload-artifact@v6
         with:
-          name: ${{ env.ARTIFACT_NAME }}
-          path: ${{ env.ZIP_NAME }}
+          name: ${{ steps.version.outputs.artifact_name }}
+          path: ${{ steps.version.outputs.zip_name }}
