@@ -161,7 +161,7 @@ jobs:
               echo
             fi
             echo "## Included Artifacts"
-            find artifacts -type f \( -name "*.zip" -o -name "*.tar.gz" \) -printf -- "- %f\n" | sort
+            find artifacts -type f \( -name "*.zip" -o -name "*.tar.gz" \) -exec basename {} \; | sed 's/^/- /' | sort
           } > draft_release_notes.md
 
       - name: Create draft release
