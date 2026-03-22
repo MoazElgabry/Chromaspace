@@ -212,7 +212,11 @@ jobs:
               echo
             fi
             echo "## Included Artifacts"
-            find artifacts -type f \( -name "*.zip" -o -name "*.tar.gz" \) -exec basename {} \; | sed 's/^/- /' | sort
+            if [ -d artifacts ]; then
+              find artifacts -type f \( -name "*.zip" -o -name "*.tar.gz" \) -exec basename {} \; | sed 's/^/- /' | sort
+            else
+              echo "- No downloaded artifacts were found for this run."
+            fi
           } > draft_release_notes.md
 
       - name: Skip draft release because version is already published
