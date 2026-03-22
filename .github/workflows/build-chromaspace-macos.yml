@@ -89,10 +89,11 @@ jobs:
           zip_name="${{ steps.version.outputs.zip_name }}"
           ditto -c -k --sequesterRsrc --keepParent \
             bundle/Chromaspace.ofx.bundle \
-            ../../${zip_name}
+            ../${zip_name}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v6
         with:
           name: ${{ steps.version.outputs.artifact_name }}
           path: ${{ steps.version.outputs.zip_name }}
+          if-no-files-found: error

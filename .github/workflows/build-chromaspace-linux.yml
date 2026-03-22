@@ -116,7 +116,7 @@ jobs:
 
       - name: Package Linux portable bundle
         run: |
-          tar -czf ../../${{ steps.version.outputs.archive_name }} \
+          tar -czf ../${{ steps.version.outputs.archive_name }} \
             -C bundle Chromaspace.ofx.bundle
 
       - name: Upload artifact
@@ -124,3 +124,4 @@ jobs:
         with:
           name: ${{ steps.version.outputs.artifact_name }}
           path: ${{ steps.version.outputs.archive_name }}
+          if-no-files-found: error
