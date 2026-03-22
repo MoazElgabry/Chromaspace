@@ -146,9 +146,8 @@ jobs:
             : > latest_release_body.txt
           fi
 
-          short_sha="${SHA::7}"
           draft_tag="chromaspace-draft-v${PACKAGE_VERSION}"
-          draft_title="${latest_name} draft (${REF_NAME} ${short_sha})"
+          draft_title="Chromaspace v${PACKAGE_VERSION}"
           final_tag="v${PACKAGE_VERSION}"
 
           existing_draft_json="$(gh api "repos/${REPO}/releases/tags/${draft_tag}" 2>/dev/null || true)"
