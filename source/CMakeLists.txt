@@ -5,8 +5,37 @@ set(CUBE_DISPLAY_VERSION "1.0.1")
 set(PLUGIN_BASENAME "Chromaspace")
 set(PLUGIN_IDENTIFIER "com.moazelgabry.chromaspace")
 set(LOCAL_OFX_SDK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/ofx-sdk")
-set(SHARED_ICON_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../icons")
-set(WORKSHOP_COMMON_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../common")
+
+set(_CHROMASPACE_COMMON_CANDIDATES
+  "${CMAKE_CURRENT_SOURCE_DIR}/../common"
+  "${CMAKE_CURRENT_SOURCE_DIR}/../../common"
+)
+set(WORKSHOP_COMMON_DIR "")
+foreach(_candidate IN LISTS _CHROMASPACE_COMMON_CANDIDATES)
+  if(EXISTS "${_candidate}/color/ColorManagement.cpp")
+    set(WORKSHOP_COMMON_DIR "${_candidate}")
+    break()
+  endif()
+endforeach()
+if(WORKSHOP_COMMON_DIR STREQUAL "")
+  message(FATAL_ERROR "Could not locate shared common sources beside Chromaspace/source.")
+endif()
+
+set(_CHROMASPACE_ICON_CANDIDATES
+  "${CMAKE_CURRENT_SOURCE_DIR}/../icons"
+  "${CMAKE_CURRENT_SOURCE_DIR}/../../icons"
+)
+set(SHARED_ICON_DIR "")
+foreach(_candidate IN LISTS _CHROMASPACE_ICON_CANDIDATES)
+  if(EXISTS "${_candidate}/Icon_Candidate.png")
+    set(SHARED_ICON_DIR "${_candidate}")
+    break()
+  endif()
+endforeach()
+if(SHARED_ICON_DIR STREQUAL "")
+  message(FATAL_ERROR "Could not locate shared icon assets beside Chromaspace/source.")
+endif()
+
 set(WORKSHOP_COLOR_SOURCES
   "${WORKSHOP_COMMON_DIR}/color/ColorManagement.cpp"
 )
