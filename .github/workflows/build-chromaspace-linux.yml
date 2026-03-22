@@ -30,7 +30,14 @@ jobs:
       - name: Resolve package version
         id: version
         run: |
-          version="$(python3 -c 'import pathlib,re; text=pathlib.Path("CMakeLists.txt").read_text(encoding="utf-8"); match=re.search(r''set\(CUBE_DISPLAY_VERSION\s+\"([^\"]+)\"\)'', text) or re.search(r''project\([^\)]*VERSION\s+([0-9A-Za-z.\-]+)'', text); print(match.group(1) if match else (_ for _ in ()).throw(SystemExit("Could not determine Chromaspace version from source/CMakeLists.txt")))' )"
+          version="$(grep -Eo 'set\(CUBE_DISPLAY_VERSION "[^"]+"\)' CMakeLists.txt | sed -E 's/.*"([^"]+)".*/\1/' | head -n1)"
+          if [ -z "${version}" ]; then
+            version="$(grep -Eo 'project\([^)]*VERSION [0-9A-Za-z.\-]+' CMakeLists.txt | sed -E 's/.*VERSION ([0-9A-Za-z.\-]+)/\1/' | head -n1)"
+          fi
+          if [ -z "${version}" ]; then
+            echo "Could not determine Chromaspace version from source/CMakeLists.txt"
+            exit 1
+          fi
           echo "package_version=${version}" >> "$GITHUB_OUTPUT"
           echo "archive_name=Chromaspace_v${version}_linux_x86_64_cuda_opencl_cpu_portable.tar.gz" >> "$GITHUB_OUTPUT"
           echo "artifact_name=Chromaspace-v${version}-linux-x86_64-cuda-opencl-cpu" >> "$GITHUB_OUTPUT"
