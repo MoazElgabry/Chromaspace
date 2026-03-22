@@ -153,8 +153,18 @@ jobs:
           draft_exists="false"
           skip_release="false"
           legacy_published_draft_tag="false"
+          draft_tag_match="false"
+          final_tag_match="false"
 
           if [ -n "${existing_draft_json}" ]; then
+            draft_tag_match="$(printf '%s' "${existing_draft_json}" | python3 -c "import json,sys; data=json.load(sys.stdin); print(str(bool(data.get('id')) and data.get('tag_name','') == sys.argv[1]).lower())" "${draft_tag}")"
+          fi
+
+          if [ -n "${final_release_json}" ]; then
+            final_tag_match="$(printf '%s' "${final_release_json}" | python3 -c "import json,sys; data=json.load(sys.stdin); print(str(bool(data.get('id')) and data.get('tag_name','') == sys.argv[1]).lower())" "${final_tag}")"
+          fi
+
+          if [ "${draft_tag_match}" = "true" ]; then
             is_draft="$(printf '%s' "${existing_draft_json}" | python3 -c "import json,sys; print(str(json.load(sys.stdin).get('draft', False)).lower())")"
             if [ "${is_draft}" = "true" ]; then
               draft_exists="true"
@@ -164,7 +174,7 @@ jobs:
             fi
           fi
 
-          if [ -n "${final_release_json}" ]; then
+          if [ "${final_tag_match}" = "true" ]; then
             final_is_draft="$(printf '%s' "${final_release_json}" | python3 -c "import json,sys; print(str(json.load(sys.stdin).get('draft', False)).lower())")"
             if [ "${final_is_draft}" != "true" ]; then
               skip_release="true"
