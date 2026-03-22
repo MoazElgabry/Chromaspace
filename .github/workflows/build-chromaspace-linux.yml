@@ -116,12 +116,19 @@ jobs:
 
       - name: Package Linux portable bundle
         run: |
-          tar -czf ../${{ steps.version.outputs.archive_name }} \
+          package_path="${GITHUB_WORKSPACE}/${{ steps.version.outputs.archive_name }}"
+          rm -f "${package_path}"
+          tar -czf "${package_path}" \
             -C bundle Chromaspace.ofx.bundle
+
+      - name: Verify packaged Linux archive
+        run: |
+          package_path="${GITHUB_WORKSPACE}/${{ steps.version.outputs.archive_name }}"
+          test -f "${package_path}"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v6
         with:
           name: ${{ steps.version.outputs.artifact_name }}
-          path: ${{ steps.version.outputs.archive_name }}
+          path: ${{ github.workspace }}/${{ steps.version.outputs.archive_name }}
           if-no-files-found: error

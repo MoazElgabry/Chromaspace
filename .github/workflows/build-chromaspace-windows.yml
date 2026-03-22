@@ -111,12 +111,20 @@ jobs:
       - name: Package Windows portable bundle
         run: |
           $zipName = "${{ steps.version.outputs.zip_name }}"
-          if (Test-Path "..\\$zipName") { Remove-Item "..\\$zipName" -Force }
-          Compress-Archive -Path "bundle/Chromaspace.ofx.bundle" -DestinationPath "..\\$zipName" -CompressionLevel Optimal
+          $packagePath = Join-Path $env:GITHUB_WORKSPACE $zipName
+          if (Test-Path $packagePath) { Remove-Item $packagePath -Force }
+          Compress-Archive -Path "bundle/Chromaspace.ofx.bundle" -DestinationPath $packagePath -CompressionLevel Optimal
+
+      - name: Verify packaged Windows archive
+        run: |
+          $packagePath = Join-Path $env:GITHUB_WORKSPACE "${{ steps.version.outputs.zip_name }}"
+          if (!(Test-Path $packagePath)) {
+            throw "Missing packaged Windows archive at $packagePath"
+          }
 
       - name: Upload artifact
         uses: actions/upload-artifact@v6
         with:
           name: ${{ steps.version.outputs.artifact_name }}
-          path: ${{ steps.version.outputs.zip_name }}
+          path: ${{ github.workspace }}/${{ steps.version.outputs.zip_name }}
           if-no-files-found: error

@@ -87,13 +87,20 @@ jobs:
       - name: Package macOS portable bundle
         run: |
           zip_name="${{ steps.version.outputs.zip_name }}"
+          package_path="${GITHUB_WORKSPACE}/${zip_name}"
+          rm -f "${package_path}"
           ditto -c -k --sequesterRsrc --keepParent \
             bundle/Chromaspace.ofx.bundle \
-            ../${zip_name}
+            "${package_path}"
+
+      - name: Verify packaged macOS archive
+        run: |
+          package_path="${GITHUB_WORKSPACE}/${{ steps.version.outputs.zip_name }}"
+          test -f "${package_path}"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v6
         with:
           name: ${{ steps.version.outputs.artifact_name }}
-          path: ${{ steps.version.outputs.zip_name }}
+          path: ${{ github.workspace }}/${{ steps.version.outputs.zip_name }}
           if-no-files-found: error
