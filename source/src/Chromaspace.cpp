@@ -85,8 +85,10 @@ constexpr int kPluginVersionMinor = 0;
 constexpr const char* kPluginVersionLabel = "v1.0.0";
 constexpr const char* kPluginName = "Chromaspace";
 constexpr const char* kWebsiteUrl = "https://moazelgabry.com";
-constexpr const char* kReleasesUrl = "https://github.com/MoazElgabry/ME_OFX/releases";
-constexpr const char* kIssueUrl = "https://github.com/MoazElgabry/ME_OFX/issues";
+constexpr const char* kReleasesUrl = "https://github.com/MoazElgabry/Chromaspace/releases/latest";
+constexpr const char* kIssueUrl = "https://github.com/MoazElgabry/Chromaspace/issues";
+constexpr const char* kPluginManagerProductName = "Moaz Elgabry Plugins";
+constexpr const char* kPluginManagerBundleId = "com.moazelgabry.pluginmanager";
 
 std::string cubeViewerLogPath() {
 #if defined(_WIN32)
@@ -1086,6 +1088,87 @@ void openUrl(const std::string& url) {
 #endif
 }
 
+#if defined(_WIN32)
+bool launchPathWithShell(const std::string& path) {
+  const INT_PTR result = reinterpret_cast<INT_PTR>(
+      ShellExecuteA(nullptr, "open", path.c_str(), nullptr, nullptr, SW_SHOWNORMAL));
+  return result > 32;
+}
+
+std::string envValueOrEmpty(const char* name) {
+  const char* value = std::getenv(name);
+  return (value && value[0] != '\0') ? std::string(value) : std::string();
+}
+#else
+bool spawnDetached(const std::vector<std::string>& args) {
+  if (args.empty()) return false;
+  std::vector<char*> argv;
+  argv.reserve(args.size() + 1u);
+  for (const auto& arg : args) {
+    argv.push_back(const_cast<char*>(arg.c_str()));
+  }
+  argv.push_back(nullptr);
+  pid_t pid = 0;
+  return posix_spawnp(&pid, argv[0], nullptr, nullptr, argv.data(), environ) == 0;
+}
+
+bool pathExists(const std::string& path) {
+  if (path.empty()) return false;
+  std::error_code ec;
+  return std::filesystem::exists(std::filesystem::path(path), ec);
+}
+#endif
+
+bool openPluginManager() {
+#if defined(_WIN32)
+  const std::string exeName = std::string(kPluginManagerProductName) + ".exe";
+  std::vector<std::string> candidates;
+  const std::string localAppData = envValueOrEmpty("LOCALAPPDATA");
+  if (!localAppData.empty()) {
+    candidates.push_back(joinPath(joinPath(joinPath(localAppData, "Programs"), kPluginManagerProductName), exeName));
+    candidates.push_back(joinPath(joinPath(joinPath(localAppData, "Programs"), "MoazElgabryPluginManager"), exeName));
+  }
+  const std::string programFiles = envValueOrEmpty("ProgramFiles");
+  if (!programFiles.empty()) {
+    candidates.push_back(joinPath(joinPath(programFiles, kPluginManagerProductName), exeName));
+  }
+  const std::string programFilesX86 = envValueOrEmpty("ProgramFiles(x86)");
+  if (!programFilesX86.empty()) {
+    candidates.push_back(joinPath(joinPath(programFilesX86, kPluginManagerProductName), exeName));
+  }
+  for (const auto& candidate : candidates) {
+    if (fileExistsForLaunch(candidate) && launchPathWithShell(candidate)) return true;
+  }
+  return false;
+#elif defined(__APPLE__)
+  std::vector<std::string> appPaths = {
+      std::string("/Applications/") + kPluginManagerProductName + ".app"
+  };
+  const char* home = std::getenv("HOME");
+  if (home && home[0] != '\0') {
+    appPaths.push_back(joinPath(joinPath(home, "Applications"), std::string(kPluginManagerProductName) + ".app"));
+  }
+  for (const auto& appPath : appPaths) {
+    if (pathExists(appPath) && spawnDetached({"open", "-a", appPath})) return true;
+  }
+  return false;
+#else
+  const char* home = std::getenv("HOME");
+  std::vector<std::pair<std::string, std::string>> desktopCandidates;
+  if (home && home[0] != '\0') {
+    desktopCandidates.push_back({joinPath(joinPath(joinPath(home, ".local"), "share"), "applications"), kPluginManagerBundleId});
+    desktopCandidates.push_back({joinPath(joinPath(joinPath(home, ".local"), "share"), "applications"), "moaz-elgabry-plugins"});
+  }
+  desktopCandidates.push_back({"/usr/share/applications", kPluginManagerBundleId});
+  desktopCandidates.push_back({"/usr/share/applications", "moaz-elgabry-plugins"});
+  for (const auto& candidate : desktopCandidates) {
+    const std::string desktopPath = joinPath(candidate.first, candidate.second + ".desktop");
+    if (pathExists(desktopPath) && spawnDetached({"gtk-launch", candidate.second})) return true;
+  }
+  return spawnDetached({"moaz-elgabry-plugins"});
+#endif
+}
+
 class ChromaspaceEffect : public ImageEffect {
  public:
   friend class ChromaspaceOverlayInteract;
@@ -1582,7 +1665,7 @@ class ChromaspaceEffect : public ImageEffect {
       return;
     }
     if (paramName == "supportLatestReleases") {
-      openUrl(kReleasesUrl);
+      if (!openPluginManager()) openUrl(kReleasesUrl);
       return;
     }
     if (paramName == "supportReportIssue") {
