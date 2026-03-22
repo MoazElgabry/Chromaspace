@@ -1299,6 +1299,7 @@ std::string pointDrawSourceLabel(bool useInputCudaBuffers,
 
 struct ResolvedPayload;
 struct InputCloudPayload;
+struct InputCloudSample;
 struct PlotRemapSpec;
 struct ComputeSessionState;
 
@@ -1342,7 +1343,7 @@ bool buildIdentityOverlayMeshOnGpu(const ResolvedPayload& payload,
                                    );
 bool canUseInputCloudComputePath(const ResolvedPayload& payload);
 bool ensureInputCloudComputeProgram(InputCloudComputeCache* cache);
-bool parseInputCloudRawRgbPoints(const InputCloudPayload& cloud, std::vector<float>* rawPoints);
+bool parseInputCloudSamples(const InputCloudPayload& cloud, std::vector<InputCloudSample>* samples);
 bool cubeSliceContainsPoint(const PlotRemapSpec& spec, float r, float g, float b);
 bool cubeSliceContainsPoint(const ResolvedPayload& payload, float r, float g, float b);
 size_t overlayIdentityPointCap(const ResolvedPayload& payload, int cubeSize);
@@ -1363,6 +1364,9 @@ bool buildInputCloudMeshOnGpu(const ResolvedPayload& payload,
                               );
 float wrapHue01(float h);
 float rawRgbHue01(float r, float g, float b, float cMax, float delta);
+void rgbToHsvHexconePlane(float r, float g, float b, float* outX, float* outZ);
+void rgbToPlotCircularHsl(float r, float g, float b, float* outH, float* outRadius, float* outL);
+void rgbToPlotCircularHsv(float r, float g, float b, float* outH, float* outRadius, float* outV);
 void rgbToNormConeCoords(float r, float g, float b, bool normalized, bool allowOverflow, float* outHue, float* outChroma, float* outValue);
 void rgbToChen(float r, float g, float b, bool allowOverflow, float* outHue, float* outChroma, float* outLight);
 void rgbToRgbCone(float r, float g, float b, float* outMagnitude, float* outHue, float* outPolar);
@@ -1418,6 +1422,8 @@ struct PlotRemapSpec {
   bool showOverflow = false;
   bool highlightOverflow = true;
   bool cubeSlicingEnabled = false;
+  bool neutralRadiusEnabled = false;
+  float neutralRadius = 1.0f;
   bool cubeSliceRed = true;
   bool cubeSliceGreen = false;
   bool cubeSliceBlue = false;
@@ -1430,6 +1436,25 @@ struct PlotRemapSpec {
   WorkshopColor::ChromaticityColorSpec chromaticity{};
   WorkshopColor::Mat3f chromaticityRgbToXyz{};
   WorkshopColor::Vec2f chromaticityWhite{};
+};
+
+struct LassoPointNorm {
+  float xNorm = 0.0f;
+  float yNorm = 0.0f;
+};
+
+struct LassoStroke {
+  bool subtract = false;
+  std::vector<LassoPointNorm> points;
+};
+
+struct LassoRegionState {
+  uint64_t revision = 0;
+  std::vector<LassoStroke> strokes;
+
+  bool empty() const {
+    return strokes.empty();
+  }
 };
 
 struct ComputeSessionState {
@@ -1460,6 +1485,7 @@ struct ResolvedPayload {
   bool volumeSlicingEnabled = false;
   std::string volumeSlicingMode = "hue";
   bool lassoRegionEmpty = false;
+  std::string lassoData;
   bool circularHsl = false;
   bool circularHsv = false;
   bool normConeNormalized = true;
@@ -1472,6 +1498,8 @@ struct ResolvedPayload {
   bool showOverflow = false;
   bool highlightOverflow = true;
   bool cubeSlicingEnabled = false;
+  bool neutralRadiusEnabled = false;
+  float neutralRadius = 1.0f;
   bool cubeSliceRed = true;
   bool cubeSliceGreen = false;
   bool cubeSliceBlue = false;
@@ -1508,6 +1536,14 @@ struct InputCloudPayload {
   std::string points;
 };
 
+struct InputCloudSample {
+  float xNorm = 0.5f;
+  float yNorm = 0.5f;
+  float r = 0.0f;
+  float g = 0.0f;
+  float b = 0.0f;
+};
+
 bool canUseOverlayComputePath(const ResolvedPayload& payload) {
   return payload.identityOverlayEnabled && payload.plotMode != "chromaticity";
 }
@@ -1533,6 +1569,8 @@ PlotRemapSpec makePlotRemapSpec(const ResolvedPayload& payload) {
   spec.showOverflow = payload.showOverflow;
   spec.highlightOverflow = payload.highlightOverflow;
   spec.cubeSlicingEnabled = payload.cubeSlicingEnabled;
+  spec.neutralRadiusEnabled = payload.neutralRadiusEnabled;
+  spec.neutralRadius = payload.neutralRadius;
   spec.cubeSliceRed = payload.cubeSliceRed;
   spec.cubeSliceGreen = payload.cubeSliceGreen;
   spec.cubeSliceBlue = payload.cubeSliceBlue;
@@ -2630,39 +2668,138 @@ void main() {
   return true;
 }
 
-bool parseInputCloudRawRgbPoints(const InputCloudPayload& cloud, std::vector<float>* rawPoints) {
-  if (!rawPoints) return false;
-  rawPoints->clear();
+std::vector<std::string> splitViewerString(const std::string& text, char delimiter) {
+  std::vector<std::string> parts;
+  std::string current;
+  for (const char c : text) {
+    if (c == delimiter) {
+      parts.push_back(current);
+      current.clear();
+    } else {
+      current.push_back(c);
+    }
+  }
+  parts.push_back(current);
+  return parts;
+}
+
+bool parseViewerUint64(const std::string& text, uint64_t* value) {
+  if (!value) return false;
+  char* end = nullptr;
+  const unsigned long long parsed = std::strtoull(text.c_str(), &end, 10);
+  if (!end || *end != '\0') return false;
+  *value = static_cast<uint64_t>(parsed);
+  return true;
+}
+
+bool parseViewerIntStrict(const std::string& text, int* value) {
+  if (!value) return false;
+  char* end = nullptr;
+  const long parsed = std::strtol(text.c_str(), &end, 10);
+  if (!end || *end != '\0') return false;
+  *value = static_cast<int>(parsed);
+  return true;
+}
+
+bool parseViewerFloatStrict(const std::string& text, float* value) {
+  if (!value) return false;
+  char* end = nullptr;
+  const float parsed = std::strtof(text.c_str(), &end);
+  if (!end || *end != '\0') return false;
+  *value = parsed;
+  return true;
+}
+
+LassoRegionState parseViewerLassoRegionState(const std::string& serialized) {
+  LassoRegionState state{};
+  if (serialized.empty()) return state;
+  const auto records = splitViewerString(serialized, '|');
+  if (records.size() < 2 || records[0] != "v1") return state;
+  if (!parseViewerUint64(records[1], &state.revision)) return LassoRegionState{};
+  for (size_t i = 2; i < records.size(); ++i) {
+    const auto fields = splitViewerString(records[i], ',');
+    if (fields.size() < 2 || fields[0].size() != 1) return LassoRegionState{};
+    int pointCount = 0;
+    if (!parseViewerIntStrict(fields[1], &pointCount) || pointCount < 3) return LassoRegionState{};
+    if (fields.size() != static_cast<size_t>(2 + pointCount * 2)) return LassoRegionState{};
+    LassoStroke stroke{};
+    stroke.subtract = (fields[0][0] == 's' || fields[0][0] == 'S');
+    stroke.points.reserve(static_cast<size_t>(pointCount));
+    for (int pointIndex = 0; pointIndex < pointCount; ++pointIndex) {
+      float xNorm = 0.0f;
+      float yNorm = 0.0f;
+      if (!parseViewerFloatStrict(fields[2 + pointIndex * 2], &xNorm) ||
+          !parseViewerFloatStrict(fields[3 + pointIndex * 2], &yNorm)) {
+        return LassoRegionState{};
+      }
+      stroke.points.push_back({clampf(xNorm, 0.0f, 1.0f), clampf(yNorm, 0.0f, 1.0f)});
+    }
+    state.strokes.push_back(std::move(stroke));
+  }
+  return state;
+}
+
+bool pointInViewerLassoPolygon(const std::vector<LassoPointNorm>& polygon, double xNorm, double yNorm) {
+  if (polygon.size() < 3) return false;
+  bool inside = false;
+  const size_t count = polygon.size();
+  for (size_t i = 0, j = count - 1; i < count; j = i++) {
+    const double xi = polygon[i].xNorm;
+    const double yi = polygon[i].yNorm;
+    const double xj = polygon[j].xNorm;
+    const double yj = polygon[j].yNorm;
+    const bool intersects = ((yi > yNorm) != (yj > yNorm)) &&
+                            (xNorm < (xj - xi) * (yNorm - yi) / ((yj - yi) + 1e-12) + xi);
+    if (intersects) inside = !inside;
+  }
+  return inside;
+}
+
+bool viewerLassoContainsPoint(const LassoRegionState& state, double xNorm, double yNorm) {
+  bool inside = false;
+  for (const auto& stroke : state.strokes) {
+    if (!pointInViewerLassoPolygon(stroke.points, xNorm, yNorm)) continue;
+    inside = !stroke.subtract;
+  }
+  return inside;
+}
+
+bool parseInputCloudSamples(const InputCloudPayload& cloud, std::vector<InputCloudSample>* samples) {
+  if (!samples) return false;
+  samples->clear();
   std::string flattened = cloud.points;
   std::replace(flattened.begin(), flattened.end(), ';', ' ');
   std::istringstream is(flattened);
   float x = 0.0f, y = 0.0f, z = 0.0f, r = 0.0f, g = 0.0f, b = 0.0f;
   while (is >> x >> y >> z >> r >> g >> b) {
-    (void)x;
-    (void)y;
     (void)z;
-    rawPoints->push_back(r);
-    rawPoints->push_back(g);
-    rawPoints->push_back(b);
+    samples->push_back({clampf(x, 0.0f, 1.0f), clampf(y, 0.0f, 1.0f), r, g, b});
   }
-  return !rawPoints->empty();
+  return !samples->empty();
 }
 
-void filterRawPointsForCubeSlicing(const ResolvedPayload& payload, std::vector<float>* rawPoints) {
+void filterInputCloudSamples(const ResolvedPayload& payload, std::vector<InputCloudSample>* samples) {
+  if (!samples || samples->empty()) return;
   const PlotRemapSpec remap = makePlotRemapSpec(payload);
-  if (!rawPoints || rawPoints->empty() || !remap.cubeSlicingEnabled) return;
-  std::vector<float> filtered;
-  filtered.reserve(rawPoints->size());
-  for (size_t i = 0; i + 2 < rawPoints->size(); i += 3u) {
-    const float r = (*rawPoints)[i + 0u];
-    const float g = (*rawPoints)[i + 1u];
-    const float b = (*rawPoints)[i + 2u];
-    if (!cubeSliceContainsPoint(remap, r, g, b)) continue;
-    filtered.push_back(r);
-    filtered.push_back(g);
-    filtered.push_back(b);
+  const bool lassoEnabled = payload.volumeSlicingEnabled && payload.volumeSlicingMode == "lasso";
+  const LassoRegionState lassoState = lassoEnabled ? parseViewerLassoRegionState(payload.lassoData) : LassoRegionState{};
+  const bool cubeFilterEnabled = remap.cubeSlicingEnabled || remap.neutralRadiusEnabled;
+  if (!lassoEnabled && !cubeFilterEnabled) return;
+  if (lassoEnabled && (payload.lassoRegionEmpty || lassoState.strokes.empty())) {
+    samples->clear();
+    return;
   }
-  rawPoints->swap(filtered);
+  std::vector<InputCloudSample> filtered;
+  filtered.reserve(samples->size());
+  for (const auto& sample : *samples) {
+    if (lassoEnabled && !viewerLassoContainsPoint(lassoState, sample.xNorm, sample.yNorm)) continue;
+    const float r = sample.r;
+    const float g = sample.g;
+    const float b = sample.b;
+    if (!cubeSliceContainsPoint(remap, r, g, b)) continue;
+    filtered.push_back(sample);
+  }
+  samples->swap(filtered);
 }
 
 bool buildInputCloudMeshOnGpu(const ResolvedPayload& payload,
@@ -2906,6 +3043,7 @@ bool parseParamsMessage(const std::string& line, ResolvedPayload* out) {
   int lassoRegionEmpty = 0;
   extractInt(line, "lassoRegionEmpty", &lassoRegionEmpty);
   p.lassoRegionEmpty = (lassoRegionEmpty != 0);
+  extractQuoted(line, "lassoData", &p.lassoData);
   extractQuoted(line, "quality", &p.quality);
   extractQuoted(line, "pointShape", &p.pointShape);
   extractQuoted(line, "version", &p.version);
@@ -2933,6 +3071,10 @@ bool parseParamsMessage(const std::string& line, ResolvedPayload* out) {
   int cubeSlicingEnabled = 0;
   extractInt(line, "cubeSlicingEnabled", &cubeSlicingEnabled);
   p.cubeSlicingEnabled = (cubeSlicingEnabled != 0);
+  int neutralRadiusEnabled = 0;
+  extractInt(line, "neutralRadiusEnabled", &neutralRadiusEnabled);
+  p.neutralRadiusEnabled = (neutralRadiusEnabled != 0);
+  extractFloat(line, "neutralRadius", &p.neutralRadius);
   int cubeSliceRed = 1;
   extractInt(line, "cubeSliceRed", &cubeSliceRed);
   p.cubeSliceRed = (cubeSliceRed != 0);
@@ -2979,6 +3121,7 @@ bool parseParamsMessage(const std::string& line, ResolvedPayload* out) {
   p.chromaticityPlanckianLocus = (chromaticityPlanckianLocus != 0);
   p.pointSize = clampf(p.pointSize, 0.35f, 4.0f);
   p.pointDensity = clampf(p.pointDensity, 0.1f, 4.0f);
+  p.neutralRadius = clampf(p.neutralRadius, 0.0f, 1.0f);
   p.overflowHighlightR = clamp01(p.overflowHighlightR);
   p.overflowHighlightG = clamp01(p.overflowHighlightG);
   p.overflowHighlightB = clamp01(p.overflowHighlightB);
@@ -3026,7 +3169,97 @@ bool pointOverflowsCube(float r, float g, float b) {
   return r < 0.0f || r > 1.0f || g < 0.0f || g > 1.0f || b < 0.0f || b > 1.0f;
 }
 
+float normalizedNeutralRadiusForPoint(const PlotRemapSpec& spec, float r, float g, float b) {
+  constexpr float kRgbAxisMaxRadius = 0.8164965809277260f;
+  constexpr float kPolarMax = 0.9553166181245093f;
+  constexpr float kChenPolarScale = 1.0467733744265997f;
+
+  switch (spec.plotMode) {
+    case PlotModeKind::Rgb: {
+      const float rr = clamp01(r);
+      const float gg = clamp01(g);
+      const float bb = clamp01(b);
+      const float rotX = 0.81649658093f * rr - 0.40824829046f * gg - 0.40824829046f * bb;
+      const float rotY = 0.70710678118f * gg - 0.70710678118f * bb;
+      return clampf(std::sqrt(rotX * rotX + rotY * rotY) / kRgbAxisMaxRadius, 0.0f, 1.0f);
+    }
+    case PlotModeKind::Hsl: {
+      if (spec.circularHsl) {
+        float h = 0.0f;
+        float radius = 0.0f;
+        float l = 0.0f;
+        rgbToPlotCircularHsl(r, g, b, &h, &radius, &l);
+        return clampf(radius, 0.0f, 1.0f);
+      }
+      const float cMax = std::max(r, std::max(g, b));
+      const float cMin = std::min(r, std::min(g, b));
+      return clampf(cMax - cMin, 0.0f, 1.0f);
+    }
+    case PlotModeKind::Hsv: {
+      if (spec.circularHsv) {
+        float h = 0.0f;
+        float radius = 0.0f;
+        float v = 0.0f;
+        rgbToPlotCircularHsv(r, g, b, &h, &radius, &v);
+        return clampf(radius, 0.0f, 1.0f);
+      }
+      float x = 0.0f;
+      float z = 0.0f;
+      rgbToHsvHexconePlane(r, g, b, &x, &z);
+      return clampf(std::hypot(x, z), 0.0f, 1.0f);
+    }
+    case PlotModeKind::Chen: {
+      float h = 0.0f;
+      float chroma = 0.0f;
+      float light = 0.0f;
+      rgbToChen(r, g, b, spec.showOverflow, &h, &chroma, &light);
+      const float polar = chroma / kChenPolarScale;
+      const float radius = light * std::sin(polar) / kRgbAxisMaxRadius;
+      return clampf(radius, 0.0f, 1.0f);
+    }
+    case PlotModeKind::RgbToCone: {
+      float magnitude = 0.0f;
+      float hue = 0.0f;
+      float polar = 0.0f;
+      rgbToRgbCone(r, g, b, &magnitude, &hue, &polar);
+      const float radial = magnitude * std::sin(polar * kPolarMax);
+      return clampf(radial / std::sin(kPolarMax), 0.0f, 1.0f);
+    }
+    case PlotModeKind::JpConical: {
+      float magnitude = 0.0f;
+      float hue = 0.0f;
+      float polar = 0.0f;
+      rgbToJpConical(r, g, b, spec.showOverflow, &magnitude, &hue, &polar);
+      const float radial = magnitude * std::sin(polar * kPolarMax);
+      return clampf(radial / std::sin(kPolarMax), 0.0f, 1.0f);
+    }
+    case PlotModeKind::NormCone: {
+      float hue = 0.0f;
+      float chroma = 0.0f;
+      float value = 0.0f;
+      rgbToNormConeCoords(r, g, b, spec.normConeNormalized, spec.showOverflow, &hue, &chroma, &value);
+      return clampf(chroma, 0.0f, 1.0f);
+    }
+    case PlotModeKind::Reuleaux: {
+      float hue = 0.0f;
+      float sat = 0.0f;
+      float value = 0.0f;
+      rgbToReuleaux(r, g, b, spec.showOverflow, &hue, &sat, &value);
+      return clampf(sat, 0.0f, 1.0f);
+    }
+    case PlotModeKind::Chromaticity:
+    default:
+      return 0.0f;
+  }
+}
+
+bool neutralRadiusContainsPoint(const PlotRemapSpec& spec, float r, float g, float b) {
+  if (!spec.neutralRadiusEnabled || spec.plotMode == PlotModeKind::Chromaticity || spec.showOverflow) return true;
+  return normalizedNeutralRadiusForPoint(spec, r, g, b) <= spec.neutralRadius + 1e-6f;
+}
+
 bool cubeSliceContainsPoint(const PlotRemapSpec& spec, float r, float g, float b) {
+  if (!neutralRadiusContainsPoint(spec, r, g, b)) return false;
   const bool anyRegionSelected = spec.cubeSliceRed || spec.cubeSliceGreen || spec.cubeSliceBlue ||
                                  spec.cubeSliceCyan || spec.cubeSliceYellow || spec.cubeSliceMagenta;
   if (!spec.cubeSlicingEnabled) return true;
@@ -3724,9 +3957,16 @@ bool buildInputCloudMesh(const ResolvedPayload& payload,
                          const InputCloudPayload& cloud,
                          MeshData* out) {
   if (!out) return false;
+  std::vector<InputCloudSample> samples;
   std::vector<float> rawPoints;
-  if (!parseInputCloudRawRgbPoints(cloud, &rawPoints)) return false;
-  filterRawPointsForCubeSlicing(payload, &rawPoints);
+  if (!parseInputCloudSamples(cloud, &samples)) return false;
+  filterInputCloudSamples(payload, &samples);
+  rawPoints.reserve(samples.size() * 3u);
+  for (const auto& sample : samples) {
+    rawPoints.push_back(sample.r);
+    rawPoints.push_back(sample.g);
+    rawPoints.push_back(sample.b);
+  }
   if (rawPoints.empty()) {
     buildEmptyInputCloudMesh(cloud, out);
     return true;
@@ -5382,10 +5622,10 @@ void drawVolumeSliceHueGuides(const ResolvedPayload& payload) {
   }
 }
 
-void drawOrientationLockIndicator(int width, int height, int axisLock, float pulse) {
+void drawOrientationLockIndicator(int width, int height, int axisLock, float pulse, float yOffset = 34.0f) {
   if (axisLock == 0 || width <= 0 || height <= 0) return;
   const float cx = static_cast<float>(width) - 34.0f;
-  const float cy = 34.0f;
+  const float cy = yOffset;
   const float arm = 12.0f + 1.8f * pulse;
   const float faintAlpha = 0.18f;
   const float activeAlpha = 0.82f + 0.18f * pulse;
@@ -5567,15 +5807,102 @@ void drawSlowModifierIndicator(int width,
   glMatrixMode(GL_MODELVIEW);
 }
 
+void drawNeutralRadiusIndicator(int width,
+                                int height,
+                                float xOffset,
+                                float yOffset,
+                                float alpha,
+                                const HudTextRenderer* textRenderer = nullptr) {
+  if (width <= 0 || height <= 0 || alpha <= 0.0f) return;
+  const float cx = static_cast<float>(width) - xOffset;
+  const float cy = static_cast<float>(height) - yOffset;
+
+  glMatrixMode(GL_PROJECTION);
+  glPushMatrix();
+  glLoadIdentity();
+  glOrtho(0.0, static_cast<double>(width), 0.0, static_cast<double>(height), -1.0, 1.0);
+  glMatrixMode(GL_MODELVIEW);
+  glPushMatrix();
+  glLoadIdentity();
+
+  glDisable(GL_DEPTH_TEST);
+  glEnable(GL_BLEND);
+  glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+
+  if (textRenderer && textRenderer->available) {
+    const std::string symbol = u8"\u22A2\u25CB\u22A3";
+    const float scale = 0.92f;
+    const float textWidth = WorkshopText::measureTextWidth(textRenderer->atlas, symbol, scale);
+    if (textWidth > 0.5f) {
+      const float ascent = static_cast<float>(std::max(1, textRenderer->atlas.ascent));
+      const float descent = static_cast<float>(std::max(0, textRenderer->atlas.descent));
+      const float baselineY = std::round(cy - ((ascent - descent) * scale * 0.5f));
+      std::vector<WorkshopText::TextQuadVertex> quads;
+      WorkshopText::appendTextQuads(textRenderer->atlas,
+                                    symbol,
+                                    std::round(cx - textWidth * 0.5f),
+                                    baselineY,
+                                    scale,
+                                    &quads);
+      if (!quads.empty()) {
+        glEnable(GL_TEXTURE_2D);
+        glBindTexture(GL_TEXTURE_2D, textRenderer->texture);
+        glBegin(GL_TRIANGLES);
+        glColor4f(0.96f, 0.98f, 1.0f, alpha);
+        for (const auto& v : quads) {
+          glTexCoord2f(v.u, v.v);
+          glVertex2f(v.x, v.y);
+        }
+        glEnd();
+        glBindTexture(GL_TEXTURE_2D, 0);
+        glDisable(GL_TEXTURE_2D);
+        glEnable(GL_DEPTH_TEST);
+        glPopMatrix();
+        glMatrixMode(GL_PROJECTION);
+        glPopMatrix();
+        glMatrixMode(GL_MODELVIEW);
+        return;
+      }
+    }
+  }
+
+  glLineWidth(1.4f);
+  glColor4f(0.96f, 0.98f, 1.0f, 0.90f * alpha);
+  glBegin(GL_LINES);
+  glVertex2f(cx - 12.0f, cy + 6.0f);
+  glVertex2f(cx - 12.0f, cy - 6.0f);
+  glVertex2f(cx - 12.0f, cy);
+  glVertex2f(cx - 7.2f, cy);
+  glVertex2f(cx + 12.0f, cy + 6.0f);
+  glVertex2f(cx + 12.0f, cy - 6.0f);
+  glVertex2f(cx + 12.0f, cy);
+  glVertex2f(cx + 7.2f, cy);
+  glEnd();
+
+  glBegin(GL_LINE_LOOP);
+  for (int i = 0; i < 28; ++i) {
+    const float t = (static_cast<float>(i) / 28.0f) * 6.28318530718f;
+    glVertex2f(cx + std::cos(t) * 4.8f, cy + std::sin(t) * 4.8f);
+  }
+  glEnd();
+
+  glEnable(GL_DEPTH_TEST);
+  glPopMatrix();
+  glMatrixMode(GL_PROJECTION);
+  glPopMatrix();
+  glMatrixMode(GL_MODELVIEW);
+}
+
 void drawRollDirectionIndicator(int width,
                                 int height,
                                 int direction,
                                 float pulse,
+                                float yOffset = 30.0f,
                                 const HudTextRenderer* symbolText = nullptr,
                                 const HudTextRenderer* hudText = nullptr) {
   if (width <= 0 || height <= 0 || direction == 0) return;
   const float cx = static_cast<float>(width) - 34.0f;
-  const float cy = 30.0f;
+  const float cy = yOffset;
   const float radius = 7.6f + 1.0f * pulse;
   const float alpha = 0.60f + 0.34f * pulse;
   const int steps = 34;
@@ -5755,9 +6082,9 @@ void cursorPosCallback(GLFWwindow* window, double xpos, double ypos) {
   if (anyDown && !app->leftDown) {
     app->leftDown = true;
     app->zoomMode = (r == GLFW_PRESS);
-    const bool shiftPanFromLeft = !app->zoomMode && (l == GLFW_PRESS) && shift && (m != GLFW_PRESS);
+    const bool shiftPanFromLeft = !app->zoomMode && !rollModifier && (l == GLFW_PRESS) && shift && (m != GLFW_PRESS);
     app->rollMode = !app->zoomMode && !shiftPanFromLeft &&
-                    (l == GLFW_PRESS) && !shift && (m != GLFW_PRESS) && rollModifier;
+                    (l == GLFW_PRESS) && (m != GLFW_PRESS) && rollModifier;
     app->panMode = !app->zoomMode && !app->rollMode && ((m == GLFW_PRESS) || shiftPanFromLeft);
     app->shiftPanGesture = app->panMode && shift;
     app->lastX = xpos;
@@ -5805,15 +6132,22 @@ void cursorPosCallback(GLFWwindow* window, double xpos, double ypos) {
     return;
   }
   if (app->rollMode) {
+    const bool ctrl = app->ctrlHeld ||
+                      glfwGetKey(window, GLFW_KEY_LEFT_CONTROL) == GLFW_PRESS ||
+                      glfwGetKey(window, GLFW_KEY_RIGHT_CONTROL) == GLFW_PRESS ||
+                      nativeControlModifierPressed();
     const float drag = std::fabs(dx) >= std::fabs(dy) ? dx : -dy;
     if (std::fabs(drag) > 0.05f) {
       app->rollDirection = drag > 0.0f ? 1 : -1;
       app->rollFeedbackUntil = glfwGetTime() + 0.18;
     }
+    const float rollScale = ctrl ? 2.0f : (shift ? shiftPrecisionFactor() : 1.0f);
+    if (ctrl) app->speedFeedbackUntil = glfwGetTime() + 0.18;
+    if (!ctrl && shift) app->slowFeedbackUntil = glfwGetTime() + 0.18;
     Quat next{app->cam.qx, app->cam.qy, app->cam.qz, app->cam.qw};
     // Prepend a roll around the view axis so it behaves like rotating the screen frame itself,
     // not like spinning the object in its own local coordinates.
-    const Quat qRoll = axisAngleQ(Vec3{0.0f, 0.0f, 1.0f}, -drag * 0.0065f);
+    const Quat qRoll = axisAngleQ(Vec3{0.0f, 0.0f, 1.0f}, -drag * 0.0065f * rollScale);
     next = normalizeQ(mulQ(qRoll, next));
     app->cam.qx = next.x;
     app->cam.qy = next.y;
@@ -6851,24 +7185,10 @@ int main() {
                                   overlayTextRenderer ? *overlayTextRenderer : hudText);
     }
 
-    if (app.orientAxisLock != 0) {
-      const float pulse = clampf(static_cast<float>((app.orientAxisFeedbackUntil - glfwGetTime()) / 0.18), 0.0f, 1.0f);
-      drawOrientationLockIndicator(width, height, app.orientAxisLock, pulse);
-    }
     int indicatorSlot = 0;
     auto indicatorYOffset = [&](int slot) {
       return 30.0f + static_cast<float>(slot) * 26.0f;
     };
-    if (app.shiftPanGesture && app.panMode) {
-      drawModifierSymbolIndicator(width, height, 'P', 34.0f, indicatorYOffset(indicatorSlot++), 1.0f);
-    }
-    if (app.rollMode) {
-      const float feedback = clampf(static_cast<float>((app.rollFeedbackUntil - glfwGetTime()) / 0.18), 0.0f, 1.0f);
-      const float breathe = 0.5f + 0.5f * std::sin(static_cast<float>(glfwGetTime()) * 8.0f);
-      drawRollDirectionIndicator(width, height, app.rollDirection,
-                                 0.30f + 0.70f * std::max(feedback, breathe * 0.6f), &hudSymbolText, &hudText);
-      ++indicatorSlot;
-    }
     const float slowPulse = clampf(static_cast<float>((app.slowFeedbackUntil - glfwGetTime()) / 0.18), 0.0f, 1.0f);
     const bool combinedSlowModifierHeld =
         app.shiftHeld && !app.ctrlHeld && (app.altHeld || app.superHeld || app.rollKeyHeld);
@@ -6882,6 +7202,22 @@ int main() {
                                 0.50f + 0.50f * slowIndicatorStrength,
                                 overlayTextRenderer);
     }
+    if (app.panMode) {
+      drawModifierSymbolIndicator(width, height, 'P', 34.0f, indicatorYOffset(indicatorSlot++), 1.0f);
+    }
+    if (app.rollMode) {
+      const float feedback = clampf(static_cast<float>((app.rollFeedbackUntil - glfwGetTime()) / 0.18), 0.0f, 1.0f);
+      const float breathe = 0.5f + 0.5f * std::sin(static_cast<float>(glfwGetTime()) * 8.0f);
+      drawRollDirectionIndicator(width, height, app.rollDirection,
+                                 0.30f + 0.70f * std::max(feedback, breathe * 0.6f),
+                                 indicatorYOffset(indicatorSlot++),
+                                 &hudSymbolText,
+                                 &hudText);
+    }
+    if (app.orientAxisLock != 0) {
+      const float pulse = clampf(static_cast<float>((app.orientAxisFeedbackUntil - glfwGetTime()) / 0.18), 0.0f, 1.0f);
+      drawOrientationLockIndicator(width, height, app.orientAxisLock, pulse, indicatorYOffset(indicatorSlot++));
+    }
     const float speedPulse = clampf(static_cast<float>((app.speedFeedbackUntil - glfwGetTime()) / 0.18), 0.0f, 1.0f);
     if (speedPulse > 0.0f) {
       drawModifierSymbolIndicator(width,
@@ -6890,6 +7226,14 @@ int main() {
                                   34.0f,
                                   indicatorYOffset(indicatorSlot++),
                                   0.55f + 0.45f * speedPulse);
+    }
+    if (resolved.neutralRadiusEnabled) {
+      drawNeutralRadiusIndicator(width,
+                                 height,
+                                 42.0f,
+                                 28.0f,
+                                 0.82f,
+                                 overlayTextRenderer);
     }
 
     glfwSwapBuffers(window);

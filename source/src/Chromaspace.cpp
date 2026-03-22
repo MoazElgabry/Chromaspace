@@ -597,8 +597,12 @@ enum class SlicePlotModeKind {
 struct SliceSelectionSpec {
   SlicePlotModeKind plotMode = SlicePlotModeKind::Rgb;
   bool showOverflow = false;
+  bool circularHsl = false;
+  bool circularHsv = false;
   bool normConeNormalized = true;
   bool enabled = false;
+  bool neutralRadiusEnabled = false;
+  float neutralRadius = 1.0f;
   bool cubeSliceRed = true;
   bool cubeSliceGreen = false;
   bool cubeSliceBlue = false;
@@ -632,6 +636,38 @@ float rawRgbHue01(float r, float g, float b, float cMax, float delta) {
     h = ((r - g) / delta) + 4.0f;
   }
   return wrapHue01(h / 6.0f);
+}
+
+void rgbToHsvHexconePlaneSlice(float r, float g, float b, float* outX, float* outZ) {
+  *outX = r - 0.5f * g - 0.5f * b;
+  *outZ = 0.8660254037844386f * (g - b);
+}
+
+void rgbToPlotCircularHslSlice(float r, float g, float b, float* outH, float* outRadius, float* outL) {
+  const float cMax = std::max(r, std::max(g, b));
+  const float cMin = std::min(r, std::min(g, b));
+  const float delta = cMax - cMin;
+  const float l = 0.5f * (cMax + cMin);
+  float h = rawRgbHue01(r, g, b, cMax, delta);
+  float satDenom = 1.0f - std::fabs(2.0f * l - 1.0f);
+  if (delta > 1e-6f && satDenom < 0.0f) {
+    h = wrapHue01(h + 0.5f);
+  }
+  if (std::fabs(satDenom) <= 1e-6f) {
+    satDenom = satDenom < 0.0f ? -1e-6f : 1e-6f;
+  }
+  *outH = h;
+  *outRadius = std::fabs(delta / satDenom);
+  *outL = l;
+}
+
+void rgbToPlotCircularHsvSlice(float r, float g, float b, float* outH, float* outRadius, float* outV) {
+  const float cMax = std::max(r, std::max(g, b));
+  const float cMin = std::min(r, std::min(g, b));
+  const float delta = cMax - cMin;
+  *outH = rawRgbHue01(r, g, b, cMax, delta);
+  *outRadius = (delta > 1e-6f && cMax > 1e-6f) ? (delta / cMax) : 0.0f;
+  *outV = cMax;
 }
 
 void rgbToChenSlice(float r, float g, float b, bool allowOverflow, float* outHue, float* outChroma, float* outLight) {
@@ -761,7 +797,96 @@ void rgbToReuleauxSlice(float r, float g, float b, bool allowOverflow, float* ou
   *outValue = allowOverflow ? std::max(r, std::max(g, b)) : clamp01(std::max(r, std::max(g, b)));
 }
 
+float normalizedNeutralRadiusForSlice(const SliceSelectionSpec& spec, float r, float g, float b) {
+  constexpr float kRgbAxisMaxRadius = 0.8164965809277260f;
+  constexpr float kPolarMax = 0.9553166181245093f;
+  constexpr float kChenPolarScale = 1.0467733744265997f;
+
+  switch (spec.plotMode) {
+    case SlicePlotModeKind::Rgb: {
+      const float rr = clamp01(r);
+      const float gg = clamp01(g);
+      const float bb = clamp01(b);
+      const float rotX = 0.81649658093f * rr - 0.40824829046f * gg - 0.40824829046f * bb;
+      const float rotY = 0.70710678118f * gg - 0.70710678118f * bb;
+      return clampf(std::sqrt(rotX * rotX + rotY * rotY) / kRgbAxisMaxRadius, 0.0f, 1.0f);
+    }
+    case SlicePlotModeKind::Hsl: {
+      if (spec.circularHsl) {
+        float h = 0.0f;
+        float radius = 0.0f;
+        float l = 0.0f;
+        rgbToPlotCircularHslSlice(r, g, b, &h, &radius, &l);
+        return clampf(radius, 0.0f, 1.0f);
+      }
+      const float cMax = std::max(r, std::max(g, b));
+      const float cMin = std::min(r, std::min(g, b));
+      return clampf(cMax - cMin, 0.0f, 1.0f);
+    }
+    case SlicePlotModeKind::Hsv: {
+      if (spec.circularHsv) {
+        float h = 0.0f;
+        float radius = 0.0f;
+        float v = 0.0f;
+        rgbToPlotCircularHsvSlice(r, g, b, &h, &radius, &v);
+        return clampf(radius, 0.0f, 1.0f);
+      }
+      float x = 0.0f;
+      float z = 0.0f;
+      rgbToHsvHexconePlaneSlice(r, g, b, &x, &z);
+      return clampf(std::hypot(x, z), 0.0f, 1.0f);
+    }
+    case SlicePlotModeKind::Chen: {
+      float h = 0.0f;
+      float chroma = 0.0f;
+      float light = 0.0f;
+      rgbToChenSlice(r, g, b, spec.showOverflow, &h, &chroma, &light);
+      const float polar = chroma / kChenPolarScale;
+      const float radius = light * std::sin(polar) / kRgbAxisMaxRadius;
+      return clampf(radius, 0.0f, 1.0f);
+    }
+    case SlicePlotModeKind::RgbToCone: {
+      float magnitude = 0.0f;
+      float hue = 0.0f;
+      float polar = 0.0f;
+      rgbToRgbConeSlice(r, g, b, &magnitude, &hue, &polar);
+      const float radial = magnitude * std::sin(polar * kPolarMax);
+      return clampf(radial / std::sin(kPolarMax), 0.0f, 1.0f);
+    }
+    case SlicePlotModeKind::JpConical: {
+      float magnitude = 0.0f;
+      float hue = 0.0f;
+      float polar = 0.0f;
+      rgbToJpConicalSlice(r, g, b, spec.showOverflow, &magnitude, &hue, &polar);
+      const float radial = magnitude * std::sin(polar * kPolarMax);
+      return clampf(radial / std::sin(kPolarMax), 0.0f, 1.0f);
+    }
+    case SlicePlotModeKind::NormCone: {
+      float hue = 0.0f;
+      float chroma = 0.0f;
+      float value = 0.0f;
+      rgbToNormConeCoordsSlice(r, g, b, spec.normConeNormalized, spec.showOverflow, &hue, &chroma, &value);
+      return clampf(chroma, 0.0f, 1.0f);
+    }
+    case SlicePlotModeKind::Reuleaux: {
+      float hue = 0.0f;
+      float sat = 0.0f;
+      float value = 0.0f;
+      rgbToReuleauxSlice(r, g, b, spec.showOverflow, &hue, &sat, &value);
+      return clampf(sat, 0.0f, 1.0f);
+    }
+    default:
+      return 0.0f;
+  }
+}
+
+bool neutralRadiusContainsPoint(const SliceSelectionSpec& spec, float r, float g, float b) {
+  if (!spec.neutralRadiusEnabled) return true;
+  return normalizedNeutralRadiusForSlice(spec, r, g, b) <= spec.neutralRadius + 1e-6f;
+}
+
 bool volumeSliceContainsPoint(const SliceSelectionSpec& spec, float r, float g, float b) {
+  if (!neutralRadiusContainsPoint(spec, r, g, b)) return false;
   const bool anyRegionSelected = spec.cubeSliceRed || spec.cubeSliceGreen || spec.cubeSliceBlue ||
                                  spec.cubeSliceCyan || spec.cubeSliceYellow || spec.cubeSliceMagenta;
   if (!spec.enabled) return true;
@@ -1206,6 +1331,14 @@ class ChromaspaceEffect : public ImageEffect {
       }
       return;
     }
+    if (paramName == "cubeViewerNeutralRadius") {
+      cubeViewerDebugLog(std::string("changedParam(cubeViewerNeutralRadius) -> ") +
+                         std::to_string(currentNeutralRadiusValue(args.time)));
+      if (cubeViewerRequested_) {
+        pushParamsUpdate(args.time, "cubeViewerNeutralRadius");
+      }
+      return;
+    }
     if (paramName == "cubeViewerHighlightOverflow") {
       cubeViewerDebugLog(std::string("changedParam(cubeViewerHighlightOverflow) -> ") +
                          (getBoolValue("cubeViewerHighlightOverflow", args.time, true) ? "1" : "0"));
@@ -1220,7 +1353,6 @@ class ChromaspaceEffect : public ImageEffect {
       cubeViewerDebugLog(std::string("changedParam(cubeViewerLassoRegionMode) -> ") +
                          (currentLassoRegionSlicingEnabled(args.time) ? "1" : "0"));
       syncCubeSlicingUi(args.time);
-      invalidateCubeViewerCloudState();
       if (cubeViewerRequested_) {
         pushParamsUpdate(args.time, "cubeViewerLassoRegionMode");
       }
@@ -1233,10 +1365,8 @@ class ChromaspaceEffect : public ImageEffect {
       cubeViewerDebugLog(std::string("changedParam(") + paramName + ") -> " +
                          (getBoolValue(paramName, args.time, true) ? "1" : "0"));
       syncCubeSlicingUi(args.time);
-      invalidateCubeViewerCloudState();
       if (cubeViewerRequested_) {
         pushParamsUpdate(args.time, paramName);
-        (void)trySendCachedCloud(args.time, paramName);
       }
       return;
     }
@@ -1880,16 +2010,32 @@ class ChromaspaceEffect : public ImageEffect {
     return currentCubeSlicingSupported(time) && !currentChromaticityPlotMode(time);
   }
 
+  bool currentNeutralRadiusSlicingAllowed(double time) {
+    return currentCubeSlicingSupported(time) &&
+           !currentChromaticityPlotMode(time);
+  }
+
+  double currentNeutralRadiusValue(double time) {
+    return std::clamp(getDoubleValue("cubeViewerNeutralRadius", time, 1.0), 0.0, 1.0);
+  }
+
+  bool currentNeutralRadiusSlicingEnabled(double time) {
+    return currentNeutralRadiusSlicingAllowed(time) &&
+           !currentShowOverflow(time) &&
+           currentNeutralRadiusValue(time) < 0.999999;
+  }
+
   bool currentVolumeSlicingEnabled(double time) {
     if (!currentCubeSlicingSupported(time)) return false;
     if (getBoolValue("cubeViewerLassoRegionMode", time, false)) return true;
-    return currentHueSectorSlicingAllowed(time) && anyCubeSliceRegionSelected(time);
+    if (currentHueSectorSlicingAllowed(time) && anyCubeSliceRegionSelected(time)) return true;
+    return currentNeutralRadiusSlicingEnabled(time);
   }
 
   bool currentHueSectorSlicingEnabled(double time) {
     return currentHueSectorSlicingAllowed(time) &&
-           currentVolumeSlicingEnabled(time) &&
-           currentVolumeSlicingMode(time) == VolumeSlicingMode::HueSectors;
+           currentVolumeSlicingMode(time) == VolumeSlicingMode::HueSectors &&
+           anyCubeSliceRegionSelected(time);
   }
 
   bool currentLassoRegionSlicingEnabled(double time) {
@@ -1927,8 +2073,12 @@ class ChromaspaceEffect : public ImageEffect {
       spec.plotMode = SlicePlotModeKind::Rgb;
     }
     spec.showOverflow = currentShowOverflow(time);
+    spec.circularHsl = currentCircularHsl(time);
+    spec.circularHsv = currentCircularHsv(time);
     spec.normConeNormalized = getBoolValue("cubeViewerNormConeNormalized", time, true);
     spec.enabled = currentHueSectorSlicingEnabled(time);
+    spec.neutralRadiusEnabled = currentNeutralRadiusSlicingEnabled(time);
+    spec.neutralRadius = static_cast<float>(currentNeutralRadiusValue(time));
     spec.cubeSliceRed = getBoolValue("cubeViewerSliceRed", time, true);
     spec.cubeSliceGreen = getBoolValue("cubeViewerSliceGreen", time, false);
     spec.cubeSliceBlue = getBoolValue("cubeViewerSliceBlue", time, false);
@@ -2008,7 +2158,6 @@ class ChromaspaceEffect : public ImageEffect {
                        " revision=" + std::to_string(state.revision) +
                        " strokes=" + std::to_string(state.strokes.size()));
     syncCubeSlicingUi(time);
-    invalidateCubeViewerCloudState();
     if (cubeViewerRequested_) {
       pushParamsUpdate(time, reason);
     }
@@ -2060,7 +2209,6 @@ class ChromaspaceEffect : public ImageEffect {
                        " revision=" + std::to_string(state.revision) +
                        " strokes=" + std::to_string(state.strokes.size()));
     syncCubeSlicingUi(time);
-    invalidateCubeViewerCloudState();
     if (cubeViewerRequested_) {
       pushParamsUpdate(time, reason);
     }
@@ -2070,11 +2218,18 @@ class ChromaspaceEffect : public ImageEffect {
   void syncCubeSlicingUi(double time) {
     const bool supported = currentCubeSlicingSupported(time);
     const bool hueSectorAllowed = currentHueSectorSlicingAllowed(time);
+    const bool neutralRadiusVisible = currentNeutralRadiusSlicingAllowed(time);
     const bool lassoSelected = supported && getBoolValue("cubeViewerLassoRegionMode", time, false);
     const bool lassoMode = supported && currentVolumeSlicingMode(time) == VolumeSlicingMode::LassoRegion;
+    const bool neutralRadiusEnabled = neutralRadiusVisible &&
+                                      !currentShowOverflow(time);
     const bool hueOptionsVisible = supported && hueSectorAllowed && !lassoSelected;
     setParamVisibility(fetchGroupParam("grp_cube_viewer_slicing"), supported);
     setParamVisibility(fetchBooleanParam("cubeViewerLassoRegionMode"), supported);
+    if (auto* p = fetchDoubleParam("cubeViewerNeutralRadius")) {
+      p->setIsSecret(!neutralRadiusVisible);
+      p->setEnabled(neutralRadiusEnabled);
+    }
     setParamVisibility(fetchBooleanParam("cubeViewerSliceRed"), hueOptionsVisible);
     setParamVisibility(fetchBooleanParam("cubeViewerSliceGreen"), hueOptionsVisible);
     setParamVisibility(fetchBooleanParam("cubeViewerSliceBlue"), hueOptionsVisible);
@@ -2296,11 +2451,6 @@ class ChromaspaceEffect : public ImageEffect {
     const int chromaticityInputTransfer = currentChromaticityInputTransferChoice(time);
     const int chromaticityReferenceBasis = currentChromaticityReferenceBasisChoice(time);
     const int chromaticityOverlayPrimaries = currentChromaticityOverlayPrimariesChoice(time);
-    const bool volumeSlicingEnabled = currentVolumeSlicingEnabled(time);
-    const bool cubeSlicingEnabled = currentHueSectorSlicingEnabled(time);
-    const std::string slicingMode = currentVolumeSlicingModeLabel(time);
-    const bool lassoRegionEmpty = currentLassoRegionState(time).empty();
-    const std::string lassoData = getStringValue("cubeViewerLassoData", time, "");
     const auto overflowColor = getRGBValue("cubeViewerOverflowHighlightColor", time, {1.0, 0.0, 0.0});
     const auto backgroundColor = getRGBValue("cubeViewerBackgroundColor", time, {0.08, 0.08, 0.09});
     std::ostringstream oss;
@@ -2319,16 +2469,6 @@ class ChromaspaceEffect : public ImageEffect {
          << "|chromaticityOverlayPrimaries=" << chromaticityOverlayPrimaries
          << "|showOverflow=" << (showOverflow ? 1 : 0)
          << "|highlightOverflow=" << (highlightOverflow ? 1 : 0)
-         << "|volumeSlicingEnabled=" << (volumeSlicingEnabled ? 1 : 0)
-         << "|volumeSlicingMode=" << slicingMode
-         << "|cubeSlicingEnabled=" << (cubeSlicingEnabled ? 1 : 0)
-         << "|sliceRed=" << (getBoolValue("cubeViewerSliceRed", time, true) ? 1 : 0)
-         << "|sliceGreen=" << (getBoolValue("cubeViewerSliceGreen", time, false) ? 1 : 0)
-         << "|sliceBlue=" << (getBoolValue("cubeViewerSliceBlue", time, false) ? 1 : 0)
-         << "|sliceCyan=" << (getBoolValue("cubeViewerSliceCyan", time, false) ? 1 : 0)
-         << "|sliceYellow=" << (getBoolValue("cubeViewerSliceYellow", time, false) ? 1 : 0)
-         << "|sliceMagenta=" << (getBoolValue("cubeViewerSliceMagenta", time, false) ? 1 : 0)
-         << "|lassoHash=" << fnv1a64(lassoData)
          << "|overflowColor=" << overflowColor[0] << "," << overflowColor[1] << "," << overflowColor[2]
          << "|backgroundColor=" << backgroundColor[0] << "," << backgroundColor[1] << "," << backgroundColor[2]
          << "|drawMode=" << (currentDrawOnImageMode(time) ? 1 : 0)
@@ -2377,6 +2517,7 @@ class ChromaspaceEffect : public ImageEffect {
     const bool cubeSlicingEnabled = currentHueSectorSlicingEnabled(time);
     const std::string slicingMode = currentVolumeSlicingModeLabel(time);
     const bool lassoRegionEmpty = currentLassoRegionState(time).empty();
+    const std::string lassoData = getStringValue("cubeViewerLassoData", time, "");
     const auto overflowColor = getRGBValue("cubeViewerOverflowHighlightColor", time, {1.0, 0.0, 0.0});
     const auto backgroundColor = getRGBValue("cubeViewerBackgroundColor", time, {0.08, 0.08, 0.09});
     const bool drawOnImageMode = currentDrawOnImageMode(time);
@@ -2416,7 +2557,10 @@ class ChromaspaceEffect : public ImageEffect {
         << ",\"volumeSlicingEnabled\":" << (volumeSlicingEnabled ? 1 : 0)
         << ",\"volumeSlicingMode\":\"" << slicingMode << "\""
         << ",\"lassoRegionEmpty\":" << (lassoRegionEmpty ? 1 : 0)
+        << ",\"lassoData\":\"" << jsonEscape(lassoData) << "\""
         << ",\"cubeSlicingEnabled\":" << (cubeSlicingEnabled ? 1 : 0)
+        << ",\"neutralRadiusEnabled\":" << (currentNeutralRadiusSlicingEnabled(time) ? 1 : 0)
+        << ",\"neutralRadius\":" << currentNeutralRadiusValue(time)
         << ",\"cubeSliceRed\":" << (getBoolValue("cubeViewerSliceRed", time, true) ? 1 : 0)
         << ",\"cubeSliceGreen\":" << (getBoolValue("cubeViewerSliceGreen", time, false) ? 1 : 0)
         << ",\"cubeSliceBlue\":" << (getBoolValue("cubeViewerSliceBlue", time, false) ? 1 : 0)
@@ -2484,12 +2628,12 @@ class ChromaspaceEffect : public ImageEffect {
     return preserveOverflow ? value : clamp01(value);
   }
 
-  void appendCloudPointSample(std::string* pts, bool* first, float r, float g, float b) const {
+  void appendCloudPointSample(std::string* pts, bool* first, float xNorm, float yNorm, float r, float g, float b) const {
     if (!pts || !first) return;
     if (!*first) pts->push_back(';');
     *first = false;
     char sample[96];
-    const int n = std::snprintf(sample, sizeof(sample), "%.6f %.6f %.6f %.6f %.6f %.6f", r, g, b, r, g, b);
+    const int n = std::snprintf(sample, sizeof(sample), "%.6f %.6f %.6f %.6f %.6f %.6f", xNorm, yNorm, 0.0f, r, g, b);
     if (n > 0) pts->append(sample, static_cast<size_t>(n));
   }
 
@@ -2523,6 +2667,8 @@ class ChromaspaceEffect : public ImageEffect {
     if (width <= 0 || height <= 0) return out;
 
     struct OccupancyCandidate {
+      float xNorm = 0.0f;
+      float yNorm = 0.0f;
       float r = 0.0f;
       float g = 0.0f;
       float b = 0.0f;
@@ -2538,22 +2684,17 @@ class ChromaspaceEffect : public ImageEffect {
     const int resolution = qualityResolutionForIndex(qualityIndex);
     const bool preserveOverflow = currentShowOverflow(time);
     const bool occupancyFill = currentOccupancyGuidedFill(time);
-    const bool lassoFiltering = currentLassoRegionSlicingEnabled(time);
-    const LassoRegionState lassoState = currentLassoRegionState(time);
     const SliceSelectionSpec hueSliceSpec = currentHueSectorSliceSpec(time);
-    NormalizedBounds lassoBounds{};
-    const bool haveLassoBounds = lassoFiltering && computeLassoSamplingBounds(lassoState, &lassoBounds);
-    const bool lassoRegionEmpty = lassoFiltering && lassoState.empty();
     const bool anyHueRegionSelected = hueSliceSpec.cubeSliceRed || hueSliceSpec.cubeSliceGreen ||
                                       hueSliceSpec.cubeSliceBlue || hueSliceSpec.cubeSliceCyan ||
                                       hueSliceSpec.cubeSliceYellow || hueSliceSpec.cubeSliceMagenta;
     const bool noHueRegionSelected = hueSliceSpec.enabled && !anyHueRegionSelected;
-    const bool selectionImpossible = lassoRegionEmpty || noHueRegionSelected;
+    const bool selectionImpossible = noHueRegionSelected;
     const int scaledWidth = std::max(1, static_cast<int>(std::lround(static_cast<double>(width) * scaleFactor)));
     const int scaledHeight = std::max(1, static_cast<int>(std::lround(static_cast<double>(height) * scaleFactor)));
     const int pointCount = std::max(512, static_cast<int>(std::lround(
         static_cast<double>(qualityPointCountForIndex(qualityIndex, previewMode)) * scaleFactor * scaleFactor)));
-    const int selectionRetryMultiplier = lassoFiltering ? 32 : (hueSliceSpec.enabled ? 12 : 1);
+    const int selectionRetryMultiplier = (hueSliceSpec.enabled || hueSliceSpec.neutralRadiusEnabled) ? 12 : 1;
     const int maxPrimaryAttempts = selectionImpossible
                                        ? 0
                                        : (selectionRetryMultiplier <= 1
@@ -2568,9 +2709,6 @@ class ChromaspaceEffect : public ImageEffect {
     int primaryAttempts = 0;
     int primaryAccepted = 0;
 
-    auto remapSelectionCoordinate = [](double t, double start, double end) {
-      return start + (end - start) * t;
-    };
     auto sampleUvForAttempt = [&](int attemptIndex, double* outU, double* outV) {
       double u = 0.0;
       double v = 0.0;
@@ -2598,20 +2736,15 @@ class ChromaspaceEffect : public ImageEffect {
           break;
         }
       }
-      if (haveLassoBounds) {
-        u = remapSelectionCoordinate(u, lassoBounds.x1, lassoBounds.x2);
-        v = remapSelectionCoordinate(v, lassoBounds.y1, lassoBounds.y2);
-      }
       *outU = std::clamp(u, 0.0, 1.0);
       *outV = std::clamp(v, 0.0, 1.0);
     };
     auto sampleAcceptedBySelection = [&](int x, int y, float r, float g, float b) {
-      if (lassoFiltering) {
-        const double xNorm = (static_cast<double>(x) + 0.5) / static_cast<double>(width);
-        const double yNorm = (static_cast<double>(y) + 0.5) / static_cast<double>(height);
-        if (!lassoRegionContainsPoint(lassoState, xNorm, yNorm)) return false;
-      }
-      if (hueSliceSpec.enabled && !volumeSliceContainsPoint(hueSliceSpec, r, g, b)) return false;
+      (void)x;
+      (void)y;
+      (void)r;
+      (void)g;
+      (void)b;
       return true;
     };
 
@@ -2630,7 +2763,9 @@ class ChromaspaceEffect : public ImageEffect {
       const float g = sampledChannelValue(pix[1], preserveOverflow);
       const float b = sampledChannelValue(pix[2], preserveOverflow);
       if (!sampleAcceptedBySelection(x, y, r, g, b)) continue;
-      appendCloudPointSample(&pts, &first, r, g, b);
+      const float xNorm = static_cast<float>((static_cast<double>(x) + 0.5) / static_cast<double>(width));
+      const float yNorm = static_cast<float>((static_cast<double>(y) + 0.5) / static_cast<double>(height));
+      appendCloudPointSample(&pts, &first, xNorm, yNorm, r, g, b);
       ++occupancy[occupancyBinIndex(r, g, b, preserveOverflow)];
       ++primaryAccepted;
     }
@@ -2651,10 +2786,6 @@ class ChromaspaceEffect : public ImageEffect {
                                 static_cast<int>(candidates.size()) < candidateTarget; ++attemptIndex) {
         double u = halton(static_cast<uint32_t>(attemptIndex + 1), 2);
         double v = halton(static_cast<uint32_t>(attemptIndex + 1), 3);
-        if (haveLassoBounds) {
-          u = remapSelectionCoordinate(u, lassoBounds.x1, lassoBounds.x2);
-          v = remapSelectionCoordinate(v, lassoBounds.y1, lassoBounds.y2);
-        }
         const int sx = std::clamp(static_cast<int>(u * static_cast<double>(scaledWidth - 1)), 0, scaledWidth - 1);
         const int sy = std::clamp(static_cast<int>(v * static_cast<double>(scaledHeight - 1)), 0, scaledHeight - 1);
         const int x = std::clamp(static_cast<int>(((static_cast<double>(sx) + 0.5) / static_cast<double>(scaledWidth)) * static_cast<double>(width)), 0, width - 1);
@@ -2667,6 +2798,8 @@ class ChromaspaceEffect : public ImageEffect {
         if (!sampleAcceptedBySelection(x, y, r, g, b)) continue;
         const int bin = occupancyBinIndex(r, g, b, preserveOverflow);
         OccupancyCandidate candidate{};
+        candidate.xNorm = static_cast<float>((static_cast<double>(x) + 0.5) / static_cast<double>(width));
+        candidate.yNorm = static_cast<float>((static_cast<double>(y) + 0.5) / static_cast<double>(height));
         candidate.r = r;
         candidate.g = g;
         candidate.b = b;
@@ -2684,7 +2817,7 @@ class ChromaspaceEffect : public ImageEffect {
       pts.reserve(pts.size() + static_cast<size_t>(appendCount) * 52u);
       for (int i = 0; i < appendCount; ++i) {
         const auto& candidate = candidates[static_cast<size_t>(i)];
-        appendCloudPointSample(&pts, &first, candidate.r, candidate.g, candidate.b);
+        appendCloudPointSample(&pts, &first, candidate.xNorm, candidate.yNorm, candidate.r, candidate.g, candidate.b);
       }
     }
 
@@ -2704,9 +2837,7 @@ class ChromaspaceEffect : public ImageEffect {
     cubeViewerDebugLog(std::string("Built whole-image cloud payload: quality=") + out.quality +
                        " sampling=" + samplingModeLabelForIndex(samplingMode) +
                        " occupancyFill=" + (occupancyFill ? "1" : "0") +
-                       " lasso=" + (lassoFiltering ? "1" : "0") +
                        " hueSlice=" + (hueSliceSpec.enabled ? "1" : "0") +
-                       " lassoStrokes=" + std::to_string(lassoState.strokes.size()) +
                        " attempts=" + std::to_string(primaryAttempts) +
                        " accepted=" + std::to_string(primaryAccepted) +
                        " scale=" + scaleLabelForIndex(scaleIndex) +
@@ -4208,6 +4339,7 @@ class ChromaspaceFactory : public PluginFactoryHelper<ChromaspaceFactory> {
           {"cubeViewerCircularHsl", "For HSL only: switch from the default HSL bicone view to a circular cylindrical HSL view with hue as angle, saturation as radius, and lightness as height. When overflow is enabled, out-of-range RGB values are converted with the raw HSL formula so useful out-of-bound cylindrical points remain visible."},
           {"cubeViewerCircularHsv", "For HSV only: switch from the default Smith hexcone view to a circular cylindrical HSV view with hue as angle, saturation as radius, and value as height."},
           {"cubeViewerLassoRegionMode", "When enabled, Volume Slicing uses a drawn lasso region on the image instead of the hue-sector filters."},
+          {"cubeViewerNeutralRadius", "Keep only samples within this normalized distance from the achromatic axis so the extreme outer saturation shell is hidden and the more typical image range is easier to inspect. Disabled while Show Overflow is enabled."},
           {"cubeViewerSliceRed", "Show only the red sector. In Cube mode this is the red-dominant tetrahedral region; in the other plot models it is the red-centered hue sector."},
           {"cubeViewerSliceGreen", "Show only the green sector. In Cube mode this is the green-dominant tetrahedral region; in the other plot models it is the green-centered hue sector."},
           {"cubeViewerSliceBlue", "Show only the blue sector. In Cube mode this is the blue-dominant tetrahedral region; in the other plot models it is the blue-centered hue sector."},
@@ -4407,6 +4539,14 @@ class ChromaspaceFactory : public PluginFactoryHelper<ChromaspaceFactory> {
     cubeViewerSliceMagenta->setDefault(false);
     cubeViewerSliceMagenta->setParent(*grpCubeViewerSlicing);
     if (const char* hint = tooltipFor("cubeViewerSliceMagenta")) cubeViewerSliceMagenta->setHint(hint);
+
+    auto* cubeViewerNeutralRadius = d.defineDoubleParam("cubeViewerNeutralRadius");
+    cubeViewerNeutralRadius->setLabel("Neutral Radius");
+    cubeViewerNeutralRadius->setRange(0.0, 1.0);
+    cubeViewerNeutralRadius->setDisplayRange(0.0, 1.0);
+    cubeViewerNeutralRadius->setDefault(1.0);
+    cubeViewerNeutralRadius->setParent(*grpCubeViewerSlicing);
+    if (const char* hint = tooltipFor("cubeViewerNeutralRadius")) cubeViewerNeutralRadius->setHint(hint);
 
     auto* cubeViewerLassoOperation = d.defineChoiceParam("cubeViewerLassoOperation");
     cubeViewerLassoOperation->setLabel("Lasso Operation");

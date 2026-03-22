@@ -339,3 +339,12 @@ add_custom_command(TARGET Chromaspace_CubeViewer POST_BUILD
     "${OFX_OUTPUT_DIR}/${PLUGIN_BASENAME}.pdb"
     "${OFX_OUTPUT_DIR}/Chromaspace_CubeViewer.ilk"
     "${OFX_OUTPUT_DIR}/Chromaspace_CubeViewer.pdb")
+
+if(UNIX AND NOT APPLE)
+  # Linux hosts launch the bundled viewer directly, so keep the execute bit on both
+  # the built helper and the copy staged into the OFX bundle.
+  add_custom_command(TARGET Chromaspace_CubeViewer POST_BUILD
+    COMMAND /bin/chmod +x "$<TARGET_FILE:Chromaspace_CubeViewer>"
+    COMMAND /bin/chmod +x "${OFX_OUTPUT_DIR}/$<TARGET_FILE_NAME:Chromaspace_CubeViewer>"
+    VERBATIM)
+endif()
