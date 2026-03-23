@@ -36,6 +36,7 @@ struct OverlayRequest {
 
 struct InputRequest {
   int pointCount = 0;
+  float pointAlphaScale = 1.0f;
   RemapUniforms remap;
 };
 

@@ -296,7 +296,7 @@ void notifyExistingViewerBringToFront() {
 }
 #endif
 
-const char* kViewerVersionString = "v1.0.1";
+const char* kViewerVersionString = "v1.0.2";
 
 #if !defined(_WIN32)
 bool sendAllSocket(int fd, const char* data, size_t size) {
@@ -657,6 +657,7 @@ using ViewerGLDeleteProgramProc = void(APIENTRY *)(GLuint);
 using ViewerGLUseProgramProc = void(APIENTRY *)(GLuint);
 using ViewerGLGetUniformLocationProc = GLint(APIENTRY *)(GLuint, const char*);
 using ViewerGLUniform1iProc = void(APIENTRY *)(GLint, GLint);
+using ViewerGLUniform1fProc = void(APIENTRY *)(GLint, GLfloat);
 using ViewerGLBindBufferBaseProc = void(APIENTRY *)(GLenum, GLuint, GLuint);
 using ViewerGLDispatchComputeProc = void(APIENTRY *)(GLuint, GLuint, GLuint);
 using ViewerGLMemoryBarrierProc = void(APIENTRY *)(GLbitfield);
@@ -743,6 +744,7 @@ struct ViewerGlComputeApi {
   ViewerGLUseProgramProc useProgram = nullptr;
   ViewerGLGetUniformLocationProc getUniformLocation = nullptr;
   ViewerGLUniform1iProc uniform1i = nullptr;
+  ViewerGLUniform1fProc uniform1f = nullptr;
   ViewerGLBindBufferBaseProc bindBufferBase = nullptr;
   ViewerGLDispatchComputeProc dispatchCompute = nullptr;
   ViewerGLMemoryBarrierProc memoryBarrier = nullptr;
@@ -766,6 +768,7 @@ const ViewerGlComputeApi& viewerGlComputeApi() {
     a.useProgram = reinterpret_cast<ViewerGLUseProgramProc>(glfwGetProcAddress("glUseProgram"));
     a.getUniformLocation = reinterpret_cast<ViewerGLGetUniformLocationProc>(glfwGetProcAddress("glGetUniformLocation"));
     a.uniform1i = reinterpret_cast<ViewerGLUniform1iProc>(glfwGetProcAddress("glUniform1i"));
+    a.uniform1f = reinterpret_cast<ViewerGLUniform1fProc>(glfwGetProcAddress("glUniform1f"));
     a.bindBufferBase = reinterpret_cast<ViewerGLBindBufferBaseProc>(glfwGetProcAddress("glBindBufferBase"));
     a.dispatchCompute = reinterpret_cast<ViewerGLDispatchComputeProc>(glfwGetProcAddress("glDispatchCompute"));
     a.memoryBarrier = reinterpret_cast<ViewerGLMemoryBarrierProc>(glfwGetProcAddress("glMemoryBarrier"));
@@ -774,6 +777,7 @@ const ViewerGlComputeApi& viewerGlComputeApi() {
                   a.attachShader != nullptr && a.linkProgram != nullptr && a.getProgramiv != nullptr &&
                   a.getProgramInfoLog != nullptr && a.deleteShader != nullptr && a.deleteProgram != nullptr &&
                   a.useProgram != nullptr && a.getUniformLocation != nullptr && a.uniform1i != nullptr &&
+                  a.uniform1f != nullptr &&
                   a.bindBufferBase != nullptr && a.dispatchCompute != nullptr && a.memoryBarrier != nullptr;
     return a;
   }();
@@ -926,6 +930,7 @@ struct InputCloudComputeCache {
   GLint circularHslLoc = -1;
   GLint circularHsvLoc = -1;
   GLint normConeNormalizedLoc = -1;
+  GLint pointAlphaScaleLoc = -1;
   uint64_t builtSerial = 0;
   GLsizei pointCount = 0;
   bool available = false;
@@ -1198,6 +1203,7 @@ bool runViewerCudaStartupSelfTest(std::string* reason) {
   };
   ChromaspaceCuda::InputRequest inputRequest{};
   inputRequest.pointCount = static_cast<int>(rawPoints.size() / 3u);
+  inputRequest.pointAlphaScale = 1.0f;
   inputRequest.remap.plotMode = 0;
   inputRequest.remap.normConeNormalized = 1;
 
@@ -1346,6 +1352,8 @@ bool ensureInputCloudComputeProgram(InputCloudComputeCache* cache);
 bool parseInputCloudSamples(const InputCloudPayload& cloud, std::vector<InputCloudSample>* samples);
 bool cubeSliceContainsPoint(const PlotRemapSpec& spec, float r, float g, float b);
 bool cubeSliceContainsPoint(const ResolvedPayload& payload, float r, float g, float b);
+float pointAlphaScaleForPointSize(float pointSize);
+float scaledPointAlpha(float baseAlpha, float pointSize);
 size_t overlayIdentityPointCap(const ResolvedPayload& payload, int cubeSize);
 bool buildInputCloudMeshCpu(const ResolvedPayload& payload,
                             const InputCloudPayload& cloud,
@@ -2403,6 +2411,7 @@ uniform int uPlotMode;
 uniform int uCircularHsl;
 uniform int uCircularHsv;
 uniform int uNormConeNormalized;
+uniform float uPointAlphaScale;
 
 const float kTau = 6.28318530717958647692;
 const float kPi = 3.14159265358979323846;
@@ -2612,7 +2621,7 @@ void main() {
   colorVals[colorBase + 0u] = cr;
   colorVals[colorBase + 1u] = cg;
   colorVals[colorBase + 2u] = cb;
-  colorVals[colorBase + 3u] = (uShowOverflow != 0 && uHighlightOverflow != 0 && overflowPoint) ? 0.95 : 0.72;
+  colorVals[colorBase + 3u] = ((uShowOverflow != 0 && uHighlightOverflow != 0 && overflowPoint) ? 0.95 : 0.72) * uPointAlphaScale;
 }
 )GLSL";
 
@@ -2653,13 +2662,15 @@ void main() {
   cache->circularHslLoc = api.getUniformLocation(program, "uCircularHsl");
   cache->circularHsvLoc = api.getUniformLocation(program, "uCircularHsv");
   cache->normConeNormalizedLoc = api.getUniformLocation(program, "uNormConeNormalized");
+  cache->pointAlphaScaleLoc = api.getUniformLocation(program, "uPointAlphaScale");
   cache->available = cache->pointCountLoc >= 0 &&
                      cache->showOverflowLoc >= 0 &&
                      cache->highlightOverflowLoc >= 0 &&
                      cache->plotModeLoc >= 0 &&
                      cache->circularHslLoc >= 0 &&
                      cache->circularHsvLoc >= 0 &&
-                     cache->normConeNormalizedLoc >= 0;
+                     cache->normConeNormalizedLoc >= 0 &&
+                     cache->pointAlphaScaleLoc >= 0;
   if (!cache->available) {
     logViewerEvent("Input-cloud compute program missing one or more uniforms; falling back to CPU.");
     releaseInputCloudComputeCache(cache);
@@ -2822,6 +2833,7 @@ bool buildInputCloudMeshOnGpu(const ResolvedPayload& payload,
   if (pointCount == 0) return false;
   ChromaspaceMetal::InputRequest request{};
   request.pointCount = static_cast<int>(pointCount);
+  request.pointAlphaScale = pointAlphaScaleForPointSize(payload.pointSize);
   request.remap = makeMetalRemapUniforms(uniforms);
   MeshData mesh{};
   mesh.resolution = cloud.resolution <= 25 ? 25 : (cloud.resolution <= 41 ? 41 : 57);
@@ -2866,6 +2878,7 @@ bool buildInputCloudMeshOnGpu(const ResolvedPayload& payload,
       bufferApi.bindBuffer(GL_ARRAY_BUFFER, 0);
       ChromaspaceCuda::InputRequest request{};
       request.pointCount = static_cast<int>(pointCount);
+      request.pointAlphaScale = pointAlphaScaleForPointSize(payload.pointSize);
       request.remap = makeCudaRemapUniforms(uniforms);
       std::string error;
       if (ChromaspaceCuda::buildInputMesh(reinterpret_cast<ChromaspaceCuda::InputCache*>(cudaCache),
@@ -2930,6 +2943,7 @@ bool buildInputCloudMeshOnGpu(const ResolvedPayload& payload,
   computeApi.uniform1i(cache->circularHslLoc, uniforms.circularHsl);
   computeApi.uniform1i(cache->circularHsvLoc, uniforms.circularHsv);
   computeApi.uniform1i(cache->normConeNormalizedLoc, uniforms.normConeNormalized);
+  computeApi.uniform1f(cache->pointAlphaScaleLoc, pointAlphaScaleForPointSize(payload.pointSize));
   computeApi.bindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, cache->input);
   computeApi.bindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, cache->verts);
   computeApi.bindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, cache->colors);
@@ -3119,7 +3133,7 @@ bool parseParamsMessage(const std::string& line, ResolvedPayload* out) {
   int chromaticityPlanckianLocus = 1;
   extractInt(line, "chromaticityPlanckianLocus", &chromaticityPlanckianLocus);
   p.chromaticityPlanckianLocus = (chromaticityPlanckianLocus != 0);
-  p.pointSize = clampf(p.pointSize, 0.35f, 4.0f);
+  p.pointSize = clampf(p.pointSize, 0.35f, 3.0f);
   p.pointDensity = clampf(p.pointDensity, 0.1f, 4.0f);
   p.neutralRadius = clampf(p.neutralRadius, 0.0f, 1.0f);
   p.overflowHighlightR = clamp01(p.overflowHighlightR);
@@ -3253,9 +3267,14 @@ float normalizedNeutralRadiusForPoint(const PlotRemapSpec& spec, float r, float 
   }
 }
 
+float effectiveNeutralRadiusThreshold(float sliderValue) {
+  constexpr float kNeutralRadiusResponsePower = 2.0f;
+  return clampf(std::pow(clampf(sliderValue, 0.0f, 1.0f), kNeutralRadiusResponsePower), 0.0f, 1.0f);
+}
+
 bool neutralRadiusContainsPoint(const PlotRemapSpec& spec, float r, float g, float b) {
   if (!spec.neutralRadiusEnabled || spec.plotMode == PlotModeKind::Chromaticity || spec.showOverflow) return true;
-  return normalizedNeutralRadiusForPoint(spec, r, g, b) <= spec.neutralRadius + 1e-6f;
+  return normalizedNeutralRadiusForPoint(spec, r, g, b) <= effectiveNeutralRadiusThreshold(spec.neutralRadius) + 1e-6f;
 }
 
 bool cubeSliceContainsPoint(const PlotRemapSpec& spec, float r, float g, float b) {
@@ -3755,6 +3774,18 @@ Vec3 mapPointToPlotMode(const ResolvedPayload& payload, float r, float g, float 
   return mapPointToPlotMode(makePlotRemapSpec(payload), r, g, b);
 }
 
+float pointAlphaScaleForPointSize(float pointSize) {
+  const float size = clampf(pointSize, 0.35f, 3.0f);
+  if (size <= 1.5f) return 1.0f;
+  const float t = clampf((size - 1.5f) / 1.5f, 0.0f, 1.0f);
+  const float eased = t * t * (3.0f - 2.0f * t);
+  return clampf(1.0f + 0.28f * eased, 1.0f, 1.28f);
+}
+
+float scaledPointAlpha(float baseAlpha, float pointSize) {
+  return clampf(baseAlpha * pointAlphaScaleForPointSize(pointSize), 0.0f, 1.0f);
+}
+
 size_t overlayIdentityPointCap(const ResolvedPayload& payload, int cubeSize) {
   const size_t total = static_cast<size_t>(cubeSize) * static_cast<size_t>(cubeSize) * static_cast<size_t>(cubeSize);
   (void)payload;
@@ -3869,6 +3900,7 @@ bool buildIdentityMesh(const ResolvedPayload& payload, MeshData* out) {
   mesh.serial = nextMeshSerial();
   mesh.pointVerts.reserve(static_cast<size_t>(mesh.resolution) * mesh.resolution * mesh.resolution * 3u);
   mesh.pointColors.reserve(static_cast<size_t>(mesh.resolution) * mesh.resolution * mesh.resolution * 4u);
+  const float pointAlpha = scaledPointAlpha(0.72f, payload.pointSize);
   const int denom = std::max(1, mesh.resolution - 1);
   for (int bz = 0; bz < mesh.resolution; ++bz) {
     for (int gy = 0; gy < mesh.resolution; ++gy) {
@@ -3886,7 +3918,7 @@ bool buildIdentityMesh(const ResolvedPayload& payload, MeshData* out) {
         mesh.pointColors.push_back(cr);
         mesh.pointColors.push_back(cg);
         mesh.pointColors.push_back(cb);
-        mesh.pointColors.push_back(0.72f);
+        mesh.pointColors.push_back(pointAlpha);
       }
     }
   }
@@ -3903,6 +3935,8 @@ bool buildInputCloudMeshCpu(const ResolvedPayload& payload,
                             MeshData* out) {
   if (!out) return false;
   const PlotRemapSpec remap = makePlotRemapSpec(payload);
+  const float normalAlpha = scaledPointAlpha(0.72f, payload.pointSize);
+  const float overflowAlpha = scaledPointAlpha(0.95f, payload.pointSize);
   MeshData mesh{};
   mesh.resolution = cloud.resolution <= 25 ? 25 : (cloud.resolution <= 41 ? 41 : 57);
   mesh.quality = cloud.quality;
@@ -3928,7 +3962,7 @@ bool buildInputCloudMeshCpu(const ResolvedPayload& payload,
     mesh.pointColors.push_back(cr);
     mesh.pointColors.push_back(cg);
     mesh.pointColors.push_back(cb);
-    mesh.pointColors.push_back(overflowHighlightApplies(remap, r, g, b) ? 0.95f : 0.72f);
+    mesh.pointColors.push_back(overflowHighlightApplies(remap, r, g, b) ? overflowAlpha : normalAlpha);
   }
   if (mesh.pointVerts.empty()) return false;
   mesh.pointCount = mesh.pointVerts.size() / 3u;
@@ -6124,9 +6158,17 @@ void cursorPosCallback(GLFWwindow* window, double xpos, double ypos) {
                       glfwGetKey(window, GLFW_KEY_RIGHT_CONTROL) == GLFW_PRESS ||
                       nativeControlModifierPressed();
     const float zoomScale = ctrl ? 0.02f : (shift ? (0.01f * shiftPrecisionFactor()) : 0.01f);
+    const float verticalZoomDrag = dy;
+    const float horizontalZoomDrag = -dx;
+    const float zoomDrag =
+        (verticalZoomDrag * horizontalZoomDrag > 0.0f)
+            ? (verticalZoomDrag + horizontalZoomDrag)
+            : (std::fabs(verticalZoomDrag) >= std::fabs(horizontalZoomDrag)
+                   ? verticalZoomDrag
+                   : horizontalZoomDrag);
     if (ctrl) app->speedFeedbackUntil = glfwGetTime() + 0.18;
     if (!ctrl && shift) app->slowFeedbackUntil = glfwGetTime() + 0.18;
-    app->cam.distance = clampf(app->cam.distance * std::exp(dy * zoomScale),
+    app->cam.distance = clampf(app->cam.distance * std::exp(zoomDrag * zoomScale),
                                minCameraDistanceForView(app->cam),
                                kMaxCameraDistance);
     return;
@@ -6912,6 +6954,11 @@ int main() {
       backgroundR = clamp01(backgroundR * 0.82f + 0.05f);
       backgroundG = clamp01(backgroundG * 0.86f + 0.09f);
       backgroundB = clamp01(backgroundB * 1.10f + 0.20f);
+    }
+    if (resolved.neutralRadiusEnabled) {
+      backgroundR = 0.118f;
+      backgroundG = 0.110f;
+      backgroundB = 0.102f;
     }
     glClearColor(backgroundR, backgroundG, backgroundB, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);

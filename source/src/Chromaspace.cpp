@@ -81,8 +81,8 @@ using namespace OFX;
 constexpr const char* kPluginIdentifier = "com.moazelgabry.chromaspace";
 constexpr const char* kPluginGrouping = "Moaz Elgabry";
 constexpr int kPluginVersionMajor = 1;
-constexpr int kPluginVersionMinor = 1;
-constexpr const char* kPluginVersionLabel = "v1.0.1";
+constexpr int kPluginVersionMinor = 2;
+constexpr const char* kPluginVersionLabel = "v1.0.2";
 constexpr const char* kPluginName = "Chromaspace";
 constexpr const char* kWebsiteUrl = "https://moazelgabry.com";
 constexpr const char* kReleasesUrl = "https://github.com/MoazElgabry/Chromaspace/releases/latest";
@@ -557,8 +557,12 @@ const char* samplingModeLabelForIndex(int index) {
 // Larger splats need fewer points to stay readable, while smaller splats need a denser cloud to avoid thinning out.
 // The exponent keeps the compensation gentle rather than making point size feel like a hidden quality control.
 float derivedDensityScaleForPointSize(double pointSize) {
-  const float size = clampf(static_cast<float>(pointSize), 0.35f, 1.0f);
-  return clampf(std::pow(0.6f / size, 0.6f), 0.85f, 1.3f);
+  const float size = clampf(static_cast<float>(pointSize), 0.35f, 3.0f);
+  if (size <= 1.0f) {
+    return clampf(std::pow(0.6f / size, 0.6f), 0.85f, 1.3f);
+  }
+  const float t = clampf((size - 1.0f) / 2.0f, 0.0f, 1.0f);
+  return clampf(0.85f + 0.20f * std::pow(t, 0.75f), 0.85f, 1.05f);
 }
 
 double halton(uint32_t index, uint32_t base) {
@@ -625,6 +629,11 @@ float wrapHue01(float h) {
   h = std::fmod(h, 1.0f);
   if (h < 0.0f) h += 1.0f;
   return h;
+}
+
+float effectiveNeutralRadiusThreshold(float sliderValue) {
+  constexpr float kNeutralRadiusResponsePower = 2.0f;
+  return clampf(std::pow(clampf(sliderValue, 0.0f, 1.0f), kNeutralRadiusResponsePower), 0.0f, 1.0f);
 }
 
 float rawRgbHue01(float r, float g, float b, float cMax, float delta) {
@@ -884,7 +893,31 @@ float normalizedNeutralRadiusForSlice(const SliceSelectionSpec& spec, float r, f
 
 bool neutralRadiusContainsPoint(const SliceSelectionSpec& spec, float r, float g, float b) {
   if (!spec.neutralRadiusEnabled) return true;
-  return normalizedNeutralRadiusForSlice(spec, r, g, b) <= spec.neutralRadius + 1e-6f;
+  return normalizedNeutralRadiusForSlice(spec, r, g, b) <= effectiveNeutralRadiusThreshold(spec.neutralRadius) + 1e-6f;
+}
+
+float neutralRadiusSamplingAcceptanceProbability(const SliceSelectionSpec& spec, float normalizedRadius) {
+  if (!spec.neutralRadiusEnabled) return 1.0f;
+  const float threshold = effectiveNeutralRadiusThreshold(spec.neutralRadius);
+  if (threshold <= 1e-6f) return normalizedRadius <= threshold + 1e-6f ? 1.0f : 0.0f;
+  if (normalizedRadius > threshold + 1e-6f) return 0.0f;
+  const float clippedFraction = clampf(1.0f - threshold, 0.0f, 1.0f);
+  const float normalizedInside = clampf(normalizedRadius / threshold, 0.0f, 1.0f);
+  const float edgePenalty = 0.78f * clippedFraction;
+  return clampf(1.0f - edgePenalty * std::pow(normalizedInside, 1.35f), 0.0f, 1.0f);
+}
+
+bool neutralRadiusSamplingAcceptsPoint(const SliceSelectionSpec& spec,
+                                       float r,
+                                       float g,
+                                       float b,
+                                       uint32_t samplingSeed) {
+  if (!spec.neutralRadiusEnabled) return true;
+  const float normalizedRadius = normalizedNeutralRadiusForSlice(spec, r, g, b);
+  const float acceptProbability = neutralRadiusSamplingAcceptanceProbability(spec, normalizedRadius);
+  if (acceptProbability <= 0.0f) return false;
+  if (acceptProbability >= 0.999999f) return true;
+  return unitHash01(samplingSeed) <= static_cast<double>(acceptProbability);
 }
 
 bool volumeSliceContainsPoint(const SliceSelectionSpec& spec, float r, float g, float b) {
@@ -1414,9 +1447,21 @@ class ChromaspaceEffect : public ImageEffect {
       }
       return;
     }
+    if (paramName == "cubeViewerPlotDisplayLinear" ||
+        paramName == "cubeViewerPlotDisplayLinearTransfer") {
+      cubeViewerDebugLog(std::string("changedParam(") + paramName + ")");
+      updateDrawOnImageModeUi(args.time);
+      invalidateCubeViewerCloudState();
+      if (cubeViewerRequested_) {
+        pushParamsUpdate(args.time, paramName);
+        (void)trySendCachedCloud(args.time, paramName);
+      }
+      return;
+    }
     if (paramName == "cubeViewerNeutralRadius") {
       cubeViewerDebugLog(std::string("changedParam(cubeViewerNeutralRadius) -> ") +
                          std::to_string(currentNeutralRadiusValue(args.time)));
+      requestCubeViewerCloudResample();
       if (cubeViewerRequested_) {
         pushParamsUpdate(args.time, "cubeViewerNeutralRadius");
       }
@@ -2028,6 +2073,26 @@ class ChromaspaceEffect : public ImageEffect {
     return !currentDrawOnImageMode(time) && currentPlotMode(time) == "chromaticity";
   }
 
+  bool currentPlotDisplayLinearAllowed(double time) {
+    return !currentDrawOnImageMode(time) && !currentChromaticityPlotMode(time);
+  }
+
+  bool currentPlotDisplayLinearEnabled(double time) {
+    return currentPlotDisplayLinearAllowed(time) &&
+           getBoolValue("cubeViewerPlotDisplayLinear", time, false);
+  }
+
+  int currentPlotDisplayLinearTransferChoice(double time) {
+    return std::clamp(getChoiceValue("cubeViewerPlotDisplayLinearTransfer", time,
+                                     WorkshopColor::transferFunctionChoiceIndex(
+                                         WorkshopColor::TransferFunctionId::Gamma24)),
+                      0, static_cast<int>(WorkshopColor::transferFunctionCount()) - 1);
+  }
+
+  WorkshopColor::TransferFunctionId currentPlotDisplayLinearTransferId(double time) {
+    return WorkshopColor::transferFunctionIdFromChoiceIndex(currentPlotDisplayLinearTransferChoice(time));
+  }
+
   bool currentDrawOnImageMode(double time) {
     return getBoolValue("cubeViewerDrawOnImageEnabled", time, false);
   }
@@ -2421,6 +2486,10 @@ class ChromaspaceEffect : public ImageEffect {
       toggle->setLabel(drawOnImage ? "Switch to 3D Viewer" : "Switch to Identity Generator");
     }
     setParamVisibility(fetchPushButtonParam("openCubeViewer"), !drawOnImage);
+    setParamVisibility(fetchBooleanParam("cubeViewerPlotDisplayLinear"),
+                       !drawOnImage && !chromaticityMode);
+    setParamVisibility(fetchChoiceParam("cubeViewerPlotDisplayLinearTransfer"),
+                       !drawOnImage && !chromaticityMode && currentPlotDisplayLinearEnabled(time));
     setParamVisibility(fetchChoiceParam("cubeViewerPlotModel"), !drawOnImage);
     syncShowOverflowSupport(time);
     syncCubeSlicingUi(time);
@@ -2507,6 +2576,11 @@ class ChromaspaceEffect : public ImageEffect {
     }
   }
 
+  void requestCubeViewerCloudResample() {
+    lastCloudTime_ = std::numeric_limits<double>::quiet_NaN();
+    lastCloudBuiltAt_ = std::chrono::steady_clock::time_point{};
+  }
+
   std::string currentQualityLabel(double time) {
     return qualityLabelForIndex(getChoiceValue("cubeViewerQuality", time, cubeViewerQuality_));
   }
@@ -2530,6 +2604,8 @@ class ChromaspaceEffect : public ImageEffect {
     const bool circularHsl = currentCircularHsl(time);
     const bool circularHsv = currentCircularHsv(time);
     const bool normConeNormalized = getBoolValue("cubeViewerNormConeNormalized", time, true);
+    const bool plotDisplayLinear = currentPlotDisplayLinearEnabled(time);
+    const int plotDisplayLinearTransfer = currentPlotDisplayLinearTransferChoice(time);
     const int chromaticityInputPrimaries = currentChromaticityInputPrimariesChoice(time);
     const int chromaticityInputTransfer = currentChromaticityInputTransferChoice(time);
     const int chromaticityReferenceBasis = currentChromaticityReferenceBasisChoice(time);
@@ -2546,6 +2622,8 @@ class ChromaspaceEffect : public ImageEffect {
          << "|circularHsl=" << (circularHsl ? 1 : 0)
          << "|circularHsv=" << (circularHsv ? 1 : 0)
          << "|normConeNormalized=" << (normConeNormalized ? 1 : 0)
+         << "|plotDisplayLinear=" << (plotDisplayLinear ? 1 : 0)
+         << "|plotDisplayLinearTransfer=" << plotDisplayLinearTransfer
          << "|chromaticityInputPrimaries=" << chromaticityInputPrimaries
          << "|chromaticityInputTransfer=" << chromaticityInputTransfer
          << "|chromaticityReferenceBasis=" << chromaticityReferenceBasis
@@ -2587,6 +2665,8 @@ class ChromaspaceEffect : public ImageEffect {
     const bool circularHsl = currentCircularHsl(time);
     const bool circularHsv = currentCircularHsv(time);
     const bool normConeNormalized = getBoolValue("cubeViewerNormConeNormalized", time, true);
+    const bool plotDisplayLinear = currentPlotDisplayLinearEnabled(time);
+    const int plotDisplayLinearTransfer = currentPlotDisplayLinearTransferChoice(time);
     const int chromaticityInputPrimaries = currentChromaticityInputPrimariesChoice(time);
     const int chromaticityInputTransfer = currentChromaticityInputTransferChoice(time);
     const int chromaticityReferenceBasis = currentChromaticityReferenceBasisChoice(time);
@@ -2621,6 +2701,8 @@ class ChromaspaceEffect : public ImageEffect {
         << ",\"circularHsv\":" << (circularHsv ? 1 : 0)
         << ",\"cloudSettingsKey\":\"" << jsonEscape(cloudSettingsKey) << "\""
         << ",\"normConeNormalized\":" << (normConeNormalized ? 1 : 0)
+        << ",\"plotDisplayLinear\":" << (plotDisplayLinear ? 1 : 0)
+        << ",\"plotDisplayLinearTransfer\":" << plotDisplayLinearTransfer
         << ",\"chromaticityInputPrimaries\":" << chromaticityInputPrimaries
         << ",\"chromaticityInputTransfer\":" << chromaticityInputTransfer
         << ",\"chromaticityReferenceBasis\":" << chromaticityReferenceBasis
@@ -2667,6 +2749,8 @@ class ChromaspaceEffect : public ImageEffect {
                         " circularHsl=" + (circularHsl ? "1" : "0") +
                         " circularHsv=" + (circularHsv ? "1" : "0") +
                         " normConeNormalized=" + (normConeNormalized ? "1" : "0") +
+                         " plotDisplayLinear=" + (plotDisplayLinear ? "1" : "0") +
+                         " plotDisplayLinearTransfer=" + std::to_string(plotDisplayLinearTransfer) +
                          " quality=" + qualityLabelForIndex(qualityIndex) +
                          " sampling=" + samplingModeLabelForIndex(samplingMode) +
                          " occupancyFill=" + (occupancyFill ? "1" : "0") +
@@ -2709,6 +2793,12 @@ class ChromaspaceEffect : public ImageEffect {
 
   float sampledChannelValue(float value, bool preserveOverflow) const {
     return preserveOverflow ? value : clamp01(value);
+  }
+
+  WorkshopColor::Vec3f transformCloudSampleForPlot(double time, float r, float g, float b) {
+    WorkshopColor::Vec3f sample{r, g, b};
+    if (!currentPlotDisplayLinearEnabled(time)) return sample;
+    return WorkshopColor::decodeToLinear(sample, currentPlotDisplayLinearTransferId(time));
   }
 
   void appendCloudPointSample(std::string* pts, bool* first, float xNorm, float yNorm, float r, float g, float b) const {
@@ -2755,6 +2845,7 @@ class ChromaspaceEffect : public ImageEffect {
       float r = 0.0f;
       float g = 0.0f;
       float b = 0.0f;
+      float normalizedNeutralRadius = 0.0f;
       int bin = 0;
       int binRank = 0;
       uint32_t tie = 0;
@@ -2768,6 +2859,7 @@ class ChromaspaceEffect : public ImageEffect {
     const bool preserveOverflow = currentShowOverflow(time);
     const bool occupancyFill = currentOccupancyGuidedFill(time);
     const SliceSelectionSpec hueSliceSpec = currentHueSectorSliceSpec(time);
+    const float effectiveNeutralRadius = effectiveNeutralRadiusThreshold(hueSliceSpec.neutralRadius);
     const bool anyHueRegionSelected = hueSliceSpec.cubeSliceRed || hueSliceSpec.cubeSliceGreen ||
                                       hueSliceSpec.cubeSliceBlue || hueSliceSpec.cubeSliceCyan ||
                                       hueSliceSpec.cubeSliceYellow || hueSliceSpec.cubeSliceMagenta;
@@ -2777,7 +2869,12 @@ class ChromaspaceEffect : public ImageEffect {
     const int scaledHeight = std::max(1, static_cast<int>(std::lround(static_cast<double>(height) * scaleFactor)));
     const int pointCount = std::max(512, static_cast<int>(std::lround(
         static_cast<double>(qualityPointCountForIndex(qualityIndex, previewMode)) * scaleFactor * scaleFactor)));
-    const int selectionRetryMultiplier = (hueSliceSpec.enabled || hueSliceSpec.neutralRadiusEnabled) ? 12 : 1;
+    int selectionRetryMultiplier = hueSliceSpec.enabled ? 12 : 1;
+    if (hueSliceSpec.neutralRadiusEnabled) {
+      const int neutralRetryMultiplier =
+          8 + static_cast<int>(std::lround(clampf(1.0f - effectiveNeutralRadius, 0.0f, 1.0f) * 18.0f));
+      selectionRetryMultiplier = std::max(selectionRetryMultiplier, neutralRetryMultiplier);
+    }
     const int maxPrimaryAttempts = selectionImpossible
                                        ? 0
                                        : (selectionRetryMultiplier <= 1
@@ -2822,13 +2919,10 @@ class ChromaspaceEffect : public ImageEffect {
       *outU = std::clamp(u, 0.0, 1.0);
       *outV = std::clamp(v, 0.0, 1.0);
     };
-    auto sampleAcceptedBySelection = [&](int x, int y, float r, float g, float b) {
+    auto sampleAcceptedBySelection = [&](int x, int y, float r, float g, float b, uint32_t samplingSeed) {
       (void)x;
       (void)y;
-      (void)r;
-      (void)g;
-      (void)b;
-      return true;
+      return neutralRadiusSamplingAcceptsPoint(hueSliceSpec, r, g, b, samplingSeed);
     };
 
     for (int attemptIndex = 0; attemptIndex < maxPrimaryAttempts && primaryAccepted < pointCount; ++attemptIndex) {
@@ -2842,10 +2936,17 @@ class ChromaspaceEffect : public ImageEffect {
       const int y = std::clamp(static_cast<int>(((static_cast<double>(sy) + 0.5) / static_cast<double>(scaledHeight)) * static_cast<double>(height)), 0, height - 1);
       const float* pix = fetchPixel(x, y);
       if (!pix) continue;
-      const float r = sampledChannelValue(pix[0], preserveOverflow);
-      const float g = sampledChannelValue(pix[1], preserveOverflow);
-      const float b = sampledChannelValue(pix[2], preserveOverflow);
-      if (!sampleAcceptedBySelection(x, y, r, g, b)) continue;
+      const WorkshopColor::Vec3f linearSample = transformCloudSampleForPlot(
+          time,
+          sampledChannelValue(pix[0], preserveOverflow),
+          sampledChannelValue(pix[1], preserveOverflow),
+          sampledChannelValue(pix[2], preserveOverflow));
+      const float r = linearSample.x;
+      const float g = linearSample.y;
+      const float b = linearSample.z;
+      const uint32_t samplingSeed = static_cast<uint32_t>(attemptIndex * 2654435761u) ^
+                                    static_cast<uint32_t>(x * 911u + y * 3571u);
+      if (!sampleAcceptedBySelection(x, y, r, g, b, samplingSeed)) continue;
       const float xNorm = static_cast<float>((static_cast<double>(x) + 0.5) / static_cast<double>(width));
       const float yNorm = static_cast<float>((static_cast<double>(y) + 0.5) / static_cast<double>(height));
       appendCloudPointSample(&pts, &first, xNorm, yNorm, r, g, b);
@@ -2875,10 +2976,17 @@ class ChromaspaceEffect : public ImageEffect {
         const int y = std::clamp(static_cast<int>(((static_cast<double>(sy) + 0.5) / static_cast<double>(scaledHeight)) * static_cast<double>(height)), 0, height - 1);
         const float* pix = fetchPixel(x, y);
         if (!pix) continue;
-        const float r = sampledChannelValue(pix[0], preserveOverflow);
-        const float g = sampledChannelValue(pix[1], preserveOverflow);
-        const float b = sampledChannelValue(pix[2], preserveOverflow);
-        if (!sampleAcceptedBySelection(x, y, r, g, b)) continue;
+        const WorkshopColor::Vec3f linearSample = transformCloudSampleForPlot(
+            time,
+            sampledChannelValue(pix[0], preserveOverflow),
+            sampledChannelValue(pix[1], preserveOverflow),
+            sampledChannelValue(pix[2], preserveOverflow));
+        const float r = linearSample.x;
+        const float g = linearSample.y;
+        const float b = linearSample.z;
+        const uint32_t samplingSeed = static_cast<uint32_t>((attemptIndex + 1) * 2246822519u) ^
+                                      static_cast<uint32_t>(x * 977u + y * 4051u);
+        if (!sampleAcceptedBySelection(x, y, r, g, b, samplingSeed)) continue;
         const int bin = occupancyBinIndex(r, g, b, preserveOverflow);
         OccupancyCandidate candidate{};
         candidate.xNorm = static_cast<float>((static_cast<double>(x) + 0.5) / static_cast<double>(width));
@@ -2886,6 +2994,7 @@ class ChromaspaceEffect : public ImageEffect {
         candidate.r = r;
         candidate.g = g;
         candidate.b = b;
+        candidate.normalizedNeutralRadius = normalizedNeutralRadiusForSlice(hueSliceSpec, r, g, b);
         candidate.bin = bin;
         candidate.binRank = binCandidateRank[bin]++;
         candidate.tie = static_cast<uint32_t>(attemptIndex);
@@ -2893,6 +3002,10 @@ class ChromaspaceEffect : public ImageEffect {
       }
       std::sort(candidates.begin(), candidates.end(), [&](const OccupancyCandidate& a, const OccupancyCandidate& b) {
         if (occupancy[a.bin] != occupancy[b.bin]) return occupancy[a.bin] < occupancy[b.bin];
+        if (hueSliceSpec.neutralRadiusEnabled &&
+            std::fabs(a.normalizedNeutralRadius - b.normalizedNeutralRadius) > 1e-6f) {
+          return a.normalizedNeutralRadius < b.normalizedNeutralRadius;
+        }
         if (a.binRank != b.binRank) return a.binRank < b.binRank;
         return a.tie < b.tie;
       });
@@ -2921,6 +3034,7 @@ class ChromaspaceEffect : public ImageEffect {
                        " sampling=" + samplingModeLabelForIndex(samplingMode) +
                        " occupancyFill=" + (occupancyFill ? "1" : "0") +
                        " hueSlice=" + (hueSliceSpec.enabled ? "1" : "0") +
+                       " neutralRadius=" + (hueSliceSpec.neutralRadiusEnabled ? std::to_string(effectiveNeutralRadius) : std::string("off")) +
                        " attempts=" + std::to_string(primaryAttempts) +
                        " accepted=" + std::to_string(primaryAccepted) +
                        " scale=" + scaleLabelForIndex(scaleIndex) +
@@ -2957,9 +3071,14 @@ class ChromaspaceEffect : public ImageEffect {
       for (int x = bounds.x1; x < bounds.x2; ++x) {
         const float* pix = reinterpret_cast<const float*>(src->getPixelAddress(x, y));
         if (!pix) continue;
-        const float r = sampledChannelValue(pix[0], preserveOverflow);
-        const float g = sampledChannelValue(pix[1], preserveOverflow);
-        const float b = sampledChannelValue(pix[2], preserveOverflow);
+        const WorkshopColor::Vec3f linearSample = transformCloudSampleForPlot(
+            time,
+            sampledChannelValue(pix[0], preserveOverflow),
+            sampledChannelValue(pix[1], preserveOverflow),
+            sampledChannelValue(pix[2], preserveOverflow));
+        const float r = linearSample.x;
+        const float g = linearSample.y;
+        const float b = linearSample.z;
         if (!first) pts.push_back(';');
         first = false;
         char sample[96];
@@ -3028,9 +3147,14 @@ class ChromaspaceEffect : public ImageEffect {
           const int x = std::clamp(static_cast<int>(std::lround(localX)), 0, width - 1);
           const float* pix = fetchPixel(x, y);
           if (!pix) continue;
-          const float r = sampledChannelValue(pix[0], preserveOverflow);
-          const float g = sampledChannelValue(pix[1], preserveOverflow);
-          const float b = sampledChannelValue(pix[2], preserveOverflow);
+        const WorkshopColor::Vec3f linearSample = transformCloudSampleForPlot(
+            time,
+            sampledChannelValue(pix[0], preserveOverflow),
+            sampledChannelValue(pix[1], preserveOverflow),
+            sampledChannelValue(pix[2], preserveOverflow));
+        const float r = linearSample.x;
+        const float g = linearSample.y;
+        const float b = linearSample.z;
           samples.push_back(r);
           samples.push_back(g);
           samples.push_back(b);
@@ -3107,9 +3231,14 @@ class ChromaspaceEffect : public ImageEffect {
             0, std::max(0, width - 1));
         const float* pix = fetchPixel(x, y);
         if (!pix) continue;
-        const float r = sampledChannelValue(pix[0], preserveOverflow);
-        const float g = sampledChannelValue(pix[1], preserveOverflow);
-        const float b = sampledChannelValue(pix[2], preserveOverflow);
+        const WorkshopColor::Vec3f linearSample = transformCloudSampleForPlot(
+            time,
+            sampledChannelValue(pix[0], preserveOverflow),
+            sampledChannelValue(pix[1], preserveOverflow),
+            sampledChannelValue(pix[2], preserveOverflow));
+        const float r = linearSample.x;
+        const float g = linearSample.y;
+        const float b = linearSample.z;
         if (!first) pts.push_back(';');
         first = false;
         char sample[96];
@@ -4413,7 +4542,7 @@ class ChromaspaceFactory : public PluginFactoryHelper<ChromaspaceFactory> {
           {"cubeViewerOnTop", "Keep the external viewer above the host application."},
           {"cubeViewerQuality", "Viewer sampling density for the 3D cube (Low=25^3, about 45k points; Medium=41^3, about 90k points; High=57^3, about 180k points)."},
           {"cubeViewerScale", "Scales the sampled image domain used for cube generation to lighten processing. 100% keeps full size, while lower values reduce cloud-build work."},
-          {"cubeViewerPointSize", "Makes points larger or smaller and automatically adjusts point density in the opposite direction to keep the cloud readable."},
+          {"cubeViewerPointSize", "Makes points larger or smaller and automatically adjusts point density in the opposite direction to keep the cloud readable. Sizes above 1.0 use a looser density reduction so the cloud can clump more densely instead of opening up too much."},
           {"cubeViewerSamplingMode", "Balanced uses a deterministic lattice for stable coverage, Stratified adds jitter for cleaner coverage, and Random gives a noisier organic scatter."},
           {"cubeViewerOccupancyGuidedFill", "Adds a second occupancy-guided pass after the normal image sampler so sparsely occupied RGB regions receive more support and the plot reads denser without switching to the instance-1 workflow."},
           {"cubeViewerPointShape", "Choose whether points are rendered as circular or square splats in the viewer."},
@@ -4422,7 +4551,7 @@ class ChromaspaceFactory : public PluginFactoryHelper<ChromaspaceFactory> {
           {"cubeViewerCircularHsl", "For HSL only: switch from the default HSL bicone view to a circular cylindrical HSL view with hue as angle, saturation as radius, and lightness as height. When overflow is enabled, out-of-range RGB values are converted with the raw HSL formula so useful out-of-bound cylindrical points remain visible."},
           {"cubeViewerCircularHsv", "For HSV only: switch from the default Smith hexcone view to a circular cylindrical HSV view with hue as angle, saturation as radius, and value as height."},
           {"cubeViewerLassoRegionMode", "When enabled, Volume Slicing uses a drawn lasso region on the image instead of the hue-sector filters."},
-          {"cubeViewerNeutralRadius", "Keep only samples within this normalized distance from the achromatic axis so the extreme outer saturation shell is hidden and the more typical image range is easier to inspect. Disabled while Show Overflow is enabled."},
+          {"cubeViewerNeutralRadius", "Keep only samples within this normalized distance from the achromatic axis so the extreme outer saturation shell is hidden and the more typical image range is easier to inspect."},
           {"cubeViewerSliceRed", "Show only the red sector. In Cube mode this is the red-dominant tetrahedral region; in the other plot models it is the red-centered hue sector."},
           {"cubeViewerSliceGreen", "Show only the green sector. In Cube mode this is the green-dominant tetrahedral region; in the other plot models it is the green-centered hue sector."},
           {"cubeViewerSliceBlue", "Show only the blue sector. In Cube mode this is the blue-dominant tetrahedral region; in the other plot models it is the blue-centered hue sector."},
@@ -4444,6 +4573,8 @@ class ChromaspaceFactory : public PluginFactoryHelper<ChromaspaceFactory> {
 {"cubeViewerSampleDrawnCubeSize", "Sets the identity-strip resolution from 4 to 65. In the identity generator this controls the generated strip density, and in a downstream instance it should match instance 1 so the strip can be decoded correctly."},
 {"cubeViewerModeToggle", "Switch between the 3D viewer and the identity generator. The identity generator burns the identity strip into the image and hides plot-only controls."},
           {"cubeViewerPlotModel", "Choose which 3D color geometry is used to plot the current signal: RGB cube, HSL bicone or circular HSL, HSV hexcone or circular HSV, Chen, Norm-Cone, JP-Conical, Reuleaux, or Chromaticity xyY."},
+          {"cubeViewerPlotDisplayLinear", "Decode sampled input values from the selected input transfer function to linear light before building the 3D plot. Intended for non-chromaticity plot modes."},
+          {"cubeViewerPlotDisplayLinearTransfer", "Choose the assumed input transfer function used when Plot in Display Linear is enabled."},
           {"cubeViewerNormConeNormalized", "For Norm-Cone only: when enabled, use the normalized cone chroma from JP's DCTL; when disabled, use the raw spherical chroma variant instead."},
           {"cubeViewerChromaticityInputPrimaries", "Choose the assumed input primaries used to convert incoming RGB into XYZ before plotting chromaticity xyY."},
           {"cubeViewerChromaticityInputTransfer", "Choose the assumed input transfer function used to decode incoming RGB to linear light before chromaticity conversion."},
@@ -4477,6 +4608,22 @@ class ChromaspaceFactory : public PluginFactoryHelper<ChromaspaceFactory> {
     auto* openCubeViewer = d.definePushButtonParam("openCubeViewer");
     openCubeViewer->setLabel("Open 3D Viewer");
     if (const char* hint = tooltipFor("openCubeViewer")) openCubeViewer->setHint(hint);
+
+    auto* cubeViewerPlotDisplayLinear = d.defineBooleanParam("cubeViewerPlotDisplayLinear");
+    cubeViewerPlotDisplayLinear->setLabel("Plot in Display Linear");
+    cubeViewerPlotDisplayLinear->setDefault(false);
+    if (const char* hint = tooltipFor("cubeViewerPlotDisplayLinear")) cubeViewerPlotDisplayLinear->setHint(hint);
+
+    auto* cubeViewerPlotDisplayLinearTransfer = d.defineChoiceParam("cubeViewerPlotDisplayLinearTransfer");
+    cubeViewerPlotDisplayLinearTransfer->setLabel("Input Transfer Function");
+    for (std::size_t i = 0; i < WorkshopColor::transferFunctionCount(); ++i) {
+      cubeViewerPlotDisplayLinearTransfer->appendOption(WorkshopColor::transferFunctionDefinition(i).label);
+    }
+    cubeViewerPlotDisplayLinearTransfer->setDefault(
+        WorkshopColor::transferFunctionChoiceIndex(WorkshopColor::TransferFunctionId::Gamma24));
+    cubeViewerPlotDisplayLinearTransfer->setIsSecret(true);
+    cubeViewerPlotDisplayLinearTransfer->setEnabled(false);
+    if (const char* hint = tooltipFor("cubeViewerPlotDisplayLinearTransfer")) cubeViewerPlotDisplayLinearTransfer->setHint(hint);
 
     auto* cubeViewerCircularHsl = d.defineBooleanParam("cubeViewerCircularHsl");
     cubeViewerCircularHsl->setLabel("Circular HSL");
@@ -4773,9 +4920,9 @@ class ChromaspaceFactory : public PluginFactoryHelper<ChromaspaceFactory> {
 
     auto* cubeViewerPointSize = d.defineDoubleParam("cubeViewerPointSize");
     cubeViewerPointSize->setLabel("Point Size");
-    cubeViewerPointSize->setDefault(0.800);
-    cubeViewerPointSize->setRange(0.35, 1.0);
-    cubeViewerPointSize->setDisplayRange(0.35, 1.0);
+    cubeViewerPointSize->setDefault(1.100);
+    cubeViewerPointSize->setRange(0.35, 3.0);
+    cubeViewerPointSize->setDisplayRange(0.35, 3.0);
     cubeViewerPointSize->setIncrement(0.025);
     cubeViewerPointSize->setParent(*grpCubeViewer);
     if (const char* hint = tooltipFor("cubeViewerPointSize")) cubeViewerPointSize->setHint(hint);

@@ -45,6 +45,7 @@ struct InputUniforms {
   int circularHsl;
   int circularHsv;
   int normConeNormalized;
+  float pointAlphaScale;
 };
 
 struct InputSampleUniforms {
@@ -89,6 +90,7 @@ struct InputUniforms {
   int circularHsl;
   int circularHsv;
   int normConeNormalized;
+  float pointAlphaScale;
 };
 
 struct InputSampleUniforms {
@@ -353,8 +355,8 @@ kernel void inputKernel(const device packed_float3* inputVals [[buffer(0)]],
     mapDisplayColor(r, g, b, cr, cg, cb);
   }
   colorVals[index] = float4(cr, cg, cb,
-                            (u.showOverflow != 0 && u.highlightOverflow != 0 &&
-                             overflowPoint) ? 0.95 : 0.72);
+                            ((u.showOverflow != 0 && u.highlightOverflow != 0 &&
+                              overflowPoint) ? 0.95 : 0.72) * u.pointAlphaScale);
 }
 
 kernel void inputSampleKernel(const device packed_float3* srcVerts [[buffer(0)]],
@@ -687,6 +689,7 @@ bool buildInputMesh(const InputRequest& request,
   uniforms.circularHsl = request.remap.circularHsl;
   uniforms.circularHsv = request.remap.circularHsv;
   uniforms.normConeNormalized = request.remap.normConeNormalized;
+  uniforms.pointAlphaScale = request.pointAlphaScale;
 
   id<MTLBuffer> inputBuffer = makeSharedBuffer(reinterpret_cast<const PackedFloat3*>(rawPoints.data()), pointCount);
   id<MTLBuffer> vertBuffer = makeEmptySharedBuffer(pointCount * sizeof(PackedFloat3));

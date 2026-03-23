@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(Chromaspace VERSION 1.0.1 LANGUAGES CXX)
-set(CUBE_DISPLAY_VERSION "1.0.1")
+project(Chromaspace VERSION 1.0.2 LANGUAGES CXX)
+set(CUBE_DISPLAY_VERSION "1.0.2")
 set(PLUGIN_BASENAME "Chromaspace")
 set(PLUGIN_IDENTIFIER "com.moazelgabry.chromaspace")
 set(LOCAL_OFX_SDK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/ofx-sdk")
@@ -66,6 +66,11 @@ find_package(Threads REQUIRED)
 find_package(OpenCL QUIET)
 find_package(CUDAToolkit QUIET)
 include(CheckLanguage)
+
+set(CHROMASPACE_CUDA_RUNTIME_TARGET CUDA::cudart)
+if(UNIX AND NOT APPLE AND CUDAToolkit_FOUND)
+  set(CHROMASPACE_CUDA_RUNTIME_TARGET CUDA::cudart_static)
+endif()
 
 option(CHROMASPACE_USE_BUNDLED_TEXT_DEPS "Use pinned bundled FreeType/HarfBuzz for viewer text rendering" ON)
 option(CHROMASPACE_TEXT_DEPS_ALLOW_SYSTEM "Allow resolving system FreeType/HarfBuzz when bundled text deps are disabled" OFF)
@@ -132,7 +137,7 @@ target_include_directories(${PLUGIN_BASENAME} PRIVATE
 
 if(CUDAToolkit_FOUND)
   target_compile_definitions(${PLUGIN_BASENAME} PRIVATE CHROMASPACE_HAS_CUDA)
-  target_link_libraries(${PLUGIN_BASENAME} PRIVATE CUDA::cudart)
+  target_link_libraries(${PLUGIN_BASENAME} PRIVATE ${CHROMASPACE_CUDA_RUNTIME_TARGET})
 endif()
 
 if(OpenCL_FOUND)
@@ -268,11 +273,15 @@ endif()
 if(CHROMASPACE_VIEWER_HAS_CUDA)
   target_compile_definitions(Chromaspace_CubeViewer PRIVATE CHROMASPACE_VIEWER_HAS_CUDA)
   target_include_directories(Chromaspace_CubeViewer PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
-  target_link_libraries(Chromaspace_CubeViewer PRIVATE CUDA::cudart)
+  target_link_libraries(Chromaspace_CubeViewer PRIVATE ${CHROMASPACE_CUDA_RUNTIME_TARGET})
+  set(_CHROMASPACE_VIEWER_CUDA_RUNTIME Shared)
+  if(UNIX AND NOT APPLE)
+    set(_CHROMASPACE_VIEWER_CUDA_RUNTIME Static)
+  endif()
   set_target_properties(Chromaspace_CubeViewer PROPERTIES
     CUDA_STANDARD 17
     CUDA_STANDARD_REQUIRED ON
-    CUDA_RUNTIME_LIBRARY Shared
+    CUDA_RUNTIME_LIBRARY ${_CHROMASPACE_VIEWER_CUDA_RUNTIME}
     CUDA_SEPARABLE_COMPILATION OFF)
 endif()
 target_link_libraries(Chromaspace_CubeViewer PRIVATE ${CHROMASPACE_TEXT_DEPS_TARGET})

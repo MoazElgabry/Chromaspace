@@ -56,6 +56,7 @@ struct InputKernelUniforms {
   int circularHsl;
   int circularHsv;
   int normConeNormalized;
+  float pointAlphaScale;
 };
 
 struct InputSampleKernelUniforms {
@@ -554,7 +555,7 @@ __global__ void inputKernel(float* verts, float* colors, const float* input, Inp
   colors[cbase + 0u] = cr;
   colors[cbase + 1u] = cg;
   colors[cbase + 2u] = cb;
-  colors[cbase + 3u] = (u.showOverflow != 0 && u.highlightOverflow != 0 && overflow) ? 0.95f : 0.72f;
+  colors[cbase + 3u] = ((u.showOverflow != 0 && u.highlightOverflow != 0 && overflow) ? 0.95f : 0.72f) * u.pointAlphaScale;
 }
 
 __global__ void inputSampleKernel(float* dstVerts,
@@ -758,6 +759,7 @@ bool buildInputMesh(InputCache* cache,
   uniforms.circularHsl = request.remap.circularHsl;
   uniforms.circularHsv = request.remap.circularHsv;
   uniforms.normConeNormalized = request.remap.normConeNormalized;
+  uniforms.pointAlphaScale = request.pointAlphaScale;
   return buildMesh(cache, pointCount, rawPoints.data(), rawPoints.size(), uniforms, launchInput, serial, error);
 }
 
