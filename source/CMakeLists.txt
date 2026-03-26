@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(Chromaspace VERSION 1.0.2 LANGUAGES CXX)
-set(CUBE_DISPLAY_VERSION "1.0.2")
+project(Chromaspace VERSION 1.0.3 LANGUAGES CXX)
+set(CUBE_DISPLAY_VERSION "1.0.3Beta")
 set(PLUGIN_BASENAME "Chromaspace")
 set(PLUGIN_IDENTIFIER "com.moazelgabry.chromaspace")
 set(LOCAL_OFX_SDK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/ofx-sdk")
@@ -86,6 +86,7 @@ if(APPLE)
   enable_language(OBJCXX)
 endif()
 set(CHROMASPACE_VIEWER_HAS_CUDA OFF)
+set(CHROMASPACE_PLUGIN_HAS_CUDA_KERNELS OFF)
 if(CUDAToolkit_FOUND AND NOT APPLE)
   if((NOT CMAKE_CUDA_COMPILER OR CMAKE_CUDA_COMPILER MATCHES "-NOTFOUND$")
      AND DEFINED CUDAToolkit_NVCC_EXECUTABLE
@@ -108,6 +109,7 @@ if(CUDAToolkit_FOUND AND NOT APPLE AND CMAKE_CUDA_COMPILER)
     set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --allow-unsupported-compiler")
   endif()
   set(CHROMASPACE_VIEWER_HAS_CUDA ON)
+  set(CHROMASPACE_PLUGIN_HAS_CUDA_KERNELS ON)
 endif()
 
 set(OFX_SUPPORT_SOURCES
@@ -121,11 +123,20 @@ set(OFX_SUPPORT_SOURCES
   ${LOCAL_OFX_SDK_DIR}/Support/Library/ofxsPropertyValidation.cpp
 )
 
-add_library(${PLUGIN_BASENAME} SHARED
+set(CHROMASPACE_PLUGIN_SOURCES
   src/Chromaspace.cpp
   ${WORKSHOP_COLOR_SOURCES}
   $<$<PLATFORM_ID:Darwin>:src/metal/ChromaspaceMetal.mm>
   ${OFX_SUPPORT_SOURCES}
+)
+if(CHROMASPACE_PLUGIN_HAS_CUDA_KERNELS)
+  list(APPEND CHROMASPACE_PLUGIN_SOURCES
+    src/cuda/ChromaspaceCloudCuda.cu
+  )
+endif()
+
+add_library(${PLUGIN_BASENAME} SHARED
+  ${CHROMASPACE_PLUGIN_SOURCES}
 )
 
 target_include_directories(${PLUGIN_BASENAME} PRIVATE
@@ -139,6 +150,13 @@ if(CUDAToolkit_FOUND)
   target_compile_definitions(${PLUGIN_BASENAME} PRIVATE CHROMASPACE_HAS_CUDA)
   target_link_libraries(${PLUGIN_BASENAME} PRIVATE ${CHROMASPACE_CUDA_RUNTIME_TARGET})
 endif()
+if(CHROMASPACE_PLUGIN_HAS_CUDA_KERNELS)
+  target_compile_definitions(${PLUGIN_BASENAME} PRIVATE CHROMASPACE_PLUGIN_HAS_CUDA_KERNELS)
+  set_target_properties(${PLUGIN_BASENAME} PROPERTIES
+    CUDA_STANDARD 17
+    CUDA_STANDARD_REQUIRED ON
+    CUDA_SEPARABLE_COMPILATION OFF)
+endif()
 
 if(OpenCL_FOUND)
   target_compile_definitions(${PLUGIN_BASENAME} PRIVATE CHROMASPACE_HAS_OPENCL)
@@ -148,7 +166,8 @@ endif()
 
 if(MSVC)
   target_compile_definitions(${PLUGIN_BASENAME} PRIVATE _CRT_SECURE_NO_WARNINGS)
-  target_compile_options(${PLUGIN_BASENAME} PRIVATE /W3 /bigobj /MP /EHsc)
+  target_compile_options(${PLUGIN_BASENAME} PRIVATE
+    $<$<COMPILE_LANGUAGE:CXX>:/W3 /bigobj /MP /EHsc>)
 endif()
 
 if(APPLE)

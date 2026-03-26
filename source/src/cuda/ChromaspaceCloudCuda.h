@@ -5,7 +5,9 @@
 #include <string>
 #include <vector>
 
-namespace ChromaspaceMetal {
+#include <cuda_runtime_api.h>
+
+namespace ChromaspaceCloudCuda {
 
 struct Sample {
   float xNorm = 0.0f;
@@ -20,16 +22,14 @@ struct OccupancyCandidate {
   Sample sample{};
   float normalizedNeutralRadius = 0.0f;
   int bin = 0;
-  std::uint32_t tie = 0;
+  uint32_t tie = 0;
 };
 
 struct Request {
-  const void* srcMetalBuffer = nullptr;
+  const float* srcBase = nullptr;
   std::size_t srcRowBytes = 0;
   int width = 0;
   int height = 0;
-  int originX = 0;
-  int originY = 0;
   int scaledWidth = 0;
   int scaledHeight = 0;
   int pointCount = 0;
@@ -49,7 +49,7 @@ struct Request {
   int plotDisplayLinearTransfer = 0;
   int neutralRadiusEnabled = 0;
   float neutralRadius = 1.0f;
-  void* metalCommandQueue = nullptr;
+  cudaStream_t stream = nullptr;
 };
 
 struct Result {
@@ -66,12 +66,10 @@ struct Result {
 bool buildWholeImageCloud(const Request& request, Result* out);
 
 struct StripRequest {
-  const void* srcMetalBuffer = nullptr;
+  const float* srcBase = nullptr;
   std::size_t srcRowBytes = 0;
   int width = 0;
   int height = 0;
-  int originX = 0;
-  int originY = 0;
   int resolution = 0;
   int preserveOverflow = 0;
   int readCube = 0;
@@ -84,7 +82,7 @@ struct StripRequest {
   int rampHeight = 0;
   int rampSampleRows = 0;
   float cellWidth = 1.0f;
-  void* metalCommandQueue = nullptr;
+  cudaStream_t stream = nullptr;
 };
 
 struct StripResult {
@@ -95,33 +93,4 @@ struct StripResult {
 
 bool buildIdentityStripCloud(const StripRequest& request, StripResult* out);
 
-bool copyHostBuffers(
-    const void* srcMetalBuffer,
-    void* dstMetalBuffer,
-    int width,
-    int height,
-    size_t srcRowBytes,
-    size_t dstRowBytes,
-    int originX,
-    int originY,
-    void* metalCommandQueue,
-    const float* overlayPixels,
-    int overlayX,
-    int overlayY,
-    int overlayWidth,
-    int overlayHeight);
-
-bool copyHostBuffersReadback(
-    const void* srcMetalBuffer,
-    void* dstMetalBuffer,
-    int width,
-    int height,
-    size_t srcRowBytes,
-    size_t dstRowBytes,
-    int originX,
-    int originY,
-    void* metalCommandQueue,
-    float* readbackSrc,
-    size_t readbackSrcRowBytes);
-
-}  // namespace ChromaspaceMetal
+}  // namespace ChromaspaceCloudCuda

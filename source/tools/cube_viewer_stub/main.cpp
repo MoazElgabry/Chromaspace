@@ -31,6 +31,7 @@
 #if defined(__APPLE__)
 #include <mach-o/dyld.h>
 #endif
+#include <sys/mman.h>
 #include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -296,7 +297,7 @@ void notifyExistingViewerBringToFront() {
 }
 #endif
 
-const char* kViewerVersionString = "v1.0.2";
+const char* kViewerVersionString = "v1.0.3Beta";
 
 #if !defined(_WIN32)
 bool sendAllSocket(int fd, const char* data, size_t size) {
@@ -1541,7 +1542,13 @@ struct InputCloudPayload {
   int resolution = 25;
   std::string paramHash;
   std::string settingsKey;
+  std::string transport = "json";
+  uint64_t pointCount = 0;
+  int pointStride = 24;
+  std::string shmName;
+  uint64_t shmSize = 0;
   std::string points;
+  std::vector<float> packedPoints;
 };
 
 struct InputCloudSample {
@@ -2775,9 +2782,57 @@ bool viewerLassoContainsPoint(const LassoRegionState& state, double xNorm, doubl
   return inside;
 }
 
+bool loadInputCloudSharedMemory(const InputCloudPayload& cloud, std::vector<float>* outPackedPoints) {
+  if (!outPackedPoints) return false;
+  outPackedPoints->clear();
+  if (cloud.transport != "shm" || cloud.shmName.empty() || cloud.pointCount == 0 || cloud.pointStride <= 0) return false;
+  const uint64_t expectedBytes = cloud.pointCount * static_cast<uint64_t>(cloud.pointStride);
+  if (expectedBytes == 0 || (cloud.shmSize != 0 && expectedBytes > cloud.shmSize)) return false;
+  if (cloud.pointStride != static_cast<int>(6u * sizeof(float))) return false;
+  outPackedPoints->assign(static_cast<size_t>(cloud.pointCount) * 6u, 0.0f);
+#if defined(_WIN32)
+  HANDLE mapping = OpenFileMappingA(FILE_MAP_READ, FALSE, cloud.shmName.c_str());
+  if (mapping == nullptr) return false;
+  const void* mapped = MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, static_cast<SIZE_T>(expectedBytes));
+  if (!mapped) {
+    CloseHandle(mapping);
+    return false;
+  }
+  std::memcpy(outPackedPoints->data(), mapped, static_cast<size_t>(expectedBytes));
+  UnmapViewOfFile(mapped);
+  CloseHandle(mapping);
+  return true;
+#else
+  const int fd = shm_open(cloud.shmName.c_str(), O_RDONLY, 0);
+  if (fd < 0) return false;
+  void* mapped = mmap(nullptr, static_cast<size_t>(expectedBytes), PROT_READ, MAP_SHARED, fd, 0);
+  if (mapped == MAP_FAILED) {
+    ::close(fd);
+    return false;
+  }
+  std::memcpy(outPackedPoints->data(), mapped, static_cast<size_t>(expectedBytes));
+  munmap(mapped, static_cast<size_t>(expectedBytes));
+  ::close(fd);
+  return true;
+#endif
+}
+
 bool parseInputCloudSamples(const InputCloudPayload& cloud, std::vector<InputCloudSample>* samples) {
   if (!samples) return false;
   samples->clear();
+  if (!cloud.packedPoints.empty()) {
+    const size_t pointCount = cloud.packedPoints.size() / 6u;
+    samples->reserve(pointCount);
+    for (size_t i = 0; i < pointCount; ++i) {
+      const size_t base = i * 6u;
+      samples->push_back({clampf(cloud.packedPoints[base + 0], 0.0f, 1.0f),
+                          clampf(cloud.packedPoints[base + 1], 0.0f, 1.0f),
+                          cloud.packedPoints[base + 3],
+                          cloud.packedPoints[base + 4],
+                          cloud.packedPoints[base + 5]});
+    }
+    return !samples->empty();
+  }
   std::string flattened = cloud.points;
   std::replace(flattened.begin(), flattened.end(), ';', ' ');
   std::istringstream is(flattened);
@@ -3164,10 +3219,25 @@ bool parseInputCloudMessage(const std::string& line, InputCloudPayload* out) {
   extractQuoted(line, "quality", &p.quality);
   extractQuoted(line, "paramHash", &p.paramHash);
   extractQuoted(line, "settingsKey", &p.settingsKey);
+  extractQuoted(line, "transport", &p.transport);
+  extractQuoted(line, "shmName", &p.shmName);
   extractQuoted(line, "points", &p.points);
   int resolution = 25;
   extractInt(line, "resolution", &resolution);
   p.resolution = resolution;
+  uint64_t pointCount = 0;
+  extractUInt64(line, "pointCount", &pointCount);
+  p.pointCount = pointCount;
+  int pointStride = 24;
+  extractInt(line, "pointStride", &pointStride);
+  p.pointStride = pointStride;
+  uint64_t shmSize = 0;
+  extractUInt64(line, "shmSize", &shmSize);
+  p.shmSize = shmSize;
+  if (p.transport == "shm" && !loadInputCloudSharedMemory(p, &p.packedPoints)) {
+    logViewerEvent(std::string("Failed to load shared-memory cloud: ") + p.shmName);
+    return false;
+  }
   *out = std::move(p);
   return true;
 }
