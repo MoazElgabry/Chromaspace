@@ -9,6 +9,8 @@ on:
 
 jobs:
   build-windows:
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
     runs-on: windows-2022
 
     defaults:
@@ -85,9 +87,25 @@ jobs:
           "PYTHON_EXE=$venvPython" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           $venvScripts | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
+      - name: Install CUDA toolkit
+        uses: Jimver/cuda-toolkit@v0.2.30
+        with:
+          cuda: "12.9.1"
+
+      - name: Verify CUDA toolkit
+        run: |
+          nvcc --version
+          if (-not $env:CUDA_PATH) {
+            throw "CUDA_PATH was not set by the CUDA toolkit installer."
+          }
+          $hostConfig = Join-Path $env:CUDA_PATH "include\\crt\\host_config.h"
+          if (-not (Test-Path $hostConfig -PathType Leaf)) {
+            throw "CUDA toolkit install is incomplete. Missing required compiler header: $hostConfig"
+          }
+
       - name: Configure
         run: |
-          cmd /c "call ""$env:VSDEVCMD"" -arch=x64 -host_arch=x64 && cmake -S . -B build-win -G Ninja -DCMAKE_BUILD_TYPE=Release -DPython3_EXECUTABLE=""$env:PYTHON_EXE"" -DCHROMASPACE_USE_BUNDLED_TEXT_DEPS=ON"
+          cmd /c "call ""$env:VSDEVCMD"" -arch=x64 -host_arch=x64 && cmake -S . -B build-win -G Ninja -DCMAKE_BUILD_TYPE=Release -DPython3_EXECUTABLE=""$env:PYTHON_EXE"" -DCHROMASPACE_USE_BUNDLED_TEXT_DEPS=ON -DCUDAToolkit_ROOT=""$env:CUDA_PATH"" -DCMAKE_CUDA_COMPILER=""$env:CUDA_PATH\\bin\\nvcc.exe"" -DCMAKE_CUDA_ARCHITECTURES=""61;75;86;89"""
 
       - name: Build
         run: |

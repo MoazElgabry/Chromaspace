@@ -64,6 +64,24 @@ list(PREPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 
 find_package(Threads REQUIRED)
 find_package(OpenCL QUIET)
+if(WIN32 AND NOT DEFINED CUDAToolkit_ROOT)
+  set(_CHROMASPACE_WINDOWS_CUDA_CANDIDATES
+    "$ENV{CUDA_PATH_V12_9}"
+    "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.9"
+    "$ENV{CUDA_PATH_V12_8}"
+    "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.8"
+    "$ENV{CUDA_PATH_V11_8}"
+    "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v11.8"
+    "$ENV{CUDA_PATH}"
+  )
+  foreach(_cuda_candidate IN LISTS _CHROMASPACE_WINDOWS_CUDA_CANDIDATES)
+    if(_cuda_candidate AND EXISTS "${_cuda_candidate}/bin/nvcc.exe")
+      set(CUDAToolkit_ROOT "${_cuda_candidate}" CACHE PATH "Preferred CUDA toolkit root" FORCE)
+      set(CMAKE_CUDA_COMPILER "${_cuda_candidate}/bin/nvcc.exe" CACHE FILEPATH "CUDA compiler" FORCE)
+      break()
+    endif()
+  endforeach()
+endif()
 find_package(CUDAToolkit QUIET)
 include(CheckLanguage)
 
@@ -102,7 +120,7 @@ if(CUDAToolkit_FOUND AND NOT APPLE AND CMAKE_CUDA_COMPILER)
   set(CMAKE_CUDA_STANDARD 17)
   set(CMAKE_CUDA_STANDARD_REQUIRED ON)
   if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-    set(CMAKE_CUDA_ARCHITECTURES 75 86 89)
+    set(CMAKE_CUDA_ARCHITECTURES 61 75 86 89)
   endif()
   if(WIN32 AND CMAKE_CUDA_FLAGS MATCHES "(^| )--allow-unsupported-compiler( |$)")
   elseif(WIN32)

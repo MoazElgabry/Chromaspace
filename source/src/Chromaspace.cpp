@@ -3065,32 +3065,30 @@ class ChromaspaceEffect : public ImageEffect {
     return a.b < b.b;
   }
 
-  ViewerCloudSample toViewerCloudSample(const ChromaspaceCloudCuda::Sample& sample) {
-    return {sample.xNorm, sample.yNorm, sample.zReserved, sample.r, sample.g, sample.b};
+  template <typename SampleT>
+  ViewerCloudSample toViewerCloudSample(const SampleT& sample) {
+    ViewerCloudSample out{};
+    out.xNorm = sample.xNorm;
+    out.yNorm = sample.yNorm;
+    out.zReserved = sample.zReserved;
+    out.r = sample.r;
+    out.g = sample.g;
+    out.b = sample.b;
+    return out;
   }
 
-  std::vector<ViewerCloudSample> toViewerCloudSamples(const std::vector<ChromaspaceCloudCuda::Sample>& samples) {
+  template <typename SampleT>
+  std::vector<ViewerCloudSample> toViewerCloudSamples(const std::vector<SampleT>& sourceSamples) {
     std::vector<ViewerCloudSample> out;
-    out.reserve(samples.size());
-    for (const auto& sample : samples) {
-      out.push_back(toViewerCloudSample(sample));
+    const std::size_t sampleCount = sourceSamples.size();
+    out.reserve(sampleCount);
+    for (std::size_t i = 0; i < sampleCount; ++i) {
+      out.push_back(toViewerCloudSample(sourceSamples[i]));
     }
     return out;
   }
 
 #if defined(__APPLE__)
-  ViewerCloudSample toViewerCloudSample(const ChromaspaceMetal::Sample& sample) {
-    return {sample.xNorm, sample.yNorm, sample.zReserved, sample.r, sample.g, sample.b};
-  }
-
-  std::vector<ViewerCloudSample> toViewerCloudSamples(const std::vector<ChromaspaceMetal::Sample>& samples) {
-    std::vector<ViewerCloudSample> out;
-    out.reserve(samples.size());
-    for (const auto& sample : samples) {
-      out.push_back(toViewerCloudSample(sample));
-    }
-    return out;
-  }
 #endif
 
   CloudBuildResult finalizeCloudBuildFromSamples(
