@@ -54,6 +54,7 @@ struct Request {
 
 struct Result {
   std::vector<Sample> primarySamples;
+  std::vector<Sample> appendedSamples;
   std::vector<OccupancyCandidate> occupancyCandidates;
   std::vector<int> occupancy;
   int primaryAttempts = 0;

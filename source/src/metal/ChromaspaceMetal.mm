@@ -18,8 +18,29 @@ inline size_t packedRowBytesForWidth(int width) {
   return static_cast<size_t>(width) * 4u * sizeof(float);
 }
 
+inline bool validateFloatRowBytes(size_t rowBytes) {
+  return rowBytes >= 4u * sizeof(float) && (rowBytes % sizeof(float)) == 0u;
+}
+
 inline size_t offsetForOrigin(size_t rowBytes, int originX, int originY) {
   return static_cast<size_t>(originY) * rowBytes + static_cast<size_t>(originX) * 4u * sizeof(float);
+}
+
+bool checkedProductToInt(int a, int b, int* out) {
+  if (!out || a < 0 || b < 0) return false;
+  const long long product = static_cast<long long>(a) * static_cast<long long>(b);
+  if (product > static_cast<long long>(std::numeric_limits<int>::max())) return false;
+  *out = static_cast<int>(product);
+  return true;
+}
+
+bool checkedCubeToInt(int value, int* out) {
+  if (!out || value < 0) return false;
+  const long long v = static_cast<long long>(value);
+  const long long product = v * v * v;
+  if (product > static_cast<long long>(std::numeric_limits<int>::max())) return false;
+  *out = static_cast<int>(product);
+  return true;
 }
 
 bool encodeCopyRows(
@@ -97,12 +118,27 @@ struct StripRequestGpu {
   float cellWidth = 1.0f;
 };
 
+struct CombinedPackRequestGpu {
+  int stripCount = 0;
+  int maxPrimaryCount = 0;
+};
+
+struct AppendSelectRequestGpu {
+  int candidateCount = 0;
+  int extraPointCount = 0;
+  int occupancyThreshold = 0;
+  float radiusMin = 0.0f;
+  float radiusMax = 1.0f;
+};
+
 struct PipelineBundle {
   id<MTLDevice> device = nil;
   id<MTLComputePipelineState> primary = nil;
   id<MTLComputePipelineState> occupancy = nil;
   id<MTLComputePipelineState> stripCube = nil;
   id<MTLComputePipelineState> stripRamp = nil;
+  id<MTLComputePipelineState> packCombined = nil;
+  id<MTLComputePipelineState> appendSelect = nil;
 };
 
 std::mutex gPipelineMutex;
@@ -310,13 +346,56 @@ kernel void stripRampKernel(device const float* srcFloats [[buffer(0)]], device 
   if (request.plotDisplayLinearEnabled != 0) { r = decodeTransferChannelFast(r, request.plotDisplayLinearTransfer); g = decodeTransferChannelFast(g, request.plotDisplayLinearTransfer); b = decodeTransferChannelFast(b, request.plotDisplayLinearTransfer); }
   Sample sample; sample.xNorm = r; sample.yNorm = g; sample.zReserved = b; sample.r = r; sample.g = g; sample.b = b; outSamples[index] = sample;
 }
+
+kernel void packCombinedKernel(device const Sample* stripSamples [[buffer(0)]],
+                               device const Sample* primarySamples [[buffer(1)]],
+                               device const atomic_uint* primaryCount [[buffer(2)]],
+                               device Sample* combinedOut [[buffer(3)]],
+                               constant CombinedPackRequestGpu& request [[buffer(4)]],
+                               uint tid [[thread_position_in_grid]]) {
+  const int index = (int)tid;
+  const int primaryAccepted = (int)atomic_load_explicit(primaryCount, memory_order_relaxed);
+  const int total = request.stripCount + min(primaryAccepted, request.maxPrimaryCount);
+  if (index >= total) return;
+  if (index < request.stripCount) {
+    combinedOut[index] = stripSamples[index];
+  } else {
+    const int primaryIndex = index - request.stripCount;
+    combinedOut[index] = primarySamples[primaryIndex];
+  }
+}
+
+kernel void appendSelectKernel(device const OccupancyCandidate* candidateIn [[buffer(0)]],
+                               device const atomic_uint* occupancyBins [[buffer(1)]],
+                               device atomic_uint* appendCount [[buffer(2)]],
+                               device Sample* appendOut [[buffer(3)]],
+                               constant AppendSelectRequestGpu& request [[buffer(4)]],
+                               uint tid [[thread_position_in_grid]]) {
+  const int index = (int)tid;
+  if (index >= request.candidateCount) return;
+  const OccupancyCandidate candidate = candidateIn[index];
+  if (candidate.bin < 0) return;
+  const uint occ = atomic_load_explicit(&occupancyBins[candidate.bin], memory_order_relaxed);
+  if ((int)occ != request.occupancyThreshold) return;
+  if (candidate.normalizedNeutralRadius < request.radiusMin) return;
+  const bool lastBucket = request.radiusMax >= 0.9999f;
+  if (lastBucket) {
+    if (candidate.normalizedNeutralRadius > request.radiusMax) return;
+  } else {
+    if (candidate.normalizedNeutralRadius >= request.radiusMax) return;
+  }
+  const uint outIndex = atomic_fetch_add_explicit(appendCount, 1u, memory_order_relaxed);
+  if ((int)outIndex >= request.extraPointCount) return;
+  appendOut[outIndex] = candidate.sample;
+}
 )METAL";
 
 bool ensurePipelines(id<MTLDevice> device, PipelineBundle* out, std::string* error) {
   if (!device || !out) return false;
   std::lock_guard<std::mutex> lock(gPipelineMutex);
   if (gPipelines.device == device && gPipelines.primary != nil && gPipelines.occupancy != nil &&
-      gPipelines.stripCube != nil && gPipelines.stripRamp != nil) { *out = gPipelines; return true; }
+      gPipelines.stripCube != nil && gPipelines.stripRamp != nil && gPipelines.packCombined != nil &&
+      gPipelines.appendSelect != nil) { *out = gPipelines; return true; }
   NSError* compileError = nil;
   const std::string sourceString = std::string(kCloudMetalSourcePart1) + kCloudMetalSourcePart2 + kCloudMetalSourcePart3;
   NSString* source = [NSString stringWithUTF8String:sourceString.c_str()];
@@ -326,7 +405,12 @@ bool ensurePipelines(id<MTLDevice> device, PipelineBundle* out, std::string* err
   if (library == nil) { if (error) *error = nsErrorString(compileError); return false; }
   auto makePipeline = [&](NSString* name, id<MTLComputePipelineState>* outState) -> bool { NSError* localError = nil; id<MTLFunction> function = [library newFunctionWithName:name]; if (function == nil) { if (error) *error = std::string("missing Metal function: ") + (name.UTF8String ? name.UTF8String : "unknown"); return false; } id<MTLComputePipelineState> pipeline = [device newComputePipelineStateWithFunction:function error:&localError]; if (pipeline == nil) { if (error) *error = nsErrorString(localError); return false; } *outState = pipeline; return true; };
   PipelineBundle built{}; built.device = device;
-  if (!makePipeline(@"primaryPassKernel", &built.primary) || !makePipeline(@"occupancyPassKernel", &built.occupancy) || !makePipeline(@"stripCubeKernel", &built.stripCube) || !makePipeline(@"stripRampKernel", &built.stripRamp)) return false;
+  if (!makePipeline(@"primaryPassKernel", &built.primary) ||
+      !makePipeline(@"occupancyPassKernel", &built.occupancy) ||
+      !makePipeline(@"stripCubeKernel", &built.stripCube) ||
+      !makePipeline(@"stripRampKernel", &built.stripRamp) ||
+      !makePipeline(@"packCombinedKernel", &built.packCombined) ||
+      !makePipeline(@"appendSelectKernel", &built.appendSelect)) return false;
   gPipelines = built; *out = gPipelines; return true;
 }
 
@@ -345,6 +429,83 @@ std::vector<T> readSharedBuffer(id<MTLBuffer> buffer, std::size_t count) {
   return out;
 }
 
+std::vector<int> sortedUniqueOccupancyValuesAscending(const std::vector<int>& occupancy) {
+  std::vector<int> values;
+  values.reserve(occupancy.size());
+  for (int value : occupancy) {
+    if (value >= 0) values.push_back(value);
+  }
+  std::sort(values.begin(), values.end());
+  values.erase(std::unique(values.begin(), values.end()), values.end());
+  return values;
+}
+
+std::vector<Sample> selectOccupancySamplesGpu(
+    id<MTLCommandQueue> queue,
+    const PipelineBundle& pipelines,
+    id<MTLBuffer> candidateBuffer,
+    uint32_t candidateAccepted,
+    id<MTLBuffer> occupancyBuffer,
+    const std::vector<int>& occupancy,
+    int extraPointCount,
+    bool neutralRadiusEnabled,
+    std::string* error) {
+  if (queue == nil || candidateBuffer == nil || occupancyBuffer == nil || candidateAccepted == 0 || extraPointCount <= 0) {
+    return {};
+  }
+  id<MTLBuffer> appendBuffer =
+      [queue.device newBufferWithLength:static_cast<std::size_t>(extraPointCount) * sizeof(Sample) options:MTLResourceStorageModeShared];
+  id<MTLBuffer> appendCountBuffer = [queue.device newBufferWithLength:sizeof(uint32_t) options:MTLResourceStorageModeShared];
+  if (appendBuffer == nil || appendCountBuffer == nil) {
+    if (error) *error = "metal-append-buffer-allocation-failed";
+    return {};
+  }
+  std::memset(appendCountBuffer.contents, 0, sizeof(uint32_t));
+
+  const std::vector<int> thresholds = sortedUniqueOccupancyValuesAscending(occupancy);
+  const int radiusBuckets = neutralRadiusEnabled ? 6 : 1;
+  id<MTLCommandBuffer> cmd = [queue commandBuffer];
+  if (cmd == nil) {
+    if (error) *error = "metal-append-command-buffer-failed";
+    return {};
+  }
+
+  for (int threshold : thresholds) {
+    for (int bucket = 0; bucket < radiusBuckets; ++bucket) {
+      AppendSelectRequestGpu request{};
+      request.candidateCount = static_cast<int>(candidateAccepted);
+      request.extraPointCount = extraPointCount;
+      request.occupancyThreshold = threshold;
+      request.radiusMin = neutralRadiusEnabled ? (static_cast<float>(bucket) / static_cast<float>(radiusBuckets)) : 0.0f;
+      request.radiusMax = neutralRadiusEnabled ? (static_cast<float>(bucket + 1) / static_cast<float>(radiusBuckets)) : 1.0f;
+
+      id<MTLComputeCommandEncoder> encoder = [cmd computeCommandEncoder];
+      if (encoder == nil) {
+        if (error) *error = "metal-append-encoder-failed";
+        return {};
+      }
+      [encoder setBuffer:candidateBuffer offset:0 atIndex:0];
+      [encoder setBuffer:occupancyBuffer offset:0 atIndex:1];
+      [encoder setBuffer:appendCountBuffer offset:0 atIndex:2];
+      [encoder setBuffer:appendBuffer offset:0 atIndex:3];
+      [encoder setBytes:&request length:sizeof(request) atIndex:4];
+      dispatch1D(encoder, pipelines.appendSelect, static_cast<NSUInteger>(candidateAccepted));
+      [encoder endEncoding];
+    }
+  }
+
+  [cmd commit];
+  [cmd waitUntilCompleted];
+  if (cmd.status != MTLCommandBufferStatusCompleted) {
+    if (error) *error = "metal-append-command-failed";
+    return {};
+  }
+
+  uint32_t accepted = *reinterpret_cast<uint32_t*>(appendCountBuffer.contents);
+  accepted = std::min<uint32_t>(accepted, static_cast<uint32_t>(extraPointCount));
+  return readSharedBuffer<Sample>(appendBuffer, static_cast<std::size_t>(accepted));
+}
+
 }  // namespace
 
 bool buildWholeImageCloud(const Request& request, Result* out) {
@@ -354,6 +515,10 @@ bool buildWholeImageCloud(const Request& request, Result* out) {
     if (!request.srcMetalBuffer || !request.metalCommandQueue || request.srcRowBytes == 0 ||
         request.width <= 0 || request.height <= 0 || request.pointCount <= 0) {
       out->error = "invalid-request";
+      return false;
+    }
+    if (!validateFloatRowBytes(request.srcRowBytes)) {
+      out->error = "invalid-row-bytes";
       return false;
     }
     id<MTLCommandQueue> queue = (__bridge id<MTLCommandQueue>)request.metalCommandQueue;
@@ -432,7 +597,18 @@ bool buildWholeImageCloud(const Request& request, Result* out) {
     if (candidateBuffer != nil && candidateCountBuffer != nil) {
       uint32_t candidateAccepted = *reinterpret_cast<uint32_t*>(candidateCountBuffer.contents);
       candidateAccepted = std::min<uint32_t>(candidateAccepted, static_cast<uint32_t>(request.candidateTarget));
-      out->occupancyCandidates = readSharedBuffer<OccupancyCandidate>(candidateBuffer, static_cast<std::size_t>(candidateAccepted));
+      if (candidateAccepted > 0 && request.extraPointCount > 0) {
+        out->appendedSamples = selectOccupancySamplesGpu(queue,
+                                                         pipelines,
+                                                         candidateBuffer,
+                                                         candidateAccepted,
+                                                         occupancyBuffer,
+                                                         out->occupancy,
+                                                         request.extraPointCount,
+                                                         request.neutralRadiusEnabled != 0,
+                                                         &out->error);
+        if (out->appendedSamples.empty() && !out->error.empty()) return false;
+      }
     }
     out->success = true;
     return true;
@@ -448,14 +624,27 @@ bool buildIdentityStripCloud(const StripRequest& request, StripResult* out) {
       out->error = "invalid-strip-request";
       return false;
     }
+    if (!validateFloatRowBytes(request.srcRowBytes)) {
+      out->error = "invalid-strip-row-bytes";
+      return false;
+    }
     id<MTLCommandQueue> queue = (__bridge id<MTLCommandQueue>)request.metalCommandQueue;
     id<MTLBuffer> src = (__bridge id<MTLBuffer>)request.srcMetalBuffer;
     if (queue == nil || src == nil || queue.device == nil) { out->error = "metal-unavailable"; return false; }
     PipelineBundle pipelines{};
     if (!ensurePipelines(queue.device, &pipelines, &out->error)) return false;
 
-    const int cubeCount = request.readCube != 0 ? request.resolution * request.resolution * request.resolution : 0;
-    const int rampCount = request.readRamp != 0 ? request.width * std::max(0, request.rampSampleRows) : 0;
+    int cubeCount = 0;
+    if (request.readCube != 0 && !checkedCubeToInt(request.resolution, &cubeCount)) {
+      out->error = "strip-cube-count-overflow";
+      return false;
+    }
+    int rampCount = 0;
+    if (request.readRamp != 0 &&
+        !checkedProductToInt(request.width, std::max(0, request.rampSampleRows), &rampCount)) {
+      out->error = "strip-ramp-count-overflow";
+      return false;
+    }
     const int totalCount = cubeCount + rampCount;
     if (totalCount <= 0) { out->error = "empty-strip-request"; return false; }
 
@@ -499,6 +688,259 @@ bool buildIdentityStripCloud(const StripRequest& request, StripResult* out) {
     [cmd waitUntilCompleted];
     if (cmd.status != MTLCommandBufferStatusCompleted) { out->error = "metal-strip-command-failed"; return false; }
     out->samples = readSharedBuffer<Sample>(samplesBuffer, static_cast<std::size_t>(totalCount));
+    out->success = true;
+    return true;
+  }
+}
+
+bool buildWholeImageAndIdentityStripCloud(const Request& wholeImageRequest, const StripRequest& stripRequest, CombinedResult* out) {
+  if (!out) return false;
+  *out = CombinedResult{};
+  @autoreleasepool {
+    if (!wholeImageRequest.srcMetalBuffer || !wholeImageRequest.metalCommandQueue || wholeImageRequest.srcRowBytes == 0 ||
+        wholeImageRequest.width <= 0 || wholeImageRequest.height <= 0 || wholeImageRequest.pointCount <= 0) {
+      out->error = "invalid-whole-image-request";
+      return false;
+    }
+    if (!validateFloatRowBytes(wholeImageRequest.srcRowBytes)) {
+      out->error = "invalid-whole-image-row-bytes";
+      return false;
+    }
+    if (!stripRequest.srcMetalBuffer || !stripRequest.metalCommandQueue || stripRequest.srcRowBytes == 0 ||
+        stripRequest.width <= 0 || stripRequest.height <= 0 || stripRequest.resolution <= 0) {
+      out->error = "invalid-strip-request";
+      return false;
+    }
+    if (!validateFloatRowBytes(stripRequest.srcRowBytes)) {
+      out->error = "invalid-strip-row-bytes";
+      return false;
+    }
+    if (wholeImageRequest.srcMetalBuffer != stripRequest.srcMetalBuffer ||
+        wholeImageRequest.metalCommandQueue != stripRequest.metalCommandQueue ||
+        wholeImageRequest.width != stripRequest.width ||
+        wholeImageRequest.height != stripRequest.height) {
+      out->error = "mismatched-combined-request";
+      return false;
+    }
+
+    id<MTLCommandQueue> queue = (__bridge id<MTLCommandQueue>)wholeImageRequest.metalCommandQueue;
+    id<MTLBuffer> src = (__bridge id<MTLBuffer>)wholeImageRequest.srcMetalBuffer;
+    if (queue == nil || src == nil || queue.device == nil) {
+      out->error = "metal-unavailable";
+      return false;
+    }
+
+    PipelineBundle pipelines{};
+    if (!ensurePipelines(queue.device, &pipelines, &out->error)) return false;
+
+    const int binsPerAxis = wholeImageRequest.preserveOverflow != 0 ? 18 : 16;
+    const std::size_t occupancyCount = static_cast<std::size_t>(binsPerAxis * binsPerAxis * binsPerAxis);
+    id<MTLBuffer> primaryBuffer = [queue.device newBufferWithLength:static_cast<std::size_t>(wholeImageRequest.pointCount) * sizeof(Sample) options:MTLResourceStorageModeShared];
+    id<MTLBuffer> primaryCountBuffer = [queue.device newBufferWithLength:sizeof(uint32_t) options:MTLResourceStorageModeShared];
+    id<MTLBuffer> occupancyBuffer = [queue.device newBufferWithLength:occupancyCount * sizeof(uint32_t) options:MTLResourceStorageModeShared];
+    if (primaryBuffer == nil || primaryCountBuffer == nil || occupancyBuffer == nil) {
+      out->error = "metal-buffer-allocation-failed";
+      return false;
+    }
+    std::memset(primaryCountBuffer.contents, 0, sizeof(uint32_t));
+    std::memset(occupancyBuffer.contents, 0, occupancyCount * sizeof(uint32_t));
+
+    id<MTLBuffer> candidateBuffer = nil;
+    id<MTLBuffer> candidateCountBuffer = nil;
+    if (wholeImageRequest.occupancyFill != 0 &&
+        wholeImageRequest.candidateTarget > 0 &&
+        wholeImageRequest.maxCandidateAttempts > 0) {
+      candidateBuffer = [queue.device newBufferWithLength:static_cast<std::size_t>(wholeImageRequest.candidateTarget) * sizeof(OccupancyCandidate) options:MTLResourceStorageModeShared];
+      candidateCountBuffer = [queue.device newBufferWithLength:sizeof(uint32_t) options:MTLResourceStorageModeShared];
+      if (candidateBuffer == nil || candidateCountBuffer == nil) {
+        out->error = "metal-candidate-buffer-allocation-failed";
+        return false;
+      }
+      std::memset(candidateCountBuffer.contents, 0, sizeof(uint32_t));
+    }
+
+    int cubeCount = 0;
+    if (stripRequest.readCube != 0 && !checkedCubeToInt(stripRequest.resolution, &cubeCount)) {
+      out->error = "strip-cube-count-overflow";
+      return false;
+    }
+    int rampCount = 0;
+    if (stripRequest.readRamp != 0 &&
+        !checkedProductToInt(stripRequest.width, std::max(0, stripRequest.rampSampleRows), &rampCount)) {
+      out->error = "strip-ramp-count-overflow";
+      return false;
+    }
+    const int totalStripCount = cubeCount + rampCount;
+    if (totalStripCount <= 0) {
+      out->error = "empty-strip-request";
+      return false;
+    }
+    id<MTLBuffer> stripSamplesBuffer = [queue.device newBufferWithLength:static_cast<std::size_t>(totalStripCount) * sizeof(Sample) options:MTLResourceStorageModeShared];
+    id<MTLBuffer> combinedSamplesBuffer =
+        [queue.device newBufferWithLength:static_cast<std::size_t>(totalStripCount + wholeImageRequest.pointCount) * sizeof(Sample)
+                                  options:MTLResourceStorageModeShared];
+    if (stripSamplesBuffer == nil || combinedSamplesBuffer == nil) {
+      out->error = "metal-strip-buffer-allocation-failed";
+      return false;
+    }
+
+    WholeImageRequestGpu wholeGpuRequest{};
+    wholeGpuRequest.width = wholeImageRequest.width;
+    wholeGpuRequest.height = wholeImageRequest.height;
+    wholeGpuRequest.originX = wholeImageRequest.originX;
+    wholeGpuRequest.originY = wholeImageRequest.originY;
+    wholeGpuRequest.srcRowFloats = static_cast<uint32_t>(wholeImageRequest.srcRowBytes / sizeof(float));
+    wholeGpuRequest.scaledWidth = wholeImageRequest.scaledWidth;
+    wholeGpuRequest.scaledHeight = wholeImageRequest.scaledHeight;
+    wholeGpuRequest.pointCount = wholeImageRequest.pointCount;
+    wholeGpuRequest.candidateTarget = wholeImageRequest.candidateTarget;
+    wholeGpuRequest.maxPrimaryAttempts = wholeImageRequest.maxPrimaryAttempts;
+    wholeGpuRequest.maxCandidateAttempts = wholeImageRequest.maxCandidateAttempts;
+    wholeGpuRequest.samplingMode = wholeImageRequest.samplingMode;
+    wholeGpuRequest.preserveOverflow = wholeImageRequest.preserveOverflow;
+    wholeGpuRequest.plotMode = wholeImageRequest.plotMode;
+    wholeGpuRequest.circularHsl = wholeImageRequest.circularHsl;
+    wholeGpuRequest.circularHsv = wholeImageRequest.circularHsv;
+    wholeGpuRequest.normConeNormalized = wholeImageRequest.normConeNormalized;
+    wholeGpuRequest.showOverflow = wholeImageRequest.showOverflow;
+    wholeGpuRequest.plotDisplayLinearEnabled = wholeImageRequest.plotDisplayLinearEnabled;
+    wholeGpuRequest.plotDisplayLinearTransfer = wholeImageRequest.plotDisplayLinearTransfer;
+    wholeGpuRequest.neutralRadiusEnabled = wholeImageRequest.neutralRadiusEnabled;
+    wholeGpuRequest.neutralRadius = wholeImageRequest.neutralRadius;
+
+    StripRequestGpu stripGpuRequest{};
+    stripGpuRequest.width = stripRequest.width;
+    stripGpuRequest.height = stripRequest.height;
+    stripGpuRequest.originX = stripRequest.originX;
+    stripGpuRequest.originY = stripRequest.originY;
+    stripGpuRequest.srcRowFloats = static_cast<uint32_t>(stripRequest.srcRowBytes / sizeof(float));
+    stripGpuRequest.resolution = stripRequest.resolution;
+    stripGpuRequest.preserveOverflow = stripRequest.preserveOverflow;
+    stripGpuRequest.plotDisplayLinearEnabled = stripRequest.plotDisplayLinearEnabled;
+    stripGpuRequest.plotDisplayLinearTransfer = stripRequest.plotDisplayLinearTransfer;
+    stripGpuRequest.cubeY1 = stripRequest.cubeY1;
+    stripGpuRequest.stripHeight = stripRequest.stripHeight;
+    stripGpuRequest.rampY1 = stripRequest.rampY1;
+    stripGpuRequest.rampHeight = stripRequest.rampHeight;
+    stripGpuRequest.rampSampleRows = stripRequest.rampSampleRows;
+    stripGpuRequest.cellWidth = stripRequest.cellWidth;
+
+    id<MTLCommandBuffer> cmd = [queue commandBuffer];
+    if (cmd == nil) {
+      out->error = "metal-command-buffer-failed";
+      return false;
+    }
+
+    if (wholeImageRequest.maxPrimaryAttempts > 0) {
+      id<MTLComputeCommandEncoder> encoder = [cmd computeCommandEncoder];
+      if (encoder == nil) {
+        out->error = "metal-primary-encoder-failed";
+        return false;
+      }
+      [encoder setBuffer:src offset:0 atIndex:0];
+      [encoder setBuffer:primaryBuffer offset:0 atIndex:1];
+      [encoder setBuffer:primaryCountBuffer offset:0 atIndex:2];
+      [encoder setBuffer:occupancyBuffer offset:0 atIndex:3];
+      [encoder setBytes:&wholeGpuRequest length:sizeof(wholeGpuRequest) atIndex:4];
+      dispatch1D(encoder, pipelines.primary, static_cast<NSUInteger>(wholeImageRequest.maxPrimaryAttempts));
+      [encoder endEncoding];
+    }
+
+    if (candidateBuffer != nil && candidateCountBuffer != nil) {
+      id<MTLComputeCommandEncoder> encoder = [cmd computeCommandEncoder];
+      if (encoder == nil) {
+        out->error = "metal-occupancy-encoder-failed";
+        return false;
+      }
+      [encoder setBuffer:src offset:0 atIndex:0];
+      [encoder setBuffer:candidateBuffer offset:0 atIndex:1];
+      [encoder setBuffer:candidateCountBuffer offset:0 atIndex:2];
+      [encoder setBytes:&wholeGpuRequest length:sizeof(wholeGpuRequest) atIndex:3];
+      dispatch1D(encoder, pipelines.occupancy, static_cast<NSUInteger>(wholeImageRequest.maxCandidateAttempts));
+      [encoder endEncoding];
+    }
+
+    int stripOffset = 0;
+    if (cubeCount > 0) {
+      id<MTLComputeCommandEncoder> encoder = [cmd computeCommandEncoder];
+      if (encoder == nil) {
+        out->error = "metal-strip-cube-encoder-failed";
+        return false;
+      }
+      [encoder setBuffer:src offset:0 atIndex:0];
+      [encoder setBuffer:stripSamplesBuffer offset:static_cast<NSUInteger>(stripOffset) * sizeof(Sample) atIndex:1];
+      [encoder setBytes:&stripGpuRequest length:sizeof(stripGpuRequest) atIndex:2];
+      dispatch1D(encoder, pipelines.stripCube, static_cast<NSUInteger>(cubeCount));
+      [encoder endEncoding];
+      stripOffset += cubeCount;
+    }
+
+    if (rampCount > 0) {
+      id<MTLComputeCommandEncoder> encoder = [cmd computeCommandEncoder];
+      if (encoder == nil) {
+        out->error = "metal-strip-ramp-encoder-failed";
+        return false;
+      }
+      [encoder setBuffer:src offset:0 atIndex:0];
+      [encoder setBuffer:stripSamplesBuffer offset:static_cast<NSUInteger>(stripOffset) * sizeof(Sample) atIndex:1];
+      [encoder setBytes:&stripGpuRequest length:sizeof(stripGpuRequest) atIndex:2];
+      dispatch1D(encoder, pipelines.stripRamp, static_cast<NSUInteger>(rampCount));
+      [encoder endEncoding];
+    }
+
+    if (wholeImageRequest.pointCount > 0 || totalStripCount > 0) {
+      CombinedPackRequestGpu packRequest{};
+      packRequest.stripCount = totalStripCount;
+      packRequest.maxPrimaryCount = wholeImageRequest.pointCount;
+      id<MTLComputeCommandEncoder> encoder = [cmd computeCommandEncoder];
+      if (encoder == nil) {
+        out->error = "metal-pack-encoder-failed";
+        return false;
+      }
+      [encoder setBuffer:stripSamplesBuffer offset:0 atIndex:0];
+      [encoder setBuffer:primaryBuffer offset:0 atIndex:1];
+      [encoder setBuffer:primaryCountBuffer offset:0 atIndex:2];
+      [encoder setBuffer:combinedSamplesBuffer offset:0 atIndex:3];
+      [encoder setBytes:&packRequest length:sizeof(packRequest) atIndex:4];
+      dispatch1D(encoder, pipelines.packCombined, static_cast<NSUInteger>(totalStripCount + wholeImageRequest.pointCount));
+      [encoder endEncoding];
+    }
+
+    [cmd commit];
+    [cmd waitUntilCompleted];
+    if (cmd.status != MTLCommandBufferStatusCompleted) {
+      out->error = "metal-combined-command-failed";
+      return false;
+    }
+
+    uint32_t primaryAccepted = *reinterpret_cast<uint32_t*>(primaryCountBuffer.contents);
+    primaryAccepted = std::min<uint32_t>(primaryAccepted, static_cast<uint32_t>(wholeImageRequest.pointCount));
+    out->primaryAttempts = wholeImageRequest.maxPrimaryAttempts;
+    out->primaryAccepted = static_cast<int>(primaryAccepted);
+    out->extraPointCount = wholeImageRequest.extraPointCount;
+
+    const auto occupancyRaw = readSharedBuffer<uint32_t>(occupancyBuffer, occupancyCount);
+    out->occupancy.assign(occupancyRaw.begin(), occupancyRaw.end());
+    out->stripSamples = readSharedBuffer<Sample>(stripSamplesBuffer, static_cast<std::size_t>(totalStripCount));
+    out->combinedSamples = readSharedBuffer<Sample>(combinedSamplesBuffer, static_cast<std::size_t>(totalStripCount + primaryAccepted));
+
+    if (candidateBuffer != nil && candidateCountBuffer != nil) {
+      uint32_t candidateAccepted = *reinterpret_cast<uint32_t*>(candidateCountBuffer.contents);
+      candidateAccepted = std::min<uint32_t>(candidateAccepted, static_cast<uint32_t>(wholeImageRequest.candidateTarget));
+      if (candidateAccepted > 0 && wholeImageRequest.extraPointCount > 0) {
+        out->appendedSamples = selectOccupancySamplesGpu(queue,
+                                                         pipelines,
+                                                         candidateBuffer,
+                                                         candidateAccepted,
+                                                         occupancyBuffer,
+                                                         out->occupancy,
+                                                         wholeImageRequest.extraPointCount,
+                                                         wholeImageRequest.neutralRadiusEnabled != 0,
+                                                         &out->error);
+        if (out->appendedSamples.empty() && !out->error.empty()) return false;
+      }
+    }
+
     out->success = true;
     return true;
   }

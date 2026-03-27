@@ -86,8 +86,8 @@ using namespace OFX;
 constexpr const char* kPluginIdentifier = "com.moazelgabry.chromaspace";
 constexpr const char* kPluginGrouping = "Moaz Elgabry";
 constexpr int kPluginVersionMajor = 1;
-constexpr int kPluginVersionMinor = 3;
-constexpr const char* kPluginVersionLabel = "v1.0.3Beta";
+constexpr int kPluginVersionMinor = 4;
+constexpr const char* kPluginVersionLabel = "v1.0.4Beta";
 constexpr const char* kPluginName = "Chromaspace";
 constexpr const char* kWebsiteUrl = "https://moazelgabry.com";
 constexpr const char* kReleasesUrl = "https://github.com/MoazElgabry/Chromaspace/releases/latest";
@@ -275,6 +275,14 @@ struct CachedCloud {
   int resolution = 25;
   int sourceWidth = 0;
   int sourceHeight = 0;
+  bool valid = false;
+};
+
+struct CachedIdentityStripCloud {
+  std::vector<ViewerCloudSample> samples;
+  std::string cacheKey;
+  std::string paramHash;
+  int resolution = 25;
   bool valid = false;
 };
 
@@ -1815,6 +1823,7 @@ class ChromaspaceEffect : public ImageEffect {
   bool cubeViewerInputCloudRefreshPending_ = false;
   bool suppressLassoDataChangedHandling_ = false;
   CachedCloud cachedCloud_;
+  CachedIdentityStripCloud cachedIdentityStripCloud_;
   double lastCloudTime_ = std::numeric_limits<double>::quiet_NaN();
   std::chrono::steady_clock::time_point lastCloudBuiltAt_{};
   std::chrono::steady_clock::time_point lastRenderSeenAt_{};
@@ -2654,12 +2663,73 @@ class ChromaspaceEffect : public ImageEffect {
     {
       std::lock_guard<std::mutex> lock(stateMutex_);
       cachedCloud_ = CachedCloud{};
+      cachedIdentityStripCloud_ = CachedIdentityStripCloud{};
     }
   }
 
   void requestCubeViewerCloudResample() {
     lastCloudTime_ = std::numeric_limits<double>::quiet_NaN();
     lastCloudBuiltAt_ = std::chrono::steady_clock::time_point{};
+  }
+
+  std::string buildIdentityStripParamHash(int width, int height, int resolution, bool readCube, bool readRamp, double time) {
+    std::ostringstream hash;
+    hash << width << 'x' << height << ':' << resolution << ':' << qualityLabelForIndex(getChoiceValue("cubeViewerQuality", time, cubeViewerQuality_));
+    if (readCube) hash << ":drawn-cube=1";
+    if (readRamp) hash << ":drawn-ramp=1";
+    return hash.str();
+  }
+
+  std::string currentIdentityStripCacheKey(
+      double time,
+      int width,
+      int height,
+      int originX,
+      int originY,
+      int resolution,
+      bool readCube,
+      bool readRamp,
+      const std::string& backendTag) {
+    std::ostringstream oss;
+    oss << backendTag
+        << "|width=" << width
+        << "|height=" << height
+        << "|origin=" << originX << "," << originY
+        << "|resolution=" << resolution
+        << "|quality=" << qualityLabelForIndex(getChoiceValue("cubeViewerQuality", time, cubeViewerQuality_))
+        << "|readCube=" << (readCube ? 1 : 0)
+        << "|readRamp=" << (readRamp ? 1 : 0)
+        << "|showOverflow=" << (currentShowOverflow(time) ? 1 : 0)
+        << "|plotDisplayLinear=" << (currentPlotDisplayLinearEnabled(time) ? 1 : 0)
+        << "|plotDisplayLinearTransfer=" << static_cast<int>(currentPlotDisplayLinearTransferId(time));
+    return oss.str();
+  }
+
+  bool tryGetCachedIdentityStripCloud(
+      const std::string& cacheKey,
+      std::vector<ViewerCloudSample>* outSamples,
+      std::string* outParamHash,
+      int* outResolution) {
+    if (!outSamples) return false;
+    std::lock_guard<std::mutex> lock(stateMutex_);
+    if (!cachedIdentityStripCloud_.valid || cachedIdentityStripCloud_.cacheKey != cacheKey) return false;
+    *outSamples = cachedIdentityStripCloud_.samples;
+    if (outParamHash) *outParamHash = cachedIdentityStripCloud_.paramHash;
+    if (outResolution) *outResolution = cachedIdentityStripCloud_.resolution;
+    return true;
+  }
+
+  void storeCachedIdentityStripCloud(
+      const std::string& cacheKey,
+      const std::vector<ViewerCloudSample>& samples,
+      const std::string& paramHash,
+      int resolution) {
+    std::lock_guard<std::mutex> lock(stateMutex_);
+    cachedIdentityStripCloud_.samples = samples;
+    cachedIdentityStripCloud_.cacheKey = cacheKey;
+    cachedIdentityStripCloud_.paramHash = paramHash;
+    cachedIdentityStripCloud_.resolution = resolution;
+    cachedIdentityStripCloud_.valid = true;
   }
 
   std::string currentQualityLabel(double time) {
@@ -2855,7 +2925,9 @@ class ChromaspaceEffect : public ImageEffect {
   }
 
   bool shouldUseFastCloudTransport(std::size_t sampleCount) const {
-    return sampleCount >= 4096u;
+    // Prefer binary/shared-memory handoff whenever there is actual cloud data.
+    // JSON remains the fallback if mapping creation fails.
+    return sampleCount > 0u;
   }
 
   std::string buildCloudTransportName(uint64_t seq) const {
@@ -3018,10 +3090,13 @@ class ChromaspaceEffect : public ImageEffect {
 
   struct ViewerCloudSamplesBuildResult {
     std::vector<ViewerCloudSample> samples;
+    std::vector<ViewerCloudSample> identityStripSamples;
     std::string paramHash;
+    std::string identityStripParamHash;
     std::string quality;
     std::string backendName = "CPU";
     int resolution = 25;
+    int identityStripResolution = 25;
     int sourceWidth = 0;
     int sourceHeight = 0;
     int primaryAttempts = 0;
@@ -3229,33 +3304,9 @@ class ChromaspaceEffect : public ImageEffect {
     }
     std::sort(samples.begin(), samples.end(), stableSampleLess);
 
-    if (request.occupancyFill && !cudaResult.occupancyCandidates.empty() && cudaResult.extraPointCount > 0) {
-      std::sort(cudaResult.occupancyCandidates.begin(), cudaResult.occupancyCandidates.end(),
-                [&](const ChromaspaceCloudCuda::OccupancyCandidate& a,
-                    const ChromaspaceCloudCuda::OccupancyCandidate& b) {
-                  const int aOcc = (a.bin >= 0 && static_cast<std::size_t>(a.bin) < cudaResult.occupancy.size())
-                                       ? cudaResult.occupancy[static_cast<std::size_t>(a.bin)]
-                                       : std::numeric_limits<int>::max();
-                  const int bOcc = (b.bin >= 0 && static_cast<std::size_t>(b.bin) < cudaResult.occupancy.size())
-                                       ? cudaResult.occupancy[static_cast<std::size_t>(b.bin)]
-                                       : std::numeric_limits<int>::max();
-                  if (aOcc != bOcc) return aOcc < bOcc;
-                  if (sliceSpec.neutralRadiusEnabled &&
-                      std::fabs(a.normalizedNeutralRadius - b.normalizedNeutralRadius) > 1e-6f) {
-                    return a.normalizedNeutralRadius < b.normalizedNeutralRadius;
-                  }
-                  return a.tie < b.tie;
-                });
-      const int appendCount = std::min<int>(cudaResult.extraPointCount, static_cast<int>(cudaResult.occupancyCandidates.size()));
-      for (int i = 0; i < appendCount; ++i) {
-        const auto& candidate = cudaResult.occupancyCandidates[static_cast<std::size_t>(i)];
-        samples.push_back({candidate.sample.xNorm,
-                           candidate.sample.yNorm,
-                           candidate.sample.zReserved,
-                           candidate.sample.r,
-                           candidate.sample.g,
-                           candidate.sample.b});
-      }
+    if (!cudaResult.appendedSamples.empty()) {
+      const auto appended = toViewerCloudSamples(cudaResult.appendedSamples);
+      samples.insert(samples.end(), appended.begin(), appended.end());
     }
 
     std::ostringstream hash;
@@ -3311,9 +3362,15 @@ class ChromaspaceEffect : public ImageEffect {
       if (reason) *reason = "instance1-disabled";
       return false;
     }
-    const int qualityIndex = getChoiceValue("cubeViewerQuality", args.time, cubeViewerQuality_);
     const int requestedSize = getIntValue("cubeViewerSampleDrawnCubeSize", args.time, 29);
     const int resolution = clampOverlayCubeSize(requestedSize);
+    const std::string cacheKey =
+        currentIdentityStripCacheKey(args.time, width, height, bounds.x1, bounds.y1, resolution, readCube, readRamp, "cuda-strip");
+    const std::string paramHash = buildIdentityStripParamHash(width, height, resolution, readCube, readRamp, args.time);
+    if (tryGetCachedIdentityStripCloud(cacheKey, outSamples, outParamHash, outResolution)) {
+      cubeViewerDebugLog(std::string("Viewer identity strip CUDA cache hit samples=") + std::to_string(outSamples->size()));
+      return true;
+    }
     int stripHeight = 0;
     int cubeY1 = 0;
     int cubeY2 = 0;
@@ -3355,12 +3412,9 @@ class ChromaspaceEffect : public ImageEffect {
       return false;
     }
     *outSamples = toViewerCloudSamples(stripResult.samples);
-    std::ostringstream hash;
-    hash << width << 'x' << height << ':' << resolution << ':' << qualityLabelForIndex(qualityIndex);
-    if (readCube) hash << ":drawn-cube=1";
-    if (readRamp) hash << ":drawn-ramp=1";
-    *outParamHash = hash.str();
+    *outParamHash = paramHash;
     *outResolution = resolution;
+    storeCachedIdentityStripCloud(cacheKey, *outSamples, *outParamHash, *outResolution);
     const auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
     cubeViewerDebugLog(std::string("Viewer identity strip CUDA path succeeded samples=") + std::to_string(outSamples->size()) +
                        " elapsedMs=" + std::to_string(elapsedMs));
@@ -3470,33 +3524,9 @@ class ChromaspaceEffect : public ImageEffect {
     std::vector<ViewerCloudSample> samples = toViewerCloudSamples(metalResult.primarySamples);
     std::sort(samples.begin(), samples.end(), stableSampleLess);
 
-    if (request.occupancyFill && !metalResult.occupancyCandidates.empty() && metalResult.extraPointCount > 0) {
-      std::sort(metalResult.occupancyCandidates.begin(), metalResult.occupancyCandidates.end(),
-                [&](const ChromaspaceMetal::OccupancyCandidate& a,
-                    const ChromaspaceMetal::OccupancyCandidate& b) {
-                  const int aOcc = (a.bin >= 0 && static_cast<std::size_t>(a.bin) < metalResult.occupancy.size())
-                                       ? metalResult.occupancy[static_cast<std::size_t>(a.bin)]
-                                       : std::numeric_limits<int>::max();
-                  const int bOcc = (b.bin >= 0 && static_cast<std::size_t>(b.bin) < metalResult.occupancy.size())
-                                       ? metalResult.occupancy[static_cast<std::size_t>(b.bin)]
-                                       : std::numeric_limits<int>::max();
-                  if (aOcc != bOcc) return aOcc < bOcc;
-                  if (sliceSpec.neutralRadiusEnabled &&
-                      std::fabs(a.normalizedNeutralRadius - b.normalizedNeutralRadius) > 1e-6f) {
-                    return a.normalizedNeutralRadius < b.normalizedNeutralRadius;
-                  }
-                  return a.tie < b.tie;
-                });
-      const int appendCount = std::min<int>(metalResult.extraPointCount, static_cast<int>(metalResult.occupancyCandidates.size()));
-      for (int i = 0; i < appendCount; ++i) {
-        const auto& candidate = metalResult.occupancyCandidates[static_cast<std::size_t>(i)];
-        samples.push_back({candidate.sample.xNorm,
-                           candidate.sample.yNorm,
-                           candidate.sample.zReserved,
-                           candidate.sample.r,
-                           candidate.sample.g,
-                           candidate.sample.b});
-      }
+    if (!metalResult.appendedSamples.empty()) {
+      const auto appended = toViewerCloudSamples(metalResult.appendedSamples);
+      samples.insert(samples.end(), appended.begin(), appended.end());
     }
 
     std::ostringstream hash;
@@ -3517,7 +3547,190 @@ class ChromaspaceEffect : public ImageEffect {
     out->primaryAccepted = metalResult.primaryAccepted;
     out->success = true;
     const auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
-    cubeViewerDebugLog(std::string("Viewer cloud Metal kernel path succeeded samples=") + std::to_string(out->samples.size()) +
+  cubeViewerDebugLog(std::string("Viewer cloud Metal kernel path succeeded samples=") + std::to_string(out->samples.size()) +
+                     " primaryAccepted=" + std::to_string(out->primaryAccepted) +
+                     " elapsedMs=" + std::to_string(elapsedMs));
+  return true;
+}
+
+  bool buildWholeImageAndInstance1CloudMetal(
+      const ViewerCloudBuildRequest& request,
+      SliceSelectionSpec sliceSpec,
+      Image* src,
+      const RenderArguments& args,
+      ViewerCloudSamplesBuildResult* out,
+      int* outStripResolution,
+      std::string* reason) {
+    if (!out) return false;
+    *out = ViewerCloudSamplesBuildResult{};
+    if (outStripResolution) *outStripResolution = request.resolution;
+    if (!src || !src->getPixelData() || !args.isEnabledMetalRender || args.pMetalCmdQ == nullptr ||
+        request.width <= 0 || request.height <= 0) {
+      if (reason) *reason = "metal-unavailable";
+      return false;
+    }
+
+    const int scaledWidth = std::max(1, static_cast<int>(std::lround(static_cast<double>(request.width) * request.scaleFactor)));
+    const int scaledHeight = std::max(1, static_cast<int>(std::lround(static_cast<double>(request.height) * request.scaleFactor)));
+    const int pointCount = std::max(512, static_cast<int>(std::lround(
+        static_cast<double>(qualityPointCountForIndex(request.qualityIndex, request.previewMode)) *
+        request.scaleFactor * request.scaleFactor)));
+    int selectionRetryMultiplier = sliceSpec.enabled ? 12 : 1;
+    const float effectiveNeutralRadius = effectiveNeutralRadiusThreshold(sliceSpec.neutralRadius);
+    if (sliceSpec.neutralRadiusEnabled) {
+      const int neutralRetryMultiplier =
+          8 + static_cast<int>(std::lround(clampf(1.0f - effectiveNeutralRadius, 0.0f, 1.0f) * 18.0f));
+      selectionRetryMultiplier = std::max(selectionRetryMultiplier, neutralRetryMultiplier);
+    }
+    const bool anyHueRegionSelected = sliceSpec.cubeSliceRed || sliceSpec.cubeSliceGreen || sliceSpec.cubeSliceBlue ||
+                                      sliceSpec.cubeSliceCyan || sliceSpec.cubeSliceYellow || sliceSpec.cubeSliceMagenta;
+    const bool noHueRegionSelected = sliceSpec.enabled && !anyHueRegionSelected;
+    const bool selectionImpossible = noHueRegionSelected;
+    const int maxPrimaryAttempts = selectionImpossible
+                                       ? 0
+                                       : (selectionRetryMultiplier <= 1
+                                              ? pointCount
+                                              : std::min(std::max(pointCount * selectionRetryMultiplier, pointCount + 4096),
+                                                         request.previewMode ? 750000 : 3000000));
+    const int extraPointCount = std::max(2048, pointCount / (request.previewMode ? 4 : 2));
+    const int candidateTarget = std::min(std::max(extraPointCount * 3, 8192), request.previewMode ? 32768 : 131072);
+    const int maxCandidateAttempts = !request.occupancyFill || selectionImpossible
+                                         ? 0
+                                         : (selectionRetryMultiplier <= 1
+                                                ? candidateTarget
+                                                : std::min(std::max(candidateTarget * selectionRetryMultiplier, candidateTarget + 4096),
+                                                           request.previewMode ? 750000 : 3000000));
+
+    int plotMode = 0;
+    switch (sliceSpec.plotMode) {
+      case SlicePlotModeKind::Hsl: plotMode = 1; break;
+      case SlicePlotModeKind::Hsv: plotMode = 2; break;
+      case SlicePlotModeKind::Chen: plotMode = 3; break;
+      case SlicePlotModeKind::RgbToCone: plotMode = 4; break;
+      case SlicePlotModeKind::JpConical: plotMode = 5; break;
+      case SlicePlotModeKind::NormCone: plotMode = 6; break;
+      case SlicePlotModeKind::Reuleaux: plotMode = 7; break;
+      default: plotMode = 0; break;
+    }
+
+    const OfxRectI bounds = src->getBounds();
+    size_t srcRowBytes = static_cast<size_t>(std::abs(src->getRowBytes()));
+    const size_t packedRowBytes = static_cast<size_t>(request.width) * 4u * sizeof(float);
+    if (srcRowBytes == 0) srcRowBytes = packedRowBytes;
+
+    const bool readCube = currentReadIdentityPlot(args.time);
+    const bool readRamp = currentReadGrayRamp(args.time);
+    if (!readCube && !readRamp) {
+      if (reason) *reason = "instance1-disabled";
+      return false;
+    }
+    const int requestedSize = getIntValue("cubeViewerSampleDrawnCubeSize", args.time, 29);
+    const int stripResolution = clampOverlayCubeSize(requestedSize);
+    if (outStripResolution) *outStripResolution = stripResolution;
+    int stripHeight = 0;
+    int cubeY1 = 0;
+    int cubeY2 = 0;
+    int rampY1 = 0;
+    int rampY2 = 0;
+    if (!computeIdentityStripLayout(bounds, stripResolution, readRamp, &stripHeight, &cubeY1, &cubeY2, &rampY1, &rampY2)) {
+      if (reason) *reason = "layout-failed";
+      return false;
+    }
+
+    ChromaspaceMetal::Request wholeRequest{};
+    wholeRequest.srcMetalBuffer = src->getPixelData();
+    wholeRequest.srcRowBytes = srcRowBytes;
+    wholeRequest.width = request.width;
+    wholeRequest.height = request.height;
+    wholeRequest.originX = bounds.x1;
+    wholeRequest.originY = bounds.y1;
+    wholeRequest.scaledWidth = scaledWidth;
+    wholeRequest.scaledHeight = scaledHeight;
+    wholeRequest.pointCount = pointCount;
+    wholeRequest.extraPointCount = request.occupancyFill ? extraPointCount : 0;
+    wholeRequest.candidateTarget = request.occupancyFill ? candidateTarget : 0;
+    wholeRequest.maxPrimaryAttempts = maxPrimaryAttempts;
+    wholeRequest.maxCandidateAttempts = maxCandidateAttempts;
+    wholeRequest.samplingMode = request.samplingMode;
+    wholeRequest.preserveOverflow = request.preserveOverflow ? 1 : 0;
+    wholeRequest.occupancyFill = request.occupancyFill ? 1 : 0;
+    wholeRequest.plotMode = plotMode;
+    wholeRequest.circularHsl = sliceSpec.circularHsl ? 1 : 0;
+    wholeRequest.circularHsv = sliceSpec.circularHsv ? 1 : 0;
+    wholeRequest.normConeNormalized = sliceSpec.normConeNormalized ? 1 : 0;
+    wholeRequest.showOverflow = sliceSpec.showOverflow ? 1 : 0;
+    wholeRequest.plotDisplayLinearEnabled = request.plotDisplayLinearEnabled ? 1 : 0;
+    wholeRequest.plotDisplayLinearTransfer = request.plotDisplayLinearTransferId;
+    wholeRequest.neutralRadiusEnabled = sliceSpec.neutralRadiusEnabled ? 1 : 0;
+    wholeRequest.neutralRadius = sliceSpec.neutralRadius;
+    wholeRequest.metalCommandQueue = args.pMetalCmdQ;
+
+    ChromaspaceMetal::StripRequest stripRequest{};
+    stripRequest.srcMetalBuffer = src->getPixelData();
+    stripRequest.srcRowBytes = srcRowBytes;
+    stripRequest.width = request.width;
+    stripRequest.height = request.height;
+    stripRequest.originX = bounds.x1;
+    stripRequest.originY = bounds.y1;
+    stripRequest.resolution = stripResolution;
+    stripRequest.preserveOverflow = currentShowOverflow(args.time) ? 1 : 0;
+    stripRequest.readCube = readCube ? 1 : 0;
+    stripRequest.readRamp = readRamp ? 1 : 0;
+    stripRequest.plotDisplayLinearEnabled = currentPlotDisplayLinearEnabled(args.time) ? 1 : 0;
+    stripRequest.plotDisplayLinearTransfer = static_cast<int>(currentPlotDisplayLinearTransferId(args.time));
+    stripRequest.cubeY1 = cubeY1 - bounds.y1;
+    stripRequest.stripHeight = stripHeight;
+    stripRequest.rampY1 = rampY1 - bounds.y1;
+    stripRequest.rampHeight = std::max(0, rampY2 - rampY1);
+    stripRequest.rampSampleRows = std::min(stripRequest.rampHeight, std::max(4, std::min(8, stripResolution / 8 + 2)));
+    stripRequest.cellWidth = identityStripCellWidth(request.width, stripResolution);
+    stripRequest.metalCommandQueue = args.pMetalCmdQ;
+
+    ChromaspaceMetal::CombinedResult combinedResult{};
+    const auto start = std::chrono::steady_clock::now();
+    if (!ChromaspaceMetal::buildWholeImageAndIdentityStripCloud(wholeRequest, stripRequest, &combinedResult) || !combinedResult.success) {
+      if (reason) *reason = combinedResult.error.empty() ? "metal-combined-cloud-build-failed" : combinedResult.error;
+      return false;
+    }
+
+    std::sort(combinedResult.primarySamples.begin(), combinedResult.primarySamples.end(),
+              [](const ChromaspaceMetal::Sample& a, const ChromaspaceMetal::Sample& b) {
+                if (a.xNorm != b.xNorm) return a.xNorm < b.xNorm;
+                if (a.yNorm != b.yNorm) return a.yNorm < b.yNorm;
+                if (a.r != b.r) return a.r < b.r;
+                if (a.g != b.g) return a.g < b.g;
+                return a.b < b.b;
+              });
+
+    std::vector<ViewerCloudSample> samples = toViewerCloudSamples(combinedResult.combinedSamples);
+    if (!combinedResult.appendedSamples.empty()) {
+      const auto appended = toViewerCloudSamples(combinedResult.appendedSamples);
+      samples.insert(samples.end(), appended.begin(), appended.end());
+    }
+
+    std::ostringstream hash;
+    hash << request.width << 'x' << request.height << ':' << request.resolution << ':'
+         << qualityLabelForIndex(request.qualityIndex)
+         << ":sampling=" << samplingModeLabelForIndex(request.samplingMode)
+         << ":occupancyFill=" << (request.occupancyFill ? 1 : 0)
+         << ":scale=" << scaleLabelForIndex(request.scaleIndex);
+
+    out->samples = std::move(samples);
+    out->paramHash = hash.str() + "+instance1=" + std::to_string(stripResolution);
+    out->identityStripSamples = toViewerCloudSamples(combinedResult.stripSamples);
+    out->identityStripParamHash =
+        buildIdentityStripParamHash(request.width, request.height, stripResolution, readCube, readRamp, args.time);
+    out->quality = qualityLabelForIndex(request.qualityIndex);
+    out->backendName = "Metal+Metal-strip";
+    out->resolution = request.resolution;
+    out->identityStripResolution = stripResolution;
+    out->sourceWidth = request.width;
+    out->sourceHeight = request.height;
+    out->primaryAttempts = combinedResult.primaryAttempts;
+    out->primaryAccepted = combinedResult.primaryAccepted + static_cast<int>(combinedResult.stripSamples.size());
+    out->success = true;
+    const auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
+    cubeViewerDebugLog(std::string("Viewer combined Metal kernel path succeeded samples=") + std::to_string(out->samples.size()) +
                        " primaryAccepted=" + std::to_string(out->primaryAccepted) +
                        " elapsedMs=" + std::to_string(elapsedMs));
     return true;
@@ -3552,9 +3765,15 @@ class ChromaspaceEffect : public ImageEffect {
       if (reason) *reason = "instance1-disabled";
       return false;
     }
-    const int qualityIndex = getChoiceValue("cubeViewerQuality", args.time, cubeViewerQuality_);
     const int requestedSize = getIntValue("cubeViewerSampleDrawnCubeSize", args.time, 29);
     const int resolution = clampOverlayCubeSize(requestedSize);
+    const std::string cacheKey =
+        currentIdentityStripCacheKey(args.time, width, height, bounds.x1, bounds.y1, resolution, readCube, readRamp, "metal-strip");
+    const std::string paramHash = buildIdentityStripParamHash(width, height, resolution, readCube, readRamp, args.time);
+    if (tryGetCachedIdentityStripCloud(cacheKey, outSamples, outParamHash, outResolution)) {
+      cubeViewerDebugLog(std::string("Viewer identity strip Metal cache hit samples=") + std::to_string(outSamples->size()));
+      return true;
+    }
     int stripHeight = 0;
     int cubeY1 = 0;
     int cubeY2 = 0;
@@ -3597,12 +3816,9 @@ class ChromaspaceEffect : public ImageEffect {
       return false;
     }
     *outSamples = toViewerCloudSamples(stripResult.samples);
-    std::ostringstream hash;
-    hash << width << 'x' << height << ':' << resolution << ':' << qualityLabelForIndex(qualityIndex);
-    if (readCube) hash << ":drawn-cube=1";
-    if (readRamp) hash << ":drawn-ramp=1";
-    *outParamHash = hash.str();
+    *outParamHash = paramHash;
     *outResolution = resolution;
+    storeCachedIdentityStripCloud(cacheKey, *outSamples, *outParamHash, *outResolution);
     const auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
     cubeViewerDebugLog(std::string("Viewer identity strip Metal path succeeded samples=") + std::to_string(outSamples->size()) +
                        " elapsedMs=" + std::to_string(elapsedMs));
@@ -4576,12 +4792,15 @@ class ChromaspaceEffect : public ImageEffect {
 #if defined(__APPLE__)
     if (useInstance1Requested &&
         args.isEnabledMetalRender && args.pMetalCmdQ != nullptr && src->getPixelData() != nullptr) {
-      std::vector<ViewerCloudSample> stripSamples;
-      std::string stripParamHash;
+      const bool readCube = currentReadIdentityPlot(args.time);
+      const bool readRamp = currentReadGrayRamp(args.time);
       int stripResolution = request.resolution;
       std::string stripReason;
-      const bool stripBuilt = buildInstance1StripCloudMetal(src, args, &stripSamples, &stripParamHash, &stripResolution, &stripReason);
       if (showIdentityOnly) {
+        std::vector<ViewerCloudSample> stripSamples;
+        std::string stripParamHash;
+        const bool stripBuilt =
+            buildInstance1StripCloudMetal(src, args, &stripSamples, &stripParamHash, &stripResolution, &stripReason);
         if (stripBuilt) {
           cubeViewerDebugLog("Viewer cloud backend selected: Metal-strip");
           return finalizeCloudBuildFromSamples(stripSamples,
@@ -4598,25 +4817,53 @@ class ChromaspaceEffect : public ImageEffect {
       } else {
         ViewerCloudSamplesBuildResult metalBuilt{};
         std::string reason;
-        if (buildWholeImageCloudMetal(request, currentHueSectorSliceSpec(args.time), src, args, &metalBuilt, &reason)) {
-          if (stripBuilt) {
-            std::vector<ViewerCloudSample> mergedSamples;
-            mergedSamples.reserve(stripSamples.size() + metalBuilt.samples.size());
-            mergedSamples.insert(mergedSamples.end(), stripSamples.begin(), stripSamples.end());
-            mergedSamples.insert(mergedSamples.end(), metalBuilt.samples.begin(), metalBuilt.samples.end());
-            cubeViewerDebugLog("Viewer cloud backend selected: Metal-kernel + Metal-strip");
-            return finalizeCloudBuildFromSamples(mergedSamples,
-                                                 metalBuilt.paramHash + "+instance1=" + std::to_string(stripResolution),
-                                                 request.settingsKey,
-                                                 metalBuilt.resolution,
-                                                 request.qualityIndex,
-                                                 metalBuilt.sourceWidth,
-                                                 metalBuilt.sourceHeight,
-                                                 "Metal+Metal-strip",
-                                                 metalBuilt.primaryAttempts,
-                                                 metalBuilt.primaryAccepted + static_cast<int>(stripSamples.size()));
+        const int requestedSize = getIntValue("cubeViewerSampleDrawnCubeSize", args.time, 29);
+        const int cachedStripResolution = clampOverlayCubeSize(requestedSize);
+        const std::string stripCacheKey =
+            currentIdentityStripCacheKey(args.time, width, height, bounds.x1, bounds.y1, cachedStripResolution, readCube, readRamp, "metal-strip");
+        std::vector<ViewerCloudSample> cachedStripSamples;
+        int cachedResolution = cachedStripResolution;
+        if (tryGetCachedIdentityStripCloud(stripCacheKey, &cachedStripSamples, nullptr, &cachedResolution) &&
+            buildWholeImageCloudMetal(request, currentHueSectorSliceSpec(args.time), src, args, &metalBuilt, &reason)) {
+          std::vector<ViewerCloudSample> mergedSamples;
+          mergedSamples.reserve(cachedStripSamples.size() + metalBuilt.samples.size());
+          mergedSamples.insert(mergedSamples.end(), cachedStripSamples.begin(), cachedStripSamples.end());
+          mergedSamples.insert(mergedSamples.end(), metalBuilt.samples.begin(), metalBuilt.samples.end());
+          cubeViewerDebugLog("Viewer cloud backend selected: Metal-kernel + cached Metal-strip");
+          return finalizeCloudBuildFromSamples(mergedSamples,
+                                               metalBuilt.paramHash + "+instance1=" + std::to_string(cachedResolution),
+                                               request.settingsKey,
+                                               metalBuilt.resolution,
+                                               request.qualityIndex,
+                                               metalBuilt.sourceWidth,
+                                               metalBuilt.sourceHeight,
+                                               "Metal+Cached-strip",
+                                               metalBuilt.primaryAttempts,
+                                               metalBuilt.primaryAccepted + static_cast<int>(cachedStripSamples.size()));
+        }
+        if (buildWholeImageAndInstance1CloudMetal(
+                request, currentHueSectorSliceSpec(args.time), src, args, &metalBuilt, &stripResolution, &reason)) {
+          if (!metalBuilt.identityStripSamples.empty() && !metalBuilt.identityStripParamHash.empty()) {
+            storeCachedIdentityStripCloud(stripCacheKey,
+                                          metalBuilt.identityStripSamples,
+                                          metalBuilt.identityStripParamHash,
+                                          metalBuilt.identityStripResolution);
           }
-          cubeViewerDebugLog(std::string("Viewer identity strip Metal path fell back: ") + stripReason);
+          cubeViewerDebugLog("Viewer cloud backend selected: Metal-kernel + Metal-strip");
+          return finalizeCloudBuildFromSamples(metalBuilt.samples,
+                                               metalBuilt.paramHash,
+                                               request.settingsKey,
+                                               metalBuilt.resolution,
+                                               request.qualityIndex,
+                                               metalBuilt.sourceWidth,
+                                               metalBuilt.sourceHeight,
+                                               metalBuilt.backendName,
+                                               metalBuilt.primaryAttempts,
+                                               metalBuilt.primaryAccepted);
+        }
+        cubeViewerDebugLog(std::string("Viewer combined Metal kernel path fell back in instance1 mode: ") + reason);
+        if (buildWholeImageCloudMetal(request, currentHueSectorSliceSpec(args.time), src, args, &metalBuilt, &reason)) {
+          cubeViewerDebugLog("Viewer cloud backend selected: Metal-kernel");
           return finalizeCloudBuildFromSamples(metalBuilt.samples,
                                                metalBuilt.paramHash,
                                                request.settingsKey,
@@ -4630,7 +4877,7 @@ class ChromaspaceEffect : public ImageEffect {
         }
         cubeViewerDebugLog(std::string("Viewer cloud Metal kernel path fell back in instance1 mode: ") + reason);
       }
-      if (!stripBuilt && !stripReason.empty()) {
+      if (showIdentityOnly && !stripReason.empty()) {
         cubeViewerDebugLog(std::string("Viewer identity strip Metal path unavailable: ") + stripReason);
       }
     }

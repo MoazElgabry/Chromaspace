@@ -54,6 +54,7 @@ struct Request {
 
 struct Result {
   std::vector<Sample> primarySamples;
+  std::vector<Sample> appendedSamples;
   std::vector<OccupancyCandidate> occupancyCandidates;
   std::vector<int> occupancy;
   int primaryAttempts = 0;
@@ -94,6 +95,22 @@ struct StripResult {
 };
 
 bool buildIdentityStripCloud(const StripRequest& request, StripResult* out);
+
+struct CombinedResult {
+  std::vector<Sample> primarySamples;
+  std::vector<Sample> combinedSamples;
+  std::vector<Sample> appendedSamples;
+  std::vector<OccupancyCandidate> occupancyCandidates;
+  std::vector<int> occupancy;
+  std::vector<Sample> stripSamples;
+  int primaryAttempts = 0;
+  int primaryAccepted = 0;
+  int extraPointCount = 0;
+  std::string error;
+  bool success = false;
+};
+
+bool buildWholeImageAndIdentityStripCloud(const Request& wholeImageRequest, const StripRequest& stripRequest, CombinedResult* out);
 
 bool copyHostBuffers(
     const void* srcMetalBuffer,

@@ -576,6 +576,37 @@ __global__ void occupancyPassKernel(Request request, OccupancyCandidate* candida
   candidateOut[outIndex] = candidate;
 }
 
+struct AppendSelectRequest {
+  int candidateCount = 0;
+  int extraPointCount = 0;
+  int occupancyThreshold = 0;
+  float radiusMin = 0.0f;
+  float radiusMax = 1.0f;
+};
+
+__global__ void appendSelectKernel(const OccupancyCandidate* candidateIn,
+                                   const int* occupancyBins,
+                                   int* appendCount,
+                                   Sample* appendOut,
+                                   AppendSelectRequest request) {
+  const int index = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+  if (index >= request.candidateCount) return;
+  const OccupancyCandidate candidate = candidateIn[index];
+  if (candidate.bin < 0) return;
+  const int occ = occupancyBins[candidate.bin];
+  if (occ != request.occupancyThreshold) return;
+  if (candidate.normalizedNeutralRadius < request.radiusMin) return;
+  const bool lastBucket = request.radiusMax >= 0.9999f;
+  if (lastBucket) {
+    if (candidate.normalizedNeutralRadius > request.radiusMax) return;
+  } else {
+    if (candidate.normalizedNeutralRadius >= request.radiusMax) return;
+  }
+  const int outIndex = atomicAdd(appendCount, 1);
+  if (outIndex >= request.extraPointCount) return;
+  appendOut[outIndex] = candidate.sample;
+}
+
 __global__ void stripCubeKernel(StripRequest request, Sample* outSamples) {
   const int index = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
   const int resolution = request.resolution;
@@ -684,6 +715,17 @@ bool allocBuffer(DeviceBuffer<T>* buffer, std::size_t count, std::string* error)
   return true;
 }
 
+std::vector<int> sortedUniqueOccupancyValuesAscending(const std::vector<int>& occupancy) {
+  std::vector<int> values;
+  values.reserve(occupancy.size());
+  for (int value : occupancy) {
+    if (value >= 0) values.push_back(value);
+  }
+  std::sort(values.begin(), values.end());
+  values.erase(std::unique(values.begin(), values.end()), values.end());
+  return values;
+}
+
 }  // namespace
 
 bool buildWholeImageCloud(const Request& request, Result* out) {
@@ -764,13 +806,54 @@ bool buildWholeImageCloud(const Request& request, Result* out) {
       return false;
     }
     candidateAccepted = std::min(candidateAccepted, request.candidateTarget);
-    out->occupancyCandidates.assign(static_cast<std::size_t>(candidateAccepted), OccupancyCandidate{});
-    if (candidateAccepted > 0 &&
-        cudaMemcpy(out->occupancyCandidates.data(), candidates.ptr,
-                   static_cast<std::size_t>(candidateAccepted) * sizeof(OccupancyCandidate),
-                   cudaMemcpyDeviceToHost) != cudaSuccess) {
-      out->error = "candidate readback failed";
-      return false;
+    if (candidateAccepted > 0 && request.extraPointCount > 0) {
+      DeviceBuffer<Sample> appended;
+      DeviceBuffer<int> appendCount;
+      if (!allocBuffer(&appended, static_cast<std::size_t>(request.extraPointCount), &out->error) ||
+          !allocBuffer(&appendCount, 1u, &out->error)) {
+        return false;
+      }
+      if (cudaMemsetAsync(appendCount.ptr, 0, sizeof(int), request.stream) != cudaSuccess) {
+        out->error = "append-reset failed";
+        return false;
+      }
+      const std::vector<int> thresholds = sortedUniqueOccupancyValuesAscending(out->occupancy);
+      const int radiusBuckets = request.neutralRadiusEnabled != 0 ? 6 : 1;
+      const int appendBlocks = std::max(1, (candidateAccepted + 255) / 256);
+      for (int threshold : thresholds) {
+        for (int bucket = 0; bucket < radiusBuckets; ++bucket) {
+          AppendSelectRequest appendRequest{};
+          appendRequest.candidateCount = candidateAccepted;
+          appendRequest.extraPointCount = request.extraPointCount;
+          appendRequest.occupancyThreshold = threshold;
+          appendRequest.radiusMin = request.neutralRadiusEnabled != 0 ? (static_cast<float>(bucket) / static_cast<float>(radiusBuckets)) : 0.0f;
+          appendRequest.radiusMax = request.neutralRadiusEnabled != 0 ? (static_cast<float>(bucket + 1) / static_cast<float>(radiusBuckets)) : 1.0f;
+          appendSelectKernel<<<appendBlocks, 256, 0, request.stream>>>(candidates.ptr, occupancy.ptr, appendCount.ptr, appended.ptr, appendRequest);
+          if (cudaGetLastError() != cudaSuccess) {
+            out->error = "append-select failed";
+            return false;
+          }
+        }
+      }
+      if (cudaStreamSynchronize(request.stream) != cudaSuccess) {
+        out->error = "append-select sync failed";
+        return false;
+      }
+      int appendedAccepted = 0;
+      if (cudaMemcpy(&appendedAccepted, appendCount.ptr, sizeof(int), cudaMemcpyDeviceToHost) != cudaSuccess) {
+        out->error = "append-count readback failed";
+        return false;
+      }
+      appendedAccepted = std::min(appendedAccepted, request.extraPointCount);
+      out->appendedSamples.assign(static_cast<std::size_t>(appendedAccepted), Sample{});
+      if (appendedAccepted > 0 &&
+          cudaMemcpy(out->appendedSamples.data(),
+                     appended.ptr,
+                     static_cast<std::size_t>(appendedAccepted) * sizeof(Sample),
+                     cudaMemcpyDeviceToHost) != cudaSuccess) {
+        out->error = "append readback failed";
+        return false;
+      }
     }
   }
 
