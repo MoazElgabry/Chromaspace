@@ -348,6 +348,12 @@ enum class VolumeSlicingMode {
   LassoRegion = 1,
 };
 
+enum class ViewerUpdateMode {
+  Auto = 0,
+  Fluid = 1,
+  Scheduled = 2,
+};
+
 struct LassoPointNorm {
   float xNorm = 0.0f;
   float yNorm = 0.0f;
@@ -644,6 +650,14 @@ float derivedDensityScaleForPointSize(double pointSize) {
   }
   const float t = clampf((size - 1.0f) / 2.0f, 0.0f, 1.0f);
   return clampf(0.85f + 0.20f * std::pow(t, 0.75f), 0.85f, 1.05f);
+}
+
+const char* viewerUpdateModeLabelForIndex(int mode) {
+  switch (mode) {
+    case 1: return "Fluid";
+    case 2: return "Scheduled";
+    default: return "Auto";
+  }
 }
 
 double halton(uint32_t index, uint32_t base) {
@@ -1303,6 +1317,7 @@ class ChromaspaceEffect : public ImageEffect {
     srcClip_ = fetchClip(kOfxImageEffectSimpleSourceClipName);
 
     cubeViewerLive_ = getBoolValue("cubeViewerLive", 0.0, true);
+    cubeViewerUpdateMode_ = getChoiceValue("cubeViewerUpdateMode", 0.0, 0);
     cubeViewerQuality_ = getChoiceValue("cubeViewerQuality", 0.0, 0);
     cubeViewerRequested_ = false;
     cubeViewerConnected_ = false;
@@ -1459,6 +1474,13 @@ class ChromaspaceEffect : public ImageEffect {
       if (cubeViewerRequested_) {
         pushParamsUpdate(args.time, "cubeViewerLive");
       }
+      return;
+    }
+    if (paramName == "cubeViewerUpdateMode") {
+      cubeViewerUpdateMode_ = getChoiceValue("cubeViewerUpdateMode", args.time, 0);
+      deferredLatestCloudRefresh_.store(false, std::memory_order_relaxed);
+      cubeViewerDebugLog(std::string("changedParam(cubeViewerUpdateMode) -> ") +
+                         viewerUpdateModeLabelForIndex(cubeViewerUpdateMode_));
       return;
     }
     if (paramName == "cubeViewerQuality") {
@@ -1824,8 +1846,10 @@ class ChromaspaceEffect : public ImageEffect {
   bool cubeViewerConnected_ = false;
   bool cubeViewerWindowUsable_ = false;
   bool cubeViewerLive_ = true;
+  int cubeViewerUpdateMode_ = 0;
   int cubeViewerQuality_ = 0;
   bool cubeViewerInputCloudRefreshPending_ = false;
+  int playbackRenderBurstCount_ = 0;
   bool suppressLassoDataChangedHandling_ = false;
   CachedCloud cachedCloud_;
   CachedIdentityStripCloud cachedIdentityStripCloud_;
@@ -2662,6 +2686,7 @@ class ChromaspaceEffect : public ImageEffect {
   void invalidateCubeViewerCloudState() {
     cubeViewerInputCloudRefreshPending_ = true;
     deferredLatestCloudRefresh_.store(false, std::memory_order_relaxed);
+    playbackRenderBurstCount_ = 0;
     lastCloudTime_ = std::numeric_limits<double>::quiet_NaN();
     lastCloudBuiltAt_ = std::chrono::steady_clock::time_point{};
     lastCloudSourceId_.clear();
@@ -2675,6 +2700,7 @@ class ChromaspaceEffect : public ImageEffect {
 
   void requestCubeViewerCloudResample() {
     deferredLatestCloudRefresh_.store(false, std::memory_order_relaxed);
+    playbackRenderBurstCount_ = 0;
     lastCloudTime_ = std::numeric_limits<double>::quiet_NaN();
     lastCloudBuiltAt_ = std::chrono::steady_clock::time_point{};
   }
@@ -5222,11 +5248,31 @@ class ChromaspaceEffect : public ImageEffect {
   }
 
   bool shouldUseInteractivePreview(std::chrono::steady_clock::time_point now) {
-    constexpr auto kPlaybackRenderGap = std::chrono::milliseconds(80);
-    constexpr auto kPreviewHold = std::chrono::milliseconds(220);
+    const ViewerUpdateMode updateMode = static_cast<ViewerUpdateMode>(std::clamp(cubeViewerUpdateMode_, 0, 2));
+    if (updateMode == ViewerUpdateMode::Fluid) {
+      previewModeUntil_ = std::chrono::steady_clock::time_point{};
+      playbackRenderBurstCount_ = 0;
+      return false;
+    }
+    if (updateMode == ViewerUpdateMode::Scheduled) {
+      previewModeUntil_ = now + std::chrono::milliseconds(220);
+      playbackRenderBurstCount_ = 0;
+      return true;
+    }
+    constexpr auto kPlaybackRenderGap = std::chrono::milliseconds(60);
+    constexpr auto kPlaybackGapReset = std::chrono::milliseconds(110);
+    constexpr auto kPreviewHold = std::chrono::milliseconds(140);
+    constexpr int kBurstThreshold = 3;
     if (lastRenderSeenAt_ != std::chrono::steady_clock::time_point{}) {
       const auto renderGap = now - lastRenderSeenAt_;
       if (renderGap <= kPlaybackRenderGap) {
+        playbackRenderBurstCount_ = std::min(playbackRenderBurstCount_ + 1, kBurstThreshold);
+      } else if (renderGap >= kPlaybackGapReset) {
+        playbackRenderBurstCount_ = 0;
+      } else if (playbackRenderBurstCount_ > 0) {
+        --playbackRenderBurstCount_;
+      }
+      if (playbackRenderBurstCount_ >= kBurstThreshold) {
         previewModeUntil_ = now + kPreviewHold;
       }
     }
@@ -5263,7 +5309,10 @@ class ChromaspaceEffect : public ImageEffect {
       // The two-instance workflow is intentionally downstream-facing: graphs such as layer mixers can
       // change the incoming pixels without providing a host image identifier change that we can trust.
       // Keep this mode on a more eager steady-state refresh policy instead of waiting for a weaker sourceId signal.
-      return elapsedMs >= (previewMode ? 170 : 16);
+      const ViewerUpdateMode updateMode = static_cast<ViewerUpdateMode>(std::clamp(cubeViewerUpdateMode_, 0, 2));
+      if (updateMode == ViewerUpdateMode::Fluid) return elapsedMs >= 16;
+      if (updateMode == ViewerUpdateMode::Scheduled) return elapsedMs >= 170;
+      return elapsedMs >= (previewMode ? 120 : 16);
     }
     return elapsedMs >= steadyStateCloudIntervalMs(previewMode);
   }
@@ -5312,6 +5361,7 @@ class ChromaspaceEffect : public ImageEffect {
       cloudQueuedOrInFlight_.store(false, std::memory_order_relaxed);
     }
     deferredLatestCloudRefresh_.store(false, std::memory_order_relaxed);
+    playbackRenderBurstCount_ = 0;
     lastViewerTransportActivityMs_.store(0, std::memory_order_relaxed);
     {
       std::lock_guard<std::mutex> lock(stageMutex_);
@@ -5663,6 +5713,7 @@ class ChromaspaceEffect : public ImageEffect {
     cubeViewerWindowUsable_ = existing.ok ? (existing.visible && !existing.iconified) : true;
     cubeViewerInputCloudRefreshPending_ = true;
     deferredLatestCloudRefresh_.store(false, std::memory_order_relaxed);
+    playbackRenderBurstCount_ = 0;
     lastCloudBuiltAt_ = std::chrono::steady_clock::time_point{};
     lastHeartbeatAt_ = existing.ok ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     {
@@ -5682,6 +5733,7 @@ class ChromaspaceEffect : public ImageEffect {
     cubeViewerWindowUsable_ = false;
     cubeViewerInputCloudRefreshPending_ = false;
     deferredLatestCloudRefresh_.store(false, std::memory_order_relaxed);
+    playbackRenderBurstCount_ = 0;
     lastCloudBuiltAt_ = std::chrono::steady_clock::time_point{};
     lastHeartbeatAt_ = std::chrono::steady_clock::time_point{};
     lastCloudSourceId_.clear();
@@ -6054,6 +6106,7 @@ class ChromaspaceFactory : public PluginFactoryHelper<ChromaspaceFactory> {
           {"openCubeViewer", "Open the standalone 3D cube viewer."},
           {"closeCubeViewer", "Disconnect this OFX instance from the viewer without closing the external window."},
           {"cubeViewerLive", "When enabled, changes update the viewer continuously."},
+          {"cubeViewerUpdateMode", "Choose how live viewer refreshes are scheduled. Auto adapts between fluid and scheduled behavior, Fluid prioritizes the smoothest point-cloud updates, and Scheduled prioritizes steadier host playback when live updates become heavy."},
           {"cubeViewerOnTop", "Keep the external viewer above the host application."},
           {"cubeViewerQuality", "Viewer sampling density for the 3D cube (Low=25^3, about 45k points; Medium=41^3, about 90k points; High=57^3, about 180k points)."},
           {"cubeViewerScale", "Scales the sampled image domain used for cube generation to lighten processing. 100% keeps full size, while lower values reduce cloud-build work."},
@@ -6407,6 +6460,15 @@ class ChromaspaceFactory : public PluginFactoryHelper<ChromaspaceFactory> {
     cubeViewerLive->setDefault(true);
     cubeViewerLive->setParent(*grpCubeViewer);
     if (const char* hint = tooltipFor("cubeViewerLive")) cubeViewerLive->setHint(hint);
+
+    auto* cubeViewerUpdateMode = d.defineChoiceParam("cubeViewerUpdateMode");
+    cubeViewerUpdateMode->setLabel("Viewer Update Mode");
+    cubeViewerUpdateMode->appendOption("Auto");
+    cubeViewerUpdateMode->appendOption("Fluid");
+    cubeViewerUpdateMode->appendOption("Scheduled");
+    cubeViewerUpdateMode->setDefault(0);
+    cubeViewerUpdateMode->setParent(*grpCubeViewer);
+    if (const char* hint = tooltipFor("cubeViewerUpdateMode")) cubeViewerUpdateMode->setHint(hint);
 
     auto* cubeViewerOnTop = d.defineBooleanParam("cubeViewerOnTop");
     cubeViewerOnTop->setLabel("Keep Viewer On Top");
