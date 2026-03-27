@@ -1353,6 +1353,9 @@ class ChromaspaceEffect : public ImageEffect {
     const bool steadyState = shouldEmitSteadyStateCloud(args.time, sourceId, settingsKey, previewMode);
     const bool needCloud = needCloudWork && (firstHandoff || steadyState);
     lastRenderSeenAt_ = renderNow;
+    if (needCloudWork && !firstHandoff && !steadyState && cloudQueuedOrInFlight_.load(std::memory_order_relaxed)) {
+      deferredLatestCloudRefresh_.store(true, std::memory_order_relaxed);
+    }
     if (!drawOnImageMode && cubeViewerRequested_ && !cubeViewerConnected_) {
       pushParamsUpdate(args.time, "render/connect");
     }
@@ -1402,6 +1405,7 @@ class ChromaspaceEffect : public ImageEffect {
       return;
     }
 
+    deferredLatestCloudRefresh_.store(false, std::memory_order_relaxed);
     if (cloudChanged) {
       enqueueCloudMessage(built.payload, firstHandoff ? "first-handoff/render" : "steady-state/render");
     }
@@ -1808,6 +1812,7 @@ class ChromaspaceEffect : public ImageEffect {
   PendingMessage pendingParams_;
   PendingMessage pendingCloud_;
   std::atomic<bool> cloudQueuedOrInFlight_{false};
+  std::atomic<bool> deferredLatestCloudRefresh_{false};
   std::atomic<int64_t> lastViewerTransportActivityMs_{0};
   std::mutex statusMutex_;
   std::string pendingStatusText_;
@@ -2656,6 +2661,7 @@ class ChromaspaceEffect : public ImageEffect {
 
   void invalidateCubeViewerCloudState() {
     cubeViewerInputCloudRefreshPending_ = true;
+    deferredLatestCloudRefresh_.store(false, std::memory_order_relaxed);
     lastCloudTime_ = std::numeric_limits<double>::quiet_NaN();
     lastCloudBuiltAt_ = std::chrono::steady_clock::time_point{};
     lastCloudSourceId_.clear();
@@ -2668,6 +2674,7 @@ class ChromaspaceEffect : public ImageEffect {
   }
 
   void requestCubeViewerCloudResample() {
+    deferredLatestCloudRefresh_.store(false, std::memory_order_relaxed);
     lastCloudTime_ = std::numeric_limits<double>::quiet_NaN();
     lastCloudBuiltAt_ = std::chrono::steady_clock::time_point{};
   }
@@ -5215,12 +5222,25 @@ class ChromaspaceEffect : public ImageEffect {
   }
 
   bool shouldUseInteractivePreview(std::chrono::steady_clock::time_point now) {
-    (void)now;
-    return false;
+    constexpr auto kPlaybackRenderGap = std::chrono::milliseconds(80);
+    constexpr auto kPreviewHold = std::chrono::milliseconds(220);
+    if (lastRenderSeenAt_ != std::chrono::steady_clock::time_point{}) {
+      const auto renderGap = now - lastRenderSeenAt_;
+      if (renderGap <= kPlaybackRenderGap) {
+        previewModeUntil_ = now + kPreviewHold;
+      }
+    }
+    return previewModeUntil_ != std::chrono::steady_clock::time_point{} && now < previewModeUntil_;
   }
 
   int steadyStateCloudIntervalMs(bool previewMode) const {
-    (void)previewMode;
+    if (previewMode) {
+      switch (cubeViewerQuality_) {
+        case 0: return 80;
+        case 1: return 120;
+        default: return 170;
+      }
+    }
     switch (cubeViewerQuality_) {
       case 0: return 20;
       case 1: return 32;
@@ -5232,6 +5252,7 @@ class ChromaspaceEffect : public ImageEffect {
     if (!cubeViewerRequested_ || !cubeViewerLive_) return false;
     if (cubeViewerInputCloudRefreshPending_) return false;
     if (cloudQueuedOrInFlight_.load(std::memory_order_relaxed)) return false;
+    if (deferredLatestCloudRefresh_.load(std::memory_order_relaxed)) return true;
     if (!settingsKey.empty() && settingsKey != lastCloudSettingsKey_) return true;
     if (!sourceId.empty() && sourceId != lastCloudSourceId_) return true;
     const auto now = std::chrono::steady_clock::now();
@@ -5242,7 +5263,7 @@ class ChromaspaceEffect : public ImageEffect {
       // The two-instance workflow is intentionally downstream-facing: graphs such as layer mixers can
       // change the incoming pixels without providing a host image identifier change that we can trust.
       // Keep this mode on a more eager steady-state refresh policy instead of waiting for a weaker sourceId signal.
-      return elapsedMs >= 16;
+      return elapsedMs >= (previewMode ? 170 : 16);
     }
     return elapsedMs >= steadyStateCloudIntervalMs(previewMode);
   }
@@ -5290,6 +5311,7 @@ class ChromaspaceEffect : public ImageEffect {
       pendingCloud_ = PendingMessage{};
       cloudQueuedOrInFlight_.store(false, std::memory_order_relaxed);
     }
+    deferredLatestCloudRefresh_.store(false, std::memory_order_relaxed);
     lastViewerTransportActivityMs_.store(0, std::memory_order_relaxed);
     {
       std::lock_guard<std::mutex> lock(stageMutex_);
@@ -5420,6 +5442,7 @@ class ChromaspaceEffect : public ImageEffect {
     }
     enqueueCloudMessage(cachedCloud_.payload, reason + "/cached");
     cubeViewerInputCloudRefreshPending_ = false;
+    deferredLatestCloudRefresh_.store(false, std::memory_order_relaxed);
     cubeViewerDebugLog(std::string("Cached cloud queued: reason=") + reason +
                        " quality=" + cachedCloud_.quality +
                        " res=" + std::to_string(cachedCloud_.resolution));
@@ -5639,6 +5662,7 @@ class ChromaspaceEffect : public ImageEffect {
     cubeViewerConnected_ = existing.ok;
     cubeViewerWindowUsable_ = existing.ok ? (existing.visible && !existing.iconified) : true;
     cubeViewerInputCloudRefreshPending_ = true;
+    deferredLatestCloudRefresh_.store(false, std::memory_order_relaxed);
     lastCloudBuiltAt_ = std::chrono::steady_clock::time_point{};
     lastHeartbeatAt_ = existing.ok ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     {
@@ -5657,6 +5681,7 @@ class ChromaspaceEffect : public ImageEffect {
     cubeViewerConnected_ = false;
     cubeViewerWindowUsable_ = false;
     cubeViewerInputCloudRefreshPending_ = false;
+    deferredLatestCloudRefresh_.store(false, std::memory_order_relaxed);
     lastCloudBuiltAt_ = std::chrono::steady_clock::time_point{};
     lastHeartbeatAt_ = std::chrono::steady_clock::time_point{};
     lastCloudSourceId_.clear();
