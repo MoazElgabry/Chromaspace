@@ -560,12 +560,14 @@ __global__ void inputKernel(float* verts, float* colors, const float* input, Inp
   float alpha = (overflowHighlighted ? 0.95f : 0.72f) * u.pointAlphaScale;
   if (!overflowHighlighted && u.denseAlphaBias > 0.0f) {
     const float luma = clamp01(cr * 0.2126f + cg * 0.7152f + cb * 0.0722f);
-    const float highlightKnee = clamp01((luma - 0.70f) / 0.24f);
-    const float shadowMidProtect = 1.0f - clamp01((luma - 0.58f) / 0.30f);
+    const float maxRgb = clamp01(fmaxf(cr, fmaxf(cg, cb)));
+    const float value = (1.0f - 0.28f) * maxRgb + 0.28f * luma;
+    const float highlightKnee = clamp01((value - 0.70f) / 0.24f);
+    const float shadowMidProtect = 1.0f - clamp01((value - 0.58f) / 0.30f);
     const float multiplier =
-        fminf(1.12f,
-              fmaxf(0.76f,
-                    1.0f + 0.16f * u.denseAlphaBias * shadowMidProtect - 0.30f * u.denseAlphaBias * highlightKnee));
+        fminf(1.18f,
+              fmaxf(0.94f,
+                    1.0f + 0.22f * u.denseAlphaBias * shadowMidProtect - 0.12f * u.denseAlphaBias * highlightKnee));
     alpha = clamp01(alpha * multiplier);
   } else {
     alpha = clamp01(alpha);

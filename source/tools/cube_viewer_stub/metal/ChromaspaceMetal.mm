@@ -117,11 +117,13 @@ float luminanceAwareAlpha(float baseAlpha, float cr, float cg, float cb, float d
     return clamp(alpha, 0.0, 1.0);
   }
   float luma = clamp(cr * 0.2126 + cg * 0.7152 + cb * 0.0722, 0.0, 1.0);
-  float highlightKnee = clamp((luma - 0.70) / 0.24, 0.0, 1.0);
-  float shadowMidProtect = 1.0 - clamp((luma - 0.58) / 0.30, 0.0, 1.0);
-  float multiplier = clamp(1.0 + 0.16 * denseAlphaBias * shadowMidProtect
-                               - 0.30 * denseAlphaBias * highlightKnee,
-                           0.76, 1.12);
+  float maxRgb = clamp(max(cr, max(cg, cb)), 0.0, 1.0);
+  float value = mix(maxRgb, luma, 0.28);
+  float highlightKnee = clamp((value - 0.70) / 0.24, 0.0, 1.0);
+  float shadowMidProtect = 1.0 - clamp((value - 0.58) / 0.30, 0.0, 1.0);
+  float multiplier = clamp(1.0 + 0.22 * denseAlphaBias * shadowMidProtect
+                               - 0.12 * denseAlphaBias * highlightKnee,
+                           0.94, 1.18);
   return clamp(alpha * multiplier, 0.0, 1.0);
 }
 

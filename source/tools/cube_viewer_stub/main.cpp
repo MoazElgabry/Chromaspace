@@ -2605,11 +2605,13 @@ float luminanceAwareAlpha(float baseAlpha, float cr, float cg, float cb, bool ov
   float alpha = baseAlpha * uPointAlphaScale;
   if (overflowPoint || uDenseAlphaBias <= 0.0) return clamp(alpha, 0.0, 1.0);
   float luma = clamp(cr * 0.2126 + cg * 0.7152 + cb * 0.0722, 0.0, 1.0);
-  float highlightKnee = clamp((luma - 0.70) / 0.24, 0.0, 1.0);
-  float shadowMidProtect = 1.0 - clamp((luma - 0.58) / 0.30, 0.0, 1.0);
-  float multiplier = clamp(1.0 + 0.16 * uDenseAlphaBias * shadowMidProtect
-                               - 0.30 * uDenseAlphaBias * highlightKnee,
-                           0.76, 1.12);
+  float maxRgb = clamp(max(cr, max(cg, cb)), 0.0, 1.0);
+  float value = mix(maxRgb, luma, 0.28);
+  float highlightKnee = clamp((value - 0.70) / 0.24, 0.0, 1.0);
+  float shadowMidProtect = 1.0 - clamp((value - 0.58) / 0.30, 0.0, 1.0);
+  float multiplier = clamp(1.0 + 0.22 * uDenseAlphaBias * shadowMidProtect
+                               - 0.12 * uDenseAlphaBias * highlightKnee,
+                           0.94, 1.18);
   return clamp(alpha * multiplier, 0.0, 1.0);
 }
 
@@ -3884,8 +3886,8 @@ float pointAlphaScaleForPlot(float pointSize, float pointDensity, int resolution
   const float eased = blend * blend * (3.0f - 2.0f * blend);
   const float areaComp = 1.0f / std::pow(sizeNorm, 1.55f);
   const float densityComp = 1.0f / std::pow(densityNorm, 0.35f);
-  const float targetScale = clampf(areaComp * densityComp, 0.34f, 1.0f);
-  return clampf((1.0f - eased) + eased * targetScale, 0.34f, 1.0f);
+  const float targetScale = clampf(areaComp * densityComp, 0.62f, 1.0f);
+  return clampf((1.0f - eased) + eased * targetScale, 0.62f, 1.0f);
 }
 
 float denseAlphaBiasForPlot(float pointSize, float pointDensity, int resolution) {
@@ -3911,10 +3913,12 @@ float denseLumaProtectedAlpha(float baseAlpha,
   const float denseBias = denseAlphaBiasForPlot(pointSize, pointDensity, resolution);
   if (denseBias <= 0.0f) return scaled;
   const float luma = clampf(cr * 0.2126f + cg * 0.7152f + cb * 0.0722f, 0.0f, 1.0f);
-  const float highlightKnee = clampf((luma - 0.70f) / 0.24f, 0.0f, 1.0f);
-  const float shadowMidProtect = 1.0f - clampf((luma - 0.58f) / 0.30f, 0.0f, 1.0f);
-  const float multiplier = clampf(1.0f + 0.16f * denseBias * shadowMidProtect - 0.30f * denseBias * highlightKnee,
-                                  0.76f, 1.12f);
+  const float maxRgb = clampf(std::max(cr, std::max(cg, cb)), 0.0f, 1.0f);
+  const float value = (1.0f - 0.28f) * maxRgb + 0.28f * luma;
+  const float highlightKnee = clampf((value - 0.70f) / 0.24f, 0.0f, 1.0f);
+  const float shadowMidProtect = 1.0f - clampf((value - 0.58f) / 0.30f, 0.0f, 1.0f);
+  const float multiplier = clampf(1.0f + 0.22f * denseBias * shadowMidProtect - 0.12f * denseBias * highlightKnee,
+                                  0.94f, 1.18f);
   return clampf(scaled * multiplier, 0.0f, 1.0f);
 }
 
