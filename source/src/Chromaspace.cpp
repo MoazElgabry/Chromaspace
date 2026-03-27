@@ -5260,14 +5260,22 @@ class ChromaspaceEffect : public ImageEffect {
       return true;
     }
     constexpr auto kPlaybackRenderGap = std::chrono::milliseconds(60);
-    constexpr auto kPlaybackGapReset = std::chrono::milliseconds(110);
-    constexpr auto kPreviewHold = std::chrono::milliseconds(140);
-    constexpr int kBurstThreshold = 3;
+    constexpr auto kPlaybackGapReset = std::chrono::milliseconds(125);
+    constexpr auto kPreviewHold = std::chrono::milliseconds(95);
+    constexpr auto kTransportPressureWindow = std::chrono::milliseconds(180);
+    constexpr int kBurstThreshold = 4;
+    const int64_t lastTransportActivityMs = lastViewerTransportActivityMs_.load(std::memory_order_relaxed);
+    const bool recentTransportActivity =
+        lastTransportActivityMs > 0 &&
+        (monotonicNowMs() - lastTransportActivityMs) <= kTransportPressureWindow.count();
+    const bool cloudBackpressure = deferredLatestCloudRefresh_.load(std::memory_order_relaxed) ||
+                                   cloudQueuedOrInFlight_.load(std::memory_order_relaxed) ||
+                                   recentTransportActivity;
     if (lastRenderSeenAt_ != std::chrono::steady_clock::time_point{}) {
       const auto renderGap = now - lastRenderSeenAt_;
-      if (renderGap <= kPlaybackRenderGap) {
+      if (cloudBackpressure && renderGap <= kPlaybackRenderGap) {
         playbackRenderBurstCount_ = std::min(playbackRenderBurstCount_ + 1, kBurstThreshold);
-      } else if (renderGap >= kPlaybackGapReset) {
+      } else if (!cloudBackpressure || renderGap >= kPlaybackGapReset) {
         playbackRenderBurstCount_ = 0;
       } else if (playbackRenderBurstCount_ > 0) {
         --playbackRenderBurstCount_;
@@ -5275,6 +5283,10 @@ class ChromaspaceEffect : public ImageEffect {
       if (playbackRenderBurstCount_ >= kBurstThreshold) {
         previewModeUntil_ = now + kPreviewHold;
       }
+    }
+    if (!cloudBackpressure && playbackRenderBurstCount_ == 0) {
+      previewModeUntil_ = std::chrono::steady_clock::time_point{};
+      return false;
     }
     return previewModeUntil_ != std::chrono::steady_clock::time_point{} && now < previewModeUntil_;
   }
@@ -6461,20 +6473,25 @@ class ChromaspaceFactory : public PluginFactoryHelper<ChromaspaceFactory> {
     cubeViewerLive->setParent(*grpCubeViewer);
     if (const char* hint = tooltipFor("cubeViewerLive")) cubeViewerLive->setHint(hint);
 
+    auto* cubeViewerOnTop = d.defineBooleanParam("cubeViewerOnTop");
+    cubeViewerOnTop->setLabel("Keep Viewer On Top");
+    cubeViewerOnTop->setDefault(true);
+    cubeViewerOnTop->setParent(*grpCubeViewer);
+    if (const char* hint = tooltipFor("cubeViewerOnTop")) cubeViewerOnTop->setHint(hint);
+
+    auto* grpCubeViewerPerformance = d.defineGroupParam("grp_cube_viewer_performance");
+    grpCubeViewerPerformance->setLabel("Performance");
+    grpCubeViewerPerformance->setOpen(true);
+    grpCubeViewerPerformance->setParent(*grpCubeViewer);
+
     auto* cubeViewerUpdateMode = d.defineChoiceParam("cubeViewerUpdateMode");
     cubeViewerUpdateMode->setLabel("Viewer Update Mode");
     cubeViewerUpdateMode->appendOption("Auto");
     cubeViewerUpdateMode->appendOption("Fluid");
     cubeViewerUpdateMode->appendOption("Scheduled");
     cubeViewerUpdateMode->setDefault(0);
-    cubeViewerUpdateMode->setParent(*grpCubeViewer);
+    cubeViewerUpdateMode->setParent(*grpCubeViewerPerformance);
     if (const char* hint = tooltipFor("cubeViewerUpdateMode")) cubeViewerUpdateMode->setHint(hint);
-
-    auto* cubeViewerOnTop = d.defineBooleanParam("cubeViewerOnTop");
-    cubeViewerOnTop->setLabel("Keep Viewer On Top");
-    cubeViewerOnTop->setDefault(true);
-    cubeViewerOnTop->setParent(*grpCubeViewer);
-    if (const char* hint = tooltipFor("cubeViewerOnTop")) cubeViewerOnTop->setHint(hint);
 
     auto* cubeViewerQuality = d.defineChoiceParam("cubeViewerQuality");
     cubeViewerQuality->setLabel("Viewer Quality");
@@ -6482,7 +6499,7 @@ class ChromaspaceFactory : public PluginFactoryHelper<ChromaspaceFactory> {
     cubeViewerQuality->appendOption("Medium");
     cubeViewerQuality->appendOption("High");
     cubeViewerQuality->setDefault(0);
-    cubeViewerQuality->setParent(*grpCubeViewer);
+    cubeViewerQuality->setParent(*grpCubeViewerPerformance);
     if (const char* hint = tooltipFor("cubeViewerQuality")) cubeViewerQuality->setHint(hint);
 
     auto* cubeViewerScale = d.defineChoiceParam("cubeViewerScale");
@@ -6492,8 +6509,13 @@ class ChromaspaceFactory : public PluginFactoryHelper<ChromaspaceFactory> {
     cubeViewerScale->appendOption("75%");
     cubeViewerScale->appendOption("100%");
     cubeViewerScale->setDefault(3);
-    cubeViewerScale->setParent(*grpCubeViewer);
+    cubeViewerScale->setParent(*grpCubeViewerPerformance);
     if (const char* hint = tooltipFor("cubeViewerScale")) cubeViewerScale->setHint(hint);
+
+    auto* grpCubeViewerAppearance = d.defineGroupParam("grp_cube_viewer_appearance");
+    grpCubeViewerAppearance->setLabel("Appearance");
+    grpCubeViewerAppearance->setOpen(false);
+    grpCubeViewerAppearance->setParent(*grpCubeViewer);
 
     auto* cubeViewerPointSize = d.defineDoubleParam("cubeViewerPointSize");
     cubeViewerPointSize->setLabel("Point Size");
@@ -6501,7 +6523,7 @@ class ChromaspaceFactory : public PluginFactoryHelper<ChromaspaceFactory> {
     cubeViewerPointSize->setRange(0.35, 3.0);
     cubeViewerPointSize->setDisplayRange(0.35, 3.0);
     cubeViewerPointSize->setIncrement(0.025);
-    cubeViewerPointSize->setParent(*grpCubeViewer);
+    cubeViewerPointSize->setParent(*grpCubeViewerAppearance);
     if (const char* hint = tooltipFor("cubeViewerPointSize")) cubeViewerPointSize->setHint(hint);
 
     auto* cubeViewerPointShape = d.defineChoiceParam("cubeViewerPointShape");
@@ -6509,7 +6531,7 @@ class ChromaspaceFactory : public PluginFactoryHelper<ChromaspaceFactory> {
     cubeViewerPointShape->appendOption("Circle");
     cubeViewerPointShape->appendOption("Square");
     cubeViewerPointShape->setDefault(0);
-    cubeViewerPointShape->setParent(*grpCubeViewer);
+    cubeViewerPointShape->setParent(*grpCubeViewerAppearance);
     if (const char* hint = tooltipFor("cubeViewerPointShape")) cubeViewerPointShape->setHint(hint);
 
     auto* cubeViewerSamplingMode = d.defineChoiceParam("cubeViewerSamplingMode");
@@ -6518,13 +6540,13 @@ class ChromaspaceFactory : public PluginFactoryHelper<ChromaspaceFactory> {
     cubeViewerSamplingMode->appendOption("Stratified");
     cubeViewerSamplingMode->appendOption("Random");
     cubeViewerSamplingMode->setDefault(0);
-    cubeViewerSamplingMode->setParent(*grpCubeViewer);
+    cubeViewerSamplingMode->setParent(*grpCubeViewerAppearance);
     if (const char* hint = tooltipFor("cubeViewerSamplingMode")) cubeViewerSamplingMode->setHint(hint);
 
     auto* cubeViewerOccupancyGuidedFill = d.defineBooleanParam("cubeViewerOccupancyGuidedFill");
     cubeViewerOccupancyGuidedFill->setLabel("Occupancy-guided fill");
     cubeViewerOccupancyGuidedFill->setDefault(true);
-    cubeViewerOccupancyGuidedFill->setParent(*grpCubeViewer);
+    cubeViewerOccupancyGuidedFill->setParent(*grpCubeViewerAppearance);
     if (const char* hint = tooltipFor("cubeViewerOccupancyGuidedFill")) cubeViewerOccupancyGuidedFill->setHint(hint);
 
     auto* cubeViewerOverflowHighlightColor = d.defineRGBParam("cubeViewerOverflowHighlightColor");

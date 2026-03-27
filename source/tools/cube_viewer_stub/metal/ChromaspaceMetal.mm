@@ -46,6 +46,7 @@ struct InputUniforms {
   int circularHsv;
   int normConeNormalized;
   float pointAlphaScale;
+  float denseAlphaBias;
 };
 
 struct InputSampleUniforms {
@@ -91,6 +92,7 @@ struct InputUniforms {
   int circularHsv;
   int normConeNormalized;
   float pointAlphaScale;
+  float denseAlphaBias;
 };
 
 struct InputSampleUniforms {
@@ -106,6 +108,21 @@ float wrapHue01(float h) {
   h = fmod(h, 1.0);
   if (h < 0.0) h += 1.0;
   return h;
+}
+
+float luminanceAwareAlpha(float baseAlpha, float cr, float cg, float cb, float denseAlphaBias, bool overflowPoint,
+                          float pointAlphaScale) {
+  float alpha = baseAlpha * pointAlphaScale;
+  if (overflowPoint || denseAlphaBias <= 0.0) {
+    return clamp(alpha, 0.0, 1.0);
+  }
+  float luma = clamp(cr * 0.2126 + cg * 0.7152 + cb * 0.0722, 0.0, 1.0);
+  float highlightKnee = clamp((luma - 0.70) / 0.24, 0.0, 1.0);
+  float shadowMidProtect = 1.0 - clamp((luma - 0.58) / 0.30, 0.0, 1.0);
+  float multiplier = clamp(1.0 + 0.16 * denseAlphaBias * shadowMidProtect
+                               - 0.30 * denseAlphaBias * highlightKnee,
+                           0.76, 1.12);
+  return clamp(alpha * multiplier, 0.0, 1.0);
 }
 
 float rawRgbHue01(float r, float g, float b, float cMax, float delta) {
@@ -354,9 +371,15 @@ kernel void inputKernel(const device packed_float3* inputVals [[buffer(0)]],
   } else {
     mapDisplayColor(r, g, b, cr, cg, cb);
   }
+  bool overflowHighlighted = (u.showOverflow != 0 && u.highlightOverflow != 0 && overflowPoint);
   colorVals[index] = float4(cr, cg, cb,
-                            ((u.showOverflow != 0 && u.highlightOverflow != 0 &&
-                              overflowPoint) ? 0.95 : 0.72) * u.pointAlphaScale);
+                            luminanceAwareAlpha(overflowHighlighted ? 0.95 : 0.72,
+                                                cr,
+                                                cg,
+                                                cb,
+                                                u.denseAlphaBias,
+                                                overflowHighlighted,
+                                                u.pointAlphaScale));
 }
 
 kernel void inputSampleKernel(const device packed_float3* srcVerts [[buffer(0)]],
@@ -690,6 +713,7 @@ bool buildInputMesh(const InputRequest& request,
   uniforms.circularHsv = request.remap.circularHsv;
   uniforms.normConeNormalized = request.remap.normConeNormalized;
   uniforms.pointAlphaScale = request.pointAlphaScale;
+  uniforms.denseAlphaBias = request.denseAlphaBias;
 
   id<MTLBuffer> inputBuffer = makeSharedBuffer(reinterpret_cast<const PackedFloat3*>(rawPoints.data()), pointCount);
   id<MTLBuffer> vertBuffer = makeEmptySharedBuffer(pointCount * sizeof(PackedFloat3));

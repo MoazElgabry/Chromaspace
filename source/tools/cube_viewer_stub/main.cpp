@@ -932,6 +932,7 @@ struct InputCloudComputeCache {
   GLint circularHsvLoc = -1;
   GLint normConeNormalizedLoc = -1;
   GLint pointAlphaScaleLoc = -1;
+  GLint denseAlphaBiasLoc = -1;
   uint64_t builtSerial = 0;
   GLsizei pointCount = 0;
   bool available = false;
@@ -1353,8 +1354,11 @@ bool ensureInputCloudComputeProgram(InputCloudComputeCache* cache);
 bool parseInputCloudSamples(const InputCloudPayload& cloud, std::vector<InputCloudSample>* samples);
 bool cubeSliceContainsPoint(const PlotRemapSpec& spec, float r, float g, float b);
 bool cubeSliceContainsPoint(const ResolvedPayload& payload, float r, float g, float b);
-float pointAlphaScaleForPointSize(float pointSize);
-float scaledPointAlpha(float baseAlpha, float pointSize);
+float pointAlphaScaleForPlot(float pointSize, float pointDensity, int resolution);
+float denseAlphaBiasForPlot(float pointSize, float pointDensity, int resolution);
+float denseLumaProtectedAlpha(float baseAlpha, float pointSize, float pointDensity, int resolution,
+                              float cr, float cg, float cb, bool overflowPoint);
+float scaledPointAlpha(float baseAlpha, float pointSize, float pointDensity, int resolution);
 size_t overlayIdentityPointCap(const ResolvedPayload& payload, int cubeSize);
 bool buildInputCloudMeshCpu(const ResolvedPayload& payload,
                             const InputCloudPayload& cloud,
@@ -2419,6 +2423,7 @@ uniform int uCircularHsl;
 uniform int uCircularHsv;
 uniform int uNormConeNormalized;
 uniform float uPointAlphaScale;
+uniform float uDenseAlphaBias;
 
 const float kTau = 6.28318530717958647692;
 const float kPi = 3.14159265358979323846;
@@ -2596,6 +2601,18 @@ void mapDisplayColor(float inR, float inG, float inB, out float outR, out float 
   outB = pow(clamp01(inB), 1.0 / 2.2);
 }
 
+float luminanceAwareAlpha(float baseAlpha, float cr, float cg, float cb, bool overflowPoint) {
+  float alpha = baseAlpha * uPointAlphaScale;
+  if (overflowPoint || uDenseAlphaBias <= 0.0) return clamp(alpha, 0.0, 1.0);
+  float luma = clamp(cr * 0.2126 + cg * 0.7152 + cb * 0.0722, 0.0, 1.0);
+  float highlightKnee = clamp((luma - 0.70) / 0.24, 0.0, 1.0);
+  float shadowMidProtect = 1.0 - clamp((luma - 0.58) / 0.30, 0.0, 1.0);
+  float multiplier = clamp(1.0 + 0.16 * uDenseAlphaBias * shadowMidProtect
+                               - 0.30 * uDenseAlphaBias * highlightKnee,
+                           0.76, 1.12);
+  return clamp(alpha * multiplier, 0.0, 1.0);
+}
+
 void main() {
   uint index = gl_GlobalInvocationID.x;
   if (index >= uint(max(uPointCount, 0))) return;
@@ -2628,7 +2645,9 @@ void main() {
   colorVals[colorBase + 0u] = cr;
   colorVals[colorBase + 1u] = cg;
   colorVals[colorBase + 2u] = cb;
-  colorVals[colorBase + 3u] = ((uShowOverflow != 0 && uHighlightOverflow != 0 && overflowPoint) ? 0.95 : 0.72) * uPointAlphaScale;
+  colorVals[colorBase + 3u] =
+      luminanceAwareAlpha(((uShowOverflow != 0 && uHighlightOverflow != 0 && overflowPoint) ? 0.95 : 0.72),
+                          cr, cg, cb, overflowPoint);
 }
 )GLSL";
 
@@ -2670,6 +2689,7 @@ void main() {
   cache->circularHsvLoc = api.getUniformLocation(program, "uCircularHsv");
   cache->normConeNormalizedLoc = api.getUniformLocation(program, "uNormConeNormalized");
   cache->pointAlphaScaleLoc = api.getUniformLocation(program, "uPointAlphaScale");
+  cache->denseAlphaBiasLoc = api.getUniformLocation(program, "uDenseAlphaBias");
   cache->available = cache->pointCountLoc >= 0 &&
                      cache->showOverflowLoc >= 0 &&
                      cache->highlightOverflowLoc >= 0 &&
@@ -2677,7 +2697,8 @@ void main() {
                      cache->circularHslLoc >= 0 &&
                      cache->circularHsvLoc >= 0 &&
                      cache->normConeNormalizedLoc >= 0 &&
-                     cache->pointAlphaScaleLoc >= 0;
+                     cache->pointAlphaScaleLoc >= 0 &&
+                     cache->denseAlphaBiasLoc >= 0;
   if (!cache->available) {
     logViewerEvent("Input-cloud compute program missing one or more uniforms; falling back to CPU.");
     releaseInputCloudComputeCache(cache);
@@ -2888,7 +2909,8 @@ bool buildInputCloudMeshOnGpu(const ResolvedPayload& payload,
   if (pointCount == 0) return false;
   ChromaspaceMetal::InputRequest request{};
   request.pointCount = static_cast<int>(pointCount);
-  request.pointAlphaScale = pointAlphaScaleForPointSize(payload.pointSize);
+  request.pointAlphaScale = pointAlphaScaleForPlot(payload.pointSize, payload.pointDensity, payload.resolution);
+  request.denseAlphaBias = denseAlphaBiasForPlot(payload.pointSize, payload.pointDensity, payload.resolution);
   request.remap = makeMetalRemapUniforms(uniforms);
   MeshData mesh{};
   mesh.resolution = cloud.resolution <= 25 ? 25 : (cloud.resolution <= 41 ? 41 : 57);
@@ -2933,7 +2955,8 @@ bool buildInputCloudMeshOnGpu(const ResolvedPayload& payload,
       bufferApi.bindBuffer(GL_ARRAY_BUFFER, 0);
       ChromaspaceCuda::InputRequest request{};
       request.pointCount = static_cast<int>(pointCount);
-      request.pointAlphaScale = pointAlphaScaleForPointSize(payload.pointSize);
+      request.pointAlphaScale = pointAlphaScaleForPlot(payload.pointSize, payload.pointDensity, payload.resolution);
+      request.denseAlphaBias = denseAlphaBiasForPlot(payload.pointSize, payload.pointDensity, payload.resolution);
       request.remap = makeCudaRemapUniforms(uniforms);
       std::string error;
       if (ChromaspaceCuda::buildInputMesh(reinterpret_cast<ChromaspaceCuda::InputCache*>(cudaCache),
@@ -2998,7 +3021,10 @@ bool buildInputCloudMeshOnGpu(const ResolvedPayload& payload,
   computeApi.uniform1i(cache->circularHslLoc, uniforms.circularHsl);
   computeApi.uniform1i(cache->circularHsvLoc, uniforms.circularHsv);
   computeApi.uniform1i(cache->normConeNormalizedLoc, uniforms.normConeNormalized);
-  computeApi.uniform1f(cache->pointAlphaScaleLoc, pointAlphaScaleForPointSize(payload.pointSize));
+  computeApi.uniform1f(cache->pointAlphaScaleLoc,
+                       pointAlphaScaleForPlot(payload.pointSize, payload.pointDensity, payload.resolution));
+  computeApi.uniform1f(cache->denseAlphaBiasLoc,
+                       denseAlphaBiasForPlot(payload.pointSize, payload.pointDensity, payload.resolution));
   computeApi.bindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, cache->input);
   computeApi.bindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, cache->verts);
   computeApi.bindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, cache->colors);
@@ -3844,16 +3870,66 @@ Vec3 mapPointToPlotMode(const ResolvedPayload& payload, float r, float g, float 
   return mapPointToPlotMode(makePlotRemapSpec(payload), r, g, b);
 }
 
-float pointAlphaScaleForPointSize(float pointSize) {
+float pointAlphaScaleForPlot(float pointSize, float pointDensity, int resolution) {
   const float size = clampf(pointSize, 0.35f, 3.0f);
-  if (size <= 1.5f) return 1.0f;
-  const float t = clampf((size - 1.5f) / 1.5f, 0.0f, 1.0f);
-  const float eased = t * t * (3.0f - 2.0f * t);
-  return clampf(1.0f + 0.28f * eased, 1.0f, 1.28f);
+  const float density = clampf(pointDensity, 0.35f, 4.0f);
+  const float resolutionScale = clampf(static_cast<float>(resolution) / 41.0f, 0.60f, 1.45f);
+  const float sizeNorm = std::max(1.0f, size / 1.15f);
+  const float densityNorm = std::max(1.0f, density * resolutionScale);
+  const float sizeBlend = clampf((size - 1.10f) / 1.40f, 0.0f, 1.0f);
+  const float densityBlend = clampf((densityNorm - 1.0f) / 0.55f, 0.0f, 1.0f);
+  const float blend = clampf(std::max(sizeBlend, densityBlend), 0.0f, 1.0f);
+  if (blend <= 0.0f) return 1.0f;
+
+  const float eased = blend * blend * (3.0f - 2.0f * blend);
+  const float areaComp = 1.0f / std::pow(sizeNorm, 1.55f);
+  const float densityComp = 1.0f / std::pow(densityNorm, 0.35f);
+  const float targetScale = clampf(areaComp * densityComp, 0.34f, 1.0f);
+  return clampf((1.0f - eased) + eased * targetScale, 0.34f, 1.0f);
 }
 
-float scaledPointAlpha(float baseAlpha, float pointSize) {
-  return clampf(baseAlpha * pointAlphaScaleForPointSize(pointSize), 0.0f, 1.0f);
+float denseAlphaBiasForPlot(float pointSize, float pointDensity, int resolution) {
+  const float size = clampf(pointSize, 0.35f, 3.0f);
+  const float density = clampf(pointDensity, 0.35f, 4.0f);
+  const float resolutionScale = clampf(static_cast<float>(resolution) / 41.0f, 0.60f, 1.45f);
+  const float sizeBlend = clampf((size - 1.10f) / 1.40f, 0.0f, 1.0f);
+  const float densityBlend = clampf((density * resolutionScale - 1.0f) / 0.55f, 0.0f, 1.0f);
+  const float blend = clampf(std::max(sizeBlend, densityBlend), 0.0f, 1.0f);
+  return blend * blend * (3.0f - 2.0f * blend);
+}
+
+float denseLumaProtectedAlpha(float baseAlpha,
+                              float pointSize,
+                              float pointDensity,
+                              int resolution,
+                              float cr,
+                              float cg,
+                              float cb,
+                              bool overflowPoint) {
+  const float scaled = scaledPointAlpha(baseAlpha, pointSize, pointDensity, resolution);
+  if (overflowPoint) return scaled;
+  const float denseBias = denseAlphaBiasForPlot(pointSize, pointDensity, resolution);
+  if (denseBias <= 0.0f) return scaled;
+  const float luma = clampf(cr * 0.2126f + cg * 0.7152f + cb * 0.0722f, 0.0f, 1.0f);
+  const float highlightKnee = clampf((luma - 0.70f) / 0.24f, 0.0f, 1.0f);
+  const float shadowMidProtect = 1.0f - clampf((luma - 0.58f) / 0.30f, 0.0f, 1.0f);
+  const float multiplier = clampf(1.0f + 0.16f * denseBias * shadowMidProtect - 0.30f * denseBias * highlightKnee,
+                                  0.76f, 1.12f);
+  return clampf(scaled * multiplier, 0.0f, 1.0f);
+}
+
+float scaledPointAlpha(float baseAlpha, float pointSize, float pointDensity, int resolution) {
+  return clampf(baseAlpha * pointAlphaScaleForPlot(pointSize, pointDensity, resolution), 0.0f, 1.0f);
+}
+
+float densePlotGlowSuppression(float pointSize, float pointDensity, int resolution) {
+  const float size = clampf(pointSize, 0.35f, 3.0f);
+  const float density = clampf(pointDensity, 0.35f, 4.0f);
+  const float resolutionScale = clampf(static_cast<float>(resolution) / 41.0f, 0.65f, 1.50f);
+  const float sizeBlend = clampf((size - 1.20f) / 1.30f, 0.0f, 1.0f);
+  const float densityBlend = clampf((density * resolutionScale - 1.0f) / 0.50f, 0.0f, 1.0f);
+  const float blend = clampf(sizeBlend * densityBlend, 0.0f, 1.0f);
+  return blend * blend * (3.0f - 2.0f * blend);
 }
 
 size_t overlayIdentityPointCap(const ResolvedPayload& payload, int cubeSize) {
@@ -3970,7 +4046,6 @@ bool buildIdentityMesh(const ResolvedPayload& payload, MeshData* out) {
   mesh.serial = nextMeshSerial();
   mesh.pointVerts.reserve(static_cast<size_t>(mesh.resolution) * mesh.resolution * mesh.resolution * 3u);
   mesh.pointColors.reserve(static_cast<size_t>(mesh.resolution) * mesh.resolution * mesh.resolution * 4u);
-  const float pointAlpha = scaledPointAlpha(0.72f, payload.pointSize);
   const int denom = std::max(1, mesh.resolution - 1);
   for (int bz = 0; bz < mesh.resolution; ++bz) {
     for (int gy = 0; gy < mesh.resolution; ++gy) {
@@ -3988,7 +4063,8 @@ bool buildIdentityMesh(const ResolvedPayload& payload, MeshData* out) {
         mesh.pointColors.push_back(cr);
         mesh.pointColors.push_back(cg);
         mesh.pointColors.push_back(cb);
-        mesh.pointColors.push_back(pointAlpha);
+        mesh.pointColors.push_back(
+            denseLumaProtectedAlpha(0.72f, payload.pointSize, payload.pointDensity, payload.resolution, cr, cg, cb, false));
       }
     }
   }
@@ -4005,8 +4081,6 @@ bool buildInputCloudMeshCpu(const ResolvedPayload& payload,
                             MeshData* out) {
   if (!out) return false;
   const PlotRemapSpec remap = makePlotRemapSpec(payload);
-  const float normalAlpha = scaledPointAlpha(0.72f, payload.pointSize);
-  const float overflowAlpha = scaledPointAlpha(0.95f, payload.pointSize);
   MeshData mesh{};
   mesh.resolution = cloud.resolution <= 25 ? 25 : (cloud.resolution <= 41 ? 41 : 57);
   mesh.quality = cloud.quality;
@@ -4022,7 +4096,8 @@ bool buildInputCloudMeshCpu(const ResolvedPayload& payload,
     mesh.pointVerts.push_back(pos.y);
     mesh.pointVerts.push_back(pos.z);
     float cr = 0.0f, cg = 0.0f, cb = 0.0f;
-    if (overflowHighlightApplies(remap, r, g, b)) {
+    const bool overflowPoint = overflowHighlightApplies(remap, r, g, b);
+    if (overflowPoint) {
       cr = remap.overflowHighlightR;
       cg = remap.overflowHighlightG;
       cb = remap.overflowHighlightB;
@@ -4032,7 +4107,13 @@ bool buildInputCloudMeshCpu(const ResolvedPayload& payload,
     mesh.pointColors.push_back(cr);
     mesh.pointColors.push_back(cg);
     mesh.pointColors.push_back(cb);
-    mesh.pointColors.push_back(overflowHighlightApplies(remap, r, g, b) ? overflowAlpha : normalAlpha);
+    mesh.pointColors.push_back(
+        denseLumaProtectedAlpha(overflowPoint ? 0.95f : 0.72f,
+                                payload.pointSize,
+                                payload.pointDensity,
+                                payload.resolution,
+                                cr, cg, cb,
+                                overflowPoint));
   }
   if (mesh.pointVerts.empty()) return false;
   mesh.pointCount = mesh.pointVerts.size() / 3u;
@@ -7077,6 +7158,8 @@ int main() {
     const float zoomComp = clampf(std::pow(6.0f / std::max(0.2f, app.cam.distance), 0.52f), 0.90f, 2.35f);
     pointSize = clampf(pointSize * zoomComp, 1.0f, 24.0f);
     const bool useSquarePoints = resolved.pointShape == "Square";
+    const float denseGlowSuppress =
+        densePlotGlowSuppression(resolved.pointSize, densityForView, mesh.resolution);
     if (useSquarePoints) {
       glDisable(GL_POINT_SMOOTH);
     } else {
@@ -7204,15 +7287,22 @@ int main() {
     if (activePointCount > 0 && haveDrawablePointSource) {
       glDisable(GL_DEPTH_TEST);
       glDisableClientState(GL_COLOR_ARRAY);
-      // A neutral interior thickening pass helps sparse image clouds read more like a solid volume.
-      glColor4f(0.95f, 0.96f, 1.0f, clampf(0.05f / std::sqrt(densityForView), 0.014f, 0.05f));
-      glPointSize(pointSize * clampf(0.56f / std::sqrt(densityForView), 0.30f, 0.58f));
-      glDrawArrays(GL_POINTS, 0, static_cast<GLsizei>(activePointCount));
-      // A soft additive-looking halo helps sparse clouds read as a volume without over-brightening dense ones.
-      const float haloAlpha = clampf(0.06f / densityForView, 0.012f, 0.05f);
-      if (haloAlpha > 0.013f) {
+      // The white interior thickening/halo passes help sparse plots, but they quickly wash out dense large splats.
+      // Fade them down aggressively in that regime so the colored structure stays crisp.
+      const float thickeningAlpha =
+          clampf((0.05f / std::sqrt(densityForView)) * (1.0f - 0.92f * denseGlowSuppress), 0.0f, 0.05f);
+      if (thickeningAlpha > 0.006f) {
+        glColor4f(0.95f, 0.96f, 1.0f, thickeningAlpha);
+        glPointSize(pointSize * clampf((0.56f / std::sqrt(densityForView)) * (1.0f - 0.22f * denseGlowSuppress),
+                                       0.24f, 0.58f));
+        glDrawArrays(GL_POINTS, 0, static_cast<GLsizei>(activePointCount));
+      }
+      const float haloAlpha =
+          clampf((0.06f / densityForView) * (1.0f - 0.97f * denseGlowSuppress), 0.0f, 0.05f);
+      if (haloAlpha > 0.006f) {
         glColor4f(0.95f, 0.96f, 1.0f, haloAlpha);
-        glPointSize(pointSize * clampf(0.52f / std::sqrt(densityForView), 0.28f, 0.55f));
+        glPointSize(pointSize * clampf((0.52f / std::sqrt(densityForView)) * (1.0f - 0.26f * denseGlowSuppress),
+                                       0.22f, 0.55f));
         glDrawArrays(GL_POINTS, 0, static_cast<GLsizei>(activePointCount));
       }
       glEnableClientState(GL_COLOR_ARRAY);

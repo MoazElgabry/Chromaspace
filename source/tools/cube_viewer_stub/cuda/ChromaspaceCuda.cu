@@ -57,6 +57,7 @@ struct InputKernelUniforms {
   int circularHsv;
   int normConeNormalized;
   float pointAlphaScale;
+  float denseAlphaBias;
 };
 
 struct InputSampleKernelUniforms {
@@ -555,7 +556,21 @@ __global__ void inputKernel(float* verts, float* colors, const float* input, Inp
   colors[cbase + 0u] = cr;
   colors[cbase + 1u] = cg;
   colors[cbase + 2u] = cb;
-  colors[cbase + 3u] = ((u.showOverflow != 0 && u.highlightOverflow != 0 && overflow) ? 0.95f : 0.72f) * u.pointAlphaScale;
+  const bool overflowHighlighted = (u.showOverflow != 0 && u.highlightOverflow != 0 && overflow);
+  float alpha = (overflowHighlighted ? 0.95f : 0.72f) * u.pointAlphaScale;
+  if (!overflowHighlighted && u.denseAlphaBias > 0.0f) {
+    const float luma = clamp01(cr * 0.2126f + cg * 0.7152f + cb * 0.0722f);
+    const float highlightKnee = clamp01((luma - 0.70f) / 0.24f);
+    const float shadowMidProtect = 1.0f - clamp01((luma - 0.58f) / 0.30f);
+    const float multiplier =
+        fminf(1.12f,
+              fmaxf(0.76f,
+                    1.0f + 0.16f * u.denseAlphaBias * shadowMidProtect - 0.30f * u.denseAlphaBias * highlightKnee));
+    alpha = clamp01(alpha * multiplier);
+  } else {
+    alpha = clamp01(alpha);
+  }
+  colors[cbase + 3u] = alpha;
 }
 
 __global__ void inputSampleKernel(float* dstVerts,
@@ -760,6 +775,7 @@ bool buildInputMesh(InputCache* cache,
   uniforms.circularHsv = request.remap.circularHsv;
   uniforms.normConeNormalized = request.remap.normConeNormalized;
   uniforms.pointAlphaScale = request.pointAlphaScale;
+  uniforms.denseAlphaBias = request.denseAlphaBias;
   return buildMesh(cache, pointCount, rawPoints.data(), rawPoints.size(), uniforms, launchInput, serial, error);
 }
 
