@@ -90,6 +90,12 @@ jobs:
 
       - name: Verify bundle outputs
         run: |
+          grep -q "CHROMASPACE_PLUGIN_HAS_CUDA_KERNELS:BOOL=ON" build-linux/CMakeCache.txt
+          grep -q "CHROMASPACE_VIEWER_HAS_CUDA:BOOL=ON" build-linux/CMakeCache.txt
+          if ! find build-linux -name '*ChromaspaceCloudCuda.cu.o' -o -name '*ChromaspaceCloudCuda.cu.obj' | grep -q .; then
+            echo "Plugin CUDA kernel object was not built."
+            exit 1
+          fi
           grep -q "CHROMASPACE_TEXT_DEPS_PROVIDER:INTERNAL=bundled" build-linux/CMakeCache.txt
           test -f bundle/Chromaspace.ofx.bundle/Contents/Linux-x86-64/Chromaspace.ofx
           test -f bundle/Chromaspace.ofx.bundle/Contents/Linux-x86-64/Chromaspace_CubeViewer
