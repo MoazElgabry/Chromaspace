@@ -346,7 +346,7 @@ inline float clampf(float v, float lo, float hi) {
 }
 
 constexpr float kMinCameraDistance = 0.008f;
-constexpr float kMaxCameraDistance = 100.0f;
+constexpr float kMaxCameraDistance = 1000.0f;
 constexpr float kMinOrthoHalfHeight = 0.25f;
 constexpr float kViewerFovYDegrees = 28.0f;
 
@@ -626,6 +626,173 @@ void setOrthographicInspectionCamera(CameraState* cam, int viewIndex) {
   }
 }
 
+bool computePointBounds(const float* verts,
+                        size_t pointCount,
+                        Vec3* outMin,
+                        Vec3* outMax) {
+  if (!verts || pointCount == 0 || !outMin || !outMax) return false;
+  float minX = std::numeric_limits<float>::max();
+  float minY = std::numeric_limits<float>::max();
+  float minZ = std::numeric_limits<float>::max();
+  float maxX = -std::numeric_limits<float>::max();
+  float maxY = -std::numeric_limits<float>::max();
+  float maxZ = -std::numeric_limits<float>::max();
+  for (size_t i = 0; i < pointCount; ++i) {
+    const Vec3 src{verts[i * 3u + 0u], verts[i * 3u + 1u], verts[i * 3u + 2u]};
+    minX = std::min(minX, src.x);
+    minY = std::min(minY, src.y);
+    minZ = std::min(minZ, src.z);
+    maxX = std::max(maxX, src.x);
+    maxY = std::max(maxY, src.y);
+    maxZ = std::max(maxZ, src.z);
+  }
+  if (!std::isfinite(minX) || !std::isfinite(maxX) ||
+      !std::isfinite(minY) || !std::isfinite(maxY) ||
+      !std::isfinite(minZ) || !std::isfinite(maxZ)) {
+    return false;
+  }
+  *outMin = Vec3{minX, minY, minZ};
+  *outMax = Vec3{maxX, maxY, maxZ};
+  return true;
+}
+
+struct MeshData;
+void setMeshFitBoundsFromVerts(MeshData* mesh);
+
+bool fitCameraToBounds(CameraState* cam,
+                       Quat modelOrientation,
+                       const Vec3& boundsMin,
+                       const Vec3& boundsMax,
+                       int width,
+                       int height) {
+  if (!cam) return false;
+  width = std::max(width, 1);
+  height = std::max(height, 1);
+  const float aspect = static_cast<float>(width) / static_cast<float>(height);
+  const float tanHalfY = tanHalfFovDegrees(kViewerFovYDegrees);
+  const float tanHalfX = std::max(1e-4f, tanHalfY * aspect);
+  const float kPadding = 1.10f;
+
+  const Quat camQ = normalizeQ(Quat{cam->qx, cam->qy, cam->qz, cam->qw});
+  const Quat modelQ = normalizeQ(modelOrientation);
+  float minX = std::numeric_limits<float>::max();
+  float minY = std::numeric_limits<float>::max();
+  float minZ = std::numeric_limits<float>::max();
+  float maxX = -std::numeric_limits<float>::max();
+  float maxY = -std::numeric_limits<float>::max();
+  float maxZ = -std::numeric_limits<float>::max();
+
+  for (int corner = 0; corner < 8; ++corner) {
+    const Vec3 src{
+        (corner & 1) ? boundsMax.x : boundsMin.x,
+        (corner & 2) ? boundsMax.y : boundsMin.y,
+        (corner & 4) ? boundsMax.z : boundsMin.z};
+    const Vec3 modelP = rotateVecByQuat(modelQ, src);
+    const Vec3 viewP = rotateVecByQuat(camQ, modelP);
+    minX = std::min(minX, viewP.x);
+    minY = std::min(minY, viewP.y);
+    minZ = std::min(minZ, viewP.z);
+    maxX = std::max(maxX, viewP.x);
+    maxY = std::max(maxY, viewP.y);
+    maxZ = std::max(maxZ, viewP.z);
+  }
+
+  if (!std::isfinite(minX) || !std::isfinite(maxX) || !std::isfinite(minY) || !std::isfinite(maxY) ||
+      !std::isfinite(minZ) || !std::isfinite(maxZ)) {
+    return false;
+  }
+
+  const float centerX = 0.5f * (minX + maxX);
+  const float centerY = 0.5f * (minY + maxY);
+  cam->panX = -centerX;
+  cam->panY = -centerY;
+
+  if (cam->orthographic) {
+    const float halfX = 0.5f * (maxX - minX) * kPadding;
+    const float halfY = 0.5f * (maxY - minY) * kPadding;
+    const float requiredDistance = std::max({minCameraDistanceForView(*cam),
+                                             halfY / std::max(tanHalfY, 1e-4f),
+                                             halfX / tanHalfX});
+    cam->distance = clampf(requiredDistance, minCameraDistanceForView(*cam), kMaxCameraDistance);
+    return true;
+  }
+
+  float requiredDistance = minCameraDistanceForView(*cam);
+  for (int corner = 0; corner < 8; ++corner) {
+    const Vec3 src{
+        (corner & 1) ? boundsMax.x : boundsMin.x,
+        (corner & 2) ? boundsMax.y : boundsMin.y,
+        (corner & 4) ? boundsMax.z : boundsMin.z};
+    const Vec3 modelP = rotateVecByQuat(modelQ, src);
+    const Vec3 viewP = rotateVecByQuat(camQ, modelP);
+    const float localX = std::fabs(viewP.x - centerX) * kPadding;
+    const float localY = std::fabs(viewP.y - centerY) * kPadding;
+    requiredDistance = std::max(requiredDistance, viewP.z + localX / tanHalfX);
+    requiredDistance = std::max(requiredDistance, viewP.z + localY / std::max(tanHalfY, 1e-4f));
+  }
+  requiredDistance = std::max(requiredDistance, maxZ + 0.18f);
+  cam->distance = clampf(requiredDistance, minCameraDistanceForView(*cam), kMaxCameraDistance);
+  return true;
+}
+
+bool computeViewBoundsFromAabb(Quat camOrientation,
+                               Quat modelOrientation,
+                               const Vec3& boundsMin,
+                               const Vec3& boundsMax,
+                               float* outMinX,
+                               float* outMinY,
+                               float* outMinZ,
+                               float* outMaxX,
+                               float* outMaxY,
+                               float* outMaxZ) {
+  if (!outMinX || !outMinY || !outMinZ || !outMaxX || !outMaxY || !outMaxZ) return false;
+  const Quat camQ = normalizeQ(camOrientation);
+  const Quat modelQ = normalizeQ(modelOrientation);
+  float minX = std::numeric_limits<float>::max();
+  float minY = std::numeric_limits<float>::max();
+  float minZ = std::numeric_limits<float>::max();
+  float maxX = -std::numeric_limits<float>::max();
+  float maxY = -std::numeric_limits<float>::max();
+  float maxZ = -std::numeric_limits<float>::max();
+  for (int corner = 0; corner < 8; ++corner) {
+    const Vec3 src{
+        (corner & 1) ? boundsMax.x : boundsMin.x,
+        (corner & 2) ? boundsMax.y : boundsMin.y,
+        (corner & 4) ? boundsMax.z : boundsMin.z};
+    const Vec3 modelP = rotateVecByQuat(modelQ, src);
+    const Vec3 viewP = rotateVecByQuat(camQ, modelP);
+    minX = std::min(minX, viewP.x);
+    minY = std::min(minY, viewP.y);
+    minZ = std::min(minZ, viewP.z);
+    maxX = std::max(maxX, viewP.x);
+    maxY = std::max(maxY, viewP.y);
+    maxZ = std::max(maxZ, viewP.z);
+  }
+  if (!std::isfinite(minX) || !std::isfinite(minY) || !std::isfinite(minZ) ||
+      !std::isfinite(maxX) || !std::isfinite(maxY) || !std::isfinite(maxZ)) {
+    return false;
+  }
+  *outMinX = minX;
+  *outMinY = minY;
+  *outMinZ = minZ;
+  *outMaxX = maxX;
+  *outMaxY = maxY;
+  *outMaxZ = maxZ;
+  return true;
+}
+
+bool fitCameraToPoints(CameraState* cam,
+                       Quat modelOrientation,
+                       const float* verts,
+                       size_t pointCount,
+                       int width,
+                       int height) {
+  Vec3 boundsMin{};
+  Vec3 boundsMax{};
+  if (!computePointBounds(verts, pointCount, &boundsMin, &boundsMax)) return false;
+  return fitCameraToBounds(cam, modelOrientation, boundsMin, boundsMax, width, height);
+}
+
 const char* orthographicViewLabel(const CameraState& cam) {
   if (!cam.orthographic) return nullptr;
   switch (cam.orthographicView) {
@@ -887,7 +1054,21 @@ struct MeshData {
   std::vector<float> pointVerts;
   std::vector<float> pointColors;
   size_t pointCount = 0;
+  bool hasFitBounds = false;
+  Vec3 fitMin{};
+  Vec3 fitMax{};
 };
+
+void setMeshFitBoundsFromVerts(MeshData* mesh) {
+  if (!mesh || mesh->pointVerts.empty() || mesh->pointCount == 0) return;
+  Vec3 minP{};
+  Vec3 maxP{};
+  if (computePointBounds(mesh->pointVerts.data(), mesh->pointCount, &minP, &maxP)) {
+    mesh->fitMin = minP;
+    mesh->fitMax = maxP;
+    mesh->hasFitBounds = true;
+  }
+}
 
 uint64_t nextMeshSerial() {
   static std::atomic<uint64_t> serial{1u};
@@ -924,7 +1105,10 @@ struct InputCloudComputeCache {
   GLuint verts = 0;
   GLuint colors = 0;
   GLuint program = 0;
+  GLuint boundsBuffer = 0;
+  GLuint boundsProgram = 0;
   GLint pointCountLoc = -1;
+  GLint boundsPointCountLoc = -1;
   GLint showOverflowLoc = -1;
   GLint highlightOverflowLoc = -1;
   GLint plotModeLoc = -1;
@@ -954,6 +1138,9 @@ struct InputCloudCudaCache {
   uint64_t builtSerial = 0;
   GLsizei pointCount = 0;
   bool available = false;
+  bool hasFitBounds = false;
+  float fitMin[3] = {0.0f, 0.0f, 0.0f};
+  float fitMax[3] = {0.0f, 0.0f, 0.0f};
   void* internal = nullptr;
 };
 
@@ -1042,8 +1229,8 @@ void releaseInputCloudComputeCache(InputCloudComputeCache* cache) {
   const ViewerGlBufferApi& bufferApi = viewerGlBufferApi();
   const ViewerGlComputeApi& computeApi = viewerGlComputeApi();
   if (bufferApi.available) {
-    GLuint buffers[3] = {cache->input, cache->verts, cache->colors};
-    GLuint toDelete[3] = {};
+    GLuint buffers[4] = {cache->input, cache->verts, cache->colors, cache->boundsBuffer};
+    GLuint toDelete[4] = {};
     GLsizei count = 0;
     for (GLuint id : buffers) {
       if (id != 0) toDelete[count++] = id;
@@ -1051,8 +1238,9 @@ void releaseInputCloudComputeCache(InputCloudComputeCache* cache) {
     if (count > 0) bufferApi.deleteBuffers(count, toDelete);
     bufferApi.bindBuffer(GL_ARRAY_BUFFER, 0);
   }
-  if (computeApi.available && cache->program != 0) {
-    computeApi.deleteProgram(cache->program);
+  if (computeApi.available) {
+    if (cache->program != 0) computeApi.deleteProgram(cache->program);
+    if (cache->boundsProgram != 0) computeApi.deleteProgram(cache->boundsProgram);
   }
   *cache = InputCloudComputeCache{};
 }
@@ -1283,6 +1471,19 @@ bool sampledFloatsNear(const std::vector<float>& cpu, const std::vector<float>& 
   return true;
 }
 
+uint32_t orderedUintFromFloat(float value) {
+  uint32_t bits = 0u;
+  std::memcpy(&bits, &value, sizeof(bits));
+  return (bits & 0x80000000u) ? ~bits : (bits ^ 0x80000000u);
+}
+
+float floatFromOrderedUint(uint32_t ordered) {
+  const uint32_t bits = (ordered & 0x80000000u) ? (ordered ^ 0x80000000u) : ~ordered;
+  float value = 0.0f;
+  std::memcpy(&value, &bits, sizeof(value));
+  return value;
+}
+
 void logParityCheckResult(bool enabled, const std::string& label, bool ok, const std::string& detail) {
   if (!enabled) return;
   logViewerDiagnostic(true, std::string("Parity ") + label + ": " + (ok ? "ok" : "mismatch") + " " + detail);
@@ -1351,6 +1552,7 @@ bool buildIdentityOverlayMeshOnGpu(const ResolvedPayload& payload,
                                    );
 bool canUseInputCloudComputePath(const ResolvedPayload& payload);
 bool ensureInputCloudComputeProgram(InputCloudComputeCache* cache);
+bool ensureInputCloudBoundsProgram(InputCloudComputeCache* cache);
 bool parseInputCloudSamples(const InputCloudPayload& cloud, std::vector<InputCloudSample>* samples);
 bool cubeSliceContainsPoint(const PlotRemapSpec& spec, float r, float g, float b);
 bool cubeSliceContainsPoint(const ResolvedPayload& payload, float r, float g, float b);
@@ -2709,6 +2911,116 @@ void main() {
   return true;
 }
 
+bool ensureInputCloudBoundsProgram(InputCloudComputeCache* cache) {
+  if (!cache) return false;
+  if (cache->boundsProgram != 0) return true;
+  const ViewerGlComputeApi& api = viewerGlComputeApi();
+  if (!api.available) return false;
+  static const char* kShaderSrc = R"GLSL(
+#version 430
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) readonly buffer VertBuffer { float vertVals[]; };
+layout(std430, binding = 1) buffer BoundsBuffer { uint boundsVals[]; };
+uniform int uPointCount;
+
+uint orderedUintFromFloat(float v) {
+  uint bits = floatBitsToUint(v);
+  return (bits & 0x80000000u) != 0u ? ~bits : (bits ^ 0x80000000u);
+}
+
+void main() {
+  uint index = gl_GlobalInvocationID.x;
+  if (index >= uint(max(uPointCount, 0))) return;
+  uint base = index * 3u;
+  uint ox = orderedUintFromFloat(vertVals[base + 0u]);
+  uint oy = orderedUintFromFloat(vertVals[base + 1u]);
+  uint oz = orderedUintFromFloat(vertVals[base + 2u]);
+  atomicMin(boundsVals[0], ox);
+  atomicMin(boundsVals[1], oy);
+  atomicMin(boundsVals[2], oz);
+  atomicMax(boundsVals[3], ox);
+  atomicMax(boundsVals[4], oy);
+  atomicMax(boundsVals[5], oz);
+}
+)GLSL";
+
+  const GLuint shader = api.createShader(GL_COMPUTE_SHADER);
+  if (shader == 0) return false;
+  api.shaderSource(shader, 1, &kShaderSrc, nullptr);
+  api.compileShader(shader);
+  GLint compiled = 0;
+  api.getShaderiv(shader, GL_COMPILE_STATUS, &compiled);
+  if (!compiled) {
+    logViewerEvent(std::string("Input-cloud bounds shader compile failed: ") + readShaderLog(shader, false, api));
+    api.deleteShader(shader);
+    return false;
+  }
+
+  const GLuint program = api.createProgram();
+  if (program == 0) {
+    api.deleteShader(shader);
+    return false;
+  }
+  api.attachShader(program, shader);
+  api.linkProgram(program);
+  api.deleteShader(shader);
+
+  GLint linked = 0;
+  api.getProgramiv(program, GL_LINK_STATUS, &linked);
+  if (!linked) {
+    logViewerEvent(std::string("Input-cloud bounds program link failed: ") + readShaderLog(program, true, api));
+    api.deleteProgram(program);
+    return false;
+  }
+
+  cache->boundsProgram = program;
+  cache->boundsPointCountLoc = api.getUniformLocation(program, "uPointCount");
+  if (cache->boundsPointCountLoc < 0) {
+    logViewerEvent("Input-cloud bounds compute program missing uPointCount; fit will fall back.");
+    releaseInputCloudComputeCache(cache);
+    return false;
+  }
+  return true;
+}
+
+bool computeInputCloudGpuBounds(InputCloudComputeCache* cache,
+                                size_t pointCount,
+                                Vec3* outMin,
+                                Vec3* outMax) {
+  if (!cache || pointCount == 0 || !outMin || !outMax) return false;
+  const ViewerGlBufferApi& bufferApi = viewerGlBufferApi();
+  const ViewerGlComputeApi& computeApi = viewerGlComputeApi();
+  if (!bufferApi.available || !computeApi.available || bufferApi.getBufferSubData == nullptr) return false;
+  if (!ensureInputCloudBoundsProgram(cache)) return false;
+  if (cache->boundsBuffer == 0) bufferApi.genBuffers(1, &cache->boundsBuffer);
+  if (cache->boundsBuffer == 0) return false;
+
+  const uint32_t initVals[6] = {
+      0xffffffffu, 0xffffffffu, 0xffffffffu,
+      0u, 0u, 0u};
+  bufferApi.bindBuffer(GL_SHADER_STORAGE_BUFFER, cache->boundsBuffer);
+  bufferApi.bufferData(GL_SHADER_STORAGE_BUFFER, sizeof(initVals), initVals, GL_DYNAMIC_DRAW);
+  computeApi.useProgram(cache->boundsProgram);
+  computeApi.uniform1i(cache->boundsPointCountLoc, static_cast<GLint>(pointCount));
+  computeApi.bindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, cache->verts);
+  computeApi.bindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, cache->boundsBuffer);
+  const GLuint groups = static_cast<GLuint>((pointCount + 63u) / 64u);
+  computeApi.dispatchCompute(groups, 1u, 1u);
+  computeApi.memoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_BUFFER_UPDATE_BARRIER_BIT);
+
+  uint32_t packed[6] = {};
+  bufferApi.getBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, static_cast<ViewerGLsizeiptr>(sizeof(packed)), packed);
+  bufferApi.bindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+  *outMin = Vec3{floatFromOrderedUint(packed[0]),
+                 floatFromOrderedUint(packed[1]),
+                 floatFromOrderedUint(packed[2])};
+  *outMax = Vec3{floatFromOrderedUint(packed[3]),
+                 floatFromOrderedUint(packed[4]),
+                 floatFromOrderedUint(packed[5])};
+  return std::isfinite(outMin->x) && std::isfinite(outMin->y) && std::isfinite(outMin->z) &&
+         std::isfinite(outMax->x) && std::isfinite(outMax->y) && std::isfinite(outMax->z);
+}
+
 std::vector<std::string> splitViewerString(const std::string& text, char delimiter) {
   std::vector<std::string> parts;
   std::string current;
@@ -2926,6 +3238,7 @@ bool buildInputCloudMeshOnGpu(const ResolvedPayload& payload,
   }
   mesh.pointCount = mesh.pointVerts.size() / 3u;
   if (mesh.pointCount == 0 || mesh.pointColors.size() != mesh.pointCount * 4u) return false;
+  setMeshFitBoundsFromVerts(&mesh);
   *out = std::move(mesh);
   cache->builtSerial = out->serial;
   cache->pointCount = static_cast<GLsizei>(out->pointCount);
@@ -2972,6 +3285,11 @@ bool buildInputCloudMeshOnGpu(const ResolvedPayload& payload,
         mesh.paramHash = cloud.paramHash;
         mesh.serial = cudaCache->builtSerial;
         mesh.pointCount = pointCount;
+        if (cudaCache->hasFitBounds) {
+          mesh.hasFitBounds = true;
+          mesh.fitMin = Vec3{cudaCache->fitMin[0], cudaCache->fitMin[1], cudaCache->fitMin[2]};
+          mesh.fitMax = Vec3{cudaCache->fitMax[0], cudaCache->fitMax[1], cudaCache->fitMax[2]};
+        }
         *out = std::move(mesh);
         const bool parityOk = runInputParityCheckWithBuffers(payload, cloud, rawPoints, cudaCache->verts, cudaCache->colors, *out, viewerParityChecksEnabled());
         if (!parityOk) {
@@ -3042,6 +3360,13 @@ bool buildInputCloudMeshOnGpu(const ResolvedPayload& payload,
   mesh.paramHash = cloud.paramHash;
   mesh.serial = nextMeshSerial();
   mesh.pointCount = pointCount;
+  Vec3 gpuMin{};
+  Vec3 gpuMax{};
+  if (computeInputCloudGpuBounds(cache, pointCount, &gpuMin, &gpuMax)) {
+    mesh.hasFitBounds = true;
+    mesh.fitMin = gpuMin;
+    mesh.fitMax = gpuMax;
+  }
   *out = std::move(mesh);
   cache->builtSerial = out->serial;
   cache->pointCount = static_cast<GLsizei>(pointCount);
@@ -4121,8 +4446,36 @@ bool buildInputCloudMeshCpu(const ResolvedPayload& payload,
   }
   if (mesh.pointVerts.empty()) return false;
   mesh.pointCount = mesh.pointVerts.size() / 3u;
+  setMeshFitBoundsFromVerts(&mesh);
   *out = std::move(mesh);
   return true;
+}
+
+bool buildInputCloudFitMeshCpu(const ResolvedPayload& payload,
+                               const InputCloudPayload& cloud,
+                               MeshData* out) {
+  if (!out) return false;
+  std::vector<InputCloudSample> samples;
+  if (!parseInputCloudSamples(cloud, &samples)) return false;
+  filterInputCloudSamples(payload, &samples);
+  std::vector<float> rawPoints;
+  rawPoints.reserve(samples.size() * 3u);
+  for (const auto& sample : samples) {
+    rawPoints.push_back(sample.r);
+    rawPoints.push_back(sample.g);
+    rawPoints.push_back(sample.b);
+  }
+  if (rawPoints.empty()) {
+    MeshData mesh{};
+    mesh.resolution = cloud.resolution <= 25 ? 25 : (cloud.resolution <= 41 ? 41 : 57);
+    mesh.quality = cloud.quality;
+    mesh.paramHash = cloud.paramHash;
+    mesh.serial = nextMeshSerial();
+    mesh.pointCount = 0;
+    *out = std::move(mesh);
+    return true;
+  }
+  return buildInputCloudMeshCpu(payload, cloud, rawPoints, out);
 }
 
 void buildEmptyInputCloudMesh(const InputCloudPayload& cloud, MeshData* out) {
@@ -4598,6 +4951,7 @@ struct AppState {
   double orientAxisFeedbackUntil = 0.0;
   double slowFeedbackUntil = 0.0;
   double speedFeedbackUntil = 0.0;
+  double fitFeedbackUntil = 0.0;
   bool leftDown = false;
   bool panMode = false;
   bool shiftPanGesture = false;
@@ -4628,6 +4982,7 @@ struct AppState {
   bool altHeld = false;
   bool superHeld = false;
   bool rollKeyHeld = false;
+  bool fitVolumeRequested = false;
   double lastHoverActivationAttempt = -10.0;
 };
 
@@ -4786,10 +5141,14 @@ void applyMouseModifierBits(AppState* app, int mods) {
   app->superHeld = app->superHeld || (mods & GLFW_MOD_SUPER) != 0 || nativeSuperModifierPressed();
 }
 
-void keyCallback(GLFWwindow* window, int, int, int, int) {
+void keyCallback(GLFWwindow* window, int key, int, int action, int) {
   AppState* app = reinterpret_cast<AppState*>(glfwGetWindowUserPointer(window));
   if (!app) return;
   refreshModifierState(window, app);
+  if (action == GLFW_PRESS && key == GLFW_KEY_F) {
+    app->fitVolumeRequested = true;
+    app->fitFeedbackUntil = glfwGetTime() + 0.55;
+  }
 }
 
 void tryActivateViewerOnHover(GLFWwindow* window, AppState* app) {
@@ -6082,6 +6441,74 @@ void drawNeutralRadiusIndicator(int width,
   glMatrixMode(GL_MODELVIEW);
 }
 
+void drawFitIndicator(int width,
+                      int height,
+                      float xOffset,
+                      float yOffset,
+                      float alpha,
+                      const HudTextRenderer* textRenderer = nullptr) {
+  if (width <= 0 || height <= 0 || alpha <= 0.0f) return;
+  const std::string label = "Fit";
+  glMatrixMode(GL_PROJECTION);
+  glPushMatrix();
+  glLoadIdentity();
+  glOrtho(0.0, static_cast<double>(width), 0.0, static_cast<double>(height), -1.0, 1.0);
+  glMatrixMode(GL_MODELVIEW);
+  glPushMatrix();
+  glLoadIdentity();
+
+  glDisable(GL_DEPTH_TEST);
+  glEnable(GL_BLEND);
+  glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+
+  if (textRenderer && textRenderer->available) {
+    const float scale = 0.92f;
+    const float textWidth = WorkshopText::measureTextWidth(textRenderer->atlas, label, scale);
+    if (textWidth > 0.5f) {
+      const float ascent = static_cast<float>(std::max(1, textRenderer->atlas.ascent));
+      const float descent = static_cast<float>(std::max(0, textRenderer->atlas.descent));
+      const float baselineY = std::round(yOffset - ((ascent - descent) * scale * 0.5f));
+      std::vector<WorkshopText::TextQuadVertex> quads;
+      WorkshopText::appendTextQuads(textRenderer->atlas,
+                                    label,
+                                    std::round(static_cast<float>(width) - xOffset - textWidth),
+                                    baselineY,
+                                    scale,
+                                    &quads);
+      if (!quads.empty()) {
+        glEnable(GL_TEXTURE_2D);
+        glBindTexture(GL_TEXTURE_2D, textRenderer->texture);
+        glBegin(GL_TRIANGLES);
+        glColor4f(0.96f, 0.98f, 1.0f, alpha);
+        for (const auto& v : quads) {
+          glTexCoord2f(v.u, v.v);
+          glVertex2f(v.x, v.y);
+        }
+        glEnd();
+        glBindTexture(GL_TEXTURE_2D, 0);
+        glDisable(GL_TEXTURE_2D);
+        glEnable(GL_DEPTH_TEST);
+        glPopMatrix();
+        glMatrixMode(GL_PROJECTION);
+        glPopMatrix();
+        glMatrixMode(GL_MODELVIEW);
+        return;
+      }
+    }
+  }
+
+  const float scale = 10.0f;
+  const float textWidth = bitmapTextWidth(label, scale);
+  glColor4f(0.96f, 0.98f, 1.0f, alpha);
+  drawScreenText(label, static_cast<float>(width) - xOffset - textWidth, yOffset - scale * 0.33f, scale);
+
+  glEnable(GL_DEPTH_TEST);
+  glPopMatrix();
+  glMatrixMode(GL_PROJECTION);
+  glPopMatrix();
+  glMatrixMode(GL_MODELVIEW);
+}
+
 void drawRollDirectionIndicator(int width,
                                 int height,
                                 int direction,
@@ -7076,8 +7503,31 @@ int main() {
     // Let the near plane relax as the user pushes into very close inspection
     // so points near the camera do not disappear just because the orbit distance
     // is much tighter than the original default framing.
+    float sceneMinX = 0.0f;
+    float sceneMinY = 0.0f;
+    float sceneMinZ = -1.0f;
+    float sceneMaxX = 0.0f;
+    float sceneMaxY = 0.0f;
+    float sceneMaxZ = 1.0f;
+    bool haveSceneBounds = false;
+    if (mesh.hasFitBounds) {
+      haveSceneBounds = computeViewBoundsFromAabb(Quat{app.cam.qx, app.cam.qy, app.cam.qz, app.cam.qw},
+                                                  app.modelOrientation,
+                                                  mesh.fitMin,
+                                                  mesh.fitMax,
+                                                  &sceneMinX,
+                                                  &sceneMinY,
+                                                  &sceneMinZ,
+                                                  &sceneMaxX,
+                                                  &sceneMaxY,
+                                                  &sceneMaxZ);
+    }
     const float zNear = clampf(app.cam.distance * 0.025f, 0.0018f, 0.08f);
-    const float zFar = 100.0f;
+    float zFar = 100.0f;
+    if (haveSceneBounds) {
+      const float depthToBack = std::max(0.2f, app.cam.distance - sceneMinZ + 1.5f);
+      zFar = clampf(depthToBack, 100.0f, 4000.0f);
+    }
     const float ymax = zNear * tanHalfFovDegrees(fovy);
     const float xmax = ymax * aspect;
     if (app.cam.orthographic) {
@@ -7236,6 +7686,28 @@ int main() {
     const bool haveDrawablePointSource = useInputSampledCudaBuffers || useInputSampledComputeBuffers ||
                                          useInputCudaBuffers || useInputComputeBuffers || usePointBuffers ||
                                          (activePointVerts != nullptr && activePointColors != nullptr);
+    if (app.fitVolumeRequested) {
+      bool fitApplied = false;
+      if (mesh.hasFitBounds) {
+        fitApplied = fitCameraToBounds(&app.cam, app.modelOrientation, mesh.fitMin, mesh.fitMax, width, height);
+      }
+      const float* fitVerts = mesh.pointVerts.empty() ? activePointVerts : mesh.pointVerts.data();
+      size_t fitCount = mesh.pointVerts.empty() ? activePointCount : mesh.pointCount;
+      if (!fitApplied && fitVerts != nullptr && fitCount > 0) {
+        fitCameraToPoints(&app.cam, app.modelOrientation, fitVerts, fitCount, width, height);
+        fitApplied = true;
+      }
+      MeshData fitMesh{};
+      if (!fitApplied &&
+          hasCurrentCloud &&
+          resolved.sourceMode == "input" &&
+          cloudMatchesResolved(resolved, currentCloud) &&
+          buildInputCloudFitMeshCpu(resolved, currentCloud, &fitMesh) &&
+          fitMesh.hasFitBounds) {
+        fitCameraToBounds(&app.cam, app.modelOrientation, fitMesh.fitMin, fitMesh.fitMax, width, height);
+      }
+      app.fitVolumeRequested = false;
+    }
     const std::string drawSourceLabel = pointDrawSourceLabel(useInputCudaBuffers,
                                                              useInputComputeBuffers,
                                                              usePointBuffers,
@@ -7445,6 +7917,15 @@ int main() {
                                  28.0f,
                                  0.82f,
                                  overlayTextRenderer);
+    }
+    const float fitPulse = clampf(static_cast<float>((app.fitFeedbackUntil - glfwGetTime()) / 0.55), 0.0f, 1.0f);
+    if (fitPulse > 0.0f) {
+      drawFitIndicator(width,
+                       height,
+                       34.0f,
+                       28.0f,
+                       0.58f + 0.42f * fitPulse,
+                       overlayTextRenderer);
     }
 
     glfwSwapBuffers(window);

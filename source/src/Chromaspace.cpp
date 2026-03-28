@@ -1307,6 +1307,34 @@ bool openPluginManager() {
 #endif
 }
 
+const std::vector<WorkshopColor::TransferFunctionId>& plotLinearTransferChoices() {
+  static const std::vector<WorkshopColor::TransferFunctionId> kChoices = []() {
+    std::vector<WorkshopColor::TransferFunctionId> ids;
+    ids.reserve(WorkshopColor::transferFunctionCount());
+    for (std::size_t i = 0; i < WorkshopColor::transferFunctionCount(); ++i) {
+      const auto id = WorkshopColor::transferFunctionDefinition(i).id;
+      if (id == WorkshopColor::TransferFunctionId::Linear) continue;
+      ids.push_back(id);
+    }
+    return ids;
+  }();
+  return kChoices;
+}
+
+int plotLinearTransferChoiceIndex(WorkshopColor::TransferFunctionId id) {
+  const auto& choices = plotLinearTransferChoices();
+  const auto it = std::find(choices.begin(), choices.end(), id);
+  if (it == choices.end()) return 0;
+  return static_cast<int>(std::distance(choices.begin(), it));
+}
+
+WorkshopColor::TransferFunctionId plotLinearTransferIdFromChoice(int index) {
+  const auto& choices = plotLinearTransferChoices();
+  if (choices.empty()) return WorkshopColor::TransferFunctionId::Gamma24;
+  const int clamped = std::clamp(index, 0, static_cast<int>(choices.size()) - 1);
+  return choices[static_cast<std::size_t>(clamped)];
+}
+
 class ChromaspaceEffect : public ImageEffect {
  public:
   friend class ChromaspaceOverlayInteract;
@@ -2191,13 +2219,13 @@ class ChromaspaceEffect : public ImageEffect {
 
   int currentPlotDisplayLinearTransferChoice(double time) {
     return std::clamp(getChoiceValue("cubeViewerPlotDisplayLinearTransfer", time,
-                                     WorkshopColor::transferFunctionChoiceIndex(
+                                     plotLinearTransferChoiceIndex(
                                          WorkshopColor::TransferFunctionId::Gamma24)),
-                      0, static_cast<int>(WorkshopColor::transferFunctionCount()) - 1);
+                      0, static_cast<int>(plotLinearTransferChoices().size()) - 1);
   }
 
   WorkshopColor::TransferFunctionId currentPlotDisplayLinearTransferId(double time) {
-    return WorkshopColor::transferFunctionIdFromChoiceIndex(currentPlotDisplayLinearTransferChoice(time));
+    return plotLinearTransferIdFromChoice(currentPlotDisplayLinearTransferChoice(time));
   }
 
   bool currentDrawOnImageMode(double time) {
@@ -6190,17 +6218,17 @@ class ChromaspaceFactory : public PluginFactoryHelper<ChromaspaceFactory> {
     if (const char* hint = tooltipFor("openCubeViewer")) openCubeViewer->setHint(hint);
 
     auto* cubeViewerPlotDisplayLinear = d.defineBooleanParam("cubeViewerPlotDisplayLinear");
-    cubeViewerPlotDisplayLinear->setLabel("Plot in Display Linear");
+    cubeViewerPlotDisplayLinear->setLabel("Plot in Linear");
     cubeViewerPlotDisplayLinear->setDefault(false);
     if (const char* hint = tooltipFor("cubeViewerPlotDisplayLinear")) cubeViewerPlotDisplayLinear->setHint(hint);
 
     auto* cubeViewerPlotDisplayLinearTransfer = d.defineChoiceParam("cubeViewerPlotDisplayLinearTransfer");
     cubeViewerPlotDisplayLinearTransfer->setLabel("Input Transfer Function");
-    for (std::size_t i = 0; i < WorkshopColor::transferFunctionCount(); ++i) {
-      cubeViewerPlotDisplayLinearTransfer->appendOption(WorkshopColor::transferFunctionDefinition(i).label);
+    for (const auto id : plotLinearTransferChoices()) {
+      cubeViewerPlotDisplayLinearTransfer->appendOption(WorkshopColor::transferFunctionDefinition(id).label);
     }
     cubeViewerPlotDisplayLinearTransfer->setDefault(
-        WorkshopColor::transferFunctionChoiceIndex(WorkshopColor::TransferFunctionId::Gamma24));
+        plotLinearTransferChoiceIndex(WorkshopColor::TransferFunctionId::Gamma24));
     cubeViewerPlotDisplayLinearTransfer->setIsSecret(true);
     cubeViewerPlotDisplayLinearTransfer->setEnabled(false);
     if (const char* hint = tooltipFor("cubeViewerPlotDisplayLinearTransfer")) cubeViewerPlotDisplayLinearTransfer->setHint(hint);

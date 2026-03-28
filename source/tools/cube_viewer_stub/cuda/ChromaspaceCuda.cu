@@ -73,6 +73,7 @@ struct CacheImpl {
   size_t pointCapacity = 0;
   float* deviceInput = nullptr;
   size_t inputCapacityFloats = 0;
+  unsigned int* deviceBounds = nullptr;
 };
 
 struct SampleCacheImpl {
@@ -90,6 +91,13 @@ CudaContext& context() {
 
 const char* errorString(cudaError_t err) {
   return cudaGetErrorString(err);
+}
+
+float floatFromOrderedUint(unsigned int ordered) {
+  const unsigned int bits = (ordered & 0x80000000u) ? (ordered ^ 0x80000000u) : ~ordered;
+  float value = 0.0f;
+  std::memcpy(&value, &bits, sizeof(value));
+  return value;
 }
 
 bool ensureContext(std::string* error) {
@@ -156,6 +164,7 @@ void releaseImpl(CacheImpl* impl) {
   if (impl->vertsResource) cudaGraphicsUnregisterResource(impl->vertsResource);
   if (impl->colorsResource) cudaGraphicsUnregisterResource(impl->colorsResource);
   if (impl->deviceInput) cudaFree(impl->deviceInput);
+  if (impl->deviceBounds) cudaFree(impl->deviceBounds);
   delete impl;
 }
 
@@ -280,6 +289,22 @@ bool ensureInputCapacity(CacheImpl* impl, size_t floatCount, std::string* error)
   }
   impl->inputCapacityFloats = floatCount;
   return true;
+}
+
+bool ensureBoundsCapacity(CacheImpl* impl, std::string* error) {
+  if (!impl) return false;
+  if (impl->deviceBounds != nullptr) return true;
+  cudaError_t err = cudaMalloc(&impl->deviceBounds, 6u * sizeof(unsigned int));
+  if (err != cudaSuccess) {
+    if (error) *error = std::string("Failed to allocate CUDA bounds buffer: ") + errorString(err);
+    return false;
+  }
+  return true;
+}
+
+inline __device__ unsigned int orderedUintFromFloat(float value) {
+  unsigned int bits = __float_as_uint(value);
+  return (bits & 0x80000000u) ? ~bits : (bits ^ 0x80000000u);
 }
 
 inline __device__ float clamp01(float v) {
@@ -575,6 +600,21 @@ __global__ void inputKernel(float* verts, float* colors, const float* input, Inp
   colors[cbase + 3u] = alpha;
 }
 
+__global__ void boundsKernel(const float* verts, unsigned int* boundsVals, int pointCount) {
+  const unsigned int index = blockIdx.x * blockDim.x + threadIdx.x;
+  if (index >= static_cast<unsigned int>(max(pointCount, 0))) return;
+  const unsigned int base = index * 3u;
+  const unsigned int ox = orderedUintFromFloat(verts[base + 0u]);
+  const unsigned int oy = orderedUintFromFloat(verts[base + 1u]);
+  const unsigned int oz = orderedUintFromFloat(verts[base + 2u]);
+  atomicMin(&boundsVals[0], ox);
+  atomicMin(&boundsVals[1], oy);
+  atomicMin(&boundsVals[2], oz);
+  atomicMax(&boundsVals[3], ox);
+  atomicMax(&boundsVals[4], oy);
+  atomicMax(&boundsVals[5], oz);
+}
+
 __global__ void inputSampleKernel(float* dstVerts,
                                   float* dstColors,
                                   const float* srcVerts,
@@ -676,6 +716,73 @@ bool buildMesh(CacheT* cache,
   return true;
 }
 
+bool computeInputBounds(InputCache* cache, std::string* error) {
+  if (!cache || cache->verts == 0 || cache->pointCount <= 0) {
+    if (error) *error = "CUDA input cache has no point buffer for bounds.";
+    return false;
+  }
+  std::string localError;
+  if (!ensureContext(&localError)) {
+    if (error) *error = localError;
+    return false;
+  }
+  CacheImpl* impl = ensureImpl(cache);
+  if (!impl || !impl->vertsResource) {
+    if (error) *error = "CUDA input cache is not registered for bounds.";
+    return false;
+  }
+  if (!ensureBoundsCapacity(impl, &localError)) {
+    if (error) *error = localError;
+    return false;
+  }
+
+  const unsigned int initVals[6] = {0xffffffffu, 0xffffffffu, 0xffffffffu, 0u, 0u, 0u};
+  cudaError_t err = cudaMemcpy(impl->deviceBounds, initVals, sizeof(initVals), cudaMemcpyHostToDevice);
+  if (err != cudaSuccess) {
+    if (error) *error = std::string("Failed to initialize CUDA bounds buffer: ") + errorString(err);
+    return false;
+  }
+
+  std::array<cudaGraphicsResource*, 1> resources = {impl->vertsResource};
+  err = cudaGraphicsMapResources(static_cast<int>(resources.size()), resources.data(), 0);
+  if (err != cudaSuccess) {
+    if (error) *error = std::string("Failed to map CUDA bounds resource: ") + errorString(err);
+    return false;
+  }
+
+  float* devVerts = nullptr;
+  size_t vertsBytes = 0;
+  err = cudaGraphicsResourceGetMappedPointer(reinterpret_cast<void**>(&devVerts), &vertsBytes, impl->vertsResource);
+  if (err == cudaSuccess) {
+    const unsigned int threads = 256u;
+    const unsigned int blocks = static_cast<unsigned int>((static_cast<size_t>(cache->pointCount) + threads - 1u) / threads);
+    boundsKernel<<<blocks, threads>>>(devVerts, impl->deviceBounds, cache->pointCount);
+    err = cudaGetLastError();
+    if (err == cudaSuccess) err = cudaDeviceSynchronize();
+  }
+  cudaGraphicsUnmapResources(static_cast<int>(resources.size()), resources.data(), 0);
+  if (err != cudaSuccess) {
+    if (error) *error = std::string("CUDA bounds kernel failed: ") + errorString(err);
+    return false;
+  }
+
+  unsigned int packed[6] = {};
+  err = cudaMemcpy(packed, impl->deviceBounds, sizeof(packed), cudaMemcpyDeviceToHost);
+  if (err != cudaSuccess) {
+    if (error) *error = std::string("Failed to read CUDA bounds buffer: ") + errorString(err);
+    return false;
+  }
+  cache->fitMin[0] = floatFromOrderedUint(packed[0]);
+  cache->fitMin[1] = floatFromOrderedUint(packed[1]);
+  cache->fitMin[2] = floatFromOrderedUint(packed[2]);
+  cache->fitMax[0] = floatFromOrderedUint(packed[3]);
+  cache->fitMax[1] = floatFromOrderedUint(packed[4]);
+  cache->fitMax[2] = floatFromOrderedUint(packed[5]);
+  cache->hasFitBounds = std::isfinite(cache->fitMin[0]) && std::isfinite(cache->fitMin[1]) && std::isfinite(cache->fitMin[2]) &&
+                        std::isfinite(cache->fitMax[0]) && std::isfinite(cache->fitMax[1]) && std::isfinite(cache->fitMax[2]);
+  return cache->hasFitBounds;
+}
+
 void launchOverlay(float* verts, float* colors, const float* input, OverlayKernelUniforms uniforms, unsigned int blocks) {
   overlayKernel<<<blocks, 256u>>>(verts, colors, input, uniforms);
 }
@@ -723,6 +830,7 @@ void releaseOverlayCache(OverlayCache* cache) {
 
 void releaseInputCache(InputCache* cache) {
   releaseCache(cache);
+  if (cache) cache->hasFitBounds = false;
 }
 
 void releaseInputSampleCache(InputSampleCache* cache) {
@@ -778,7 +886,15 @@ bool buildInputMesh(InputCache* cache,
   uniforms.normConeNormalized = request.remap.normConeNormalized;
   uniforms.pointAlphaScale = request.pointAlphaScale;
   uniforms.denseAlphaBias = request.denseAlphaBias;
-  return buildMesh(cache, pointCount, rawPoints.data(), rawPoints.size(), uniforms, launchInput, serial, error);
+  cache->hasFitBounds = false;
+  if (!buildMesh(cache, pointCount, rawPoints.data(), rawPoints.size(), uniforms, launchInput, serial, error)) {
+    return false;
+  }
+  std::string localError;
+  if (!computeInputBounds(cache, &localError) && error && error->empty()) {
+    *error = localError;
+  }
+  return true;
 }
 
 bool buildInputSampledMesh(InputCache* sourceCache,

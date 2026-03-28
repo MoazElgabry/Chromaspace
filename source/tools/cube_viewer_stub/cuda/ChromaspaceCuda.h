@@ -61,6 +61,9 @@ struct InputCache {
   unsigned long long builtSerial = 0;
   int pointCount = 0;
   bool available = false;
+  bool hasFitBounds = false;
+  float fitMin[3] = {0.0f, 0.0f, 0.0f};
+  float fitMax[3] = {0.0f, 0.0f, 0.0f};
   void* internal = nullptr;
 };
 
