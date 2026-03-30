@@ -208,8 +208,15 @@ bool nativeSuperModifierPressed() {
 bool viewerDebugLogEnabled() {
   const char* direct = std::getenv("CHROMASPACE_DEBUG_LOG");
   if (direct && direct[0] != '\0' && std::strcmp(direct, "0") != 0) return true;
+  const char* multi = std::getenv("CHROMASPACE_MULTI_INSTANCE_DEBUG");
+  if (multi && multi[0] != '\0' && std::strcmp(multi, "0") != 0) return true;
   const char* diagnostics = std::getenv("CHROMASPACE_DIAGNOSTICS");
   return diagnostics != nullptr && diagnostics[0] != '\0' && std::strcmp(diagnostics, "0") != 0;
+}
+
+bool viewerMultiInstanceDebugEnabled() {
+  const char* direct = std::getenv("CHROMASPACE_MULTI_INSTANCE_DEBUG");
+  return direct != nullptr && direct[0] != '\0' && std::strcmp(direct, "0") != 0;
 }
 
 void logViewerEvent(const std::string& msg) {
@@ -224,6 +231,11 @@ void logViewerEvent(const std::string& msg) {
   if (!f) return;
   std::fprintf(f, "[Chromaspace] %s\n", msg.c_str());
   std::fclose(f);
+}
+
+void logViewerMultiInstance(const std::string& msg) {
+  if (!viewerMultiInstanceDebugEnabled()) return;
+  logViewerEvent(std::string("[multi] ") + msg);
 }
 
 bool viewerDiagnosticsEnabled() {
@@ -297,7 +309,7 @@ void notifyExistingViewerBringToFront() {
 }
 #endif
 
-const char* kViewerVersionString = "v1.0.5Beta";
+const char* kViewerVersionString = "v1.0.6Beta";
 
 #if !defined(_WIN32)
 bool sendAllSocket(int fd, const char* data, size_t size) {
@@ -7359,6 +7371,17 @@ int main() {
                << " ramp=" << (resolved.identityOverlayRamp ? 1 : 0);
             logViewerEvent(os.str());
           }
+          if (viewerMultiInstanceDebugEnabled()) {
+            std::ostringstream os;
+            os << "paramsApplied"
+               << " sender=" << resolved.senderId
+               << " seq=" << resolved.seq
+               << " sourceMode=" << resolved.sourceMode
+               << " settingsKey=" << resolved.cloudSettingsKey
+               << " hasCurrentCloud=" << (hasCurrentCloud ? 1 : 0)
+               << " hasDeferredCloud=" << (hasDeferredCloud ? 1 : 0);
+            logViewerMultiInstance(os.str());
+          }
           logComputeEligibilityTransitions(resolved, &app);
           if (resolved.identityOverlayEnabled) {
             MeshData nextOverlay{};
@@ -7383,7 +7406,9 @@ int main() {
             if (buildIdentityMesh(resolved, &identityMesh)) {
               mesh = identityMesh;
             }
-          } else if (hasDeferredCloud && cloudMatchesResolved(resolved, deferredCloud)) {
+          } else if (hasDeferredCloud &&
+                     senderMatchesCurrent(resolved.senderId, deferredCloud.senderId) &&
+                     cloudMatchesResolved(resolved, deferredCloud)) {
             MeshData nextMesh{};
             if (buildInputCloudMesh(resolved, app.gpuCaps, &app.computeSession, &inputCloudComputeCache,
 #if defined(CHROMASPACE_VIEWER_HAS_CUDA) && !defined(__APPLE__)
@@ -7395,9 +7420,19 @@ int main() {
               hasCurrentCloud = true;
               lastCloudSeq = deferredCloud.seq;
               hasDeferredCloud = false;
+              if (viewerMultiInstanceDebugEnabled()) {
+                std::ostringstream os;
+                os << "deferredCloudAppliedAfterParams"
+                   << " sender=" << deferredCloud.senderId
+                   << " cloudSeq=" << deferredCloud.seq
+                   << " settings=" << deferredCloud.settingsKey;
+                logViewerMultiInstance(os.str());
+              }
               logViewerEvent("Applied deferred input cloud after params switched to matching settings.");
             }
-          } else if (hasCurrentCloud && cloudMatchesResolved(resolved, currentCloud)) {
+          } else if (hasCurrentCloud &&
+                     senderMatchesCurrent(resolved.senderId, currentCloud.senderId) &&
+                     cloudMatchesResolved(resolved, currentCloud)) {
             MeshData nextMesh{};
             if (buildInputCloudMesh(resolved, app.gpuCaps, &app.computeSession, &inputCloudComputeCache,
 #if defined(CHROMASPACE_VIEWER_HAS_CUDA) && !defined(__APPLE__)
@@ -7405,10 +7440,19 @@ int main() {
 #endif
                                     currentCloud, &nextMesh)) {
               mesh = std::move(nextMesh);
+              if (viewerMultiInstanceDebugEnabled()) {
+                std::ostringstream os;
+                os << "activeCloudRebuiltAfterParams"
+                   << " sender=" << currentCloud.senderId
+                   << " cloudSeq=" << currentCloud.seq
+                   << " settings=" << currentCloud.settingsKey;
+                logViewerMultiInstance(os.str());
+              }
               logViewerEvent("Rebuilt active input cloud after params update.");
             }
           } else {
             hasCurrentCloud = false;
+            currentCloud = InputCloudPayload{};
             mesh = MeshData{};
             mesh.quality = "Waiting";
             mesh.resolution = resolved.resolution;
@@ -7433,16 +7477,51 @@ int main() {
           logViewerEvent(os.str());
         }
         if (!senderMatchesCurrent(resolved.senderId, cp.senderId)) {
+          if (viewerMultiInstanceDebugEnabled()) {
+            std::ostringstream os;
+            os << "cloudRejected/nonActiveSender"
+               << " activeSender=" << resolved.senderId
+               << " cloudSender=" << cp.senderId
+               << " cloudSeq=" << cp.seq
+               << " activeSettings=" << resolved.cloudSettingsKey
+               << " cloudSettings=" << cp.settingsKey;
+            logViewerMultiInstance(os.str());
+          }
           logViewerEvent("Ignored input cloud from non-active sender.");
         } else if (cp.seq <= lastCloudSeq) {
+          if (viewerMultiInstanceDebugEnabled()) {
+            std::ostringstream os;
+            os << "cloudRejected/staleSeq"
+               << " sender=" << cp.senderId
+               << " cloudSeq=" << cp.seq
+               << " lastCloudSeq=" << lastCloudSeq;
+            logViewerMultiInstance(os.str());
+          }
           logViewerEvent("Ignored stale input cloud sequence.");
         } else if (resolved.sourceMode != "input") {
           deferredCloud = cp;
           hasDeferredCloud = true;
+          if (viewerMultiInstanceDebugEnabled()) {
+            std::ostringstream os;
+            os << "cloudDeferred/sourceMode"
+               << " sender=" << cp.senderId
+               << " cloudSeq=" << cp.seq
+               << " sourceMode=" << resolved.sourceMode;
+            logViewerMultiInstance(os.str());
+          }
           logViewerEvent("Deferred input cloud until params switch viewer to input mode.");
         } else if (!cloudMatchesResolved(resolved, cp)) {
           deferredCloud = cp;
           hasDeferredCloud = true;
+          if (viewerMultiInstanceDebugEnabled()) {
+            std::ostringstream os;
+            os << "cloudDeferred/settingsMismatch"
+               << " sender=" << cp.senderId
+               << " cloudSeq=" << cp.seq
+               << " activeSettings=" << resolved.cloudSettingsKey
+               << " cloudSettings=" << cp.settingsKey;
+            logViewerMultiInstance(os.str());
+          }
           logViewerEvent("Deferred input cloud until params match cloud settings.");
         } else {
           MeshData nextMesh{};
@@ -7456,6 +7535,15 @@ int main() {
             hasCurrentCloud = true;
             lastCloudSeq = cp.seq;
             hasDeferredCloud = false;
+            if (viewerMultiInstanceDebugEnabled()) {
+              std::ostringstream os;
+              os << "cloudApplied"
+                 << " sender=" << cp.senderId
+                 << " cloudSeq=" << cp.seq
+                 << " settings=" << cp.settingsKey
+                 << " points=" << (nextMesh.pointCount > 0 ? nextMesh.pointCount : (nextMesh.pointVerts.size() / 3u));
+              logViewerMultiInstance(os.str());
+            }
             std::ostringstream os;
             os << "Applied input cloud: seq=" << cp.seq
                << " points=" << (mesh.pointCount > 0 ? mesh.pointCount : (mesh.pointVerts.size() / 3u))
