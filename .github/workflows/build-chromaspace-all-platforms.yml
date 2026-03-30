@@ -16,6 +16,9 @@ jobs:
     outputs:
       should_build: ${{ steps.changes.outputs.should_build }}
       changed_files: ${{ steps.changes.outputs.changed_files }}
+      package_version: ${{ steps.changes.outputs.package_version }}
+      published_release_exists: ${{ steps.changes.outputs.published_release_exists }}
+      skip_reason: ${{ steps.changes.outputs.skip_reason }}
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -27,6 +30,8 @@ jobs:
         env:
           BEFORE: ${{ github.event.before }}
           AFTER: ${{ github.sha }}
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
 
@@ -43,10 +48,39 @@ jobs:
           printf '%s\n' "${changed_files}" > changed_files.txt
 
           if grep -Eq '^(source/CMakeLists\.txt|source/cmake/|source/src/|source/tools/|common/|icons/|\.github/workflows/build-chromaspace-(all-platforms|windows|macos|linux)\.yml)' changed_files.txt; then
-            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            should_build="true"
           else
-            echo "should_build=false" >> "$GITHUB_OUTPUT"
+            should_build="false"
           fi
+
+          version="$(grep -Eo 'set\(CUBE_DISPLAY_VERSION "[^"]+"\)' source/CMakeLists.txt | sed -E 's/.*"([^"]+)".*/\1/' | head -n1)"
+          if [ -z "${version}" ]; then
+            version="$(grep -Eo 'project\([^)]*VERSION [0-9A-Za-z.\-]+' source/CMakeLists.txt | sed -E 's/.*VERSION ([0-9A-Za-z.\-]+)/\1/' | head -n1)"
+          fi
+          if [ -z "${version}" ]; then
+            echo "Could not determine Chromaspace version from source/CMakeLists.txt"
+            exit 1
+          fi
+
+          final_tag="v${version}"
+          published_release_exists="false"
+          skip_reason=""
+          final_release_json="$(gh api "repos/${REPO}/releases/tags/${final_tag}" 2>/dev/null || true)"
+          if [ -n "${final_release_json}" ]; then
+            final_tag_match="$(printf '%s' "${final_release_json}" | python3 -c "import json,sys; data=json.load(sys.stdin); print(str(bool(data.get('id')) and data.get('tag_name','') == sys.argv[1]).lower())" "${final_tag}")"
+            if [ "${final_tag_match}" = "true" ]; then
+              final_is_draft="$(printf '%s' "${final_release_json}" | python3 -c "import json,sys; print(str(json.load(sys.stdin).get('draft', False)).lower())")"
+              if [ "${final_is_draft}" != "true" ]; then
+                published_release_exists="true"
+                skip_reason="Published release already exists for ${final_tag}."
+              fi
+            fi
+          fi
+
+          echo "should_build=${should_build}" >> "$GITHUB_OUTPUT"
+          echo "package_version=${version}" >> "$GITHUB_OUTPUT"
+          echo "published_release_exists=${published_release_exists}" >> "$GITHUB_OUTPUT"
+          echo "skip_reason=${skip_reason}" >> "$GITHUB_OUTPUT"
 
           {
             echo "changed_files<<EOF"
@@ -56,9 +90,19 @@ jobs:
 
       - name: Summarize decision
         run: |
-          if [ "${{ steps.changes.outputs.should_build }}" = "true" ]; then
+          if [ "${{ steps.changes.outputs.published_release_exists }}" = "true" ]; then
+            {
+              echo "Chromaspace build skipped cleanly."
+              echo
+              echo "${{ steps.changes.outputs.skip_reason }}"
+              echo
+              echo "No platform artifacts were built because the release would have been skipped anyway."
+            } >> "$GITHUB_STEP_SUMMARY"
+          elif [ "${{ steps.changes.outputs.should_build }}" = "true" ] || [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             {
               echo "Chromaspace build will run."
+              echo
+              echo "Package version: v${{ steps.changes.outputs.package_version }}"
               echo
               echo "Relevant changes were detected in:"
               printf '%s\n' "${{ steps.changes.outputs.changed_files }}"
@@ -73,19 +117,34 @@ jobs:
 
   windows:
     needs: detect-changes
-    if: github.event_name == 'workflow_dispatch' || needs.detect-changes.outputs.should_build == 'true'
+    if: |
+      needs.detect-changes.outputs.published_release_exists != 'true' &&
+      (
+        github.event_name == 'workflow_dispatch' ||
+        needs.detect-changes.outputs.should_build == 'true'
+      )
     uses: ./.github/workflows/build-chromaspace-windows.yml
     secrets: inherit
 
   macos:
     needs: detect-changes
-    if: github.event_name == 'workflow_dispatch' || needs.detect-changes.outputs.should_build == 'true'
+    if: |
+      needs.detect-changes.outputs.published_release_exists != 'true' &&
+      (
+        github.event_name == 'workflow_dispatch' ||
+        needs.detect-changes.outputs.should_build == 'true'
+      )
     uses: ./.github/workflows/build-chromaspace-macos.yml
     secrets: inherit
 
   linux:
     needs: detect-changes
-    if: github.event_name == 'workflow_dispatch' || needs.detect-changes.outputs.should_build == 'true'
+    if: |
+      needs.detect-changes.outputs.published_release_exists != 'true' &&
+      (
+        github.event_name == 'workflow_dispatch' ||
+        needs.detect-changes.outputs.should_build == 'true'
+      )
     uses: ./.github/workflows/build-chromaspace-linux.yml
     secrets: inherit
 
@@ -96,7 +155,16 @@ jobs:
       - windows
       - macos
       - linux
-    if: github.event_name == 'push' && needs.detect-changes.outputs.should_build == 'true'
+    if: |
+      !cancelled() &&
+      needs.windows.result == 'success' &&
+      needs.macos.result == 'success' &&
+      needs.linux.result == 'success' &&
+      needs.detect-changes.outputs.published_release_exists != 'true' &&
+      (
+        github.event_name == 'workflow_dispatch' ||
+        needs.detect-changes.outputs.should_build == 'true'
+      )
     runs-on: ubuntu-latest
 
     steps:
