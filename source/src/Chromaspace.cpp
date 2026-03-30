@@ -1,9 +1,11 @@
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
 #include <cstdint>
+#include <ctime>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -1355,6 +1357,641 @@ WorkshopColor::TransferFunctionId plotLinearTransferIdFromChoice(int index) {
   return choices[static_cast<std::size_t>(clamped)];
 }
 
+struct BoolScope {
+  bool& ref;
+  const bool previous;
+  explicit BoolScope(bool& target, bool next = true) : ref(target), previous(target) {
+    ref = next;
+  }
+  ~BoolScope() {
+    ref = previous;
+  }
+};
+
+struct ChromaspacePresetValues {
+  int plotModel = 0;
+  bool plotInLinear = false;
+  int inputTransferFunction = static_cast<int>(WorkshopColor::TransferFunctionId::Gamma24);
+  bool showOverflow = false;
+  bool highlightOverflow = true;
+  int fillResolution = 29;
+  int identityReadResolution = 29;
+  bool liveUpdate = true;
+  bool keepOnTop = true;
+  int updateMode = 0;
+  int quality = 0;
+  int scale = 3;
+  double pointSize = 1.1;
+  int pointShape = 0;
+  int sampling = 0;
+  bool occupancyGuidedFill = true;
+};
+
+struct ChromaspaceUserPreset {
+  std::string id;
+  std::string name;
+  std::string createdAtUtc;
+  std::string updatedAtUtc;
+  ChromaspacePresetValues values{};
+};
+
+struct ChromaspacePresetStore {
+  bool loaded = false;
+  ChromaspaceUserPreset defaultPreset{};
+  std::vector<ChromaspaceUserPreset> userPresets;
+};
+
+constexpr const char* kChromaspacePresetDefaultName = "Default";
+constexpr const char* kChromaspacePresetCustomLabel = "(Custom)";
+
+ChromaspacePresetStore& chromaspacePresetStore() {
+  static ChromaspacePresetStore store;
+  return store;
+}
+
+std::mutex& chromaspacePresetMutex() {
+  static std::mutex mutex;
+  return mutex;
+}
+
+ChromaspacePresetValues chromaspaceFactoryPresetValues() {
+  ChromaspacePresetValues values{};
+  values.plotModel = 0;
+  values.plotInLinear = false;
+  values.inputTransferFunction = static_cast<int>(WorkshopColor::TransferFunctionId::Gamma24);
+  values.showOverflow = false;
+  values.highlightOverflow = true;
+  values.fillResolution = 29;
+  values.identityReadResolution = 29;
+  values.liveUpdate = true;
+  values.keepOnTop = true;
+  values.updateMode = 0;
+  values.quality = 0;
+  values.scale = 3;
+  values.pointSize = 1.1;
+  values.pointShape = 0;
+  values.sampling = 0;
+  values.occupancyGuidedFill = true;
+  return values;
+}
+
+std::string nowUtcIso8601() {
+  const std::time_t now = std::time(nullptr);
+  std::tm tm{};
+#if defined(_WIN32)
+  gmtime_s(&tm, &now);
+#else
+  gmtime_r(&now, &tm);
+#endif
+  char buffer[32] = {0};
+  std::strftime(buffer, sizeof(buffer), "%Y-%m-%dT%H:%M:%SZ", &tm);
+  return std::string(buffer);
+}
+
+std::string normalizePresetNameKey(const std::string& name) {
+  std::string out;
+  out.reserve(name.size());
+  bool inWhitespace = false;
+  for (char c : name) {
+    const unsigned char uc = static_cast<unsigned char>(c);
+    if (std::isspace(uc)) {
+      inWhitespace = true;
+      continue;
+    }
+    if (inWhitespace && !out.empty()) out.push_back(' ');
+    inWhitespace = false;
+    out.push_back(static_cast<char>(std::tolower(uc)));
+  }
+  while (!out.empty() && out.front() == ' ') out.erase(out.begin());
+  while (!out.empty() && out.back() == ' ') out.pop_back();
+  return out;
+}
+
+std::string sanitizePresetName(const std::string& in, const char* fallback) {
+  std::string out;
+  out.reserve(in.size());
+  for (char c : in) {
+    if (c == '\n' || c == '\r' || c == '\t') continue;
+    out.push_back(c);
+  }
+  while (!out.empty() && std::isspace(static_cast<unsigned char>(out.front()))) out.erase(out.begin());
+  while (!out.empty() && std::isspace(static_cast<unsigned char>(out.back()))) out.pop_back();
+  if (out.empty()) out = fallback ? std::string(fallback) : std::string("Preset");
+  if (out.size() > 96) out.resize(96);
+  return out;
+}
+
+std::string makePresetId(const std::string& prefix) {
+  static std::atomic<unsigned long> counter{1};
+  std::ostringstream os;
+  os << prefix << '_' << std::time(nullptr) << '_' << counter.fetch_add(1, std::memory_order_relaxed);
+  return os.str();
+}
+
+std::filesystem::path chromaspacePresetDirPath() {
+#ifdef _WIN32
+  const char* base = std::getenv("APPDATA");
+  if (!base || !*base) base = std::getenv("LOCALAPPDATA");
+  if (base && *base) return std::filesystem::path(base) / "Chromaspace";
+#elif defined(__APPLE__)
+  const char* home = std::getenv("HOME");
+  if (home && *home) return std::filesystem::path(home) / "Library" / "Application Support" / "Chromaspace";
+#else
+  const char* home = std::getenv("HOME");
+  if (home && *home) return std::filesystem::path(home) / ".config" / "Chromaspace";
+#endif
+  return std::filesystem::path(".");
+}
+
+std::filesystem::path chromaspacePresetFilePath() {
+  return chromaspacePresetDirPath() / "presets_v1.json";
+}
+
+bool chromaspacePresetValuesEqual(const ChromaspacePresetValues& a, const ChromaspacePresetValues& b) {
+  return a.plotModel == b.plotModel &&
+         a.plotInLinear == b.plotInLinear &&
+         a.inputTransferFunction == b.inputTransferFunction &&
+         a.showOverflow == b.showOverflow &&
+         a.highlightOverflow == b.highlightOverflow &&
+         a.fillResolution == b.fillResolution &&
+         a.identityReadResolution == b.identityReadResolution &&
+         a.liveUpdate == b.liveUpdate &&
+         a.keepOnTop == b.keepOnTop &&
+         a.updateMode == b.updateMode &&
+         a.quality == b.quality &&
+         a.scale == b.scale &&
+         std::abs(a.pointSize - b.pointSize) <= 1e-6 &&
+         a.pointShape == b.pointShape &&
+         a.sampling == b.sampling &&
+         a.occupancyGuidedFill == b.occupancyGuidedFill;
+}
+
+bool chromaspacePresetNameReserved(const std::string& name) {
+  return normalizePresetNameKey(name) == "default";
+}
+
+bool chromaspacePresetUserNameExistsLocked(const std::string& name,
+                                           const std::string* ignoreId = nullptr) {
+  const std::string key = normalizePresetNameKey(name);
+  if (key.empty() || key == "default") return key == "default";
+  for (const auto& preset : chromaspacePresetStore().userPresets) {
+    if (ignoreId && !ignoreId->empty() && preset.id == *ignoreId) continue;
+    if (normalizePresetNameKey(preset.name) == key) return true;
+  }
+  return false;
+}
+
+int chromaspaceUserPresetIndexByNameLocked(const std::string& name) {
+  const std::string key = normalizePresetNameKey(name);
+  const auto& presets = chromaspacePresetStore().userPresets;
+  for (int i = 0; i < static_cast<int>(presets.size()); ++i) {
+    if (normalizePresetNameKey(presets[static_cast<std::size_t>(i)].name) == key) return i;
+  }
+  return -1;
+}
+
+bool extractJsonBoolField(const std::string& json, const std::string& key, bool* out) {
+  if (!out) return false;
+  const std::string token = "\"" + key + "\":";
+  const size_t start = json.find(token);
+  if (start == std::string::npos) return false;
+  size_t pos = start + token.size();
+  while (pos < json.size() && std::isspace(static_cast<unsigned char>(json[pos]))) ++pos;
+  if (json.compare(pos, 4, "true") == 0) {
+    *out = true;
+    return true;
+  }
+  if (json.compare(pos, 5, "false") == 0) {
+    *out = false;
+    return true;
+  }
+  return false;
+}
+
+bool extractJsonNumberFieldText(const std::string& json, const std::string& key, std::string* out) {
+  if (!out) return false;
+  const std::string token = "\"" + key + "\":";
+  const size_t start = json.find(token);
+  if (start == std::string::npos) return false;
+  size_t pos = start + token.size();
+  while (pos < json.size() && std::isspace(static_cast<unsigned char>(json[pos]))) ++pos;
+  size_t end = pos;
+  while (end < json.size()) {
+    const char c = json[end];
+    if (!(std::isdigit(static_cast<unsigned char>(c)) || c == '-' || c == '+' || c == '.' || c == 'e' || c == 'E')) {
+      break;
+    }
+    ++end;
+  }
+  if (end <= pos) return false;
+  *out = json.substr(pos, end - pos);
+  return true;
+}
+
+bool extractJsonIntField(const std::string& json, const std::string& key, int* out) {
+  if (!out) return false;
+  std::string text;
+  if (!extractJsonNumberFieldText(json, key, &text)) return false;
+  try {
+    *out = std::stoi(text);
+    return true;
+  } catch (...) {
+    return false;
+  }
+}
+
+bool extractJsonDoubleField(const std::string& json, const std::string& key, double* out) {
+  if (!out) return false;
+  std::string text;
+  if (!extractJsonNumberFieldText(json, key, &text)) return false;
+  try {
+    *out = std::stod(text);
+    return true;
+  } catch (...) {
+    return false;
+  }
+}
+
+bool extractJsonStructuredField(const std::string& json,
+                                const std::string& key,
+                                char openChar,
+                                char closeChar,
+                                std::string* out) {
+  if (!out) return false;
+  const std::string token = "\"" + key + "\":";
+  const size_t start = json.find(token);
+  if (start == std::string::npos) return false;
+  size_t pos = start + token.size();
+  while (pos < json.size() && std::isspace(static_cast<unsigned char>(json[pos]))) ++pos;
+  if (pos >= json.size() || json[pos] != openChar) return false;
+  int depth = 0;
+  bool inString = false;
+  bool escaped = false;
+  size_t end = pos;
+  for (; end < json.size(); ++end) {
+    const char c = json[end];
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (c == '\\') {
+        escaped = true;
+      } else if (c == '"') {
+        inString = false;
+      }
+      continue;
+    }
+    if (c == '"') {
+      inString = true;
+      continue;
+    }
+    if (c == openChar) {
+      ++depth;
+    } else if (c == closeChar) {
+      --depth;
+      if (depth == 0) {
+        *out = json.substr(pos, end - pos + 1);
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+bool extractJsonObjectField(const std::string& json, const std::string& key, std::string* out) {
+  return extractJsonStructuredField(json, key, '{', '}', out);
+}
+
+bool extractJsonArrayField(const std::string& json, const std::string& key, std::string* out) {
+  return extractJsonStructuredField(json, key, '[', ']', out);
+}
+
+std::vector<std::string> extractJsonObjectsFromArray(const std::string& arrayJson) {
+  std::vector<std::string> out;
+  bool inString = false;
+  bool escaped = false;
+  int depth = 0;
+  size_t objectStart = std::string::npos;
+  for (size_t i = 0; i < arrayJson.size(); ++i) {
+    const char c = arrayJson[i];
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (c == '\\') {
+        escaped = true;
+      } else if (c == '"') {
+        inString = false;
+      }
+      continue;
+    }
+    if (c == '"') {
+      inString = true;
+      continue;
+    }
+    if (c == '{') {
+      if (depth == 0) objectStart = i;
+      ++depth;
+      continue;
+    }
+    if (c == '}') {
+      --depth;
+      if (depth == 0 && objectStart != std::string::npos) {
+        out.push_back(arrayJson.substr(objectStart, i - objectStart + 1));
+        objectStart = std::string::npos;
+      }
+    }
+  }
+  return out;
+}
+
+std::string chromaspacePresetValuesAsJson(const ChromaspacePresetValues& values) {
+  std::ostringstream os;
+  os << "{";
+  os << "\"plotModel\":" << values.plotModel << ",";
+  os << "\"plotInLinear\":" << (values.plotInLinear ? "true" : "false") << ",";
+  os << "\"inputTransferFunction\":" << values.inputTransferFunction << ",";
+  os << "\"showOverflow\":" << (values.showOverflow ? "true" : "false") << ",";
+  os << "\"highlightOverflow\":" << (values.highlightOverflow ? "true" : "false") << ",";
+  os << "\"fillResolution\":" << values.fillResolution << ",";
+  os << "\"identityReadResolution\":" << values.identityReadResolution << ",";
+  os << "\"liveUpdate\":" << (values.liveUpdate ? "true" : "false") << ",";
+  os << "\"keepOnTop\":" << (values.keepOnTop ? "true" : "false") << ",";
+  os << "\"updateMode\":" << values.updateMode << ",";
+  os << "\"quality\":" << values.quality << ",";
+  os << "\"scale\":" << values.scale << ",";
+  os << "\"pointSize\":" << std::setprecision(15) << values.pointSize << ",";
+  os << "\"pointShape\":" << values.pointShape << ",";
+  os << "\"sampling\":" << values.sampling << ",";
+  os << "\"occupancyGuidedFill\":" << (values.occupancyGuidedFill ? "true" : "false");
+  os << "}";
+  return os.str();
+}
+
+bool parseChromaspacePresetValuesFromJson(const std::string& json, ChromaspacePresetValues* out) {
+  if (!out) return false;
+  ChromaspacePresetValues values = chromaspaceFactoryPresetValues();
+  (void)extractJsonIntField(json, "plotModel", &values.plotModel);
+  (void)extractJsonBoolField(json, "plotInLinear", &values.plotInLinear);
+  (void)extractJsonIntField(json, "inputTransferFunction", &values.inputTransferFunction);
+  (void)extractJsonBoolField(json, "showOverflow", &values.showOverflow);
+  (void)extractJsonBoolField(json, "highlightOverflow", &values.highlightOverflow);
+  (void)extractJsonIntField(json, "fillResolution", &values.fillResolution);
+  (void)extractJsonIntField(json, "identityReadResolution", &values.identityReadResolution);
+  (void)extractJsonBoolField(json, "liveUpdate", &values.liveUpdate);
+  (void)extractJsonBoolField(json, "keepOnTop", &values.keepOnTop);
+  (void)extractJsonIntField(json, "updateMode", &values.updateMode);
+  (void)extractJsonIntField(json, "quality", &values.quality);
+  (void)extractJsonIntField(json, "scale", &values.scale);
+  (void)extractJsonDoubleField(json, "pointSize", &values.pointSize);
+  (void)extractJsonIntField(json, "pointShape", &values.pointShape);
+  (void)extractJsonIntField(json, "sampling", &values.sampling);
+  (void)extractJsonBoolField(json, "occupancyGuidedFill", &values.occupancyGuidedFill);
+  *out = values;
+  return true;
+}
+
+void saveChromaspacePresetStoreLocked() {
+  const auto path = chromaspacePresetFilePath();
+  std::error_code ec;
+  std::filesystem::create_directories(path.parent_path(), ec);
+  std::ofstream os(path, std::ios::binary | std::ios::trunc);
+  if (!os.is_open()) return;
+
+  ChromaspacePresetStore& store = chromaspacePresetStore();
+  os << "{\n";
+  os << "  \"schemaVersion\":1,\n";
+  os << "  \"updatedAtUtc\":\"" << jsonEscape(nowUtcIso8601()) << "\",\n";
+  os << "  \"defaultPreset\":{\n";
+  os << "    \"id\":\"" << jsonEscape(store.defaultPreset.id) << "\",\n";
+  os << "    \"name\":\"" << jsonEscape(store.defaultPreset.name) << "\",\n";
+  os << "    \"updatedAtUtc\":\"" << jsonEscape(store.defaultPreset.updatedAtUtc) << "\",\n";
+  os << "    \"values\":" << chromaspacePresetValuesAsJson(store.defaultPreset.values) << "\n";
+  os << "  },\n";
+  os << "  \"userPresets\":[\n";
+  for (size_t i = 0; i < store.userPresets.size(); ++i) {
+    const auto& preset = store.userPresets[i];
+    os << "    {\n";
+    os << "      \"id\":\"" << jsonEscape(preset.id) << "\",\n";
+    os << "      \"name\":\"" << jsonEscape(preset.name) << "\",\n";
+    os << "      \"createdAtUtc\":\"" << jsonEscape(preset.createdAtUtc) << "\",\n";
+    os << "      \"updatedAtUtc\":\"" << jsonEscape(preset.updatedAtUtc) << "\",\n";
+    os << "      \"values\":" << chromaspacePresetValuesAsJson(preset.values) << "\n";
+    os << "    }" << (i + 1 < store.userPresets.size() ? "," : "") << "\n";
+  }
+  os << "  ]\n";
+  os << "}\n";
+}
+
+void ensureChromaspacePresetStoreLoadedLocked() {
+  ChromaspacePresetStore& store = chromaspacePresetStore();
+  if (store.loaded) return;
+  store = ChromaspacePresetStore{};
+  store.loaded = true;
+
+  const ChromaspacePresetValues factory = chromaspaceFactoryPresetValues();
+  store.defaultPreset.id = "default";
+  store.defaultPreset.name = kChromaspacePresetDefaultName;
+  store.defaultPreset.createdAtUtc = nowUtcIso8601();
+  store.defaultPreset.updatedAtUtc = store.defaultPreset.createdAtUtc;
+  store.defaultPreset.values = factory;
+
+  bool needsSave = false;
+  std::ifstream is(chromaspacePresetFilePath(), std::ios::binary);
+  if (!is.is_open()) {
+    saveChromaspacePresetStoreLocked();
+    return;
+  }
+
+  std::string json((std::istreambuf_iterator<char>(is)), std::istreambuf_iterator<char>());
+  if (json.empty()) {
+    saveChromaspacePresetStoreLocked();
+    return;
+  }
+
+  std::string defaultObj;
+  if (extractJsonObjectField(json, "defaultPreset", &defaultObj)) {
+    std::string defaultValuesJson;
+    if (extractJsonObjectField(defaultObj, "values", &defaultValuesJson)) {
+      parseChromaspacePresetValuesFromJson(defaultValuesJson, &store.defaultPreset.values);
+    } else {
+      needsSave = true;
+    }
+    std::string updatedAtUtc;
+    if (extractJsonStringField(defaultObj, "updatedAtUtc", &updatedAtUtc)) {
+      store.defaultPreset.updatedAtUtc = updatedAtUtc;
+    }
+  } else {
+    needsSave = true;
+  }
+
+  std::string arrayJson;
+  if (extractJsonArrayField(json, "userPresets", &arrayJson)) {
+    for (const auto& objectJson : extractJsonObjectsFromArray(arrayJson)) {
+      ChromaspaceUserPreset preset{};
+      std::string name;
+      if (!extractJsonStringField(objectJson, "name", &name)) continue;
+      name = sanitizePresetName(name, "Preset");
+      if (chromaspacePresetNameReserved(name)) continue;
+      if (chromaspacePresetUserNameExistsLocked(name)) continue;
+      std::string valuesJson;
+      if (!extractJsonObjectField(objectJson, "values", &valuesJson)) continue;
+      parseChromaspacePresetValuesFromJson(valuesJson, &preset.values);
+      if (!extractJsonStringField(objectJson, "id", &preset.id) || preset.id.empty()) {
+        preset.id = makePresetId("chromaspace");
+        needsSave = true;
+      }
+      preset.name = name;
+      if (!extractJsonStringField(objectJson, "createdAtUtc", &preset.createdAtUtc) || preset.createdAtUtc.empty()) {
+        preset.createdAtUtc = nowUtcIso8601();
+        needsSave = true;
+      }
+      if (!extractJsonStringField(objectJson, "updatedAtUtc", &preset.updatedAtUtc) || preset.updatedAtUtc.empty()) {
+        preset.updatedAtUtc = preset.createdAtUtc;
+        needsSave = true;
+      }
+      store.userPresets.push_back(preset);
+    }
+  }
+
+  if (needsSave) saveChromaspacePresetStoreLocked();
+}
+
+void reloadChromaspacePresetStoreFromDiskLocked() {
+  chromaspacePresetStore() = ChromaspacePresetStore{};
+  ensureChromaspacePresetStoreLoadedLocked();
+}
+
+ChromaspacePresetValues describeChromaspaceDefaultValues() {
+  std::lock_guard<std::mutex> lock(chromaspacePresetMutex());
+  ensureChromaspacePresetStoreLoadedLocked();
+  return chromaspacePresetStore().defaultPreset.values;
+}
+
+std::vector<std::string> visibleChromaspaceUserPresetNames() {
+  std::lock_guard<std::mutex> lock(chromaspacePresetMutex());
+  ensureChromaspacePresetStoreLoadedLocked();
+  std::vector<std::string> out;
+  out.reserve(chromaspacePresetStore().userPresets.size());
+  for (const auto& preset : chromaspacePresetStore().userPresets) out.push_back(preset.name);
+  return out;
+}
+
+#ifdef _WIN32
+bool confirmChromaspacePresetOverwriteDialog(const std::string& presetName) {
+  const std::string message = "Preset '" + presetName + "' already exists. Overwrite?";
+  return MessageBoxA(nullptr, message.c_str(), "Chromaspace", MB_ICONQUESTION | MB_YESNO) == IDYES;
+}
+
+void showChromaspacePresetInfoDialog(const std::string& text) {
+  MessageBoxA(nullptr, text.c_str(), "Chromaspace", MB_ICONINFORMATION | MB_OK);
+}
+
+bool confirmChromaspacePresetDeleteDialog(const std::string& presetName) {
+  const std::string message = "Delete preset '" + presetName + "'? This cannot be undone.";
+  return MessageBoxA(nullptr, message.c_str(), "Chromaspace", MB_ICONWARNING | MB_YESNO) == IDYES;
+}
+#elif defined(__APPLE__)
+std::string execAndReadChromaspace(const std::string& cmd) {
+  std::string out;
+  FILE* f = popen(cmd.c_str(), "r");
+  if (!f) return out;
+  char buffer[512];
+  while (fgets(buffer, sizeof(buffer), f)) out += buffer;
+  pclose(f);
+  while (!out.empty() && (out.back() == '\n' || out.back() == '\r')) out.pop_back();
+  return out;
+}
+
+bool confirmChromaspacePresetOverwriteDialog(const std::string& presetName) {
+  std::string safe = presetName;
+  for (char& c : safe) if (c == '"') c = '\'';
+  const std::string cmd =
+      "osascript -e 'button returned of (display dialog \"Preset \\\"" + safe +
+      "\\\" already exists. Overwrite?\" buttons {\"Cancel\",\"Overwrite\"} default button \"Overwrite\")' 2>/dev/null";
+  return execAndReadChromaspace(cmd) == "Overwrite";
+}
+
+void showChromaspacePresetInfoDialog(const std::string& text) {
+  std::string safe = text;
+  for (char& c : safe) if (c == '"') c = '\'';
+  const std::string cmd =
+      "osascript -e 'display dialog \"" + safe + "\" buttons {\"OK\"} default button \"OK\"' 2>/dev/null";
+  (void)execAndReadChromaspace(cmd);
+}
+
+bool confirmChromaspacePresetDeleteDialog(const std::string& presetName) {
+  std::string safe = presetName;
+  for (char& c : safe) if (c == '"') c = '\'';
+  const std::string cmd =
+      "osascript -e 'button returned of (display dialog \"Delete preset \\\"" + safe +
+      "\\\"? This cannot be undone.\" buttons {\"Cancel\",\"Delete\"} default button \"Delete\")' 2>/dev/null";
+  return execAndReadChromaspace(cmd) == "Delete";
+}
+#else
+bool linuxChromaspaceCommandExists(const char* cmd) {
+  if (!cmd || !*cmd) return false;
+  std::string probe = "command -v ";
+  probe += cmd;
+  probe += " >/dev/null 2>&1";
+  return std::system(probe.c_str()) == 0;
+}
+
+bool confirmChromaspacePresetOverwriteDialog(const std::string& presetName) {
+  if (linuxChromaspaceCommandExists("zenity")) {
+    std::string safe = presetName;
+    for (char& c : safe) if (c == '"') c = '\'';
+    const std::string cmd =
+        "zenity --question --title=\"Chromaspace\" --text=\"Preset '" + safe + "' already exists. Overwrite?\" 2>/dev/null";
+    return std::system(cmd.c_str()) == 0;
+  }
+  if (linuxChromaspaceCommandExists("kdialog")) {
+    std::string safe = presetName;
+    for (char& c : safe) if (c == '"') c = '\'';
+    const std::string cmd =
+        "kdialog --warningyesno \"Preset '" + safe + "' already exists. Overwrite?\" 2>/dev/null";
+    return std::system(cmd.c_str()) == 0;
+  }
+  std::fprintf(stderr, "[Chromaspace] overwrite confirmation unavailable for preset '%s'.\n", presetName.c_str());
+  return false;
+}
+
+void showChromaspacePresetInfoDialog(const std::string& text) {
+  if (linuxChromaspaceCommandExists("zenity")) {
+    std::string safe = text;
+    for (char& c : safe) if (c == '"') c = '\'';
+    const std::string cmd = "zenity --info --title=\"Chromaspace\" --text=\"" + safe + "\" 2>/dev/null";
+    (void)std::system(cmd.c_str());
+    return;
+  }
+  if (linuxChromaspaceCommandExists("kdialog")) {
+    std::string safe = text;
+    for (char& c : safe) if (c == '"') c = '\'';
+    const std::string cmd = "kdialog --msgbox \"" + safe + "\" 2>/dev/null";
+    (void)std::system(cmd.c_str());
+    return;
+  }
+  std::fprintf(stderr, "[Chromaspace] %s\n", text.c_str());
+}
+
+bool confirmChromaspacePresetDeleteDialog(const std::string& presetName) {
+  if (linuxChromaspaceCommandExists("zenity")) {
+    std::string safe = presetName;
+    for (char& c : safe) if (c == '"') c = '\'';
+    const std::string cmd =
+        "zenity --question --title=\"Chromaspace\" --text=\"Delete preset '" + safe + "'? This cannot be undone.\" 2>/dev/null";
+    return std::system(cmd.c_str()) == 0;
+  }
+  if (linuxChromaspaceCommandExists("kdialog")) {
+    std::string safe = presetName;
+    for (char& c : safe) if (c == '"') c = '\'';
+    const std::string cmd =
+        "kdialog --warningyesno \"Delete preset '" + safe + "'? This cannot be undone.\" 2>/dev/null";
+    return std::system(cmd.c_str()) == 0;
+  }
+  std::fprintf(stderr, "[Chromaspace] delete confirmation unavailable for preset '%s'.\n", presetName.c_str());
+  return false;
+}
+#endif
+
 std::atomic<int> gSharedCubeViewerRequestCount{0};
 std::mutex gSharedCubeViewerSenderMutex;
 std::string gSharedCubeViewerActiveSenderId;
@@ -1386,6 +2023,7 @@ class ChromaspaceEffect : public ImageEffect {
     updateCircularHslToggleVisibility(0.0);
     updateCircularHsvToggleVisibility(0.0);
     updateNormConeToggleVisibility(0.0);
+    syncChromaspacePresetMenuFromDisk(0.0);
   }
 
   ~ChromaspaceEffect() override {
@@ -1406,6 +2044,7 @@ class ChromaspaceEffect : public ImageEffect {
     updateCircularHslToggleVisibility(0.0);
     updateCircularHsvToggleVisibility(0.0);
     updateNormConeToggleVisibility(0.0);
+    syncChromaspacePresetMenuState(0.0);
     logSharedViewerEvent("syncPrivateData");
     if (cubeViewerRequested_ && viewerSessionRequested() && !sharedViewerActiveForThisSender()) {
       markSharedViewerActiveSender();
@@ -1660,6 +2299,127 @@ class ChromaspaceEffect : public ImageEffect {
 
   void changedParam(const InstanceChangedArgs& args, const std::string& paramName) override {
     flushStatusLabelToHost();
+    if (suppressChromaspacePresetChangedHandling_) return;
+    if (paramName == "chromaspacePresetMenu") {
+      applySelectedChromaspacePreset(args.time);
+      return;
+    }
+    if (paramName == "chromaspacePresetSave") {
+      const std::string name = sanitizePresetName(getStringValue("chromaspacePresetName", args.time, "Preset"), "Preset");
+      if (chromaspacePresetNameReserved(name)) {
+        showChromaspacePresetInfoDialog("The preset name 'Default' is reserved. Use 'Save Defaults' to overwrite the protected Default preset.");
+        return;
+      }
+
+      ChromaspacePresetSelection preferred{};
+      preferred.kind = ChromaspacePresetSelection::Kind::User;
+      {
+        std::lock_guard<std::mutex> lock(chromaspacePresetMutex());
+        ensureChromaspacePresetStoreLoadedLocked();
+        const ChromaspacePresetValues values = captureCurrentChromaspacePresetValues(args.time);
+        const std::string now = nowUtcIso8601();
+        int existingIndex = chromaspaceUserPresetIndexByNameLocked(name);
+        if (existingIndex >= 0) {
+          if (!confirmChromaspacePresetOverwriteDialog(name)) return;
+          auto& preset = chromaspacePresetStore().userPresets[static_cast<std::size_t>(existingIndex)];
+          preset.values = values;
+          preset.updatedAtUtc = now;
+          preferred.userIndex = existingIndex;
+        } else {
+          ChromaspaceUserPreset preset{};
+          preset.id = makePresetId("chromaspace");
+          preset.name = name;
+          preset.createdAtUtc = now;
+          preset.updatedAtUtc = now;
+          preset.values = values;
+          chromaspacePresetStore().userPresets.push_back(preset);
+          preferred.userIndex = static_cast<int>(chromaspacePresetStore().userPresets.size()) - 1;
+        }
+        saveChromaspacePresetStoreLocked();
+      }
+      if (auto* p = fetchStringParam("chromaspacePresetName")) p->setValue(name);
+      syncChromaspacePresetMenuFromDisk(args.time, preferred);
+      return;
+    }
+    if (paramName == "chromaspacePresetSaveDefaults") {
+      {
+        std::lock_guard<std::mutex> lock(chromaspacePresetMutex());
+        ensureChromaspacePresetStoreLoadedLocked();
+        auto& preset = chromaspacePresetStore().defaultPreset;
+        preset.id = "default";
+        preset.name = kChromaspacePresetDefaultName;
+        if (preset.createdAtUtc.empty()) preset.createdAtUtc = nowUtcIso8601();
+        preset.updatedAtUtc = nowUtcIso8601();
+        preset.values = captureCurrentChromaspacePresetValues(args.time);
+        saveChromaspacePresetStoreLocked();
+      }
+      ChromaspacePresetSelection preferred{};
+      preferred.kind = ChromaspacePresetSelection::Kind::Default;
+      syncChromaspacePresetMenuFromDisk(args.time, preferred);
+      showChromaspacePresetInfoDialog("Chromaspace defaults saved.\n\nThese new defaults will be used from the next plugin or host restart.");
+      return;
+    }
+    if (paramName == "chromaspacePresetUpdate") {
+      const ChromaspacePresetSelection selection = selectedChromaspacePresetFromMenu(args.time);
+      if (selection.kind != ChromaspacePresetSelection::Kind::User || selection.userIndex < 0) return;
+      {
+        std::lock_guard<std::mutex> lock(chromaspacePresetMutex());
+        ensureChromaspacePresetStoreLoadedLocked();
+        if (selection.userIndex >= static_cast<int>(chromaspacePresetStore().userPresets.size())) return;
+        auto& preset = chromaspacePresetStore().userPresets[static_cast<std::size_t>(selection.userIndex)];
+        preset.values = captureCurrentChromaspacePresetValues(args.time);
+        preset.updatedAtUtc = nowUtcIso8601();
+        saveChromaspacePresetStoreLocked();
+      }
+      syncChromaspacePresetMenuFromDisk(args.time, selection);
+      return;
+    }
+    if (paramName == "chromaspacePresetRename") {
+      const ChromaspacePresetSelection selection = selectedChromaspacePresetFromMenu(args.time);
+      if (selection.kind != ChromaspacePresetSelection::Kind::User || selection.userIndex < 0) return;
+      const std::string newName = sanitizePresetName(getStringValue("chromaspacePresetName", args.time, "Preset"), "Preset");
+      if (chromaspacePresetNameReserved(newName)) {
+        showChromaspacePresetInfoDialog("The preset name 'Default' is reserved. Use 'Save Defaults' to overwrite the protected Default preset.");
+        return;
+      }
+      {
+        std::lock_guard<std::mutex> lock(chromaspacePresetMutex());
+        ensureChromaspacePresetStoreLoadedLocked();
+        if (selection.userIndex >= static_cast<int>(chromaspacePresetStore().userPresets.size())) return;
+        auto& preset = chromaspacePresetStore().userPresets[static_cast<std::size_t>(selection.userIndex)];
+        if (chromaspacePresetUserNameExistsLocked(newName, &preset.id)) {
+          showChromaspacePresetInfoDialog("A Chromaspace preset with that name already exists.");
+          return;
+        }
+        preset.name = newName;
+        preset.updatedAtUtc = nowUtcIso8601();
+        saveChromaspacePresetStoreLocked();
+      }
+      if (auto* p = fetchStringParam("chromaspacePresetName")) p->setValue(newName);
+      syncChromaspacePresetMenuFromDisk(args.time, selection);
+      return;
+    }
+    if (paramName == "chromaspacePresetDelete") {
+      const ChromaspacePresetSelection selection = selectedChromaspacePresetFromMenu(args.time);
+      if (selection.kind != ChromaspacePresetSelection::Kind::User || selection.userIndex < 0) return;
+      std::string presetName;
+      {
+        std::lock_guard<std::mutex> lock(chromaspacePresetMutex());
+        ensureChromaspacePresetStoreLoadedLocked();
+        if (selection.userIndex >= static_cast<int>(chromaspacePresetStore().userPresets.size())) return;
+        presetName = chromaspacePresetStore().userPresets[static_cast<std::size_t>(selection.userIndex)].name;
+      }
+      if (!confirmChromaspacePresetDeleteDialog(presetName)) return;
+      {
+        std::lock_guard<std::mutex> lock(chromaspacePresetMutex());
+        ensureChromaspacePresetStoreLoadedLocked();
+        if (selection.userIndex < 0 || selection.userIndex >= static_cast<int>(chromaspacePresetStore().userPresets.size())) return;
+        chromaspacePresetStore().userPresets.erase(chromaspacePresetStore().userPresets.begin() + selection.userIndex);
+        saveChromaspacePresetStoreLocked();
+      }
+      syncChromaspacePresetMenuFromDisk(args.time);
+      return;
+    }
     if (paramName == "openCubeViewer") {
       cubeViewerDebugLog("changedParam(openCubeViewer)");
       openCubeViewerSession(args.time);
@@ -1695,6 +2455,7 @@ class ChromaspaceEffect : public ImageEffect {
     if (paramName == "cubeViewerLive") {
       cubeViewerLive_ = getBoolValue("cubeViewerLive", args.time, true);
       cubeViewerDebugLog(std::string("changedParam(cubeViewerLive) -> ") + (cubeViewerLive_ ? "1" : "0"));
+      syncChromaspacePresetMenuState(args.time);
       if (viewerSessionRequested()) {
         pushParamsUpdate(args.time, "cubeViewerLive");
       }
@@ -1705,6 +2466,7 @@ class ChromaspaceEffect : public ImageEffect {
       deferredLatestCloudRefresh_.store(false, std::memory_order_relaxed);
       cubeViewerDebugLog(std::string("changedParam(cubeViewerUpdateMode) -> ") +
                          viewerUpdateModeLabelForIndex(cubeViewerUpdateMode_));
+      syncChromaspacePresetMenuState(args.time);
       return;
     }
     if (paramName == "cubeViewerQuality") {
@@ -1712,6 +2474,7 @@ class ChromaspaceEffect : public ImageEffect {
       cubeViewerDebugLog(std::string("changedParam(cubeViewerQuality) -> ") + qualityLabelForIndex(cubeViewerQuality_));
       resolveOverlaySizeParamIfAuto(args.time);
       invalidateCubeViewerCloudState();
+      syncChromaspacePresetMenuState(args.time);
       if (viewerSessionRequested()) {
         pushParamsUpdate(args.time, "cubeViewerQuality");
       }
@@ -1722,6 +2485,7 @@ class ChromaspaceEffect : public ImageEffect {
                          scaleLabelForIndex(getChoiceValue("cubeViewerScale", args.time, 3)));
       resolveOverlaySizeParamIfAuto(args.time);
       invalidateCubeViewerCloudState();
+      syncChromaspacePresetMenuState(args.time);
       if (viewerSessionRequested()) {
         pushParamsUpdate(args.time, "cubeViewerScale");
       }
@@ -1730,6 +2494,7 @@ class ChromaspaceEffect : public ImageEffect {
     if (paramName == "cubeViewerPointSize") {
       cubeViewerDebugLog(std::string("changedParam(cubeViewerPointSize) -> ") +
                          std::to_string(getDoubleValue("cubeViewerPointSize", args.time, 1.4)));
+      syncChromaspacePresetMenuState(args.time);
       if (viewerSessionRequested()) {
         pushParamsUpdate(args.time, "cubeViewerPointSize");
       }
@@ -1739,6 +2504,7 @@ class ChromaspaceEffect : public ImageEffect {
       cubeViewerDebugLog(std::string("changedParam(cubeViewerSamplingMode) -> ") +
                          samplingModeLabelForIndex(getChoiceValue("cubeViewerSamplingMode", args.time, 0)));
       invalidateCubeViewerCloudState();
+      syncChromaspacePresetMenuState(args.time);
       if (viewerSessionRequested()) {
         pushParamsUpdate(args.time, "cubeViewerSamplingMode");
       }
@@ -1748,6 +2514,7 @@ class ChromaspaceEffect : public ImageEffect {
       cubeViewerDebugLog(std::string("changedParam(cubeViewerOccupancyGuidedFill) -> ") +
                          (getBoolValue("cubeViewerOccupancyGuidedFill", args.time, false) ? "1" : "0"));
       invalidateCubeViewerCloudState();
+      syncChromaspacePresetMenuState(args.time);
       if (viewerSessionRequested()) {
         pushParamsUpdate(args.time, "cubeViewerOccupancyGuidedFill");
       }
@@ -1756,6 +2523,7 @@ class ChromaspaceEffect : public ImageEffect {
     if (paramName == "cubeViewerPointShape") {
       cubeViewerDebugLog(std::string("changedParam(cubeViewerPointShape) -> ") +
                          pointShapeLabelForIndex(getChoiceValue("cubeViewerPointShape", args.time, 0)));
+      syncChromaspacePresetMenuState(args.time);
       if (viewerSessionRequested()) {
         pushParamsUpdate(args.time, "cubeViewerPointShape");
       }
@@ -1766,6 +2534,7 @@ class ChromaspaceEffect : public ImageEffect {
                          (getBoolValue("cubeViewerShowOverflow", args.time, false) ? "1" : "0"));
       updateDrawOnImageModeUi(args.time);
       invalidateCubeViewerCloudState();
+      syncChromaspacePresetMenuState(args.time);
       if (viewerSessionRequested()) {
         pushParamsUpdate(args.time, "cubeViewerShowOverflow");
         (void)trySendCachedCloud(args.time, "cubeViewerShowOverflow");
@@ -1777,6 +2546,7 @@ class ChromaspaceEffect : public ImageEffect {
       cubeViewerDebugLog(std::string("changedParam(") + paramName + ")");
       updateDrawOnImageModeUi(args.time);
       invalidateCubeViewerCloudState();
+      syncChromaspacePresetMenuState(args.time);
       if (viewerSessionRequested()) {
         pushParamsUpdate(args.time, paramName);
         (void)trySendCachedCloud(args.time, paramName);
@@ -1796,6 +2566,7 @@ class ChromaspaceEffect : public ImageEffect {
       cubeViewerDebugLog(std::string("changedParam(cubeViewerHighlightOverflow) -> ") +
                          (getBoolValue("cubeViewerHighlightOverflow", args.time, true) ? "1" : "0"));
       syncShowOverflowSupport(args.time);
+      syncChromaspacePresetMenuState(args.time);
       if (viewerSessionRequested()) {
         pushParamsUpdate(args.time, "cubeViewerHighlightOverflow");
         (void)trySendCachedCloud(args.time, "cubeViewerHighlightOverflow");
@@ -1859,6 +2630,7 @@ class ChromaspaceEffect : public ImageEffect {
     if (paramName == "cubeViewerOnTop") {
       cubeViewerDebugLog(std::string("changedParam(cubeViewerOnTop) -> ") +
                          (getBoolValue("cubeViewerOnTop", args.time, true) ? "1" : "0"));
+      syncChromaspacePresetMenuState(args.time);
       if (viewerSessionRequested()) {
         pushParamsUpdate(args.time, "cubeViewerOnTop");
       }
@@ -1882,6 +2654,7 @@ class ChromaspaceEffect : public ImageEffect {
                                : resolvedOverlayCubeSize(requested, qualityIndex, scaleIndex);
       cubeViewerDebugLog(std::string("changedParam(cubeViewerIdentityOverlaySize) -> requested=") +
                          std::to_string(requested) + " resolved=" + std::to_string(resolved));
+      syncChromaspacePresetMenuState(args.time);
       if (viewerSessionRequested()) {
         pushParamsUpdate(args.time, "cubeViewerIdentityOverlaySize");
       }
@@ -1960,6 +2733,7 @@ class ChromaspaceEffect : public ImageEffect {
       cubeViewerDebugLog(std::string("changedParam(cubeViewerSampleDrawnCubeSize) -> requested=") +
                          std::to_string(requested) + " resolved=" + std::to_string(resolved));
       invalidateCubeViewerCloudState();
+      syncChromaspacePresetMenuState(args.time);
       if (viewerSessionRequested()) {
         pushParamsUpdate(args.time, "cubeViewerSampleDrawnCubeSize");
       }
@@ -1975,6 +2749,7 @@ class ChromaspaceEffect : public ImageEffect {
       updateCircularHsvToggleVisibility(args.time);
       updateNormConeToggleVisibility(args.time);
       invalidateCubeViewerCloudState();
+      syncChromaspacePresetMenuState(args.time);
       if (viewerSessionRequested()) {
         pushParamsUpdate(args.time, "cubeViewerPlotModel");
         (void)trySendCachedCloud(args.time, "cubeViewerPlotModel");
@@ -2074,6 +2849,10 @@ class ChromaspaceEffect : public ImageEffect {
   bool cubeViewerInputCloudRefreshPending_ = false;
   int playbackRenderBurstCount_ = 0;
   bool suppressLassoDataChangedHandling_ = false;
+  bool suppressChromaspacePresetChangedHandling_ = false;
+  bool chromaspacePresetMenuHasCustom_ = false;
+  int chromaspacePresetCustomIndex_ = -1;
+  int chromaspacePresetMenuUserCount_ = 0;
   CachedCloud cachedCloud_;
   CachedIdentityStripCloud cachedIdentityStripCloud_;
   double lastCloudTime_ = std::numeric_limits<double>::quiet_NaN();
@@ -2281,7 +3060,7 @@ class ChromaspaceEffect : public ImageEffect {
     return stageSrc_.empty() ? nullptr : stageSrc_.data();
   }
 
-  bool getBoolValue(const std::string& name, double time, bool fallback) {
+  bool getBoolValue(const std::string& name, double time, bool fallback) const {
     if (auto* p = fetchBooleanParam(name)) {
       bool value = fallback;
       p->getValueAtTime(time, value);
@@ -2290,7 +3069,7 @@ class ChromaspaceEffect : public ImageEffect {
     return fallback;
   }
 
-  int getChoiceValue(const std::string& name, double time, int fallback) {
+  int getChoiceValue(const std::string& name, double time, int fallback) const {
     if (auto* p = fetchChoiceParam(name)) {
       int value = fallback;
       p->getValueAtTime(time, value);
@@ -2299,7 +3078,7 @@ class ChromaspaceEffect : public ImageEffect {
     return fallback;
   }
 
-  double getDoubleValue(const std::string& name, double time, double fallback) {
+  double getDoubleValue(const std::string& name, double time, double fallback) const {
     if (auto* p = fetchDoubleParam(name)) {
       double value = fallback;
       p->getValueAtTime(time, value);
@@ -2319,7 +3098,7 @@ class ChromaspaceEffect : public ImageEffect {
     return fallback;
   }
 
-  int getIntValue(const std::string& name, double time, int fallback) {
+  int getIntValue(const std::string& name, double time, int fallback) const {
     if (auto* p = fetchIntParam(name)) {
       int value = fallback;
       p->getValueAtTime(time, value);
@@ -2414,14 +3193,14 @@ class ChromaspaceEffect : public ImageEffect {
            getBoolValue("cubeViewerPlotDisplayLinear", time, false);
   }
 
-  int currentPlotDisplayLinearTransferChoice(double time) {
+  int currentPlotDisplayLinearTransferChoice(double time) const {
     return std::clamp(getChoiceValue("cubeViewerPlotDisplayLinearTransfer", time,
                                      plotLinearTransferChoiceIndex(
                                          WorkshopColor::TransferFunctionId::Gamma24)),
                       0, static_cast<int>(plotLinearTransferChoices().size()) - 1);
   }
 
-  WorkshopColor::TransferFunctionId currentPlotDisplayLinearTransferId(double time) {
+  WorkshopColor::TransferFunctionId currentPlotDisplayLinearTransferId(double time) const {
     return plotLinearTransferIdFromChoice(currentPlotDisplayLinearTransferChoice(time));
   }
 
@@ -2597,13 +3376,228 @@ class ChromaspaceEffect : public ImageEffect {
     return getBoolValue("cubeViewerChromaticityPlanckianLocus", time, true);
   }
 
-  std::string getStringValue(const std::string& name, double time, const std::string& fallback) {
+  std::string getStringValue(const std::string& name, double time, const std::string& fallback) const {
     if (auto* p = fetchStringParam(name)) {
       std::string value;
       p->getValueAtTime(time, value);
       return value;
     }
     return fallback;
+  }
+
+  struct ChromaspacePresetSelection {
+    enum class Kind {
+      Default,
+      User,
+      Custom
+    };
+    Kind kind = Kind::Default;
+    int userIndex = -1;
+  };
+
+  ChromaspacePresetValues captureCurrentChromaspacePresetValues(double time) const {
+    ChromaspacePresetValues values = chromaspaceFactoryPresetValues();
+    values.plotModel = getChoiceValue("cubeViewerPlotModel", time, values.plotModel);
+    values.plotInLinear = getBoolValue("cubeViewerPlotDisplayLinear", time, values.plotInLinear);
+    values.inputTransferFunction = static_cast<int>(currentPlotDisplayLinearTransferId(time));
+    values.showOverflow = getBoolValue("cubeViewerShowOverflow", time, values.showOverflow);
+    values.highlightOverflow = getBoolValue("cubeViewerHighlightOverflow", time, values.highlightOverflow);
+    values.fillResolution = getIntValue("cubeViewerIdentityOverlaySize", time, values.fillResolution);
+    values.identityReadResolution = getIntValue("cubeViewerSampleDrawnCubeSize", time, values.identityReadResolution);
+    values.liveUpdate = getBoolValue("cubeViewerLive", time, values.liveUpdate);
+    values.keepOnTop = getBoolValue("cubeViewerOnTop", time, values.keepOnTop);
+    values.updateMode = getChoiceValue("cubeViewerUpdateMode", time, values.updateMode);
+    values.quality = getChoiceValue("cubeViewerQuality", time, values.quality);
+    values.scale = getChoiceValue("cubeViewerScale", time, values.scale);
+    values.pointSize = getDoubleValue("cubeViewerPointSize", time, values.pointSize);
+    values.pointShape = getChoiceValue("cubeViewerPointShape", time, values.pointShape);
+    values.sampling = getChoiceValue("cubeViewerSamplingMode", time, values.sampling);
+    values.occupancyGuidedFill = getBoolValue("cubeViewerOccupancyGuidedFill", time, values.occupancyGuidedFill);
+    return values;
+  }
+
+  void writeChromaspacePresetValuesToParams(const ChromaspacePresetValues& values) {
+    if (auto* p = fetchChoiceParam("cubeViewerPlotModel")) p->setValue(values.plotModel);
+    if (auto* p = fetchBooleanParam("cubeViewerPlotDisplayLinear")) p->setValue(values.plotInLinear);
+    if (auto* p = fetchChoiceParam("cubeViewerPlotDisplayLinearTransfer")) {
+      const auto transferId = static_cast<WorkshopColor::TransferFunctionId>(values.inputTransferFunction);
+      p->setValue(plotLinearTransferChoiceIndex(transferId));
+    }
+    if (auto* p = fetchBooleanParam("cubeViewerShowOverflow")) p->setValue(values.showOverflow);
+    if (auto* p = fetchBooleanParam("cubeViewerHighlightOverflow")) p->setValue(values.highlightOverflow);
+    if (auto* p = fetchIntParam("cubeViewerIdentityOverlaySize")) p->setValue(values.fillResolution);
+    if (auto* p = fetchIntParam("cubeViewerSampleDrawnCubeSize")) p->setValue(values.identityReadResolution);
+    if (auto* p = fetchBooleanParam("cubeViewerLive")) p->setValue(values.liveUpdate);
+    if (auto* p = fetchBooleanParam("cubeViewerOnTop")) p->setValue(values.keepOnTop);
+    if (auto* p = fetchChoiceParam("cubeViewerUpdateMode")) p->setValue(values.updateMode);
+    if (auto* p = fetchChoiceParam("cubeViewerQuality")) p->setValue(values.quality);
+    if (auto* p = fetchChoiceParam("cubeViewerScale")) p->setValue(values.scale);
+    if (auto* p = fetchDoubleParam("cubeViewerPointSize")) p->setValue(values.pointSize);
+    if (auto* p = fetchChoiceParam("cubeViewerPointShape")) p->setValue(values.pointShape);
+    if (auto* p = fetchChoiceParam("cubeViewerSamplingMode")) p->setValue(values.sampling);
+    if (auto* p = fetchBooleanParam("cubeViewerOccupancyGuidedFill")) p->setValue(values.occupancyGuidedFill);
+  }
+
+  ChromaspacePresetSelection matchingChromaspacePresetSelection(double time) const {
+    const ChromaspacePresetValues current = captureCurrentChromaspacePresetValues(time);
+    std::lock_guard<std::mutex> lock(chromaspacePresetMutex());
+    ensureChromaspacePresetStoreLoadedLocked();
+    if (chromaspacePresetValuesEqual(current, chromaspacePresetStore().defaultPreset.values)) {
+      return {};
+    }
+    for (int i = 0; i < static_cast<int>(chromaspacePresetStore().userPresets.size()); ++i) {
+      if (chromaspacePresetValuesEqual(current, chromaspacePresetStore().userPresets[static_cast<std::size_t>(i)].values)) {
+        ChromaspacePresetSelection selection{};
+        selection.kind = ChromaspacePresetSelection::Kind::User;
+        selection.userIndex = i;
+        return selection;
+      }
+    }
+    ChromaspacePresetSelection selection{};
+    selection.kind = ChromaspacePresetSelection::Kind::Custom;
+    return selection;
+  }
+
+  ChromaspacePresetSelection selectedChromaspacePresetFromMenu(double time) const {
+    ChromaspacePresetSelection selection{};
+    const int selectedIndex = getChoiceValue("chromaspacePresetMenu", time, 0);
+    if (selectedIndex == 0) return selection;
+    if (chromaspacePresetMenuHasCustom_ && selectedIndex == chromaspacePresetCustomIndex_) {
+      selection.kind = ChromaspacePresetSelection::Kind::Custom;
+      return selection;
+    }
+    const int userCount = chromaspacePresetMenuUserCount_;
+    if (selectedIndex >= 1 && selectedIndex <= userCount) {
+      selection.kind = ChromaspacePresetSelection::Kind::User;
+      selection.userIndex = selectedIndex - 1;
+      return selection;
+    }
+    selection.kind = ChromaspacePresetSelection::Kind::Custom;
+    return selection;
+  }
+
+  void rebuildChromaspacePresetMenu(double time, const ChromaspacePresetSelection& selection) {
+    auto* param = fetchChoiceParam("chromaspacePresetMenu");
+    if (!param) return;
+
+    param->resetOptions();
+    param->appendOption(kChromaspacePresetDefaultName);
+
+    std::vector<std::string> names;
+    {
+      std::lock_guard<std::mutex> lock(chromaspacePresetMutex());
+      ensureChromaspacePresetStoreLoadedLocked();
+      names.reserve(chromaspacePresetStore().userPresets.size());
+      for (const auto& preset : chromaspacePresetStore().userPresets) names.push_back(preset.name);
+    }
+    for (const auto& name : names) param->appendOption(name);
+
+    chromaspacePresetMenuUserCount_ = static_cast<int>(names.size());
+    chromaspacePresetMenuHasCustom_ = (selection.kind == ChromaspacePresetSelection::Kind::Custom);
+    chromaspacePresetCustomIndex_ = -1;
+    int selectedIndex = 0;
+    if (selection.kind == ChromaspacePresetSelection::Kind::User &&
+        selection.userIndex >= 0 &&
+        selection.userIndex < chromaspacePresetMenuUserCount_) {
+      selectedIndex = selection.userIndex + 1;
+    } else if (selection.kind == ChromaspacePresetSelection::Kind::Custom) {
+      param->appendOption(kChromaspacePresetCustomLabel);
+      chromaspacePresetCustomIndex_ = chromaspacePresetMenuUserCount_ + 1;
+      selectedIndex = chromaspacePresetCustomIndex_;
+    }
+    BoolScope scope(suppressChromaspacePresetChangedHandling_);
+    param->setValue(selectedIndex);
+  }
+
+  void updateChromaspacePresetActionState(double time) {
+    const ChromaspacePresetSelection selection = selectedChromaspacePresetFromMenu(time);
+    const bool userSelected = selection.kind == ChromaspacePresetSelection::Kind::User;
+    if (auto* p = fetchPushButtonParam("chromaspacePresetUpdate")) p->setEnabled(userSelected);
+    if (auto* p = fetchPushButtonParam("chromaspacePresetRename")) p->setEnabled(userSelected);
+    if (auto* p = fetchPushButtonParam("chromaspacePresetDelete")) p->setEnabled(userSelected);
+  }
+
+  void syncChromaspacePresetMenuState(double time) {
+    rebuildChromaspacePresetMenu(time, matchingChromaspacePresetSelection(time));
+    updateChromaspacePresetActionState(time);
+  }
+
+  void syncChromaspacePresetMenuFromDisk(double time,
+                                         const std::optional<ChromaspacePresetSelection>& preferred = std::nullopt) {
+    {
+      std::lock_guard<std::mutex> lock(chromaspacePresetMutex());
+      reloadChromaspacePresetStoreFromDiskLocked();
+    }
+    rebuildChromaspacePresetMenu(time, preferred ? *preferred : matchingChromaspacePresetSelection(time));
+    updateChromaspacePresetActionState(time);
+  }
+
+  void finalizeChromaspacePresetApplication(double time, const std::string& reason) {
+    cubeViewerLive_ = getBoolValue("cubeViewerLive", time, true);
+    cubeViewerUpdateMode_ = getChoiceValue("cubeViewerUpdateMode", time, 0);
+    cubeViewerQuality_ = getChoiceValue("cubeViewerQuality", time, 0);
+    resolveOverlaySizeParamIfAuto(time);
+    updateDrawOnImageModeUi(time);
+    syncIdentityOverlayGroupOpenState(time);
+    updateCircularHslToggleVisibility(time);
+    updateCircularHsvToggleVisibility(time);
+    updateNormConeToggleVisibility(time);
+    syncShowOverflowSupport(time);
+    invalidateCubeViewerCloudState();
+    syncChromaspacePresetMenuState(time);
+    if (viewerSessionRequested()) {
+      pushParamsUpdate(time, reason);
+      (void)trySendCachedCloud(time, reason);
+    }
+  }
+
+  void applySelectedChromaspacePreset(double time) {
+    const ChromaspacePresetSelection selection = selectedChromaspacePresetFromMenu(time);
+    if (selection.kind == ChromaspacePresetSelection::Kind::Custom) return;
+
+    ChromaspacePresetValues values = chromaspaceFactoryPresetValues();
+    std::string presetName;
+    {
+      std::lock_guard<std::mutex> lock(chromaspacePresetMutex());
+      ensureChromaspacePresetStoreLoadedLocked();
+      if (selection.kind == ChromaspacePresetSelection::Kind::Default) {
+        values = chromaspacePresetStore().defaultPreset.values;
+        presetName = chromaspacePresetStore().defaultPreset.name;
+      } else if (selection.userIndex >= 0 &&
+                 selection.userIndex < static_cast<int>(chromaspacePresetStore().userPresets.size())) {
+        values = chromaspacePresetStore().userPresets[static_cast<std::size_t>(selection.userIndex)].values;
+        presetName = chromaspacePresetStore().userPresets[static_cast<std::size_t>(selection.userIndex)].name;
+      } else {
+        return;
+      }
+    }
+
+    BoolScope scope(suppressChromaspacePresetChangedHandling_);
+    writeChromaspacePresetValuesToParams(values);
+    finalizeChromaspacePresetApplication(time, "chromaspacePresetMenu");
+    syncChromaspacePresetMenuFromDisk(time, selection);
+    if (selection.kind == ChromaspacePresetSelection::Kind::User) {
+      if (auto* p = fetchStringParam("chromaspacePresetName")) p->setValue(presetName);
+    }
+  }
+
+  bool isChromaspacePresetManagedParam(const std::string& paramName) const {
+    return paramName == "cubeViewerPlotModel" ||
+           paramName == "cubeViewerPlotDisplayLinear" ||
+           paramName == "cubeViewerPlotDisplayLinearTransfer" ||
+           paramName == "cubeViewerShowOverflow" ||
+           paramName == "cubeViewerHighlightOverflow" ||
+           paramName == "cubeViewerIdentityOverlaySize" ||
+           paramName == "cubeViewerSampleDrawnCubeSize" ||
+           paramName == "cubeViewerLive" ||
+           paramName == "cubeViewerOnTop" ||
+           paramName == "cubeViewerUpdateMode" ||
+           paramName == "cubeViewerQuality" ||
+           paramName == "cubeViewerScale" ||
+           paramName == "cubeViewerPointSize" ||
+           paramName == "cubeViewerPointShape" ||
+           paramName == "cubeViewerSamplingMode" ||
+           paramName == "cubeViewerOccupancyGuidedFill";
   }
 
   LassoRegionState currentLassoRegionState(double time) {
@@ -6462,6 +7456,7 @@ class ChromaspaceFactory : public PluginFactoryHelper<ChromaspaceFactory> {
       auto it = kHints.find(name);
       return it == kHints.end() ? nullptr : it->second;
     };
+    const ChromaspacePresetValues chromaspaceDefaultValues = describeChromaspaceDefaultValues();
 
     auto* cubeViewerSource = d.defineChoiceParam("cubeViewerSource");
     cubeViewerSource->appendOption("Input Image");
@@ -6478,7 +7473,7 @@ class ChromaspaceFactory : public PluginFactoryHelper<ChromaspaceFactory> {
     cubeViewerPlotModel->appendOption("JP-Conical");
     cubeViewerPlotModel->appendOption("Reuleaux");
     cubeViewerPlotModel->appendOption("Chromaticity");
-    cubeViewerPlotModel->setDefault(0);
+    cubeViewerPlotModel->setDefault(std::clamp(chromaspaceDefaultValues.plotModel, 0, 7));
     if (const char* hint = tooltipFor("cubeViewerPlotModel")) cubeViewerPlotModel->setHint(hint);
 
     auto* openCubeViewer = d.definePushButtonParam("openCubeViewer");
@@ -6487,7 +7482,7 @@ class ChromaspaceFactory : public PluginFactoryHelper<ChromaspaceFactory> {
 
     auto* cubeViewerPlotDisplayLinear = d.defineBooleanParam("cubeViewerPlotDisplayLinear");
     cubeViewerPlotDisplayLinear->setLabel("Plot in Linear");
-    cubeViewerPlotDisplayLinear->setDefault(false);
+    cubeViewerPlotDisplayLinear->setDefault(chromaspaceDefaultValues.plotInLinear);
     if (const char* hint = tooltipFor("cubeViewerPlotDisplayLinear")) cubeViewerPlotDisplayLinear->setHint(hint);
 
     auto* cubeViewerPlotDisplayLinearTransfer = d.defineChoiceParam("cubeViewerPlotDisplayLinearTransfer");
@@ -6496,7 +7491,7 @@ class ChromaspaceFactory : public PluginFactoryHelper<ChromaspaceFactory> {
       cubeViewerPlotDisplayLinearTransfer->appendOption(WorkshopColor::transferFunctionDefinition(id).label);
     }
     cubeViewerPlotDisplayLinearTransfer->setDefault(
-        plotLinearTransferChoiceIndex(WorkshopColor::TransferFunctionId::Gamma24));
+        plotLinearTransferChoiceIndex(static_cast<WorkshopColor::TransferFunctionId>(chromaspaceDefaultValues.inputTransferFunction)));
     cubeViewerPlotDisplayLinearTransfer->setIsSecret(true);
     cubeViewerPlotDisplayLinearTransfer->setEnabled(false);
     if (const char* hint = tooltipFor("cubeViewerPlotDisplayLinearTransfer")) cubeViewerPlotDisplayLinearTransfer->setHint(hint);
@@ -6524,12 +7519,12 @@ class ChromaspaceFactory : public PluginFactoryHelper<ChromaspaceFactory> {
 
     auto* cubeViewerShowOverflow = d.defineBooleanParam("cubeViewerShowOverflow");
     cubeViewerShowOverflow->setLabel("Show Overflow");
-    cubeViewerShowOverflow->setDefault(false);
+    cubeViewerShowOverflow->setDefault(chromaspaceDefaultValues.showOverflow);
     if (const char* hint = tooltipFor("cubeViewerShowOverflow")) cubeViewerShowOverflow->setHint(hint);
 
     auto* cubeViewerHighlightOverflow = d.defineBooleanParam("cubeViewerHighlightOverflow");
     cubeViewerHighlightOverflow->setLabel("Highlight Overflow");
-    cubeViewerHighlightOverflow->setDefault(true);
+    cubeViewerHighlightOverflow->setDefault(chromaspaceDefaultValues.highlightOverflow);
     if (const char* hint = tooltipFor("cubeViewerHighlightOverflow")) cubeViewerHighlightOverflow->setHint(hint);
 
     auto* cubeViewerIdentityOverlayEnabled = d.defineBooleanParam("cubeViewerIdentityOverlayEnabled");
@@ -6539,7 +7534,7 @@ class ChromaspaceFactory : public PluginFactoryHelper<ChromaspaceFactory> {
 
     auto* cubeViewerIdentityOverlaySize = d.defineIntParam("cubeViewerIdentityOverlaySize");
     cubeViewerIdentityOverlaySize->setLabel("Fill Resolution");
-    cubeViewerIdentityOverlaySize->setDefault(29);
+    cubeViewerIdentityOverlaySize->setDefault(std::clamp(chromaspaceDefaultValues.fillResolution, 4, 65));
     cubeViewerIdentityOverlaySize->setRange(4, 65);
     cubeViewerIdentityOverlaySize->setDisplayRange(4, 65);
     if (const char* hint = tooltipFor("cubeViewerIdentityOverlaySize")) cubeViewerIdentityOverlaySize->setHint(hint);
@@ -6741,7 +7736,7 @@ class ChromaspaceFactory : public PluginFactoryHelper<ChromaspaceFactory> {
 
     auto* cubeViewerSampleDrawnCubeSize = d.defineIntParam("cubeViewerSampleDrawnCubeSize");
     cubeViewerSampleDrawnCubeSize->setLabel("Resolution");
-    cubeViewerSampleDrawnCubeSize->setDefault(29);
+    cubeViewerSampleDrawnCubeSize->setDefault(std::clamp(chromaspaceDefaultValues.identityReadResolution, 4, 65));
     cubeViewerSampleDrawnCubeSize->setRange(4, 65);
     cubeViewerSampleDrawnCubeSize->setDisplayRange(4, 65);
     cubeViewerSampleDrawnCubeSize->setParent(*grpCubeViewerIdentityOverlay);
@@ -6765,13 +7760,13 @@ class ChromaspaceFactory : public PluginFactoryHelper<ChromaspaceFactory> {
 
     auto* cubeViewerLive = d.defineBooleanParam("cubeViewerLive");
     cubeViewerLive->setLabel("Live Update Viewer");
-    cubeViewerLive->setDefault(true);
+    cubeViewerLive->setDefault(chromaspaceDefaultValues.liveUpdate);
     cubeViewerLive->setParent(*grpCubeViewer);
     if (const char* hint = tooltipFor("cubeViewerLive")) cubeViewerLive->setHint(hint);
 
     auto* cubeViewerOnTop = d.defineBooleanParam("cubeViewerOnTop");
     cubeViewerOnTop->setLabel("Keep Viewer On Top");
-    cubeViewerOnTop->setDefault(true);
+    cubeViewerOnTop->setDefault(chromaspaceDefaultValues.keepOnTop);
     cubeViewerOnTop->setParent(*grpCubeViewer);
     if (const char* hint = tooltipFor("cubeViewerOnTop")) cubeViewerOnTop->setHint(hint);
 
@@ -6785,7 +7780,7 @@ class ChromaspaceFactory : public PluginFactoryHelper<ChromaspaceFactory> {
     cubeViewerUpdateMode->appendOption("Auto");
     cubeViewerUpdateMode->appendOption("Fluid");
     cubeViewerUpdateMode->appendOption("Scheduled");
-    cubeViewerUpdateMode->setDefault(0);
+    cubeViewerUpdateMode->setDefault(std::clamp(chromaspaceDefaultValues.updateMode, 0, 2));
     cubeViewerUpdateMode->setParent(*grpCubeViewerPerformance);
     if (const char* hint = tooltipFor("cubeViewerUpdateMode")) cubeViewerUpdateMode->setHint(hint);
 
@@ -6794,7 +7789,7 @@ class ChromaspaceFactory : public PluginFactoryHelper<ChromaspaceFactory> {
     cubeViewerQuality->appendOption("Low");
     cubeViewerQuality->appendOption("Medium");
     cubeViewerQuality->appendOption("High");
-    cubeViewerQuality->setDefault(0);
+    cubeViewerQuality->setDefault(std::clamp(chromaspaceDefaultValues.quality, 0, 2));
     cubeViewerQuality->setParent(*grpCubeViewerPerformance);
     if (const char* hint = tooltipFor("cubeViewerQuality")) cubeViewerQuality->setHint(hint);
 
@@ -6804,7 +7799,7 @@ class ChromaspaceFactory : public PluginFactoryHelper<ChromaspaceFactory> {
     cubeViewerScale->appendOption("50%");
     cubeViewerScale->appendOption("75%");
     cubeViewerScale->appendOption("100%");
-    cubeViewerScale->setDefault(3);
+    cubeViewerScale->setDefault(std::clamp(chromaspaceDefaultValues.scale, 0, 3));
     cubeViewerScale->setParent(*grpCubeViewerPerformance);
     if (const char* hint = tooltipFor("cubeViewerScale")) cubeViewerScale->setHint(hint);
 
@@ -6815,7 +7810,7 @@ class ChromaspaceFactory : public PluginFactoryHelper<ChromaspaceFactory> {
 
     auto* cubeViewerPointSize = d.defineDoubleParam("cubeViewerPointSize");
     cubeViewerPointSize->setLabel("Point Size");
-    cubeViewerPointSize->setDefault(1.100);
+    cubeViewerPointSize->setDefault(std::clamp(chromaspaceDefaultValues.pointSize, 0.35, 3.0));
     cubeViewerPointSize->setRange(0.35, 3.0);
     cubeViewerPointSize->setDisplayRange(0.35, 3.0);
     cubeViewerPointSize->setIncrement(0.025);
@@ -6826,7 +7821,7 @@ class ChromaspaceFactory : public PluginFactoryHelper<ChromaspaceFactory> {
     cubeViewerPointShape->setLabel("Point Shape");
     cubeViewerPointShape->appendOption("Circle");
     cubeViewerPointShape->appendOption("Square");
-    cubeViewerPointShape->setDefault(0);
+    cubeViewerPointShape->setDefault(std::clamp(chromaspaceDefaultValues.pointShape, 0, 1));
     cubeViewerPointShape->setParent(*grpCubeViewerAppearance);
     if (const char* hint = tooltipFor("cubeViewerPointShape")) cubeViewerPointShape->setHint(hint);
 
@@ -6835,15 +7830,55 @@ class ChromaspaceFactory : public PluginFactoryHelper<ChromaspaceFactory> {
     cubeViewerSamplingMode->appendOption("Balanced");
     cubeViewerSamplingMode->appendOption("Stratified");
     cubeViewerSamplingMode->appendOption("Random");
-    cubeViewerSamplingMode->setDefault(0);
+    cubeViewerSamplingMode->setDefault(std::clamp(chromaspaceDefaultValues.sampling, 0, 2));
     cubeViewerSamplingMode->setParent(*grpCubeViewerAppearance);
     if (const char* hint = tooltipFor("cubeViewerSamplingMode")) cubeViewerSamplingMode->setHint(hint);
 
     auto* cubeViewerOccupancyGuidedFill = d.defineBooleanParam("cubeViewerOccupancyGuidedFill");
     cubeViewerOccupancyGuidedFill->setLabel("Occupancy-guided fill");
-    cubeViewerOccupancyGuidedFill->setDefault(true);
+    cubeViewerOccupancyGuidedFill->setDefault(chromaspaceDefaultValues.occupancyGuidedFill);
     cubeViewerOccupancyGuidedFill->setParent(*grpCubeViewerAppearance);
     if (const char* hint = tooltipFor("cubeViewerOccupancyGuidedFill")) cubeViewerOccupancyGuidedFill->setHint(hint);
+
+    auto* grpChromaspaceDefaultsPresets = d.defineGroupParam("grp_chromaspace_defaults_presets");
+    grpChromaspaceDefaultsPresets->setLabel("Defaults & Presets");
+    grpChromaspaceDefaultsPresets->setOpen(false);
+    grpChromaspaceDefaultsPresets->setParent(*grpCubeViewer);
+
+    auto* chromaspacePresetMenu = d.defineChoiceParam("chromaspacePresetMenu");
+    chromaspacePresetMenu->setLabel("Chromaspace Preset");
+    chromaspacePresetMenu->appendOption(kChromaspacePresetDefaultName);
+    for (const auto& name : visibleChromaspaceUserPresetNames()) chromaspacePresetMenu->appendOption(name);
+    chromaspacePresetMenu->setDefault(0);
+    chromaspacePresetMenu->setParent(*grpChromaspaceDefaultsPresets);
+
+    auto* chromaspacePresetName = d.defineStringParam("chromaspacePresetName");
+    chromaspacePresetName->setLabel("Preset Name");
+    chromaspacePresetName->setDefault("");
+    chromaspacePresetName->setParent(*grpChromaspaceDefaultsPresets);
+
+    auto* chromaspacePresetSave = d.definePushButtonParam("chromaspacePresetSave");
+    chromaspacePresetSave->setLabel("Save Preset");
+    chromaspacePresetSave->setParent(*grpChromaspaceDefaultsPresets);
+
+    auto* chromaspacePresetSaveDefaults = d.definePushButtonParam("chromaspacePresetSaveDefaults");
+    chromaspacePresetSaveDefaults->setLabel("Save Defaults");
+    chromaspacePresetSaveDefaults->setParent(*grpChromaspaceDefaultsPresets);
+
+    auto* chromaspacePresetUpdate = d.definePushButtonParam("chromaspacePresetUpdate");
+    chromaspacePresetUpdate->setLabel("Update Preset");
+    chromaspacePresetUpdate->setEnabled(false);
+    chromaspacePresetUpdate->setParent(*grpChromaspaceDefaultsPresets);
+
+    auto* chromaspacePresetRename = d.definePushButtonParam("chromaspacePresetRename");
+    chromaspacePresetRename->setLabel("Rename Preset");
+    chromaspacePresetRename->setEnabled(false);
+    chromaspacePresetRename->setParent(*grpChromaspaceDefaultsPresets);
+
+    auto* chromaspacePresetDelete = d.definePushButtonParam("chromaspacePresetDelete");
+    chromaspacePresetDelete->setLabel("Delete Preset");
+    chromaspacePresetDelete->setEnabled(false);
+    chromaspacePresetDelete->setParent(*grpChromaspaceDefaultsPresets);
 
     auto* cubeViewerOverflowHighlightColor = d.defineRGBParam("cubeViewerOverflowHighlightColor");
     cubeViewerOverflowHighlightColor->setLabel("Highlight Color");
