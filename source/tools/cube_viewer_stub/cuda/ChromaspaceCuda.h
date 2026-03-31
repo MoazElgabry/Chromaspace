@@ -31,6 +31,7 @@ struct OverlayRequest {
   int ramp = 0;
   int useInputPoints = 0;
   int pointCount = 0;
+  float colorSaturation = 1.18f;
   RemapUniforms remap;
 };
 
@@ -38,6 +39,7 @@ struct InputRequest {
   int pointCount = 0;
   float pointAlphaScale = 1.0f;
   float denseAlphaBias = 0.0f;
+  float colorSaturation = 1.18f;
   RemapUniforms remap;
 };
 

@@ -31,6 +31,7 @@ struct OverlayUniforms {
   int ramp;
   int useInputPoints;
   int pointCount;
+  float colorSaturation;
   int plotMode;
   int circularHsl;
   int circularHsv;
@@ -47,6 +48,7 @@ struct InputUniforms {
   int normConeNormalized;
   float pointAlphaScale;
   float denseAlphaBias;
+  float colorSaturation;
 };
 
 struct InputSampleUniforms {
@@ -77,6 +79,7 @@ struct OverlayUniforms {
   int ramp;
   int useInputPoints;
   int pointCount;
+  float colorSaturation;
   int plotMode;
   int circularHsl;
   int circularHsv;
@@ -93,6 +96,7 @@ struct InputUniforms {
   int normConeNormalized;
   float pointAlphaScale;
   float denseAlphaBias;
+  float colorSaturation;
 };
 
 struct InputSampleUniforms {
@@ -292,6 +296,92 @@ void mapDisplayColor(float inR, float inG, float inB, thread float& outR, thread
   outB = pow(clamp01(inB), 1.0 / 2.2);
 }
 
+void rgbToHsl(float r, float g, float b, thread float& outH, thread float& outS, thread float& outL) {
+  float cMax = max(r, max(g, b));
+  float cMin = min(r, min(g, b));
+  float delta = cMax - cMin;
+  outL = 0.5 * (cMax + cMin);
+  outH = 0.0;
+  outS = 0.0;
+  if (delta > 1e-6) {
+    float denom = max(1e-6, 1.0 - abs(2.0 * outL - 1.0));
+    outS = delta / denom;
+    outH = rawRgbHue01(r, g, b, cMax, delta);
+  }
+}
+
+float hueToRgbChannel(float p, float q, float t) {
+  if (t < 0.0) t += 1.0;
+  if (t > 1.0) t -= 1.0;
+  if (t < 1.0 / 6.0) return p + (q - p) * 6.0 * t;
+  if (t < 1.0 / 2.0) return q;
+  if (t < 2.0 / 3.0) return p + (q - p) * (2.0 / 3.0 - t) * 6.0;
+  return p;
+}
+
+void hslToRgb(float h, float s, float l, thread float& outR, thread float& outG, thread float& outB) {
+  h = wrapHue01(h);
+  s = clamp01(s);
+  l = clamp01(l);
+  if (s <= 1e-6) {
+    outR = l;
+    outG = l;
+    outB = l;
+    return;
+  }
+  float q = l < 0.5 ? l * (1.0 + s) : l + s - l * s;
+  float p = 2.0 * l - q;
+  outR = clamp01(hueToRgbChannel(p, q, h + 1.0 / 3.0));
+  outG = clamp01(hueToRgbChannel(p, q, h));
+  outB = clamp01(hueToRgbChannel(p, q, h - 1.0 / 3.0));
+}
+
+void applyDisplaySaturation(float saturation, thread float& r, thread float& g, thread float& b) {
+  float sat = clamp(saturation, 1.0, 6.0);
+  float baseR = clamp01(r);
+  float baseG = clamp01(g);
+  float baseB = clamp01(b);
+  float luma = clamp(baseR * 0.2126 + baseG * 0.7152 + baseB * 0.0722, 0.0, 1.0);
+  if (sat <= 1.0) {
+    r = max(0.0, luma + (baseR - luma) * sat);
+    g = max(0.0, luma + (baseG - luma) * sat);
+    b = max(0.0, luma + (baseB - luma) * sat);
+  } else {
+    float h = 0.0;
+    float s = 0.0;
+    float l = 0.0;
+    rgbToHsl(baseR, baseG, baseB, h, s, l);
+    if (s <= 1e-5) {
+      r = baseR;
+      g = baseG;
+      b = baseB;
+    } else {
+      float t = clamp((sat - 1.0) / 5.0, 0.0, 1.0);
+      float shaped = pow(t, 0.55);
+      float targetS = clamp(s + (1.0 - s) * (0.32 + 0.68 * shaped), 0.0, 1.0);
+      float highlight = clamp((l - 0.58) / 0.34, 0.0, 1.0);
+      float targetL = clamp(l - highlight * (0.08 + 0.10 * shaped), 0.0, 1.0);
+      float boostedR = baseR;
+      float boostedG = baseG;
+      float boostedB = baseB;
+      hslToRgb(h, targetS, targetL, boostedR, boostedG, boostedB);
+      float mixAmount = clamp(0.24 + 0.76 * shaped, 0.0, 1.0);
+      r = max(0.0, baseR * (1.0 - mixAmount) + boostedR * mixAmount);
+      g = max(0.0, baseG * (1.0 - mixAmount) + boostedG * mixAmount);
+      b = max(0.0, baseB * (1.0 - mixAmount) + boostedB * mixAmount);
+    }
+  }
+  float peak = max(r, max(g, b));
+  if (peak > 1.0) {
+    r /= peak;
+    g /= peak;
+    b /= peak;
+  }
+  r = clamp(r, 0.0, 1.0);
+  g = clamp(g, 0.0, 1.0);
+  b = clamp(b, 0.0, 1.0);
+}
+
 bool pointOverflowsCube(float r, float g, float b) {
   return r < 0.0 || r > 1.0 || g < 0.0 || g > 1.0 || b < 0.0 || b > 1.0;
 }
@@ -343,6 +433,7 @@ kernel void overlayKernel(const device float4* inputVals [[buffer(0)]],
   float cg;
   float cb;
   mapDisplayColor(r, g, b, cr, cg, cb);
+  applyDisplaySaturation(u.colorSaturation, cr, cg, cb);
   colorVals[index] = float4(cr, cg, cb, alpha);
 }
 
@@ -372,6 +463,7 @@ kernel void inputKernel(const device packed_float3* inputVals [[buffer(0)]],
     cb = 0.0;
   } else {
     mapDisplayColor(r, g, b, cr, cg, cb);
+    applyDisplaySaturation(u.colorSaturation, cr, cg, cb);
   }
   bool overflowHighlighted = (u.showOverflow != 0 && u.highlightOverflow != 0 && overflowPoint);
   colorVals[index] = float4(cr, cg, cb,
@@ -650,6 +742,7 @@ bool buildOverlayMesh(const OverlayRequest& request,
   uniforms.ramp = request.ramp;
   uniforms.useInputPoints = request.useInputPoints;
   uniforms.pointCount = request.pointCount;
+  uniforms.colorSaturation = request.colorSaturation;
   uniforms.plotMode = request.remap.plotMode;
   uniforms.circularHsl = request.remap.circularHsl;
   uniforms.circularHsv = request.remap.circularHsv;
@@ -716,6 +809,7 @@ bool buildInputMesh(const InputRequest& request,
   uniforms.normConeNormalized = request.remap.normConeNormalized;
   uniforms.pointAlphaScale = request.pointAlphaScale;
   uniforms.denseAlphaBias = request.denseAlphaBias;
+  uniforms.colorSaturation = request.colorSaturation;
 
   id<MTLBuffer> inputBuffer = makeSharedBuffer(reinterpret_cast<const PackedFloat3*>(rawPoints.data()), pointCount);
   id<MTLBuffer> vertBuffer = makeEmptySharedBuffer(pointCount * sizeof(PackedFloat3));

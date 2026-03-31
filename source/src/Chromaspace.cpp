@@ -648,6 +648,17 @@ int getPointShapeValue(int index, int fallback = 0) {
   return index < 0 || index > 1 ? fallback : index;
 }
 
+int getPlotStyleValue(int index, int fallback = 0) {
+  return index < 0 || index > 1 ? fallback : index;
+}
+
+const char* plotStyleLabelForIndex(int index) {
+  switch (getPlotStyleValue(index)) {
+    case 1: return "Space";
+    default: return "Plain Scope";
+  }
+}
+
 const char* pointShapeLabelForIndex(int index) {
   switch (getPointShapeValue(index)) {
     case 1: return "Square";
@@ -1374,14 +1385,28 @@ struct ChromaspacePresetValues {
   int inputTransferFunction = static_cast<int>(WorkshopColor::TransferFunctionId::Gamma24);
   bool showOverflow = false;
   bool highlightOverflow = true;
+  bool fillVolume = false;
   int fillResolution = 29;
   int identityReadResolution = 29;
+  bool volumeSliceLassoRegion = false;
+  bool volumeSliceRed = false;
+  bool volumeSliceYellow = false;
+  bool volumeSliceGreen = false;
+  bool volumeSliceCyan = false;
+  bool volumeSliceBlue = false;
+  bool volumeSliceMagenta = false;
+  double neutralRadius = 1.0;
+  bool readGrayRamp = false;
+  bool readIdentityPlot = false;
+  bool isolateIdentityData = false;
   bool liveUpdate = true;
   bool keepOnTop = true;
   int updateMode = 0;
   int quality = 0;
   int scale = 3;
+  int plotStyle = 1;
   double pointSize = 1.1;
+  double colorSaturation = 2.0;
   int pointShape = 0;
   int sampling = 0;
   bool occupancyGuidedFill = true;
@@ -1421,14 +1446,28 @@ ChromaspacePresetValues chromaspaceFactoryPresetValues() {
   values.inputTransferFunction = static_cast<int>(WorkshopColor::TransferFunctionId::Gamma24);
   values.showOverflow = false;
   values.highlightOverflow = true;
+  values.fillVolume = false;
   values.fillResolution = 29;
   values.identityReadResolution = 29;
+  values.volumeSliceLassoRegion = false;
+  values.volumeSliceRed = false;
+  values.volumeSliceYellow = false;
+  values.volumeSliceGreen = false;
+  values.volumeSliceCyan = false;
+  values.volumeSliceBlue = false;
+  values.volumeSliceMagenta = false;
+  values.neutralRadius = 1.0;
+  values.readGrayRamp = false;
+  values.readIdentityPlot = false;
+  values.isolateIdentityData = false;
   values.liveUpdate = true;
   values.keepOnTop = true;
   values.updateMode = 0;
   values.quality = 0;
   values.scale = 3;
+  values.plotStyle = 1;
   values.pointSize = 1.1;
+  values.colorSaturation = 2.0;
   values.pointShape = 0;
   values.sampling = 0;
   values.occupancyGuidedFill = true;
@@ -1513,14 +1552,28 @@ bool chromaspacePresetValuesEqual(const ChromaspacePresetValues& a, const Chroma
          a.inputTransferFunction == b.inputTransferFunction &&
          a.showOverflow == b.showOverflow &&
          a.highlightOverflow == b.highlightOverflow &&
+         a.fillVolume == b.fillVolume &&
          a.fillResolution == b.fillResolution &&
          a.identityReadResolution == b.identityReadResolution &&
+         a.volumeSliceLassoRegion == b.volumeSliceLassoRegion &&
+         a.volumeSliceRed == b.volumeSliceRed &&
+         a.volumeSliceYellow == b.volumeSliceYellow &&
+         a.volumeSliceGreen == b.volumeSliceGreen &&
+         a.volumeSliceCyan == b.volumeSliceCyan &&
+         a.volumeSliceBlue == b.volumeSliceBlue &&
+         a.volumeSliceMagenta == b.volumeSliceMagenta &&
+         std::abs(a.neutralRadius - b.neutralRadius) <= 1e-6 &&
+         a.readGrayRamp == b.readGrayRamp &&
+         a.readIdentityPlot == b.readIdentityPlot &&
+         a.isolateIdentityData == b.isolateIdentityData &&
          a.liveUpdate == b.liveUpdate &&
          a.keepOnTop == b.keepOnTop &&
          a.updateMode == b.updateMode &&
          a.quality == b.quality &&
          a.scale == b.scale &&
+         a.plotStyle == b.plotStyle &&
          std::abs(a.pointSize - b.pointSize) <= 1e-6 &&
+         std::abs(a.colorSaturation - b.colorSaturation) <= 1e-6 &&
          a.pointShape == b.pointShape &&
          a.sampling == b.sampling &&
          a.occupancyGuidedFill == b.occupancyGuidedFill;
@@ -1711,14 +1764,28 @@ std::string chromaspacePresetValuesAsJson(const ChromaspacePresetValues& values)
   os << "\"inputTransferFunction\":" << values.inputTransferFunction << ",";
   os << "\"showOverflow\":" << (values.showOverflow ? "true" : "false") << ",";
   os << "\"highlightOverflow\":" << (values.highlightOverflow ? "true" : "false") << ",";
+  os << "\"fillVolume\":" << (values.fillVolume ? "true" : "false") << ",";
   os << "\"fillResolution\":" << values.fillResolution << ",";
   os << "\"identityReadResolution\":" << values.identityReadResolution << ",";
+  os << "\"volumeSliceLassoRegion\":" << (values.volumeSliceLassoRegion ? "true" : "false") << ",";
+  os << "\"volumeSliceRed\":" << (values.volumeSliceRed ? "true" : "false") << ",";
+  os << "\"volumeSliceYellow\":" << (values.volumeSliceYellow ? "true" : "false") << ",";
+  os << "\"volumeSliceGreen\":" << (values.volumeSliceGreen ? "true" : "false") << ",";
+  os << "\"volumeSliceCyan\":" << (values.volumeSliceCyan ? "true" : "false") << ",";
+  os << "\"volumeSliceBlue\":" << (values.volumeSliceBlue ? "true" : "false") << ",";
+  os << "\"volumeSliceMagenta\":" << (values.volumeSliceMagenta ? "true" : "false") << ",";
+  os << "\"neutralRadius\":" << std::setprecision(15) << values.neutralRadius << ",";
+  os << "\"readGrayRamp\":" << (values.readGrayRamp ? "true" : "false") << ",";
+  os << "\"readIdentityPlot\":" << (values.readIdentityPlot ? "true" : "false") << ",";
+  os << "\"isolateIdentityData\":" << (values.isolateIdentityData ? "true" : "false") << ",";
   os << "\"liveUpdate\":" << (values.liveUpdate ? "true" : "false") << ",";
   os << "\"keepOnTop\":" << (values.keepOnTop ? "true" : "false") << ",";
   os << "\"updateMode\":" << values.updateMode << ",";
   os << "\"quality\":" << values.quality << ",";
   os << "\"scale\":" << values.scale << ",";
+  os << "\"plotStyle\":" << values.plotStyle << ",";
   os << "\"pointSize\":" << std::setprecision(15) << values.pointSize << ",";
+  os << "\"colorSaturation\":" << std::setprecision(15) << values.colorSaturation << ",";
   os << "\"pointShape\":" << values.pointShape << ",";
   os << "\"sampling\":" << values.sampling << ",";
   os << "\"occupancyGuidedFill\":" << (values.occupancyGuidedFill ? "true" : "false");
@@ -1734,14 +1801,28 @@ bool parseChromaspacePresetValuesFromJson(const std::string& json, ChromaspacePr
   (void)extractJsonIntField(json, "inputTransferFunction", &values.inputTransferFunction);
   (void)extractJsonBoolField(json, "showOverflow", &values.showOverflow);
   (void)extractJsonBoolField(json, "highlightOverflow", &values.highlightOverflow);
+  (void)extractJsonBoolField(json, "fillVolume", &values.fillVolume);
   (void)extractJsonIntField(json, "fillResolution", &values.fillResolution);
   (void)extractJsonIntField(json, "identityReadResolution", &values.identityReadResolution);
+  (void)extractJsonBoolField(json, "volumeSliceLassoRegion", &values.volumeSliceLassoRegion);
+  (void)extractJsonBoolField(json, "volumeSliceRed", &values.volumeSliceRed);
+  (void)extractJsonBoolField(json, "volumeSliceYellow", &values.volumeSliceYellow);
+  (void)extractJsonBoolField(json, "volumeSliceGreen", &values.volumeSliceGreen);
+  (void)extractJsonBoolField(json, "volumeSliceCyan", &values.volumeSliceCyan);
+  (void)extractJsonBoolField(json, "volumeSliceBlue", &values.volumeSliceBlue);
+  (void)extractJsonBoolField(json, "volumeSliceMagenta", &values.volumeSliceMagenta);
+  (void)extractJsonDoubleField(json, "neutralRadius", &values.neutralRadius);
+  (void)extractJsonBoolField(json, "readGrayRamp", &values.readGrayRamp);
+  (void)extractJsonBoolField(json, "readIdentityPlot", &values.readIdentityPlot);
+  (void)extractJsonBoolField(json, "isolateIdentityData", &values.isolateIdentityData);
   (void)extractJsonBoolField(json, "liveUpdate", &values.liveUpdate);
   (void)extractJsonBoolField(json, "keepOnTop", &values.keepOnTop);
   (void)extractJsonIntField(json, "updateMode", &values.updateMode);
   (void)extractJsonIntField(json, "quality", &values.quality);
   (void)extractJsonIntField(json, "scale", &values.scale);
+  (void)extractJsonIntField(json, "plotStyle", &values.plotStyle);
   (void)extractJsonDoubleField(json, "pointSize", &values.pointSize);
+  (void)extractJsonDoubleField(json, "colorSaturation", &values.colorSaturation);
   (void)extractJsonIntField(json, "pointShape", &values.pointShape);
   (void)extractJsonIntField(json, "sampling", &values.sampling);
   (void)extractJsonBoolField(json, "occupancyGuidedFill", &values.occupancyGuidedFill);
@@ -2359,6 +2440,24 @@ class ChromaspaceEffect : public ImageEffect {
       showChromaspacePresetInfoDialog("Chromaspace defaults saved.\n\nThese new defaults will be used from the next plugin or host restart.");
       return;
     }
+    if (paramName == "chromaspacePresetRestoreDefaults") {
+      {
+        std::lock_guard<std::mutex> lock(chromaspacePresetMutex());
+        ensureChromaspacePresetStoreLoadedLocked();
+        auto& preset = chromaspacePresetStore().defaultPreset;
+        preset.id = "default";
+        preset.name = kChromaspacePresetDefaultName;
+        if (preset.createdAtUtc.empty()) preset.createdAtUtc = nowUtcIso8601();
+        preset.updatedAtUtc = nowUtcIso8601();
+        preset.values = chromaspaceFactoryPresetValues();
+        saveChromaspacePresetStoreLocked();
+      }
+      ChromaspacePresetSelection selection{};
+      selection.kind = ChromaspacePresetSelection::Kind::Default;
+      applyChromaspacePresetSelection(args.time, selection, "chromaspacePresetRestoreDefaults");
+      showChromaspacePresetInfoDialog("Chromaspace defaults restored.\n\nThe protected Default preset has been reset to the factory developer defaults, and those defaults will be used for new instances after the next plugin or host restart.");
+      return;
+    }
     if (paramName == "chromaspacePresetUpdate") {
       const ChromaspacePresetSelection selection = selectedChromaspacePresetFromMenu(args.time);
       if (selection.kind != ChromaspacePresetSelection::Kind::User || selection.userIndex < 0) return;
@@ -2500,6 +2599,24 @@ class ChromaspaceEffect : public ImageEffect {
       }
       return;
     }
+    if (paramName == "cubeViewerPlotStyle") {
+      cubeViewerDebugLog(std::string("changedParam(cubeViewerPlotStyle) -> ") +
+                         plotStyleLabelForIndex(getChoiceValue("cubeViewerPlotStyle", args.time, 0)));
+      syncChromaspacePresetMenuState(args.time);
+      if (viewerSessionRequested()) {
+        pushParamsUpdate(args.time, "cubeViewerPlotStyle");
+      }
+      return;
+    }
+    if (paramName == "cubeViewerColorSaturation") {
+      cubeViewerDebugLog(std::string("changedParam(cubeViewerColorSaturation) -> ") +
+                         std::to_string(getDoubleValue("cubeViewerColorSaturation", args.time, 2.0)));
+      syncChromaspacePresetMenuState(args.time);
+      if (viewerSessionRequested()) {
+        pushParamsUpdate(args.time, "cubeViewerColorSaturation");
+      }
+      return;
+    }
     if (paramName == "cubeViewerSamplingMode") {
       cubeViewerDebugLog(std::string("changedParam(cubeViewerSamplingMode) -> ") +
                          samplingModeLabelForIndex(getChoiceValue("cubeViewerSamplingMode", args.time, 0)));
@@ -2557,6 +2674,7 @@ class ChromaspaceEffect : public ImageEffect {
       cubeViewerDebugLog(std::string("changedParam(cubeViewerNeutralRadius) -> ") +
                          std::to_string(currentNeutralRadiusValue(args.time)));
       requestCubeViewerCloudResample();
+      syncChromaspacePresetMenuState(args.time);
       if (viewerSessionRequested()) {
         pushParamsUpdate(args.time, "cubeViewerNeutralRadius");
       }
@@ -2577,6 +2695,7 @@ class ChromaspaceEffect : public ImageEffect {
       cubeViewerDebugLog(std::string("changedParam(cubeViewerLassoRegionMode) -> ") +
                          (currentLassoRegionSlicingEnabled(args.time) ? "1" : "0"));
       syncCubeSlicingUi(args.time);
+      syncChromaspacePresetMenuState(args.time);
       if (viewerSessionRequested()) {
         pushParamsUpdate(args.time, "cubeViewerLassoRegionMode");
       }
@@ -2589,6 +2708,7 @@ class ChromaspaceEffect : public ImageEffect {
       cubeViewerDebugLog(std::string("changedParam(") + paramName + ") -> " +
                          (getBoolValue(paramName, args.time, true) ? "1" : "0"));
       syncCubeSlicingUi(args.time);
+      syncChromaspacePresetMenuState(args.time);
       if (viewerSessionRequested()) {
         pushParamsUpdate(args.time, paramName);
       }
@@ -2640,6 +2760,7 @@ class ChromaspaceEffect : public ImageEffect {
       cubeViewerDebugLog(std::string("changedParam(cubeViewerIdentityOverlayEnabled) -> ") +
                          (getBoolValue("cubeViewerIdentityOverlayEnabled", args.time, false) ? "1" : "0"));
       updateDrawOnImageModeUi(args.time);
+      syncChromaspacePresetMenuState(args.time);
       if (viewerSessionRequested()) {
         pushParamsUpdate(args.time, "cubeViewerIdentityOverlayEnabled");
       }
@@ -2673,6 +2794,7 @@ class ChromaspaceEffect : public ImageEffect {
       cubeViewerDebugLog(std::string("changedParam(cubeViewerIdentityOverlayEnabledDraw) -> ") +
                          (enabled ? "1" : "0"));
       updateDrawOnImageModeUi(args.time);
+      syncChromaspacePresetMenuState(args.time);
       if (viewerSessionRequested()) {
         pushParamsUpdate(args.time, "cubeViewerIdentityOverlayEnabledDraw");
       }
@@ -2697,6 +2819,7 @@ class ChromaspaceEffect : public ImageEffect {
       }
       syncIdentityReadbackUi(args.time);
       invalidateCubeViewerCloudState();
+      syncChromaspacePresetMenuState(args.time);
       if (viewerSessionRequested()) {
         pushParamsUpdate(args.time, "cubeViewerSampleDrawnCubeOnly");
       }
@@ -2711,6 +2834,7 @@ class ChromaspaceEffect : public ImageEffect {
       }
       syncIdentityReadbackUi(args.time);
       invalidateCubeViewerCloudState();
+      syncChromaspacePresetMenuState(args.time);
       if (viewerSessionRequested()) {
         pushParamsUpdate(args.time, "cubeViewerReadGrayRamp");
       }
@@ -2720,6 +2844,7 @@ class ChromaspaceEffect : public ImageEffect {
       cubeViewerDebugLog(std::string("changedParam(cubeViewerShowIdentityOnly) -> ") +
                          (getBoolValue("cubeViewerShowIdentityOnly", args.time, false) ? "1" : "0"));
       invalidateCubeViewerCloudState();
+      syncChromaspacePresetMenuState(args.time);
       if (viewerSessionRequested()) {
         pushParamsUpdate(args.time, "cubeViewerShowIdentityOnly");
       }
@@ -3393,23 +3518,41 @@ class ChromaspaceEffect : public ImageEffect {
     };
     Kind kind = Kind::Default;
     int userIndex = -1;
+    bool modified = false;
   };
 
   ChromaspacePresetValues captureCurrentChromaspacePresetValues(double time) const {
     ChromaspacePresetValues values = chromaspaceFactoryPresetValues();
+    const bool drawOnImage = getBoolValue("cubeViewerDrawOnImageEnabled", time, false);
     values.plotModel = getChoiceValue("cubeViewerPlotModel", time, values.plotModel);
     values.plotInLinear = getBoolValue("cubeViewerPlotDisplayLinear", time, values.plotInLinear);
     values.inputTransferFunction = static_cast<int>(currentPlotDisplayLinearTransferId(time));
     values.showOverflow = getBoolValue("cubeViewerShowOverflow", time, values.showOverflow);
     values.highlightOverflow = getBoolValue("cubeViewerHighlightOverflow", time, values.highlightOverflow);
+    values.fillVolume = drawOnImage
+                            ? getBoolValue("cubeViewerIdentityOverlayEnabledDraw", time, values.fillVolume)
+                            : getBoolValue("cubeViewerIdentityOverlayEnabled", time, values.fillVolume);
     values.fillResolution = getIntValue("cubeViewerIdentityOverlaySize", time, values.fillResolution);
     values.identityReadResolution = getIntValue("cubeViewerSampleDrawnCubeSize", time, values.identityReadResolution);
+    values.volumeSliceLassoRegion = getBoolValue("cubeViewerLassoRegionMode", time, values.volumeSliceLassoRegion);
+    values.volumeSliceRed = getBoolValue("cubeViewerSliceRed", time, values.volumeSliceRed);
+    values.volumeSliceYellow = getBoolValue("cubeViewerSliceYellow", time, values.volumeSliceYellow);
+    values.volumeSliceGreen = getBoolValue("cubeViewerSliceGreen", time, values.volumeSliceGreen);
+    values.volumeSliceCyan = getBoolValue("cubeViewerSliceCyan", time, values.volumeSliceCyan);
+    values.volumeSliceBlue = getBoolValue("cubeViewerSliceBlue", time, values.volumeSliceBlue);
+    values.volumeSliceMagenta = getBoolValue("cubeViewerSliceMagenta", time, values.volumeSliceMagenta);
+    values.neutralRadius = std::clamp(getDoubleValue("cubeViewerNeutralRadius", time, values.neutralRadius), 0.0, 1.0);
+    values.readGrayRamp = !drawOnImage && getBoolValue("cubeViewerReadGrayRamp", time, values.readGrayRamp);
+    values.readIdentityPlot = !drawOnImage && getBoolValue("cubeViewerSampleDrawnCubeOnly", time, values.readIdentityPlot);
+    values.isolateIdentityData = !drawOnImage && getBoolValue("cubeViewerShowIdentityOnly", time, values.isolateIdentityData);
     values.liveUpdate = getBoolValue("cubeViewerLive", time, values.liveUpdate);
     values.keepOnTop = getBoolValue("cubeViewerOnTop", time, values.keepOnTop);
     values.updateMode = getChoiceValue("cubeViewerUpdateMode", time, values.updateMode);
     values.quality = getChoiceValue("cubeViewerQuality", time, values.quality);
     values.scale = getChoiceValue("cubeViewerScale", time, values.scale);
+    values.plotStyle = getChoiceValue("cubeViewerPlotStyle", time, values.plotStyle);
     values.pointSize = getDoubleValue("cubeViewerPointSize", time, values.pointSize);
+    values.colorSaturation = getDoubleValue("cubeViewerColorSaturation", time, values.colorSaturation);
     values.pointShape = getChoiceValue("cubeViewerPointShape", time, values.pointShape);
     values.sampling = getChoiceValue("cubeViewerSamplingMode", time, values.sampling);
     values.occupancyGuidedFill = getBoolValue("cubeViewerOccupancyGuidedFill", time, values.occupancyGuidedFill);
@@ -3425,14 +3568,29 @@ class ChromaspaceEffect : public ImageEffect {
     }
     if (auto* p = fetchBooleanParam("cubeViewerShowOverflow")) p->setValue(values.showOverflow);
     if (auto* p = fetchBooleanParam("cubeViewerHighlightOverflow")) p->setValue(values.highlightOverflow);
+    if (auto* p = fetchBooleanParam("cubeViewerIdentityOverlayEnabled")) p->setValue(values.fillVolume);
+    if (auto* p = fetchBooleanParam("cubeViewerIdentityOverlayEnabledDraw")) p->setValue(values.fillVolume);
     if (auto* p = fetchIntParam("cubeViewerIdentityOverlaySize")) p->setValue(values.fillResolution);
     if (auto* p = fetchIntParam("cubeViewerSampleDrawnCubeSize")) p->setValue(values.identityReadResolution);
+    if (auto* p = fetchBooleanParam("cubeViewerLassoRegionMode")) p->setValue(values.volumeSliceLassoRegion);
+    if (auto* p = fetchBooleanParam("cubeViewerSliceRed")) p->setValue(values.volumeSliceRed);
+    if (auto* p = fetchBooleanParam("cubeViewerSliceYellow")) p->setValue(values.volumeSliceYellow);
+    if (auto* p = fetchBooleanParam("cubeViewerSliceGreen")) p->setValue(values.volumeSliceGreen);
+    if (auto* p = fetchBooleanParam("cubeViewerSliceCyan")) p->setValue(values.volumeSliceCyan);
+    if (auto* p = fetchBooleanParam("cubeViewerSliceBlue")) p->setValue(values.volumeSliceBlue);
+    if (auto* p = fetchBooleanParam("cubeViewerSliceMagenta")) p->setValue(values.volumeSliceMagenta);
+    if (auto* p = fetchDoubleParam("cubeViewerNeutralRadius")) p->setValue(values.neutralRadius);
+    if (auto* p = fetchBooleanParam("cubeViewerReadGrayRamp")) p->setValue(values.readGrayRamp);
+    if (auto* p = fetchBooleanParam("cubeViewerSampleDrawnCubeOnly")) p->setValue(values.readIdentityPlot);
+    if (auto* p = fetchBooleanParam("cubeViewerShowIdentityOnly")) p->setValue(values.isolateIdentityData);
     if (auto* p = fetchBooleanParam("cubeViewerLive")) p->setValue(values.liveUpdate);
     if (auto* p = fetchBooleanParam("cubeViewerOnTop")) p->setValue(values.keepOnTop);
     if (auto* p = fetchChoiceParam("cubeViewerUpdateMode")) p->setValue(values.updateMode);
     if (auto* p = fetchChoiceParam("cubeViewerQuality")) p->setValue(values.quality);
     if (auto* p = fetchChoiceParam("cubeViewerScale")) p->setValue(values.scale);
+    if (auto* p = fetchChoiceParam("cubeViewerPlotStyle")) p->setValue(values.plotStyle);
     if (auto* p = fetchDoubleParam("cubeViewerPointSize")) p->setValue(values.pointSize);
+    if (auto* p = fetchDoubleParam("cubeViewerColorSaturation")) p->setValue(values.colorSaturation);
     if (auto* p = fetchChoiceParam("cubeViewerPointShape")) p->setValue(values.pointShape);
     if (auto* p = fetchChoiceParam("cubeViewerSamplingMode")) p->setValue(values.sampling);
     if (auto* p = fetchBooleanParam("cubeViewerOccupancyGuidedFill")) p->setValue(values.occupancyGuidedFill);
@@ -3456,6 +3614,19 @@ class ChromaspaceEffect : public ImageEffect {
     ChromaspacePresetSelection selection{};
     selection.kind = ChromaspacePresetSelection::Kind::Custom;
     return selection;
+  }
+
+  ChromaspacePresetSelection resolvedChromaspacePresetSelection(double time) const {
+    const ChromaspacePresetSelection exact = matchingChromaspacePresetSelection(time);
+    if (exact.kind != ChromaspacePresetSelection::Kind::Custom) return exact;
+
+    const ChromaspacePresetSelection currentMenuSelection = selectedChromaspacePresetFromMenu(time);
+    if (currentMenuSelection.kind == ChromaspacePresetSelection::Kind::User) {
+      ChromaspacePresetSelection modified = currentMenuSelection;
+      modified.modified = true;
+      return modified;
+    }
+    return exact;
   }
 
   ChromaspacePresetSelection selectedChromaspacePresetFromMenu(double time) const {
@@ -3490,7 +3661,15 @@ class ChromaspaceEffect : public ImageEffect {
       names.reserve(chromaspacePresetStore().userPresets.size());
       for (const auto& preset : chromaspacePresetStore().userPresets) names.push_back(preset.name);
     }
-    for (const auto& name : names) param->appendOption(name);
+    for (int i = 0; i < static_cast<int>(names.size()); ++i) {
+      if (selection.kind == ChromaspacePresetSelection::Kind::User &&
+          selection.modified &&
+          selection.userIndex == i) {
+        param->appendOption(names[static_cast<std::size_t>(i)] + " (Modified)");
+      } else {
+        param->appendOption(names[static_cast<std::size_t>(i)]);
+      }
+    }
 
     chromaspacePresetMenuUserCount_ = static_cast<int>(names.size());
     chromaspacePresetMenuHasCustom_ = (selection.kind == ChromaspacePresetSelection::Kind::Custom);
@@ -3518,7 +3697,7 @@ class ChromaspaceEffect : public ImageEffect {
   }
 
   void syncChromaspacePresetMenuState(double time) {
-    rebuildChromaspacePresetMenu(time, matchingChromaspacePresetSelection(time));
+    rebuildChromaspacePresetMenu(time, resolvedChromaspacePresetSelection(time));
     updateChromaspacePresetActionState(time);
   }
 
@@ -3528,7 +3707,7 @@ class ChromaspaceEffect : public ImageEffect {
       std::lock_guard<std::mutex> lock(chromaspacePresetMutex());
       reloadChromaspacePresetStoreFromDiskLocked();
     }
-    rebuildChromaspacePresetMenu(time, preferred ? *preferred : matchingChromaspacePresetSelection(time));
+    rebuildChromaspacePresetMenu(time, preferred ? *preferred : resolvedChromaspacePresetSelection(time));
     updateChromaspacePresetActionState(time);
   }
 
@@ -3551,8 +3730,9 @@ class ChromaspaceEffect : public ImageEffect {
     }
   }
 
-  void applySelectedChromaspacePreset(double time) {
-    const ChromaspacePresetSelection selection = selectedChromaspacePresetFromMenu(time);
+  void applyChromaspacePresetSelection(double time,
+                                       const ChromaspacePresetSelection& selection,
+                                       const char* reasonParam) {
     if (selection.kind == ChromaspacePresetSelection::Kind::Custom) return;
 
     ChromaspacePresetValues values = chromaspaceFactoryPresetValues();
@@ -3574,11 +3754,15 @@ class ChromaspaceEffect : public ImageEffect {
 
     BoolScope scope(suppressChromaspacePresetChangedHandling_);
     writeChromaspacePresetValuesToParams(values);
-    finalizeChromaspacePresetApplication(time, "chromaspacePresetMenu");
+    finalizeChromaspacePresetApplication(time, reasonParam ? reasonParam : "chromaspacePresetMenu");
     syncChromaspacePresetMenuFromDisk(time, selection);
     if (selection.kind == ChromaspacePresetSelection::Kind::User) {
       if (auto* p = fetchStringParam("chromaspacePresetName")) p->setValue(presetName);
     }
+  }
+
+  void applySelectedChromaspacePreset(double time) {
+    applyChromaspacePresetSelection(time, selectedChromaspacePresetFromMenu(time), "chromaspacePresetMenu");
   }
 
   bool isChromaspacePresetManagedParam(const std::string& paramName) const {
@@ -3587,14 +3771,28 @@ class ChromaspaceEffect : public ImageEffect {
            paramName == "cubeViewerPlotDisplayLinearTransfer" ||
            paramName == "cubeViewerShowOverflow" ||
            paramName == "cubeViewerHighlightOverflow" ||
+           paramName == "cubeViewerIdentityOverlayEnabled" ||
+           paramName == "cubeViewerLassoRegionMode" ||
+           paramName == "cubeViewerSliceRed" ||
+           paramName == "cubeViewerSliceYellow" ||
+           paramName == "cubeViewerSliceGreen" ||
+           paramName == "cubeViewerSliceCyan" ||
+           paramName == "cubeViewerSliceBlue" ||
+           paramName == "cubeViewerSliceMagenta" ||
+           paramName == "cubeViewerNeutralRadius" ||
            paramName == "cubeViewerIdentityOverlaySize" ||
+           paramName == "cubeViewerReadGrayRamp" ||
+           paramName == "cubeViewerSampleDrawnCubeOnly" ||
+           paramName == "cubeViewerShowIdentityOnly" ||
            paramName == "cubeViewerSampleDrawnCubeSize" ||
            paramName == "cubeViewerLive" ||
            paramName == "cubeViewerOnTop" ||
            paramName == "cubeViewerUpdateMode" ||
            paramName == "cubeViewerQuality" ||
            paramName == "cubeViewerScale" ||
+           paramName == "cubeViewerPlotStyle" ||
            paramName == "cubeViewerPointSize" ||
+           paramName == "cubeViewerColorSaturation" ||
            paramName == "cubeViewerPointShape" ||
            paramName == "cubeViewerSamplingMode" ||
            paramName == "cubeViewerOccupancyGuidedFill";
@@ -3837,6 +4035,7 @@ class ChromaspaceEffect : public ImageEffect {
     setParamVisibility(fetchChoiceParam("cubeViewerQuality"), !drawOnImage);
     setParamVisibility(fetchChoiceParam("cubeViewerScale"), !drawOnImage);
     setParamVisibility(fetchDoubleParam("cubeViewerPointSize"), !drawOnImage);
+    setParamVisibility(fetchDoubleParam("cubeViewerColorSaturation"), !drawOnImage);
     setParamVisibility(fetchChoiceParam("cubeViewerPointShape"), !drawOnImage);
     setParamVisibility(fetchChoiceParam("cubeViewerSamplingMode"), !drawOnImage);
     setParamVisibility(fetchBooleanParam("cubeViewerOccupancyGuidedFill"), !drawOnImage);
@@ -4034,8 +4233,8 @@ class ChromaspaceEffect : public ImageEffect {
          << "|showOverflow=" << (showOverflow ? 1 : 0)
          << "|highlightOverflow=" << (highlightOverflow ? 1 : 0)
          << "|overflowColor=" << overflowColor[0] << "," << overflowColor[1] << "," << overflowColor[2]
-         << "|backgroundColor=" << backgroundColor[0] << "," << backgroundColor[1] << "," << backgroundColor[2]
-         << "|drawMode=" << (currentDrawOnImageMode(time) ? 1 : 0)
+        << "|backgroundColor=" << backgroundColor[0] << "," << backgroundColor[1] << "," << backgroundColor[2]
+        << "|drawMode=" << (currentDrawOnImageMode(time) ? 1 : 0)
         << "|useInstance1=" << (useInstance1 ? 1 : 0)
          << "|showIdentityOnly=" << (showIdentityOnly ? 1 : 0)
          << "|readIdentityPlot=" << (readIdentityPlot ? 1 : 0)
@@ -4063,9 +4262,11 @@ class ChromaspaceEffect : public ImageEffect {
     const int scaleIndex = getChoiceValue("cubeViewerScale", time, 3);
     const bool occupancyFill = currentOccupancyGuidedFill(time);
     const int pointShape = getPointShapeValue(getChoiceValue("cubeViewerPointShape", time, 0));
+    const int plotStyle = getPlotStyleValue(getChoiceValue("cubeViewerPlotStyle", time, 0));
     const int resolution = qualityResolutionForIndex(qualityIndex);
     const bool onTop = getBoolValue("cubeViewerOnTop", time, true);
     const double pointSize = getDoubleValue("cubeViewerPointSize", time, 1.4);
+    const double colorSaturation = getDoubleValue("cubeViewerColorSaturation", time, 2.0);
     const double pointDensity = derivedDensityScaleForPointSize(pointSize);
     const std::string sourceMode = currentSourceMode(time);
     const std::string plotMode = currentPlotMode(time);
@@ -4120,9 +4321,11 @@ class ChromaspaceEffect : public ImageEffect {
         << ",\"sampling\":\"" << samplingModeLabelForIndex(samplingMode) << "\""
         << ",\"occupancyFill\":" << (occupancyFill ? 1 : 0)
         << ",\"scale\":\"" << scaleLabelForIndex(scaleIndex) << "\""
+        << ",\"plotStyle\":\"" << plotStyleLabelForIndex(plotStyle) << "\""
         << ",\"pointShape\":\"" << pointShapeLabelForIndex(pointShape) << "\""
         << ",\"resolution\":" << resolution
         << ",\"pointSize\":" << pointSize
+        << ",\"colorSaturation\":" << colorSaturation
         << ",\"pointDensity\":" << pointDensity
         << ",\"showOverflow\":" << (showOverflow ? 1 : 0)
         << ",\"highlightOverflow\":" << (highlightOverflow ? 1 : 0)
@@ -4164,8 +4367,9 @@ class ChromaspaceEffect : public ImageEffect {
                          " scale=" + scaleLabelForIndex(scaleIndex) +
                          " pointShape=" + pointShapeLabelForIndex(pointShape) +
                          " res=" + std::to_string(resolution) +
-                          " pointSize=" + std::to_string(pointSize) +
-                          " pointDensity=" + std::to_string(pointDensity) +
+                         " pointSize=" + std::to_string(pointSize) +
+                         " colorSaturation=" + std::to_string(colorSaturation) +
+                         " pointDensity=" + std::to_string(pointDensity) +
                            " showOverflow=" + (showOverflow ? "1" : "0") +
                            " highlightOverflow=" + (highlightOverflow ? "1" : "0") +
                           " volumeSlicing=" + (volumeSlicingEnabled ? "1" : "0") +
@@ -7413,6 +7617,7 @@ class ChromaspaceFactory : public PluginFactoryHelper<ChromaspaceFactory> {
           {"cubeViewerQuality", "Viewer sampling density for the 3D cube (Low=25^3, about 45k points; Medium=41^3, about 90k points; High=57^3, about 180k points)."},
           {"cubeViewerScale", "Scales the sampled image domain used for cube generation to lighten processing. 100% keeps full size, while lower values reduce cloud-build work."},
           {"cubeViewerPointSize", "Makes points larger or smaller and automatically adjusts point density in the opposite direction to keep the cloud readable. Sizes above 1.0 use a looser density reduction so the cloud can clump more densely instead of opening up too much."},
+          {"cubeViewerColorSaturation", "Adjust how vivid the plotted colors appear in the viewer. Higher values reduce the washed-out white look and make it easier to read what hues are being plotted."},
           {"cubeViewerSamplingMode", "Balanced uses a deterministic lattice for stable coverage, Stratified adds jitter for cleaner coverage, and Random gives a noisier organic scatter."},
           {"cubeViewerOccupancyGuidedFill", "Adds a second occupancy-guided pass after the normal image sampler so sparsely occupied RGB regions receive more support and the plot reads denser without switching to the instance-1 workflow."},
           {"cubeViewerPointShape", "Choose whether points are rendered as circular or square splats in the viewer."},
@@ -7808,6 +8013,13 @@ class ChromaspaceFactory : public PluginFactoryHelper<ChromaspaceFactory> {
     grpCubeViewerAppearance->setOpen(false);
     grpCubeViewerAppearance->setParent(*grpCubeViewer);
 
+    auto* cubeViewerPlotStyle = d.defineChoiceParam("cubeViewerPlotStyle");
+    cubeViewerPlotStyle->setLabel("Plot Style");
+    cubeViewerPlotStyle->appendOption("Plain Scope");
+    cubeViewerPlotStyle->appendOption("Space");
+    cubeViewerPlotStyle->setDefault(std::clamp(chromaspaceDefaultValues.plotStyle, 0, 1));
+    cubeViewerPlotStyle->setParent(*grpCubeViewerAppearance);
+
     auto* cubeViewerPointSize = d.defineDoubleParam("cubeViewerPointSize");
     cubeViewerPointSize->setLabel("Point Size");
     cubeViewerPointSize->setDefault(std::clamp(chromaspaceDefaultValues.pointSize, 0.35, 3.0));
@@ -7816,6 +8028,15 @@ class ChromaspaceFactory : public PluginFactoryHelper<ChromaspaceFactory> {
     cubeViewerPointSize->setIncrement(0.025);
     cubeViewerPointSize->setParent(*grpCubeViewerAppearance);
     if (const char* hint = tooltipFor("cubeViewerPointSize")) cubeViewerPointSize->setHint(hint);
+
+    auto* cubeViewerColorSaturation = d.defineDoubleParam("cubeViewerColorSaturation");
+    cubeViewerColorSaturation->setLabel("Color Saturation");
+    cubeViewerColorSaturation->setDefault(std::clamp(chromaspaceDefaultValues.colorSaturation, 1.0, 6.0));
+    cubeViewerColorSaturation->setRange(1.0, 6.0);
+    cubeViewerColorSaturation->setDisplayRange(1.0, 6.0);
+    cubeViewerColorSaturation->setIncrement(0.01);
+    cubeViewerColorSaturation->setParent(*grpCubeViewerAppearance);
+    if (const char* hint = tooltipFor("cubeViewerColorSaturation")) cubeViewerColorSaturation->setHint(hint);
 
     auto* cubeViewerPointShape = d.defineChoiceParam("cubeViewerPointShape");
     cubeViewerPointShape->setLabel("Point Shape");
@@ -7864,6 +8085,10 @@ class ChromaspaceFactory : public PluginFactoryHelper<ChromaspaceFactory> {
     auto* chromaspacePresetSaveDefaults = d.definePushButtonParam("chromaspacePresetSaveDefaults");
     chromaspacePresetSaveDefaults->setLabel("Save Defaults");
     chromaspacePresetSaveDefaults->setParent(*grpChromaspaceDefaultsPresets);
+
+    auto* chromaspacePresetRestoreDefaults = d.definePushButtonParam("chromaspacePresetRestoreDefaults");
+    chromaspacePresetRestoreDefaults->setLabel("Restore Defaults");
+    chromaspacePresetRestoreDefaults->setParent(*grpChromaspaceDefaultsPresets);
 
     auto* chromaspacePresetUpdate = d.definePushButtonParam("chromaspacePresetUpdate");
     chromaspacePresetUpdate->setLabel("Update Preset");

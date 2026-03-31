@@ -60,6 +60,15 @@
 #ifndef GL_STATIC_DRAW
 #define GL_STATIC_DRAW 0x88E4
 #endif
+#ifndef GL_VERTEX_PROGRAM_POINT_SIZE
+#define GL_VERTEX_PROGRAM_POINT_SIZE 0x8642
+#endif
+#ifndef GL_VERTEX_SHADER
+#define GL_VERTEX_SHADER 0x8B31
+#endif
+#ifndef GL_FRAGMENT_SHADER
+#define GL_FRAGMENT_SHADER 0x8B30
+#endif
 #ifndef GL_DYNAMIC_DRAW
 #define GL_DYNAMIC_DRAW 0x88E8
 #endif
@@ -930,6 +939,17 @@ struct ViewerGlComputeApi {
   ViewerGLMemoryBarrierProc memoryBarrier = nullptr;
 };
 
+struct PointRenderProgramCache {
+  GLuint program = 0;
+  GLint pointSizeLoc = -1;
+  GLint colorSaturationLoc = -1;
+  GLint brightnessTrimLoc = -1;
+  GLint alphaGainLoc = -1;
+  GLint occlusiveModeLoc = -1;
+  bool initAttempted = false;
+  bool available = false;
+};
+
 const ViewerGlComputeApi& viewerGlComputeApi() {
   static ViewerGlComputeApi api = []() {
     ViewerGlComputeApi a{};
@@ -988,6 +1008,165 @@ std::string readShaderLog(GLuint handle, bool program, const ViewerGlComputeApi&
     log.resize(static_cast<size_t>(written));
   }
   return log;
+}
+
+bool ensurePointRenderProgram(PointRenderProgramCache* cache) {
+  if (!cache) return false;
+  if (cache->initAttempted && !cache->available) return false;
+  if (cache->available && cache->program != 0) return true;
+  cache->initAttempted = true;
+  const ViewerGlComputeApi& api = viewerGlComputeApi();
+  if (!api.available) return false;
+
+  static const char* kVertexSrc = R"GLSL(
+#version 120
+uniform float uPointSize;
+varying vec4 vColor;
+void main() {
+  gl_Position = gl_ModelViewProjectionMatrix * gl_Vertex;
+  gl_PointSize = uPointSize;
+  vColor = gl_Color;
+}
+)GLSL";
+  static const char* kFragmentSrc = R"GLSL(
+#version 120
+uniform float uColorSaturation;
+uniform float uBrightnessTrim;
+uniform float uAlphaGain;
+uniform float uOcclusiveMode;
+varying vec4 vColor;
+float hueToRgbChannel(float p, float q, float t) {
+  if (t < 0.0) t += 1.0;
+  if (t > 1.0) t -= 1.0;
+  if (t < 1.0 / 6.0) return p + (q - p) * 6.0 * t;
+  if (t < 1.0 / 2.0) return q;
+  if (t < 2.0 / 3.0) return p + (q - p) * (2.0 / 3.0 - t) * 6.0;
+  return p;
+}
+vec3 hslToRgb(vec3 hsl) {
+  float h = fract(hsl.x);
+  float s = clamp(hsl.y, 0.0, 1.0);
+  float l = clamp(hsl.z, 0.0, 1.0);
+  if (s <= 1e-6) return vec3(l);
+  float q = l < 0.5 ? l * (1.0 + s) : l + s - l * s;
+  float p = 2.0 * l - q;
+  return vec3(hueToRgbChannel(p, q, h + 1.0 / 3.0),
+              hueToRgbChannel(p, q, h),
+              hueToRgbChannel(p, q, h - 1.0 / 3.0));
+}
+void main() {
+  vec3 c = clamp(vColor.rgb, 0.0, 1.0);
+  float sat = clamp(uColorSaturation, 1.0, 6.0);
+  float luma = clamp(dot(c, vec3(0.2126, 0.7152, 0.0722)), 0.0, 1.0);
+  if (sat <= 1.0) {
+    c = max(vec3(0.0), vec3(luma) + (c - vec3(luma)) * sat);
+  } else {
+    float maxRgb = max(c.r, max(c.g, c.b));
+    float minRgb = min(c.r, min(c.g, c.b));
+    float delta = maxRgb - minRgb;
+    if (delta > 1e-6) {
+      float h = 0.0;
+      if (maxRgb == c.r) {
+        h = mod((c.g - c.b) / delta, 6.0);
+      } else if (maxRgb == c.g) {
+        h = ((c.b - c.r) / delta) + 2.0;
+      } else {
+        h = ((c.r - c.g) / delta) + 4.0;
+      }
+      h /= 6.0;
+      if (h < 0.0) h += 1.0;
+      float l = 0.5 * (maxRgb + minRgb);
+      float s = delta / max(1e-6, 1.0 - abs(2.0 * l - 1.0));
+      float t = clamp((sat - 1.0) / 5.0, 0.0, 1.0);
+      float shaped = pow(t, 0.55);
+      float targetS = clamp(s + (1.0 - s) * (0.32 + 0.68 * shaped), 0.0, 1.0);
+      float highlight = clamp((l - 0.58) / 0.34, 0.0, 1.0);
+      float targetL = clamp(l - highlight * (0.08 + 0.10 * shaped), 0.0, 1.0);
+      vec3 boosted = hslToRgb(vec3(h, targetS, targetL));
+      float mixAmount = clamp(0.24 + 0.76 * shaped, 0.0, 1.0);
+      c = max(vec3(0.0), mix(c, boosted, mixAmount));
+    }
+  }
+  float peak = max(c.r, max(c.g, c.b));
+  if (peak > 1.0) {
+    c /= peak;
+  }
+  c = clamp(c, 0.0, 1.0);
+  c = clamp(c * uBrightnessTrim, 0.0, 1.0);
+  if (uOcclusiveMode > 0.5) {
+    gl_FragColor = vec4(c, 1.0);
+  } else {
+    float alpha = clamp(vColor.a * uAlphaGain, 0.0, 1.0);
+    gl_FragColor = vec4(c * alpha, alpha);
+  }
+}
+)GLSL";
+
+  const GLuint vertexShader = api.createShader(GL_VERTEX_SHADER);
+  const GLuint fragmentShader = api.createShader(GL_FRAGMENT_SHADER);
+  if (vertexShader == 0 || fragmentShader == 0) {
+    if (vertexShader != 0) api.deleteShader(vertexShader);
+    if (fragmentShader != 0) api.deleteShader(fragmentShader);
+    return false;
+  }
+  api.shaderSource(vertexShader, 1, &kVertexSrc, nullptr);
+  api.compileShader(vertexShader);
+  GLint compiled = 0;
+  api.getShaderiv(vertexShader, GL_COMPILE_STATUS, &compiled);
+  if (!compiled) {
+    logViewerEvent(std::string("Point render vertex shader compile failed: ") + readShaderLog(vertexShader, false, api));
+    api.deleteShader(vertexShader);
+    api.deleteShader(fragmentShader);
+    return false;
+  }
+
+  api.shaderSource(fragmentShader, 1, &kFragmentSrc, nullptr);
+  api.compileShader(fragmentShader);
+  api.getShaderiv(fragmentShader, GL_COMPILE_STATUS, &compiled);
+  if (!compiled) {
+    logViewerEvent(std::string("Point render fragment shader compile failed: ") + readShaderLog(fragmentShader, false, api));
+    api.deleteShader(vertexShader);
+    api.deleteShader(fragmentShader);
+    return false;
+  }
+
+  const GLuint program = api.createProgram();
+  if (program == 0) {
+    api.deleteShader(vertexShader);
+    api.deleteShader(fragmentShader);
+    return false;
+  }
+  api.attachShader(program, vertexShader);
+  api.attachShader(program, fragmentShader);
+  api.linkProgram(program);
+  api.deleteShader(vertexShader);
+  api.deleteShader(fragmentShader);
+
+  GLint linked = 0;
+  api.getProgramiv(program, GL_LINK_STATUS, &linked);
+  if (!linked) {
+    logViewerEvent(std::string("Point render shader link failed: ") + readShaderLog(program, true, api));
+    api.deleteProgram(program);
+    return false;
+  }
+
+  cache->program = program;
+  cache->pointSizeLoc = api.getUniformLocation(program, "uPointSize");
+  cache->colorSaturationLoc = api.getUniformLocation(program, "uColorSaturation");
+  cache->brightnessTrimLoc = api.getUniformLocation(program, "uBrightnessTrim");
+  cache->alphaGainLoc = api.getUniformLocation(program, "uAlphaGain");
+  cache->occlusiveModeLoc = api.getUniformLocation(program, "uOcclusiveMode");
+  cache->available = cache->pointSizeLoc >= 0 &&
+                     cache->colorSaturationLoc >= 0 &&
+                     cache->brightnessTrimLoc >= 0 &&
+                     cache->alphaGainLoc >= 0 &&
+                     cache->occlusiveModeLoc >= 0;
+  if (!cache->available) {
+    api.deleteProgram(program);
+    *cache = PointRenderProgramCache{};
+    return false;
+  }
+  return true;
 }
 
 #if defined(CHROMASPACE_VIEWER_HAS_CUDA) && !defined(__APPLE__)
@@ -1107,6 +1286,7 @@ struct OverlayComputeCache {
   GLint circularHslLoc = -1;
   GLint circularHsvLoc = -1;
   GLint normConeNormalizedLoc = -1;
+  GLint colorSaturationLoc = -1;
   uint64_t builtSerial = 0;
   GLsizei pointCount = 0;
   bool available = false;
@@ -1129,6 +1309,7 @@ struct InputCloudComputeCache {
   GLint normConeNormalizedLoc = -1;
   GLint pointAlphaScaleLoc = -1;
   GLint denseAlphaBiasLoc = -1;
+  GLint colorSaturationLoc = -1;
   uint64_t builtSerial = 0;
   GLsizei pointCount = 0;
   bool available = false;
@@ -1255,6 +1436,15 @@ void releaseInputCloudComputeCache(InputCloudComputeCache* cache) {
     if (cache->boundsProgram != 0) computeApi.deleteProgram(cache->boundsProgram);
   }
   *cache = InputCloudComputeCache{};
+}
+
+void releasePointRenderProgramCache(PointRenderProgramCache* cache) {
+  if (!cache) return;
+  const ViewerGlComputeApi& computeApi = viewerGlComputeApi();
+  if (computeApi.available && cache->program != 0) {
+    computeApi.deleteProgram(cache->program);
+  }
+  *cache = PointRenderProgramCache{};
 }
 
 void releaseInputCloudSampleComputeCache(InputCloudSampleComputeCache* cache) {
@@ -1592,6 +1782,7 @@ bool buildInputCloudMeshOnGpu(const ResolvedPayload& payload,
 float wrapHue01(float h);
 float rawRgbHue01(float r, float g, float b, float cMax, float delta);
 void rgbToHsvHexconePlane(float r, float g, float b, float* outX, float* outZ);
+void rgbToHsl(float r, float g, float b, float* outH, float* outS, float* outL);
 void rgbToPlotCircularHsl(float r, float g, float b, float* outH, float* outRadius, float* outL);
 void rgbToPlotCircularHsv(float r, float g, float b, float* outH, float* outRadius, float* outV);
 void rgbToNormConeCoords(float r, float g, float b, bool normalized, bool allowOverflow, float* outHue, float* outChroma, float* outValue);
@@ -1721,6 +1912,8 @@ struct ResolvedPayload {
   int resolution = 25;
   float pointSize = 1.4f;
   float pointDensity = 1.0f;
+  float colorSaturation = 2.0f;
+  std::string plotStyle = "Plain Scope";
   std::string pointShape = "Circle";
   bool showOverflow = false;
   bool highlightOverflow = true;
@@ -1768,6 +1961,13 @@ struct InputCloudPayload {
   std::string points;
   std::vector<float> packedPoints;
 };
+
+float effectiveColorSaturationForPlot(float colorSaturation, float pointSize, float pointDensity, int resolution);
+float effectiveColorSaturationForPlot(const ResolvedPayload& payload);
+float displaySaturationBrightnessTrim(float effectiveSaturation, float pointSize, float pointDensity, int resolution);
+float bakedColorSaturationForPlot(float colorSaturation, float pointSize, float pointDensity, int resolution);
+float bakedColorSaturationForPlot(const ResolvedPayload& payload);
+float denseColorPreservationForPlot(float colorSaturation, float pointSize, float pointDensity, int resolution);
 
 struct InputCloudSample {
   float xNorm = 0.5f;
@@ -1973,6 +2173,7 @@ uniform int uPlotMode;
 uniform int uCircularHsl;
 uniform int uCircularHsv;
 uniform int uNormConeNormalized;
+uniform float uColorSaturation;
 
 const float kTau = 6.28318530717958647692;
 const float kPi = 3.14159265358979323846;
@@ -2147,6 +2348,94 @@ void mapDisplayColor(float inR, float inG, float inB, out float outR, out float 
   outB = pow(clamp01(inB), 1.0 / 2.2);
 }
 
+float hueToRgbChannel(float p, float q, float t) {
+  if (t < 0.0) t += 1.0;
+  if (t > 1.0) t -= 1.0;
+  if (t < 1.0 / 6.0) return p + (q - p) * 6.0 * t;
+  if (t < 1.0 / 2.0) return q;
+  if (t < 2.0 / 3.0) return p + (q - p) * (2.0 / 3.0 - t) * 6.0;
+  return p;
+}
+
+void rgbToHsl(float r, float g, float b, out float h, out float s, out float l) {
+  r = clamp01(r);
+  g = clamp01(g);
+  b = clamp01(b);
+  float cMax = max(r, max(g, b));
+  float cMin = min(r, min(g, b));
+  float delta = cMax - cMin;
+  h = 0.0;
+  l = 0.5 * (cMax + cMin);
+  s = 0.0;
+  if (delta > 1e-6) {
+    s = delta / max(1e-6, 1.0 - abs(2.0 * l - 1.0));
+    h = rawRgbHue01(r, g, b, cMax, delta);
+  }
+}
+
+void hslToRgb(float h, float s, float l, out float r, out float g, out float b) {
+  h = wrapHue01(h);
+  s = clamp01(s);
+  l = clamp01(l);
+  if (s <= 1e-6) {
+    r = l;
+    g = l;
+    b = l;
+    return;
+  }
+  float q = l < 0.5 ? l * (1.0 + s) : l + s - l * s;
+  float p = 2.0 * l - q;
+  r = clamp01(hueToRgbChannel(p, q, h + 1.0 / 3.0));
+  g = clamp01(hueToRgbChannel(p, q, h));
+  b = clamp01(hueToRgbChannel(p, q, h - 1.0 / 3.0));
+}
+
+void applyDisplaySaturation(inout float r, inout float g, inout float b) {
+  float sat = clamp(uColorSaturation, 1.0, 6.0);
+  float baseR = clamp01(r);
+  float baseG = clamp01(g);
+  float baseB = clamp01(b);
+  float luma = clamp(baseR * 0.2126 + baseG * 0.7152 + baseB * 0.0722, 0.0, 1.0);
+  if (sat <= 1.0) {
+    r = max(0.0, luma + (baseR - luma) * sat);
+    g = max(0.0, luma + (baseG - luma) * sat);
+    b = max(0.0, luma + (baseB - luma) * sat);
+  } else {
+    float h = 0.0;
+    float s = 0.0;
+    float light = 0.0;
+    rgbToHsl(baseR, baseG, baseB, h, s, light);
+    if (s <= 1e-5) {
+      r = baseR;
+      g = baseG;
+      b = baseB;
+    } else {
+      float t = clamp((sat - 1.0) / 5.0, 0.0, 1.0);
+      float shaped = pow(t, 0.55);
+      float targetS = clamp(s + (1.0 - s) * (0.32 + 0.68 * shaped), 0.0, 1.0);
+      float highlight = clamp((light - 0.58) / 0.34, 0.0, 1.0);
+      float targetL = clamp(light - highlight * (0.08 + 0.10 * shaped), 0.0, 1.0);
+      float boostedR = baseR;
+      float boostedG = baseG;
+      float boostedB = baseB;
+      hslToRgb(h, targetS, targetL, boostedR, boostedG, boostedB);
+      float mixAmount = clamp(0.24 + 0.76 * shaped, 0.0, 1.0);
+      r = max(0.0, baseR * (1.0 - mixAmount) + boostedR * mixAmount);
+      g = max(0.0, baseG * (1.0 - mixAmount) + boostedG * mixAmount);
+      b = max(0.0, baseB * (1.0 - mixAmount) + boostedB * mixAmount);
+    }
+  }
+  float peak = max(r, max(g, b));
+  if (peak > 1.0) {
+    r /= peak;
+    g /= peak;
+    b /= peak;
+  }
+  r = clamp(r, 0.0, 1.0);
+  g = clamp(g, 0.0, 1.0);
+  b = clamp(b, 0.0, 1.0);
+}
+
 void main() {
   uint index = gl_GlobalInvocationID.x;
   uint cubeSize = uint(max(uCubeSize, 1));
@@ -2200,6 +2489,7 @@ void main() {
   float cg;
   float cb;
   mapDisplayColor(r, g, b, cr, cg, cb);
+  applyDisplaySaturation(cr, cg, cb);
   colorVals[colorBase + 0u] = cr;
   colorVals[colorBase + 1u] = cg;
   colorVals[colorBase + 2u] = cb;
@@ -2245,11 +2535,13 @@ void main() {
   cache->circularHslLoc = api.getUniformLocation(program, "uCircularHsl");
   cache->circularHsvLoc = api.getUniformLocation(program, "uCircularHsv");
   cache->normConeNormalizedLoc = api.getUniformLocation(program, "uNormConeNormalized");
+  cache->colorSaturationLoc = api.getUniformLocation(program, "uColorSaturation");
   cache->available = cache->cubeSizeLoc >= 0 && cache->rampLoc >= 0 &&
                      cache->useInputPointsLoc >= 0 && cache->pointCountLoc >= 0 &&
                      cache->plotModeLoc >= 0 && cache->circularHslLoc >= 0 &&
                      cache->circularHsvLoc >= 0 &&
-                     cache->normConeNormalizedLoc >= 0;
+                     cache->normConeNormalizedLoc >= 0 &&
+                     cache->colorSaturationLoc >= 0;
   if (!cache->available) {
     logViewerEvent("Overlay compute program missing one or more uniforms; falling back to CPU.");
     releaseOverlayComputeCache(cache);
@@ -2353,6 +2645,7 @@ bool buildIdentityOverlayMeshOnGpu(const ResolvedPayload& payload,
   request.ramp = payload.identityOverlayRamp ? 1 : 0;
   request.useInputPoints = useUploadedPoints ? 1 : 0;
   request.pointCount = static_cast<int>(pointCount);
+  request.colorSaturation = bakedColorSaturationForPlot(payload);
   request.remap = makeMetalRemapUniforms(uniforms);
   MeshData mesh{};
   mesh.resolution = payload.resolution;
@@ -2414,6 +2707,7 @@ bool buildIdentityOverlayMeshOnGpu(const ResolvedPayload& payload,
       request.ramp = payload.identityOverlayRamp ? 1 : 0;
       request.useInputPoints = useUploadedPoints ? 1 : 0;
       request.pointCount = static_cast<int>(pointCount);
+      request.colorSaturation = bakedColorSaturationForPlot(payload);
       request.remap = makeCudaRemapUniforms(uniforms);
       std::string error;
       if (ChromaspaceCuda::buildOverlayMesh(reinterpret_cast<ChromaspaceCuda::OverlayCache*>(cudaCache),
@@ -2481,6 +2775,7 @@ bool buildIdentityOverlayMeshOnGpu(const ResolvedPayload& payload,
   computeApi.uniform1i(cache->circularHslLoc, uniforms.circularHsl);
   computeApi.uniform1i(cache->circularHsvLoc, uniforms.circularHsv);
   computeApi.uniform1i(cache->normConeNormalizedLoc, uniforms.normConeNormalized);
+  computeApi.uniform1f(cache->colorSaturationLoc, bakedColorSaturationForPlot(payload));
   computeApi.bindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, cache->verts);
   computeApi.bindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, cache->colors);
   computeApi.bindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, useUploadedPoints ? cache->input : 0);
@@ -2638,6 +2933,7 @@ uniform int uCircularHsv;
 uniform int uNormConeNormalized;
 uniform float uPointAlphaScale;
 uniform float uDenseAlphaBias;
+uniform float uColorSaturation;
 
 const float kTau = 6.28318530717958647692;
 const float kPi = 3.14159265358979323846;
@@ -2815,6 +3111,94 @@ void mapDisplayColor(float inR, float inG, float inB, out float outR, out float 
   outB = pow(clamp01(inB), 1.0 / 2.2);
 }
 
+float hueToRgbChannel(float p, float q, float t) {
+  if (t < 0.0) t += 1.0;
+  if (t > 1.0) t -= 1.0;
+  if (t < 1.0 / 6.0) return p + (q - p) * 6.0 * t;
+  if (t < 1.0 / 2.0) return q;
+  if (t < 2.0 / 3.0) return p + (q - p) * (2.0 / 3.0 - t) * 6.0;
+  return p;
+}
+
+void rgbToHsl(float r, float g, float b, out float h, out float s, out float l) {
+  r = clamp01(r);
+  g = clamp01(g);
+  b = clamp01(b);
+  float cMax = max(r, max(g, b));
+  float cMin = min(r, min(g, b));
+  float delta = cMax - cMin;
+  h = 0.0;
+  l = 0.5 * (cMax + cMin);
+  s = 0.0;
+  if (delta > 1e-6) {
+    s = delta / max(1e-6, 1.0 - abs(2.0 * l - 1.0));
+    h = rawRgbHue01(r, g, b, cMax, delta);
+  }
+}
+
+void hslToRgb(float h, float s, float l, out float r, out float g, out float b) {
+  h = wrapHue01(h);
+  s = clamp01(s);
+  l = clamp01(l);
+  if (s <= 1e-6) {
+    r = l;
+    g = l;
+    b = l;
+    return;
+  }
+  float q = l < 0.5 ? l * (1.0 + s) : l + s - l * s;
+  float p = 2.0 * l - q;
+  r = clamp01(hueToRgbChannel(p, q, h + 1.0 / 3.0));
+  g = clamp01(hueToRgbChannel(p, q, h));
+  b = clamp01(hueToRgbChannel(p, q, h - 1.0 / 3.0));
+}
+
+void applyDisplaySaturation(inout float r, inout float g, inout float b) {
+  float sat = clamp(uColorSaturation, 1.0, 6.0);
+  float baseR = clamp01(r);
+  float baseG = clamp01(g);
+  float baseB = clamp01(b);
+  float luma = clamp(baseR * 0.2126 + baseG * 0.7152 + baseB * 0.0722, 0.0, 1.0);
+  if (sat <= 1.0) {
+    r = max(0.0, luma + (baseR - luma) * sat);
+    g = max(0.0, luma + (baseG - luma) * sat);
+    b = max(0.0, luma + (baseB - luma) * sat);
+  } else {
+    float h = 0.0;
+    float s = 0.0;
+    float light = 0.0;
+    rgbToHsl(baseR, baseG, baseB, h, s, light);
+    if (s <= 1e-5) {
+      r = baseR;
+      g = baseG;
+      b = baseB;
+    } else {
+      float t = clamp((sat - 1.0) / 5.0, 0.0, 1.0);
+      float shaped = pow(t, 0.55);
+      float targetS = clamp(s + (1.0 - s) * (0.32 + 0.68 * shaped), 0.0, 1.0);
+      float highlight = clamp((light - 0.58) / 0.34, 0.0, 1.0);
+      float targetL = clamp(light - highlight * (0.08 + 0.10 * shaped), 0.0, 1.0);
+      float boostedR = baseR;
+      float boostedG = baseG;
+      float boostedB = baseB;
+      hslToRgb(h, targetS, targetL, boostedR, boostedG, boostedB);
+      float mixAmount = clamp(0.24 + 0.76 * shaped, 0.0, 1.0);
+      r = max(0.0, baseR * (1.0 - mixAmount) + boostedR * mixAmount);
+      g = max(0.0, baseG * (1.0 - mixAmount) + boostedG * mixAmount);
+      b = max(0.0, baseB * (1.0 - mixAmount) + boostedB * mixAmount);
+    }
+  }
+  float peak = max(r, max(g, b));
+  if (peak > 1.0) {
+    r /= peak;
+    g /= peak;
+    b /= peak;
+  }
+  r = clamp(r, 0.0, 1.0);
+  g = clamp(g, 0.0, 1.0);
+  b = clamp(b, 0.0, 1.0);
+}
+
 float luminanceAwareAlpha(float baseAlpha, float cr, float cg, float cb, bool overflowPoint) {
   float alpha = baseAlpha * uPointAlphaScale;
   if (overflowPoint || uDenseAlphaBias <= 0.0) return clamp(alpha, 0.0, 1.0);
@@ -2857,6 +3241,7 @@ void main() {
     cb = 0.0;
   } else {
     mapDisplayColor(r, g, b, cr, cg, cb);
+    applyDisplaySaturation(cr, cg, cb);
   }
   colorVals[colorBase + 0u] = cr;
   colorVals[colorBase + 1u] = cg;
@@ -2906,6 +3291,7 @@ void main() {
   cache->normConeNormalizedLoc = api.getUniformLocation(program, "uNormConeNormalized");
   cache->pointAlphaScaleLoc = api.getUniformLocation(program, "uPointAlphaScale");
   cache->denseAlphaBiasLoc = api.getUniformLocation(program, "uDenseAlphaBias");
+  cache->colorSaturationLoc = api.getUniformLocation(program, "uColorSaturation");
   cache->available = cache->pointCountLoc >= 0 &&
                      cache->showOverflowLoc >= 0 &&
                      cache->highlightOverflowLoc >= 0 &&
@@ -2914,7 +3300,8 @@ void main() {
                      cache->circularHsvLoc >= 0 &&
                      cache->normConeNormalizedLoc >= 0 &&
                      cache->pointAlphaScaleLoc >= 0 &&
-                     cache->denseAlphaBiasLoc >= 0;
+                     cache->denseAlphaBiasLoc >= 0 &&
+                     cache->colorSaturationLoc >= 0;
   if (!cache->available) {
     logViewerEvent("Input-cloud compute program missing one or more uniforms; falling back to CPU.");
     releaseInputCloudComputeCache(cache);
@@ -3237,6 +3624,7 @@ bool buildInputCloudMeshOnGpu(const ResolvedPayload& payload,
   request.pointCount = static_cast<int>(pointCount);
   request.pointAlphaScale = pointAlphaScaleForPlot(payload.pointSize, payload.pointDensity, payload.resolution);
   request.denseAlphaBias = denseAlphaBiasForPlot(payload.pointSize, payload.pointDensity, payload.resolution);
+  request.colorSaturation = bakedColorSaturationForPlot(payload);
   request.remap = makeMetalRemapUniforms(uniforms);
   MeshData mesh{};
   mesh.resolution = cloud.resolution <= 25 ? 25 : (cloud.resolution <= 41 ? 41 : 57);
@@ -3284,6 +3672,7 @@ bool buildInputCloudMeshOnGpu(const ResolvedPayload& payload,
       request.pointCount = static_cast<int>(pointCount);
       request.pointAlphaScale = pointAlphaScaleForPlot(payload.pointSize, payload.pointDensity, payload.resolution);
       request.denseAlphaBias = denseAlphaBiasForPlot(payload.pointSize, payload.pointDensity, payload.resolution);
+      request.colorSaturation = bakedColorSaturationForPlot(payload);
       request.remap = makeCudaRemapUniforms(uniforms);
       std::string error;
       if (ChromaspaceCuda::buildInputMesh(reinterpret_cast<ChromaspaceCuda::InputCache*>(cudaCache),
@@ -3357,6 +3746,7 @@ bool buildInputCloudMeshOnGpu(const ResolvedPayload& payload,
                        pointAlphaScaleForPlot(payload.pointSize, payload.pointDensity, payload.resolution));
   computeApi.uniform1f(cache->denseAlphaBiasLoc,
                        denseAlphaBiasForPlot(payload.pointSize, payload.pointDensity, payload.resolution));
+  computeApi.uniform1f(cache->colorSaturationLoc, bakedColorSaturationForPlot(payload));
   computeApi.bindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, cache->input);
   computeApi.bindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, cache->verts);
   computeApi.bindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, cache->colors);
@@ -3479,6 +3869,7 @@ bool parseParamsMessage(const std::string& line, ResolvedPayload* out) {
   p.lassoRegionEmpty = (lassoRegionEmpty != 0);
   extractQuoted(line, "lassoData", &p.lassoData);
   extractQuoted(line, "quality", &p.quality);
+  extractQuoted(line, "plotStyle", &p.plotStyle);
   extractQuoted(line, "pointShape", &p.pointShape);
   extractQuoted(line, "version", &p.version);
   int resolution = 25;
@@ -3535,6 +3926,7 @@ bool parseParamsMessage(const std::string& line, ResolvedPayload* out) {
   extractFloat(line, "viewerBackgroundColorB", &p.backgroundColorB);
   extractFloat(line, "pointSize", &p.pointSize);
   extractFloat(line, "pointDensity", &p.pointDensity);
+  extractFloat(line, "colorSaturation", &p.colorSaturation);
   int identityOverlayEnabled = 0;
   extractInt(line, "identityOverlayEnabled", &identityOverlayEnabled);
   p.identityOverlayEnabled = (identityOverlayEnabled != 0);
@@ -3555,6 +3947,7 @@ bool parseParamsMessage(const std::string& line, ResolvedPayload* out) {
   p.chromaticityPlanckianLocus = (chromaticityPlanckianLocus != 0);
   p.pointSize = clampf(p.pointSize, 0.35f, 3.0f);
   p.pointDensity = clampf(p.pointDensity, 0.1f, 4.0f);
+  p.colorSaturation = clampf(p.colorSaturation, 1.0f, 6.0f);
   p.neutralRadius = clampf(p.neutralRadius, 0.0f, 1.0f);
   p.overflowHighlightR = clamp01(p.overflowHighlightR);
   p.overflowHighlightG = clamp01(p.overflowHighlightG);
@@ -3612,6 +4005,79 @@ void mapDisplayColor(float r, float g, float b, float* outR, float* outG, float*
   *outR = gamma(r);
   *outG = gamma(g);
   *outB = gamma(b);
+}
+
+float hueToRgbChannel(float p, float q, float t) {
+  if (t < 0.0f) t += 1.0f;
+  if (t > 1.0f) t -= 1.0f;
+  if (t < 1.0f / 6.0f) return p + (q - p) * 6.0f * t;
+  if (t < 1.0f / 2.0f) return q;
+  if (t < 2.0f / 3.0f) return p + (q - p) * (2.0f / 3.0f - t) * 6.0f;
+  return p;
+}
+
+void hslToRgb(float h, float s, float l, float* outR, float* outG, float* outB) {
+  h = wrapHue01(h);
+  s = clamp01(s);
+  l = clamp01(l);
+  if (s <= 1e-6f) {
+    *outR = l;
+    *outG = l;
+    *outB = l;
+    return;
+  }
+  const float q = l < 0.5f ? l * (1.0f + s) : l + s - l * s;
+  const float p = 2.0f * l - q;
+  *outR = clamp01(hueToRgbChannel(p, q, h + 1.0f / 3.0f));
+  *outG = clamp01(hueToRgbChannel(p, q, h));
+  *outB = clamp01(hueToRgbChannel(p, q, h - 1.0f / 3.0f));
+}
+
+void applyDisplaySaturation(float saturation, float* r, float* g, float* b) {
+  if (!r || !g || !b) return;
+  float sat = clampf(saturation, 1.0f, 6.0f);
+  const float baseR = clampf(*r, 0.0f, 1.0f);
+  const float baseG = clampf(*g, 0.0f, 1.0f);
+  const float baseB = clampf(*b, 0.0f, 1.0f);
+  const float luma = clampf(baseR * 0.2126f + baseG * 0.7152f + baseB * 0.0722f, 0.0f, 1.0f);
+  if (sat <= 1.0f) {
+    *r = std::max(0.0f, luma + (baseR - luma) * sat);
+    *g = std::max(0.0f, luma + (baseG - luma) * sat);
+    *b = std::max(0.0f, luma + (baseB - luma) * sat);
+  } else {
+    float h = 0.0f;
+    float s = 0.0f;
+    float l = 0.0f;
+    rgbToHsl(baseR, baseG, baseB, &h, &s, &l);
+    if (s <= 1e-5f) {
+      *r = baseR;
+      *g = baseG;
+      *b = baseB;
+    } else {
+      const float t = clampf((sat - 1.0f) / 5.0f, 0.0f, 1.0f);
+      const float shaped = std::pow(t, 0.55f);
+      const float targetS = clampf(s + (1.0f - s) * (0.32f + 0.68f * shaped), 0.0f, 1.0f);
+      const float highlight = clampf((l - 0.58f) / 0.34f, 0.0f, 1.0f);
+      const float targetL = clampf(l - highlight * (0.08f + 0.10f * shaped), 0.0f, 1.0f);
+      float boostedR = baseR;
+      float boostedG = baseG;
+      float boostedB = baseB;
+      hslToRgb(h, targetS, targetL, &boostedR, &boostedG, &boostedB);
+      const float mixAmount = clampf(0.24f + 0.76f * shaped, 0.0f, 1.0f);
+      *r = std::max(0.0f, baseR * (1.0f - mixAmount) + boostedR * mixAmount);
+      *g = std::max(0.0f, baseG * (1.0f - mixAmount) + boostedG * mixAmount);
+      *b = std::max(0.0f, baseB * (1.0f - mixAmount) + boostedB * mixAmount);
+    }
+  }
+  const float peak = std::max(*r, std::max(*g, *b));
+  if (peak > 1.0f) {
+    *r /= peak;
+    *g /= peak;
+    *b /= peak;
+  }
+  *r = clampf(*r, 0.0f, 1.0f);
+  *g = clampf(*g, 0.0f, 1.0f);
+  *b = clampf(*b, 0.0f, 1.0f);
 }
 
 bool pointOverflowsCube(float r, float g, float b) {
@@ -4273,6 +4739,88 @@ float densePlotGlowSuppression(float pointSize, float pointDensity, int resoluti
   return blend * blend * (3.0f - 2.0f * blend);
 }
 
+float colorPreservationBiasForPlot(float pointSize, float pointDensity, int resolution) {
+  const float size = clampf(pointSize, 0.35f, 3.0f);
+  const float density = clampf(pointDensity, 0.35f, 4.0f);
+  const float resolutionScale = clampf(static_cast<float>(resolution) / 41.0f, 0.65f, 1.50f);
+  const float sizeBlend = clampf((size - 0.35f) / 1.75f, 0.0f, 1.0f);
+  const float densityBlend = clampf((density * resolutionScale - 0.35f) / 1.25f, 0.0f, 1.0f);
+  const float blend = clampf(std::max(sizeBlend, densityBlend), 0.0f, 1.0f);
+  const float eased = blend * blend * (3.0f - 2.0f * blend);
+  return clampf(0.42f + 0.58f * eased, 0.0f, 1.0f);
+}
+
+float effectiveColorSaturationForPlot(float colorSaturation, float pointSize, float pointDensity, int resolution) {
+  const float base = clampf(colorSaturation, 1.0f, 6.0f);
+  const float preserveBias = colorPreservationBiasForPlot(pointSize, pointDensity, resolution);
+  if (preserveBias <= 0.0f) return base;
+  const float saturationIntent = clampf((base - 1.0f) / 5.0f, 0.0f, 1.0f);
+  const float autoBoost = 1.0f + preserveBias * (1.20f + 0.80f * saturationIntent);
+  return clampf(base * autoBoost, 1.0f, 6.0f);
+}
+
+float effectiveColorSaturationForPlot(const ResolvedPayload& payload) {
+  return effectiveColorSaturationForPlot(payload.colorSaturation, payload.pointSize, payload.pointDensity, payload.resolution);
+}
+
+float displaySaturationBrightnessTrim(float effectiveSaturation, float pointSize, float pointDensity, int resolution) {
+  const float preserveBias = colorPreservationBiasForPlot(pointSize, pointDensity, resolution);
+  const float excess = std::max(0.0f, effectiveSaturation - 1.0f);
+  return clampf(1.0f / (1.0f + excess * (0.010f + 0.010f * preserveBias)), 0.80f, 1.0f);
+}
+
+float bakedColorSaturationForPlot(float colorSaturation, float pointSize, float pointDensity, int resolution) {
+  if (viewerGlComputeApi().available) return 1.0f;
+  return effectiveColorSaturationForPlot(colorSaturation, pointSize, pointDensity, resolution);
+}
+
+float bakedColorSaturationForPlot(const ResolvedPayload& payload) {
+  if (payload.plotStyle == "Space") {
+    return effectiveColorSaturationForPlot(payload.colorSaturation,
+                                           payload.pointSize,
+                                           payload.pointDensity,
+                                           payload.resolution);
+  }
+  return bakedColorSaturationForPlot(payload.colorSaturation, payload.pointSize, payload.pointDensity, payload.resolution);
+}
+
+float estimatedPointCoverage(float pointSize,
+                             size_t pointCount,
+                             int viewportWidth,
+                             int viewportHeight,
+                             bool squarePoints) {
+  const float viewportArea = std::max(1.0f, static_cast<float>(viewportWidth) * static_cast<float>(viewportHeight));
+  const float shapeArea = squarePoints ? 1.0f : 0.78539816339f;
+  const float pointArea = std::max(0.25f, pointSize * pointSize * shapeArea);
+  return std::max(0.0f, static_cast<float>(pointCount) * pointArea / viewportArea);
+}
+
+float drawAlphaGainForPointSize(float pointSize,
+                                float pointDensity,
+                                int resolution,
+                                size_t pointCount,
+                                int viewportWidth,
+                                int viewportHeight,
+                                bool squarePoints) {
+  const float preserveBias = colorPreservationBiasForPlot(pointSize, pointDensity, resolution);
+  const float coverage = estimatedPointCoverage(pointSize, pointCount, viewportWidth, viewportHeight, squarePoints);
+  const float sparsePointNeed = clampf((1.95f - pointSize) / 1.20f, 0.0f, 1.0f);
+  const float sparseCoverageNeed = clampf((0.010f - coverage) / 0.010f, 0.0f, 1.0f);
+  const float sparseBoost = 1.0f + sparsePointNeed * sparseCoverageNeed * (0.55f + 0.20f * preserveBias);
+  const float targetCoverage = 0.010f + 0.010f * preserveBias;
+  const float coverageRatio = coverage / std::max(1e-4f, targetCoverage);
+  const float attenuation = coverageRatio > 1.0f ? std::pow(coverageRatio, -0.72f) : 1.0f;
+  return clampf(sparseBoost * attenuation, 0.16f, 1.35f);
+}
+
+float denseColorPreservationForPlot(float colorSaturation, float pointSize, float pointDensity, int resolution) {
+  const float denseBias = std::max(densePlotGlowSuppression(pointSize, pointDensity, resolution),
+                                   colorPreservationBiasForPlot(pointSize, pointDensity, resolution));
+  if (denseBias <= 0.0f) return 0.0f;
+  const float saturationIntent = clampf((colorSaturation - 1.0f) / 5.0f, 0.0f, 1.0f);
+  return clampf(denseBias * (0.75f + 0.55f * saturationIntent), 0.0f, 1.0f);
+}
+
 size_t overlayIdentityPointCap(const ResolvedPayload& payload, int cubeSize) {
   const size_t total = static_cast<size_t>(cubeSize) * static_cast<size_t>(cubeSize) * static_cast<size_t>(cubeSize);
   (void)payload;
@@ -4296,6 +4844,7 @@ void appendOverlayPoint(const ResolvedPayload& payload,
   float cg = 0.0f;
   float cb = 0.0f;
   mapDisplayColor(r, g, b, &cr, &cg, &cb);
+  applyDisplaySaturation(bakedColorSaturationForPlot(payload), &cr, &cg, &cb);
   colors->push_back(cr);
   colors->push_back(cg);
   colors->push_back(cb);
@@ -4401,6 +4950,7 @@ bool buildIdentityMesh(const ResolvedPayload& payload, MeshData* out) {
         mesh.pointVerts.push_back(pos.z);
         float cr = 0.0f, cg = 0.0f, cb = 0.0f;
         mapDisplayColor(r, g, b, &cr, &cg, &cb);
+        applyDisplaySaturation(bakedColorSaturationForPlot(payload), &cr, &cg, &cb);
         mesh.pointColors.push_back(cr);
         mesh.pointColors.push_back(cg);
         mesh.pointColors.push_back(cb);
@@ -4444,6 +4994,7 @@ bool buildInputCloudMeshCpu(const ResolvedPayload& payload,
       cb = remap.overflowHighlightB;
     } else {
       mapDisplayColor(r, g, b, &cr, &cg, &cb);
+      applyDisplaySaturation(bakedColorSaturationForPlot(payload), &cr, &cg, &cb);
     }
     mesh.pointColors.push_back(cr);
     mesh.pointColors.push_back(cg);
@@ -7265,6 +7816,7 @@ int main() {
   MeshData overlayMesh{};
   PointBufferCache meshPointBufferCache{};
   PointBufferCache overlayPointBufferCache{};
+  PointRenderProgramCache pointRenderProgramCache{};
   OverlayComputeCache overlayComputeCache{};
   InputCloudComputeCache inputCloudComputeCache{};
   InputCloudSampleComputeCache inputCloudSampleComputeCache{};
@@ -7700,14 +8252,21 @@ int main() {
     const float zoomComp = clampf(std::pow(6.0f / std::max(0.2f, app.cam.distance), 0.52f), 0.90f, 2.35f);
     pointSize = clampf(pointSize * zoomComp, 1.0f, 24.0f);
     const bool useSquarePoints = resolved.pointShape == "Square";
+    const bool plainScopeStyle = resolved.plotStyle != "Space";
+    const float drawCoverage =
+        estimatedPointCoverage(pointSize, activePointCount, width, height, useSquarePoints);
     const float denseGlowSuppress =
         densePlotGlowSuppression(resolved.pointSize, densityForView, mesh.resolution);
-    if (useSquarePoints) {
-      glDisable(GL_POINT_SMOOTH);
-    } else {
-      glEnable(GL_POINT_SMOOTH);
-      glHint(GL_POINT_SMOOTH_HINT, GL_NICEST);
-    }
+    const float denseColorPreserve =
+        denseColorPreservationForPlot(resolved.colorSaturation, resolved.pointSize, densityForView, mesh.resolution);
+    const float coverageWhiteSuppress = clampf((drawCoverage - 0.010f) / 0.020f, 0.0f, 1.0f);
+    const float inputCloudWhiteSuppress = (resolved.sourceMode == "input" && plainScopeStyle) ? 0.78f : 0.0f;
+    const float saturationWhiteSuppress = clampf((resolved.colorSaturation - 1.0f) / 1.6f, 0.0f, 1.0f);
+    const float whitePassSuppress =
+        clampf(std::max(std::max(denseGlowSuppress, coverageWhiteSuppress),
+                        std::max(inputCloudWhiteSuppress, saturationWhiteSuppress)) *
+                   (1.0f + 1.35f * denseColorPreserve),
+               0.0f, 1.0f);
 
     glEnableClientState(GL_VERTEX_ARRAY);
     glEnableClientState(GL_COLOR_ARRAY);
@@ -7774,6 +8333,22 @@ int main() {
     const bool haveDrawablePointSource = useInputSampledCudaBuffers || useInputSampledComputeBuffers ||
                                          useInputCudaBuffers || useInputComputeBuffers || usePointBuffers ||
                                          (activePointVerts != nullptr && activePointColors != nullptr);
+    const float drawColorSaturation =
+        effectiveColorSaturationForPlot(resolved.colorSaturation, resolved.pointSize, densityForView, mesh.resolution);
+    const float drawBrightnessTrim =
+        displaySaturationBrightnessTrim(drawColorSaturation, resolved.pointSize, densityForView, mesh.resolution);
+    const float drawAlphaGain =
+        drawAlphaGainForPointSize(pointSize, densityForView, mesh.resolution, activePointCount, width, height, useSquarePoints) *
+        (plainScopeStyle ? 1.0f : 0.84f);
+    const bool usePointRenderProgram =
+        plainScopeStyle && haveDrawablePointSource && ensurePointRenderProgram(&pointRenderProgramCache);
+    const bool occlusiveInputCloud = resolved.sourceMode == "input" && plainScopeStyle;
+    if (useSquarePoints || usePointRenderProgram) {
+      glDisable(GL_POINT_SMOOTH);
+    } else {
+      glEnable(GL_POINT_SMOOTH);
+      glHint(GL_POINT_SMOOTH_HINT, GL_NICEST);
+    }
     if (app.fitVolumeRequested) {
       bool fitApplied = false;
       if (mesh.hasFitBounds) {
@@ -7813,6 +8388,27 @@ int main() {
       app.lastDrawSourceLabel = drawSourceLabel;
     }
     glPointSize(pointSize);
+    if (usePointRenderProgram) {
+      const ViewerGlComputeApi& renderApi = viewerGlComputeApi();
+      glEnable(GL_VERTEX_PROGRAM_POINT_SIZE);
+      renderApi.useProgram(pointRenderProgramCache.program);
+      renderApi.uniform1f(pointRenderProgramCache.pointSizeLoc, pointSize);
+      renderApi.uniform1f(pointRenderProgramCache.colorSaturationLoc, drawColorSaturation);
+      renderApi.uniform1f(pointRenderProgramCache.brightnessTrimLoc, drawBrightnessTrim);
+      renderApi.uniform1f(pointRenderProgramCache.alphaGainLoc, drawAlphaGain);
+      renderApi.uniform1f(pointRenderProgramCache.occlusiveModeLoc, occlusiveInputCloud ? 1.0f : 0.0f);
+    }
+    if (plainScopeStyle) {
+      glDepthMask(occlusiveInputCloud ? GL_TRUE : GL_FALSE);
+      if (occlusiveInputCloud) {
+        glDisable(GL_BLEND);
+      } else if (usePointRenderProgram) {
+        glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+      }
+    } else {
+      glDepthMask(GL_TRUE);
+      glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    }
 #if defined(CHROMASPACE_VIEWER_HAS_CUDA) && !defined(__APPLE__)
     if (useInputSampledCudaBuffers) {
       glBufferApi.bindBuffer(GL_ARRAY_BUFFER, sampledPointDraw.verts);
@@ -7848,26 +8444,50 @@ int main() {
     if (activePointCount > 0 && haveDrawablePointSource) {
       glDrawArrays(GL_POINTS, 0, static_cast<GLsizei>(activePointCount));
     }
+    if (usePointRenderProgram) {
+      const ViewerGlComputeApi& renderApi = viewerGlComputeApi();
+      renderApi.useProgram(0);
+      glDisable(GL_VERTEX_PROGRAM_POINT_SIZE);
+      if (!occlusiveInputCloud) glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    }
+    if (occlusiveInputCloud) glEnable(GL_BLEND);
+    glDepthMask(GL_TRUE);
     if (activePointCount > 0 && haveDrawablePointSource) {
       glDisable(GL_DEPTH_TEST);
       glDisableClientState(GL_COLOR_ARRAY);
-      // The white interior thickening/halo passes help sparse plots, but they quickly wash out dense large splats.
-      // Fade them down aggressively in that regime so the colored structure stays crisp.
-      const float thickeningAlpha =
-          clampf((0.05f / std::sqrt(densityForView)) * (1.0f - 0.92f * denseGlowSuppress), 0.0f, 0.05f);
-      if (thickeningAlpha > 0.006f) {
-        glColor4f(0.95f, 0.96f, 1.0f, thickeningAlpha);
-        glPointSize(pointSize * clampf((0.56f / std::sqrt(densityForView)) * (1.0f - 0.22f * denseGlowSuppress),
-                                       0.24f, 0.58f));
+      if (!plainScopeStyle) {
+        // Keep Space style anchored to the familiar committed draw model and let the newer saturation
+        // logic live in the baked point colors instead of runtime draw heuristics.
+        glColor4f(0.95f, 0.96f, 1.0f, clampf(0.05f / std::sqrt(densityForView), 0.014f, 0.05f));
+        glPointSize(pointSize * clampf(0.56f / std::sqrt(densityForView), 0.30f, 0.58f));
         glDrawArrays(GL_POINTS, 0, static_cast<GLsizei>(activePointCount));
-      }
-      const float haloAlpha =
-          clampf((0.06f / densityForView) * (1.0f - 0.97f * denseGlowSuppress), 0.0f, 0.05f);
-      if (haloAlpha > 0.006f) {
-        glColor4f(0.95f, 0.96f, 1.0f, haloAlpha);
-        glPointSize(pointSize * clampf((0.52f / std::sqrt(densityForView)) * (1.0f - 0.26f * denseGlowSuppress),
-                                       0.22f, 0.55f));
-        glDrawArrays(GL_POINTS, 0, static_cast<GLsizei>(activePointCount));
+        const float haloAlpha = clampf(0.06f / densityForView, 0.012f, 0.05f);
+        if (haloAlpha > 0.013f) {
+          glColor4f(0.95f, 0.96f, 1.0f, haloAlpha);
+          glPointSize(pointSize * clampf(0.52f / std::sqrt(densityForView), 0.28f, 0.55f));
+          glDrawArrays(GL_POINTS, 0, static_cast<GLsizei>(activePointCount));
+        }
+      } else if (!occlusiveInputCloud) {
+        // The white interior thickening/halo passes help sparse plots, but they quickly wash out dense large splats.
+        // Fade them down aggressively in that regime so the colored structure stays crisp.
+        const float thickeningAlpha =
+            clampf((0.04f / std::sqrt(densityForView)) * (1.0f - 0.97f * whitePassSuppress),
+                   0.0f, 0.04f);
+        if (thickeningAlpha > 0.006f) {
+          glColor4f(0.90f, 0.92f, 0.96f, thickeningAlpha);
+          glPointSize(pointSize * clampf((0.52f / std::sqrt(densityForView)) * (1.0f - 0.32f * whitePassSuppress),
+                                         0.20f, 0.52f));
+          glDrawArrays(GL_POINTS, 0, static_cast<GLsizei>(activePointCount));
+        }
+        const float haloAlpha =
+            clampf((0.045f / densityForView) * (1.0f - 0.99f * whitePassSuppress),
+                   0.0f, 0.035f);
+        if (haloAlpha > 0.006f) {
+          glColor4f(0.90f, 0.92f, 0.96f, haloAlpha);
+          glPointSize(pointSize * clampf((0.46f / std::sqrt(densityForView)) * (1.0f - 0.38f * whitePassSuppress),
+                                         0.18f, 0.46f));
+          glDrawArrays(GL_POINTS, 0, static_cast<GLsizei>(activePointCount));
+        }
       }
       glEnableClientState(GL_COLOR_ARRAY);
       glEnable(GL_DEPTH_TEST);
@@ -7905,6 +8525,7 @@ int main() {
         glEnable(GL_DEPTH_TEST);
       }
     }
+    glDepthMask(GL_TRUE);
     if (overlayMesh.pointCount > 0) {
       // Draw the identity solid as a true overlay so it stays readable without replacing the image cloud.
       const float overlayPointSize = std::max(1.0f, pointSize * 0.72f);
@@ -8030,6 +8651,7 @@ int main() {
 #endif
   releasePointBufferCache(&meshPointBufferCache);
   releasePointBufferCache(&overlayPointBufferCache);
+  releasePointRenderProgramCache(&pointRenderProgramCache);
   releaseOverlayComputeCache(&overlayComputeCache);
   releaseInputCloudComputeCache(&inputCloudComputeCache);
   releaseInputCloudSampleComputeCache(&inputCloudSampleComputeCache);
