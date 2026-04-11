@@ -652,10 +652,22 @@ int getPlotStyleValue(int index, int fallback = 0) {
   return index < 0 || index > 1 ? fallback : index;
 }
 
+int getGlossNeighborhoodValue(int index, int fallback = 1) {
+  return index < 0 || index > 2 ? fallback : index;
+}
+
 const char* plotStyleLabelForIndex(int index) {
   switch (getPlotStyleValue(index)) {
     case 1: return "Space";
     default: return "Plain Scope";
+  }
+}
+
+const char* glossNeighborhoodLabelForIndex(int index) {
+  switch (getGlossNeighborhoodValue(index)) {
+    case 0: return "Small";
+    case 2: return "Wide";
+    default: return "Balanced";
   }
 }
 
@@ -1381,6 +1393,12 @@ struct BoolScope {
 
 struct ChromaspacePresetValues {
   int plotModel = 0;
+  int glossNeighborhood = 1;
+  double glossLiftScale = 1.0;
+  bool glossSpatialInset = true;
+  double glossBodyOpacity = 0.28;
+  double glossHighlightOpacity = 0.95;
+  double glossPointCrispness = 0.72;
   bool plotInLinear = false;
   int inputTransferFunction = static_cast<int>(WorkshopColor::TransferFunctionId::Gamma24);
   bool showOverflow = false;
@@ -1442,6 +1460,12 @@ std::mutex& chromaspacePresetMutex() {
 ChromaspacePresetValues chromaspaceFactoryPresetValues() {
   ChromaspacePresetValues values{};
   values.plotModel = 0;
+  values.glossNeighborhood = 1;
+  values.glossLiftScale = 1.0;
+  values.glossSpatialInset = true;
+  values.glossBodyOpacity = 0.28;
+  values.glossHighlightOpacity = 0.95;
+  values.glossPointCrispness = 0.72;
   values.plotInLinear = false;
   values.inputTransferFunction = static_cast<int>(WorkshopColor::TransferFunctionId::Gamma24);
   values.showOverflow = false;
@@ -1548,6 +1572,12 @@ std::filesystem::path chromaspacePresetFilePath() {
 
 bool chromaspacePresetValuesEqual(const ChromaspacePresetValues& a, const ChromaspacePresetValues& b) {
   return a.plotModel == b.plotModel &&
+         a.glossNeighborhood == b.glossNeighborhood &&
+         std::abs(a.glossLiftScale - b.glossLiftScale) <= 1e-6 &&
+         a.glossSpatialInset == b.glossSpatialInset &&
+         std::abs(a.glossBodyOpacity - b.glossBodyOpacity) <= 1e-6 &&
+         std::abs(a.glossHighlightOpacity - b.glossHighlightOpacity) <= 1e-6 &&
+         std::abs(a.glossPointCrispness - b.glossPointCrispness) <= 1e-6 &&
          a.plotInLinear == b.plotInLinear &&
          a.inputTransferFunction == b.inputTransferFunction &&
          a.showOverflow == b.showOverflow &&
@@ -1760,6 +1790,12 @@ std::string chromaspacePresetValuesAsJson(const ChromaspacePresetValues& values)
   std::ostringstream os;
   os << "{";
   os << "\"plotModel\":" << values.plotModel << ",";
+  os << "\"glossNeighborhood\":" << values.glossNeighborhood << ",";
+  os << "\"glossLiftScale\":" << std::setprecision(15) << values.glossLiftScale << ",";
+  os << "\"glossSpatialInset\":" << (values.glossSpatialInset ? "true" : "false") << ",";
+  os << "\"glossBodyOpacity\":" << std::setprecision(15) << values.glossBodyOpacity << ",";
+  os << "\"glossHighlightOpacity\":" << std::setprecision(15) << values.glossHighlightOpacity << ",";
+  os << "\"glossPointCrispness\":" << std::setprecision(15) << values.glossPointCrispness << ",";
   os << "\"plotInLinear\":" << (values.plotInLinear ? "true" : "false") << ",";
   os << "\"inputTransferFunction\":" << values.inputTransferFunction << ",";
   os << "\"showOverflow\":" << (values.showOverflow ? "true" : "false") << ",";
@@ -1797,6 +1833,12 @@ bool parseChromaspacePresetValuesFromJson(const std::string& json, ChromaspacePr
   if (!out) return false;
   ChromaspacePresetValues values = chromaspaceFactoryPresetValues();
   (void)extractJsonIntField(json, "plotModel", &values.plotModel);
+  (void)extractJsonIntField(json, "glossNeighborhood", &values.glossNeighborhood);
+  (void)extractJsonDoubleField(json, "glossLiftScale", &values.glossLiftScale);
+  (void)extractJsonBoolField(json, "glossSpatialInset", &values.glossSpatialInset);
+  (void)extractJsonDoubleField(json, "glossBodyOpacity", &values.glossBodyOpacity);
+  (void)extractJsonDoubleField(json, "glossHighlightOpacity", &values.glossHighlightOpacity);
+  (void)extractJsonDoubleField(json, "glossPointCrispness", &values.glossPointCrispness);
   (void)extractJsonBoolField(json, "plotInLinear", &values.plotInLinear);
   (void)extractJsonIntField(json, "inputTransferFunction", &values.inputTransferFunction);
   (void)extractJsonBoolField(json, "showOverflow", &values.showOverflow);
@@ -1826,6 +1868,12 @@ bool parseChromaspacePresetValuesFromJson(const std::string& json, ChromaspacePr
   (void)extractJsonIntField(json, "pointShape", &values.pointShape);
   (void)extractJsonIntField(json, "sampling", &values.sampling);
   (void)extractJsonBoolField(json, "occupancyGuidedFill", &values.occupancyGuidedFill);
+  values.plotModel = std::clamp(values.plotModel, 0, 8);
+  values.glossNeighborhood = std::clamp(values.glossNeighborhood, 0, 2);
+  values.glossLiftScale = std::clamp(values.glossLiftScale, 0.25, 3.0);
+  values.glossBodyOpacity = std::clamp(values.glossBodyOpacity, 0.0, 1.0);
+  values.glossHighlightOpacity = std::clamp(values.glossHighlightOpacity, 0.0, 1.0);
+  values.glossPointCrispness = std::clamp(values.glossPointCrispness, 0.0, 1.0);
   *out = values;
   return true;
 }
@@ -2617,6 +2665,60 @@ class ChromaspaceEffect : public ImageEffect {
       }
       return;
     }
+    if (paramName == "cubeViewerGlossNeighborhood") {
+      cubeViewerDebugLog(std::string("changedParam(cubeViewerGlossNeighborhood) -> ") +
+                         glossNeighborhoodLabelForIndex(getChoiceValue("cubeViewerGlossNeighborhood", args.time, 1)));
+      syncChromaspacePresetMenuState(args.time);
+      if (viewerSessionRequested()) {
+        pushParamsUpdate(args.time, "cubeViewerGlossNeighborhood");
+      }
+      return;
+    }
+    if (paramName == "cubeViewerGlossSheenLift") {
+      cubeViewerDebugLog(std::string("changedParam(cubeViewerGlossSheenLift) -> ") +
+                         std::to_string(currentGlossLiftScaleValue(args.time)));
+      syncChromaspacePresetMenuState(args.time);
+      if (viewerSessionRequested()) {
+        pushParamsUpdate(args.time, "cubeViewerGlossSheenLift");
+      }
+      return;
+    }
+    if (paramName == "cubeViewerGlossSpatialInset") {
+      cubeViewerDebugLog(std::string("changedParam(cubeViewerGlossSpatialInset) -> ") +
+                         (currentGlossSpatialInsetEnabled(args.time) ? "1" : "0"));
+      syncChromaspacePresetMenuState(args.time);
+      if (viewerSessionRequested()) {
+        pushParamsUpdate(args.time, "cubeViewerGlossSpatialInset");
+      }
+      return;
+    }
+    if (paramName == "cubeViewerGlossBodyOpacity") {
+      cubeViewerDebugLog(std::string("changedParam(cubeViewerGlossBodyOpacity) -> ") +
+                         std::to_string(currentGlossBodyOpacityValue(args.time)));
+      syncChromaspacePresetMenuState(args.time);
+      if (viewerSessionRequested()) {
+        pushParamsUpdate(args.time, "cubeViewerGlossBodyOpacity");
+      }
+      return;
+    }
+    if (paramName == "cubeViewerGlossHighlightOpacity") {
+      cubeViewerDebugLog(std::string("changedParam(cubeViewerGlossHighlightOpacity) -> ") +
+                         std::to_string(currentGlossHighlightOpacityValue(args.time)));
+      syncChromaspacePresetMenuState(args.time);
+      if (viewerSessionRequested()) {
+        pushParamsUpdate(args.time, "cubeViewerGlossHighlightOpacity");
+      }
+      return;
+    }
+    if (paramName == "cubeViewerGlossPointCrispness") {
+      cubeViewerDebugLog(std::string("changedParam(cubeViewerGlossPointCrispness) -> ") +
+                         std::to_string(currentGlossPointCrispnessValue(args.time)));
+      syncChromaspacePresetMenuState(args.time);
+      if (viewerSessionRequested()) {
+        pushParamsUpdate(args.time, "cubeViewerGlossPointCrispness");
+      }
+      return;
+    }
     if (paramName == "cubeViewerSamplingMode") {
       cubeViewerDebugLog(std::string("changedParam(cubeViewerSamplingMode) -> ") +
                          samplingModeLabelForIndex(getChoiceValue("cubeViewerSamplingMode", args.time, 0)));
@@ -2916,7 +3018,6 @@ class ChromaspaceEffect : public ImageEffect {
         paramName == "cubeViewerChromaticityReferenceBasis" ||
         paramName == "cubeViewerChromaticityOverlayPrimaries") {
       cubeViewerDebugLog(std::string("changedParam(") + paramName + ")");
-      invalidateCubeViewerCloudState();
       if (viewerSessionRequested()) {
         pushParamsUpdate(args.time, paramName);
         (void)trySendCachedCloud(args.time, paramName);
@@ -3281,6 +3382,7 @@ class ChromaspaceEffect : public ImageEffect {
   }
 
   bool currentIdentityOverlayEnabled(double time) {
+    if (!currentDrawOnImageMode(time) && currentGlossViewPlotMode(time)) return false;
     return currentDrawOnImageMode(time)
                ? getBoolValue("cubeViewerIdentityOverlayEnabledDraw", time, false)
                : getBoolValue("cubeViewerIdentityOverlayEnabled", time, false);
@@ -3301,12 +3403,17 @@ class ChromaspaceEffect : public ImageEffect {
       case 5: return "jp_conical";
       case 6: return "reuleaux";
       case 7: return "chromaticity";
+      case 8: return "gloss_view";
       default: return "rgb";
     }
   }
 
   bool currentChromaticityPlotMode(double time) {
     return !currentDrawOnImageMode(time) && currentPlotMode(time) == "chromaticity";
+  }
+
+  bool currentGlossViewPlotMode(double time) {
+    return !currentDrawOnImageMode(time) && currentPlotMode(time) == "gloss_view";
   }
 
   bool currentPlotDisplayLinearAllowed(double time) {
@@ -3361,11 +3468,35 @@ class ChromaspaceEffect : public ImageEffect {
 
   bool currentShowOverflow(double time) {
     return !currentDrawOnImageMode(time) &&
-            (currentPlotMode(time) == "rgb" || currentPlotMode(time) == "hsl" ||
-             currentPlotMode(time) == "hsv" || currentPlotMode(time) == "chen" ||
-             currentPlotMode(time) == "jp_conical" || currentPlotMode(time) == "reuleaux" ||
-             currentPlotMode(time) == "chromaticity") &&
+             (currentPlotMode(time) == "rgb" || currentPlotMode(time) == "hsl" ||
+              currentPlotMode(time) == "hsv" || currentPlotMode(time) == "chen" ||
+                currentPlotMode(time) == "jp_conical" || currentPlotMode(time) == "reuleaux" ||
+              currentPlotMode(time) == "chromaticity" || currentPlotMode(time) == "gloss_view") &&
            getBoolValue("cubeViewerShowOverflow", time, false);
+  }
+
+  int currentGlossNeighborhoodChoice(double time) const {
+    return getGlossNeighborhoodValue(getChoiceValue("cubeViewerGlossNeighborhood", time, 1), 1);
+  }
+
+  double currentGlossLiftScaleValue(double time) const {
+    return std::clamp(getDoubleValue("cubeViewerGlossSheenLift", time, 1.0), 0.25, 3.0);
+  }
+
+  bool currentGlossSpatialInsetEnabled(double time) const {
+    return getBoolValue("cubeViewerGlossSpatialInset", time, true);
+  }
+
+  double currentGlossBodyOpacityValue(double time) const {
+    return std::clamp(getDoubleValue("cubeViewerGlossBodyOpacity", time, 0.10), 0.0, 1.0);
+  }
+
+  double currentGlossHighlightOpacityValue(double time) const {
+    return std::clamp(getDoubleValue("cubeViewerGlossHighlightOpacity", time, 0.42), 0.0, 1.0);
+  }
+
+  double currentGlossPointCrispnessValue(double time) const {
+    return std::clamp(getDoubleValue("cubeViewerGlossPointCrispness", time, 0.72), 0.0, 1.0);
   }
 
   bool currentCircularHsl(double time) {
@@ -3387,7 +3518,7 @@ class ChromaspaceEffect : public ImageEffect {
   }
 
   bool currentCubeSlicingSupported(double time) {
-    return !currentDrawOnImageMode(time);
+    return !currentDrawOnImageMode(time) && !currentGlossViewPlotMode(time);
   }
 
   bool currentHueSectorSlicingAllowed(double time) {
@@ -3525,6 +3656,12 @@ class ChromaspaceEffect : public ImageEffect {
     ChromaspacePresetValues values = chromaspaceFactoryPresetValues();
     const bool drawOnImage = getBoolValue("cubeViewerDrawOnImageEnabled", time, false);
     values.plotModel = getChoiceValue("cubeViewerPlotModel", time, values.plotModel);
+    values.glossNeighborhood = currentGlossNeighborhoodChoice(time);
+    values.glossLiftScale = currentGlossLiftScaleValue(time);
+    values.glossSpatialInset = currentGlossSpatialInsetEnabled(time);
+    values.glossBodyOpacity = currentGlossBodyOpacityValue(time);
+    values.glossHighlightOpacity = currentGlossHighlightOpacityValue(time);
+    values.glossPointCrispness = currentGlossPointCrispnessValue(time);
     values.plotInLinear = getBoolValue("cubeViewerPlotDisplayLinear", time, values.plotInLinear);
     values.inputTransferFunction = static_cast<int>(currentPlotDisplayLinearTransferId(time));
     values.showOverflow = getBoolValue("cubeViewerShowOverflow", time, values.showOverflow);
@@ -3561,6 +3698,12 @@ class ChromaspaceEffect : public ImageEffect {
 
   void writeChromaspacePresetValuesToParams(const ChromaspacePresetValues& values) {
     if (auto* p = fetchChoiceParam("cubeViewerPlotModel")) p->setValue(values.plotModel);
+    if (auto* p = fetchChoiceParam("cubeViewerGlossNeighborhood")) p->setValue(values.glossNeighborhood);
+    if (auto* p = fetchDoubleParam("cubeViewerGlossSheenLift")) p->setValue(values.glossLiftScale);
+    if (auto* p = fetchBooleanParam("cubeViewerGlossSpatialInset")) p->setValue(values.glossSpatialInset);
+    if (auto* p = fetchDoubleParam("cubeViewerGlossBodyOpacity")) p->setValue(values.glossBodyOpacity);
+    if (auto* p = fetchDoubleParam("cubeViewerGlossHighlightOpacity")) p->setValue(values.glossHighlightOpacity);
+    if (auto* p = fetchDoubleParam("cubeViewerGlossPointCrispness")) p->setValue(values.glossPointCrispness);
     if (auto* p = fetchBooleanParam("cubeViewerPlotDisplayLinear")) p->setValue(values.plotInLinear);
     if (auto* p = fetchChoiceParam("cubeViewerPlotDisplayLinearTransfer")) {
       const auto transferId = static_cast<WorkshopColor::TransferFunctionId>(values.inputTransferFunction);
@@ -3767,6 +3910,12 @@ class ChromaspaceEffect : public ImageEffect {
 
   bool isChromaspacePresetManagedParam(const std::string& paramName) const {
     return paramName == "cubeViewerPlotModel" ||
+           paramName == "cubeViewerGlossNeighborhood" ||
+           paramName == "cubeViewerGlossSheenLift" ||
+           paramName == "cubeViewerGlossSpatialInset" ||
+           paramName == "cubeViewerGlossBodyOpacity" ||
+           paramName == "cubeViewerGlossHighlightOpacity" ||
+           paramName == "cubeViewerGlossPointCrispness" ||
            paramName == "cubeViewerPlotDisplayLinear" ||
            paramName == "cubeViewerPlotDisplayLinearTransfer" ||
            paramName == "cubeViewerShowOverflow" ||
@@ -3808,6 +3957,16 @@ class ChromaspaceEffect : public ImageEffect {
       if (rod.x2 > rod.x1 && rod.y2 > rod.y1) return rod;
     }
     return OfxRectD{0.0, 0.0, 1.0, 1.0};
+  }
+
+  double currentSourceAspect(double time) {
+    const OfxRectD rect = currentLassoImageRect(time);
+    const double width = rect.x2 - rect.x1;
+    const double height = rect.y2 - rect.y1;
+    if (width > 1e-6 && height > 1e-6) {
+      return std::clamp(width / height, 0.25, 4.0);
+    }
+    return 16.0 / 9.0;
   }
 
   bool currentLassoSubtractOperation(double time) {
@@ -3920,7 +4079,7 @@ class ChromaspaceEffect : public ImageEffect {
                             (plotMode == "rgb" || plotMode == "hsl" ||
                              plotMode == "hsv" || plotMode == "chen" ||
                              plotMode == "jp_conical" || plotMode == "reuleaux" ||
-                             plotMode == "chromaticity");
+                             plotMode == "chromaticity" || plotMode == "gloss_view");
     const bool showOverflow = supported && getBoolValue("cubeViewerShowOverflow", time, false);
     if (auto* p = fetchBooleanParam("cubeViewerShowOverflow")) {
       if (!supported) {
@@ -3996,6 +4155,7 @@ class ChromaspaceEffect : public ImageEffect {
     const bool readIdentityPlot = currentReadIdentityPlot(time);
     const bool readGrayRamp = currentReadGrayRamp(time);
     const bool chromaticityMode = currentChromaticityPlotMode(time);
+    const bool glossViewMode = currentGlossViewPlotMode(time);
     if (drawOnImage || useInstance1Requested) {
       setGroupOpenState("grp_cube_viewer_identity_overlay", true);
     }
@@ -4061,11 +4221,26 @@ class ChromaspaceEffect : public ImageEffect {
                        !drawOnImage && chromaticityMode);
     setParamVisibility(fetchChoiceParam("cubeViewerChromaticityOverlayPrimaries"),
                        !drawOnImage && chromaticityMode);
-    setParamVisibility(fetchBooleanParam("cubeViewerIdentityOverlayEnabled"), !drawOnImage);
+    setParamVisibility(fetchGroupParam("grp_cube_viewer_gloss_structure"),
+                       !drawOnImage && glossViewMode);
+    setParamVisibility(fetchChoiceParam("cubeViewerGlossNeighborhood"),
+                       !drawOnImage && glossViewMode);
+    setParamVisibility(fetchDoubleParam("cubeViewerGlossSheenLift"),
+                       !drawOnImage && glossViewMode);
+    setParamVisibility(fetchBooleanParam("cubeViewerGlossSpatialInset"),
+                       !drawOnImage && glossViewMode);
+    setParamVisibility(fetchDoubleParam("cubeViewerGlossBodyOpacity"),
+                       !drawOnImage && glossViewMode);
+    setParamVisibility(fetchDoubleParam("cubeViewerGlossHighlightOpacity"),
+                       !drawOnImage && glossViewMode);
+    setParamVisibility(fetchDoubleParam("cubeViewerGlossPointCrispness"),
+                       !drawOnImage && glossViewMode);
+    setParamVisibility(fetchBooleanParam("cubeViewerGlossSurfaceLinks"), false);
+    setParamVisibility(fetchBooleanParam("cubeViewerIdentityOverlayEnabled"), !drawOnImage && !glossViewMode);
     setParamVisibility(fetchBooleanParam("cubeViewerIdentityOverlayEnabledDraw"), drawOnImage);
     setParamVisibility(fetchBooleanParam("cubeViewerIdentityOverlayRampDraw"), drawOnImage && overlayEnabled);
-    setParamVisibility(fetchIntParam("cubeViewerIdentityOverlaySize"), !drawOnImage && overlayEnabled);
-    setParamVisibility(fetchBooleanParam("cubeViewerIdentityOverlayRamp"), !drawOnImage && overlayEnabled);
+    setParamVisibility(fetchIntParam("cubeViewerIdentityOverlaySize"), !drawOnImage && !glossViewMode && overlayEnabled);
+    setParamVisibility(fetchBooleanParam("cubeViewerIdentityOverlayRamp"), !drawOnImage && !glossViewMode && overlayEnabled);
     setParamVisibility(fetchBooleanParam("cubeViewerSampleDrawnCubeOnly"), !drawOnImage);
     setParamVisibility(fetchBooleanParam("cubeViewerReadGrayRamp"), !drawOnImage);
     setParamVisibility(fetchIntParam("cubeViewerSampleDrawnCubeSize"),
@@ -4188,7 +4363,9 @@ class ChromaspaceEffect : public ImageEffect {
   }
 
   // This key is the contract between the OFX instance and the external viewer. Any setting that changes
-  // how the cloud should be interpreted must be represented here so stale clouds can be rejected safely.
+  // Only settings that change which RGB samples are serialized into the source cloud should live here.
+  // Pure viewer-side interpretation controls are sent separately in the params payload so the viewer
+  // can reinterpret the currently cached cloud without forcing a fresh resample.
   std::string currentCloudSettingsKey(double time) {
     const int qualityIndex = getChoiceValue("cubeViewerQuality", time, cubeViewerQuality_);
     const int samplingMode = getSamplingModeValue(getChoiceValue("cubeViewerSamplingMode", time, 0));
@@ -4208,10 +4385,6 @@ class ChromaspaceEffect : public ImageEffect {
     const bool normConeNormalized = getBoolValue("cubeViewerNormConeNormalized", time, true);
     const bool plotDisplayLinear = currentPlotDisplayLinearEnabled(time);
     const int plotDisplayLinearTransfer = currentPlotDisplayLinearTransferChoice(time);
-    const int chromaticityInputPrimaries = currentChromaticityInputPrimariesChoice(time);
-    const int chromaticityInputTransfer = currentChromaticityInputTransferChoice(time);
-    const int chromaticityReferenceBasis = currentChromaticityReferenceBasisChoice(time);
-    const int chromaticityOverlayPrimaries = currentChromaticityOverlayPrimariesChoice(time);
     const auto overflowColor = getRGBValue("cubeViewerOverflowHighlightColor", time, {1.0, 0.0, 0.0});
     const auto backgroundColor = getRGBValue("cubeViewerBackgroundColor", time, {0.08, 0.08, 0.09});
     std::ostringstream oss;
@@ -4226,10 +4399,6 @@ class ChromaspaceEffect : public ImageEffect {
          << "|normConeNormalized=" << (normConeNormalized ? 1 : 0)
          << "|plotDisplayLinear=" << (plotDisplayLinear ? 1 : 0)
          << "|plotDisplayLinearTransfer=" << plotDisplayLinearTransfer
-         << "|chromaticityInputPrimaries=" << chromaticityInputPrimaries
-         << "|chromaticityInputTransfer=" << chromaticityInputTransfer
-         << "|chromaticityReferenceBasis=" << chromaticityReferenceBasis
-         << "|chromaticityOverlayPrimaries=" << chromaticityOverlayPrimaries
          << "|showOverflow=" << (showOverflow ? 1 : 0)
          << "|highlightOverflow=" << (highlightOverflow ? 1 : 0)
          << "|overflowColor=" << overflowColor[0] << "," << overflowColor[1] << "," << overflowColor[2]
@@ -4263,6 +4432,12 @@ class ChromaspaceEffect : public ImageEffect {
     const bool occupancyFill = currentOccupancyGuidedFill(time);
     const int pointShape = getPointShapeValue(getChoiceValue("cubeViewerPointShape", time, 0));
     const int plotStyle = getPlotStyleValue(getChoiceValue("cubeViewerPlotStyle", time, 0));
+    const int glossNeighborhood = currentGlossNeighborhoodChoice(time);
+    const double glossLiftScale = currentGlossLiftScaleValue(time);
+    const bool glossSpatialInset = currentGlossSpatialInsetEnabled(time);
+    const double glossBodyOpacity = currentGlossBodyOpacityValue(time);
+    const double glossHighlightOpacity = currentGlossHighlightOpacityValue(time);
+    const double glossPointCrispness = currentGlossPointCrispnessValue(time);
     const int resolution = qualityResolutionForIndex(qualityIndex);
     const bool onTop = getBoolValue("cubeViewerOnTop", time, true);
     const double pointSize = getDoubleValue("cubeViewerPointSize", time, 1.4);
@@ -4300,6 +4475,7 @@ class ChromaspaceEffect : public ImageEffect {
                                         : resolvedOverlayCubeSize(overlayRequestedSize, qualityIndex, scaleIndex);
     const bool overlayAuto = !drawOnImageMode && clampOverlayCubeSize(overlayRequestedSize) == 25;
     const std::string cloudSettingsKey = currentCloudSettingsKey(time);
+    const double sourceAspect = currentSourceAspect(time);
     std::ostringstream oss;
     oss << "{\"type\":\"params\",\"seq\":" << seq
         << ",\"senderId\":\"" << jsonEscape(senderId_) << "\""
@@ -4311,6 +4487,7 @@ class ChromaspaceEffect : public ImageEffect {
         << ",\"normConeNormalized\":" << (normConeNormalized ? 1 : 0)
         << ",\"plotDisplayLinear\":" << (plotDisplayLinear ? 1 : 0)
         << ",\"plotDisplayLinearTransfer\":" << plotDisplayLinearTransfer
+        << ",\"sourceAspect\":" << sourceAspect
         << ",\"chromaticityInputPrimaries\":" << chromaticityInputPrimaries
         << ",\"chromaticityInputTransfer\":" << chromaticityInputTransfer
         << ",\"chromaticityReferenceBasis\":" << chromaticityReferenceBasis
@@ -4323,6 +4500,12 @@ class ChromaspaceEffect : public ImageEffect {
         << ",\"scale\":\"" << scaleLabelForIndex(scaleIndex) << "\""
         << ",\"plotStyle\":\"" << plotStyleLabelForIndex(plotStyle) << "\""
         << ",\"pointShape\":\"" << pointShapeLabelForIndex(pointShape) << "\""
+        << ",\"glossNeighborhood\":" << glossNeighborhood
+        << ",\"glossLiftScale\":" << glossLiftScale
+        << ",\"glossSpatialInset\":" << (glossSpatialInset ? 1 : 0)
+        << ",\"glossBodyOpacity\":" << glossBodyOpacity
+        << ",\"glossHighlightOpacity\":" << glossHighlightOpacity
+        << ",\"glossPointCrispness\":" << glossPointCrispness
         << ",\"resolution\":" << resolution
         << ",\"pointSize\":" << pointSize
         << ",\"colorSaturation\":" << colorSaturation
@@ -6137,13 +6320,15 @@ class ChromaspaceEffect : public ImageEffect {
     const int width = bounds.x2 - bounds.x1;
     const int height = bounds.y2 - bounds.y1;
     if (width <= 0 || height <= 0) return {};
+    const bool stableSamplingMode = currentGlossViewPlotMode(args.time);
+    const bool effectivePreviewMode = stableSamplingMode ? false : previewMode;
     const ViewerCloudBuildRequest request = makeViewerCloudBuildRequest(
         src->getPixelData() ? reinterpret_cast<const float*>(src->getPixelData()) : nullptr,
         static_cast<size_t>(std::abs(src->getRowBytes())),
         width,
         height,
         args.time,
-        previewMode);
+        effectivePreviewMode);
     const bool useInstance1Requested = currentUseInstance1Requested(args.time);
     const bool showIdentityOnly = currentShowIdentityOnly(args.time);
 #if defined(CHROMASPACE_PLUGIN_HAS_CUDA_KERNELS)
@@ -6369,27 +6554,27 @@ class ChromaspaceEffect : public ImageEffect {
     }
 #endif
     if (args.isEnabledCudaRender && args.pCudaStream != nullptr) {
-      CloudBuildResult cudaReadback = buildInputCloudPayloadFromCudaReadback(src, args, previewMode);
+      CloudBuildResult cudaReadback = buildInputCloudPayloadFromCudaReadback(src, args, effectivePreviewMode);
       if (cudaReadback.success) {
         cubeViewerDebugLog("Viewer cloud backend selected: CPU-readback/CUDA");
         return cudaReadback;
       }
     }
     if (args.isEnabledOpenCLRender && args.pOpenCLCmdQ != nullptr) {
-      CloudBuildResult openclReadback = buildInputCloudPayloadFromOpenCLReadback(src, args, previewMode);
+      CloudBuildResult openclReadback = buildInputCloudPayloadFromOpenCLReadback(src, args, effectivePreviewMode);
       if (openclReadback.success) {
         cubeViewerDebugLog("Viewer cloud backend selected: CPU-readback/OpenCL");
         return openclReadback;
       }
     }
     if (args.isEnabledMetalRender && args.pMetalCmdQ != nullptr) {
-      CloudBuildResult metalReadback = buildInputCloudPayloadFromMetalReadback(src, dst, args, previewMode);
+      CloudBuildResult metalReadback = buildInputCloudPayloadFromMetalReadback(src, dst, args, effectivePreviewMode);
       if (metalReadback.success) {
         cubeViewerDebugLog("Viewer cloud backend selected: CPU-readback/Metal");
         return metalReadback;
       }
     }
-    CloudBuildResult cpuBuilt = buildInputCloudPayload(src, args.time, previewMode);
+    CloudBuildResult cpuBuilt = buildInputCloudPayload(src, args.time, effectivePreviewMode);
     if (cpuBuilt.success) {
       cpuBuilt.backendName = "CPU";
       cubeViewerDebugLog("Viewer cloud backend selected: CPU");
@@ -7647,10 +7832,16 @@ class ChromaspaceFactory : public PluginFactoryHelper<ChromaspaceFactory> {
           {"cubeViewerShowIdentityOnly", "Only available when using the identity plot from instance 1. When enabled, the downstream plot reads only the drawn identity strip and skips the normal whole-image cloud, so you see just the transformed identity data."},
 {"cubeViewerSampleDrawnCubeSize", "Sets the identity-strip resolution from 4 to 65. In the identity generator this controls the generated strip density, and in a downstream instance it should match instance 1 so the strip can be decoded correctly."},
 {"cubeViewerModeToggle", "Switch between the 3D viewer and the identity generator. The identity generator burns the identity strip into the image and hides plot-only controls."},
-          {"cubeViewerPlotModel", "Choose which 3D color geometry is used to plot the current signal: RGB cube, HSL bicone or circular HSL, HSV hexcone or circular HSV, Chen, Norm-Cone, JP-Conical, Reuleaux, or Chromaticity xyY."},
+          {"cubeViewerPlotModel", "Choose which 3D color geometry or analysis view is used to inspect the current signal: RGB cube, HSL bicone or circular HSL, HSV hexcone or circular HSV, Chen, Norm-Cone, JP-Conical, Reuleaux, Chromaticity xyY, or Gloss View."},
           {"cubeViewerPlotDisplayLinear", "Decode sampled input values from the selected input transfer function to linear light before building the 3D plot. Intended for non-chromaticity plot modes."},
           {"cubeViewerPlotDisplayLinearTransfer", "Choose the assumed input transfer function used when Plot in Display Linear is enabled."},
           {"cubeViewerNormConeNormalized", "For Norm-Cone only: when enabled, use the normalized cone chroma from JP's DCTL; when disabled, use the raw spherical chroma variant instead."},
+          {"cubeViewerGlossNeighborhood", "Gloss View only: choose how large the local image-space neighborhood is when estimating local body and sheen structure."},
+          {"cubeViewerGlossSheenLift", "Gloss View only: scale the signed field/projection amplitude used by the new Gloss View instrument. This affects how strongly positive and negative departures read in the linked field and projection views."},
+          {"cubeViewerGlossSpatialInset", "Gloss View only: when the 3D projection is active, show the linked 2D field mini-map so the projected structure can be related back to the image footprint."},
+          {"cubeViewerGlossBodyOpacity", "Gloss View only: beta tuning control for the base field visibility. Kept public during beta while the new field-first readability model is being tuned."},
+          {"cubeViewerGlossHighlightOpacity", "Gloss View only: beta tuning control for the signed signal visibility. Kept public during beta for live readability tuning."},
+          {"cubeViewerGlossPointCrispness", "Gloss View only: beta tuning control for 3D projection sharpness so the projected field can be sharpened live without rebuilding the cloud."},
           {"cubeViewerChromaticityInputPrimaries", "Choose the assumed input primaries used to convert incoming RGB into XYZ before plotting chromaticity xyY."},
           {"cubeViewerChromaticityInputTransfer", "Choose the assumed input transfer function used to decode incoming RGB to linear light before chromaticity conversion."},
           {"cubeViewerChromaticityReferenceBasis", "Plot chromaticity coordinates relative to the CIE standard observer basis or the selected input observer basis."},
@@ -7678,7 +7869,8 @@ class ChromaspaceFactory : public PluginFactoryHelper<ChromaspaceFactory> {
     cubeViewerPlotModel->appendOption("JP-Conical");
     cubeViewerPlotModel->appendOption("Reuleaux");
     cubeViewerPlotModel->appendOption("Chromaticity");
-    cubeViewerPlotModel->setDefault(std::clamp(chromaspaceDefaultValues.plotModel, 0, 7));
+    cubeViewerPlotModel->appendOption("Gloss View");
+    cubeViewerPlotModel->setDefault(std::clamp(chromaspaceDefaultValues.plotModel, 0, 8));
     if (const char* hint = tooltipFor("cubeViewerPlotModel")) cubeViewerPlotModel->setHint(hint);
 
     auto* openCubeViewer = d.definePushButtonParam("openCubeViewer");
@@ -7721,6 +7913,82 @@ class ChromaspaceFactory : public PluginFactoryHelper<ChromaspaceFactory> {
     cubeViewerNormConeNormalized->setIsSecret(true);
     cubeViewerNormConeNormalized->setEnabled(false);
     if (const char* hint = tooltipFor("cubeViewerNormConeNormalized")) cubeViewerNormConeNormalized->setHint(hint);
+
+    auto* grpCubeViewerGlossStructure = d.defineGroupParam("grp_cube_viewer_gloss_structure");
+    grpCubeViewerGlossStructure->setLabel("Gloss View");
+    grpCubeViewerGlossStructure->setOpen(false);
+    grpCubeViewerGlossStructure->setIsSecret(true);
+    grpCubeViewerGlossStructure->setEnabled(false);
+
+    auto* cubeViewerGlossNeighborhood = d.defineChoiceParam("cubeViewerGlossNeighborhood");
+    cubeViewerGlossNeighborhood->setLabel("Neighborhood");
+    cubeViewerGlossNeighborhood->appendOption("Small");
+    cubeViewerGlossNeighborhood->appendOption("Balanced");
+    cubeViewerGlossNeighborhood->appendOption("Wide");
+    cubeViewerGlossNeighborhood->setDefault(std::clamp(chromaspaceDefaultValues.glossNeighborhood, 0, 2));
+    cubeViewerGlossNeighborhood->setParent(*grpCubeViewerGlossStructure);
+    cubeViewerGlossNeighborhood->setIsSecret(true);
+    cubeViewerGlossNeighborhood->setEnabled(false);
+    if (const char* hint = tooltipFor("cubeViewerGlossNeighborhood")) cubeViewerGlossNeighborhood->setHint(hint);
+
+    auto* cubeViewerGlossSheenLift = d.defineDoubleParam("cubeViewerGlossSheenLift");
+    cubeViewerGlossSheenLift->setLabel("Signal Scale");
+    cubeViewerGlossSheenLift->setRange(0.25, 3.0);
+    cubeViewerGlossSheenLift->setDisplayRange(0.25, 3.0);
+    cubeViewerGlossSheenLift->setIncrement(0.01);
+    cubeViewerGlossSheenLift->setDefault(std::clamp(chromaspaceDefaultValues.glossLiftScale, 0.25, 3.0));
+    cubeViewerGlossSheenLift->setParent(*grpCubeViewerGlossStructure);
+    cubeViewerGlossSheenLift->setIsSecret(true);
+    cubeViewerGlossSheenLift->setEnabled(false);
+    if (const char* hint = tooltipFor("cubeViewerGlossSheenLift")) cubeViewerGlossSheenLift->setHint(hint);
+
+    auto* cubeViewerGlossSpatialInset = d.defineBooleanParam("cubeViewerGlossSpatialInset");
+    cubeViewerGlossSpatialInset->setLabel("Spatial Inset");
+    cubeViewerGlossSpatialInset->setDefault(chromaspaceDefaultValues.glossSpatialInset);
+    cubeViewerGlossSpatialInset->setParent(*grpCubeViewerGlossStructure);
+    cubeViewerGlossSpatialInset->setIsSecret(true);
+    cubeViewerGlossSpatialInset->setEnabled(false);
+    if (const char* hint = tooltipFor("cubeViewerGlossSpatialInset")) cubeViewerGlossSpatialInset->setHint(hint);
+
+    auto* cubeViewerGlossBodyOpacity = d.defineDoubleParam("cubeViewerGlossBodyOpacity");
+    cubeViewerGlossBodyOpacity->setLabel("Base Field Opacity");
+    cubeViewerGlossBodyOpacity->setRange(0.0, 1.0);
+    cubeViewerGlossBodyOpacity->setDisplayRange(0.0, 1.0);
+    cubeViewerGlossBodyOpacity->setIncrement(0.01);
+    cubeViewerGlossBodyOpacity->setDefault(std::clamp(chromaspaceDefaultValues.glossBodyOpacity, 0.0, 1.0));
+    cubeViewerGlossBodyOpacity->setParent(*grpCubeViewerGlossStructure);
+    cubeViewerGlossBodyOpacity->setIsSecret(true);
+    cubeViewerGlossBodyOpacity->setEnabled(false);
+    if (const char* hint = tooltipFor("cubeViewerGlossBodyOpacity")) cubeViewerGlossBodyOpacity->setHint(hint);
+
+    auto* cubeViewerGlossHighlightOpacity = d.defineDoubleParam("cubeViewerGlossHighlightOpacity");
+    cubeViewerGlossHighlightOpacity->setLabel("Signal Opacity");
+    cubeViewerGlossHighlightOpacity->setRange(0.0, 1.0);
+    cubeViewerGlossHighlightOpacity->setDisplayRange(0.0, 1.0);
+    cubeViewerGlossHighlightOpacity->setIncrement(0.01);
+    cubeViewerGlossHighlightOpacity->setDefault(std::clamp(chromaspaceDefaultValues.glossHighlightOpacity, 0.0, 1.0));
+    cubeViewerGlossHighlightOpacity->setParent(*grpCubeViewerGlossStructure);
+    cubeViewerGlossHighlightOpacity->setIsSecret(true);
+    cubeViewerGlossHighlightOpacity->setEnabled(false);
+    if (const char* hint = tooltipFor("cubeViewerGlossHighlightOpacity")) cubeViewerGlossHighlightOpacity->setHint(hint);
+
+    auto* cubeViewerGlossPointCrispness = d.defineDoubleParam("cubeViewerGlossPointCrispness");
+    cubeViewerGlossPointCrispness->setLabel("Projection Sharpness");
+    cubeViewerGlossPointCrispness->setRange(0.0, 1.0);
+    cubeViewerGlossPointCrispness->setDisplayRange(0.0, 1.0);
+    cubeViewerGlossPointCrispness->setIncrement(0.01);
+    cubeViewerGlossPointCrispness->setDefault(std::clamp(chromaspaceDefaultValues.glossPointCrispness, 0.0, 1.0));
+    cubeViewerGlossPointCrispness->setParent(*grpCubeViewerGlossStructure);
+    cubeViewerGlossPointCrispness->setIsSecret(true);
+    cubeViewerGlossPointCrispness->setEnabled(false);
+    if (const char* hint = tooltipFor("cubeViewerGlossPointCrispness")) cubeViewerGlossPointCrispness->setHint(hint);
+
+    auto* cubeViewerGlossSurfaceLinks = d.defineBooleanParam("cubeViewerGlossSurfaceLinks");
+    cubeViewerGlossSurfaceLinks->setLabel("Surface Links");
+    cubeViewerGlossSurfaceLinks->setDefault(true);
+    cubeViewerGlossSurfaceLinks->setParent(*grpCubeViewerGlossStructure);
+    cubeViewerGlossSurfaceLinks->setIsSecret(true);
+    cubeViewerGlossSurfaceLinks->setEnabled(false);
 
     auto* cubeViewerShowOverflow = d.defineBooleanParam("cubeViewerShowOverflow");
     cubeViewerShowOverflow->setLabel("Show Overflow");

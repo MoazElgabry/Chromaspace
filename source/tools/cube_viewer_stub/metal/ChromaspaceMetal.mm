@@ -4,6 +4,7 @@
 #import <simd/simd.h>
 
 #include <algorithm>
+#include <array>
 #include <cstring>
 #include <mutex>
 #include <sstream>
@@ -20,6 +21,15 @@ struct MetalContext {
   id<MTLComputePipelineState> overlayPipeline = nil;
   id<MTLComputePipelineState> inputPipeline = nil;
   id<MTLComputePipelineState> inputSamplePipeline = nil;
+  id<MTLComputePipelineState> glossFieldAccumulatePipeline = nil;
+  id<MTLComputePipelineState> glossFieldFinalizePipeline = nil;
+  id<MTLComputePipelineState> glossFieldMaxPipeline = nil;
+  id<MTLComputePipelineState> glossFieldNormalizePipeline = nil;
+  id<MTLComputePipelineState> glossFieldBlurPipeline = nil;
+  id<MTLComputePipelineState> glossFieldBodyPipeline = nil;
+  id<MTLComputePipelineState> glossFieldRawSignalPipeline = nil;
+  id<MTLComputePipelineState> glossFieldWeightedSignalPipeline = nil;
+  id<MTLComputePipelineState> glossFieldFinalNormalizePipeline = nil;
   std::string deviceName;
   std::string initError;
   bool initAttempted = false;
@@ -40,6 +50,10 @@ struct OverlayUniforms {
 
 struct InputUniforms {
   int pointCount;
+  int inputStride;
+  int glossView;
+  float sourceAspect;
+  float glossLiftScale;
   int showOverflow;
   int highlightOverflow;
   int plotMode;
@@ -54,6 +68,20 @@ struct InputUniforms {
 struct InputSampleUniforms {
   int fullPointCount;
   int visiblePointCount;
+};
+
+struct GlossFieldAccumulateUniforms {
+  int pointCount;
+  int gridWidth;
+  int gridHeight;
+  int showOverflow;
+};
+
+struct GlossFieldCellUniforms {
+  int cellCount;
+  int gridWidth;
+  int gridHeight;
+  int neighborhoodChoice;
 };
 
 struct PackedFloat3 {
@@ -88,6 +116,10 @@ struct OverlayUniforms {
 
 struct InputUniforms {
   int pointCount;
+  int inputStride;
+  int glossView;
+  float sourceAspect;
+  float glossLiftScale;
   int showOverflow;
   int highlightOverflow;
   int plotMode;
@@ -104,8 +136,54 @@ struct InputSampleUniforms {
   int visiblePointCount;
 };
 
+struct GlossFieldAccumulateUniforms {
+  int pointCount;
+  int gridWidth;
+  int gridHeight;
+  int showOverflow;
+};
+
+struct GlossFieldCellUniforms {
+  int cellCount;
+  int gridWidth;
+  int gridHeight;
+  int neighborhoodChoice;
+};
+
 float clamp01(float v) {
   return clamp(v, 0.0, 1.0);
+}
+
+constant float kGlossFieldAccumScale = 1024.0;
+constant float kGlossFieldAccumInvScale = 1.0 / 1024.0;
+
+uint glossEncodeAccum(float v) {
+  return uint(clamp(v, 0.0, 2.0) * kGlossFieldAccumScale + 0.5);
+}
+
+float glossDecodeAccum(uint v) {
+  return float(v) * kGlossFieldAccumInvScale;
+}
+
+float glossCommonComponent(float r, float g, float b) {
+  return max(0.0, min(r, min(g, b)));
+}
+
+float glossNeutrality(float r, float g, float b) {
+  float common = glossCommonComponent(r, g, b);
+  float maxRgb = max(r, max(g, b));
+  return maxRgb > 1e-6 ? clamp(common / maxRgb, 0.0, 1.0) : 0.0;
+}
+
+float glossStrengthCue(float r, float g, float b) {
+  float common = glossCommonComponent(r, g, b);
+  float neutrality = glossNeutrality(r, g, b);
+  return clamp(common * (0.75 + 0.85 * neutrality), 0.0, 1.0);
+}
+
+float glossPresenceWeight(float glossCue) {
+  float t = clamp((glossCue - 0.06) / 0.22, 0.0, 1.0);
+  return t * t * (3.0 - 2.0 * t);
 }
 
 float wrapHue01(float h) {
@@ -437,22 +515,48 @@ kernel void overlayKernel(const device float4* inputVals [[buffer(0)]],
   colorVals[index] = float4(cr, cg, cb, alpha);
 }
 
-kernel void inputKernel(const device packed_float3* inputVals [[buffer(0)]],
+kernel void inputKernel(const device float* inputVals [[buffer(0)]],
                         device packed_float3* vertVals [[buffer(1)]],
                         device float4* colorVals [[buffer(2)]],
                         constant InputUniforms& u [[buffer(3)]],
                         uint index [[thread_position_in_grid]]) {
   uint total = uint(max(u.pointCount, 0));
   if (index >= total) return;
-  packed_float3 p = inputVals[index];
-  float r = p.x;
-  float g = p.y;
-  float b = p.z;
+  uint stride = uint(max(u.inputStride, 3));
+  uint base = index * stride;
+  float xNorm = 0.5;
+  float yNorm = 0.5;
+  float r = inputVals[base + 0];
+  float g = inputVals[base + 1];
+  float b = inputVals[base + 2];
+  if (u.glossView != 0 && stride >= 6) {
+    xNorm = clamp(inputVals[base + 0], 0.0, 1.0);
+    yNorm = clamp(inputVals[base + 1], 0.0, 1.0);
+    r = inputVals[base + 3];
+    g = inputVals[base + 4];
+    b = inputVals[base + 5];
+  }
   bool overflowPoint = pointOverflowsCube(r, g, b);
   float plotR = (u.showOverflow != 0) ? r : clamp01(r);
   float plotG = (u.showOverflow != 0) ? g : clamp01(g);
   float plotB = (u.showOverflow != 0) ? b : clamp01(b);
   float3 pos = mapPlotPosition(plotR, plotG, plotB, u.plotMode, u.circularHsl, u.circularHsv, u.normConeNormalized, u.showOverflow);
+  if (u.glossView != 0) {
+    float aspect = clamp(u.sourceAspect, 0.25, 4.0);
+    float halfWidth = aspect >= 1.0 ? 1.22 : (1.22 * aspect);
+    float halfDepth = aspect >= 1.0 ? (1.22 / aspect) : 1.22;
+    float common = glossCommonComponent(plotR, plotG, plotB);
+    float bodyR = max(plotR - common, 0.0);
+    float bodyG = max(plotG - common, 0.0);
+    float bodyB = max(plotB - common, 0.0);
+    float bodyLuma = clamp(bodyR * 0.2126 + bodyG * 0.7152 + bodyB * 0.0722, 0.0, 1.0);
+    float glossCue = glossStrengthCue(plotR, plotG, plotB);
+    float glossPresence = glossPresenceWeight(glossCue);
+    float xPos = -halfWidth + (2.0 * halfWidth * xNorm);
+    float zPos = halfDepth - (2.0 * halfDepth * yNorm);
+    float yPos = -0.92 + bodyLuma * 0.92 + glossCue * glossPresence * u.glossLiftScale * 1.34;
+    pos = float3(xPos, yPos, zPos);
+  }
   vertVals[index] = packed_float3(pos.x, pos.y, pos.z);
   float cr;
   float cg;
@@ -464,10 +568,23 @@ kernel void inputKernel(const device packed_float3* inputVals [[buffer(0)]],
   } else {
     mapDisplayColor(r, g, b, cr, cg, cb);
     applyDisplaySaturation(u.colorSaturation, cr, cg, cb);
+    if (u.glossView != 0) {
+      float glossPresence = glossPresenceWeight(glossStrengthCue(plotR, plotG, plotB));
+      float neutralBlend = clamp(0.08 + 0.52 * glossPresence, 0.0, 0.62);
+      float brightnessGain = 1.18 + 1.20 * glossPresence;
+      cr = clamp((cr * (1.0 - neutralBlend) + neutralBlend) * brightnessGain, 0.0, 1.0);
+      cg = clamp((cg * (1.0 - neutralBlend) + neutralBlend) * brightnessGain, 0.0, 1.0);
+      cb = clamp((cb * (1.0 - neutralBlend) + neutralBlend) * brightnessGain, 0.0, 1.0);
+    }
   }
   bool overflowHighlighted = (u.showOverflow != 0 && u.highlightOverflow != 0 && overflowPoint);
+  float baseAlpha = overflowHighlighted ? 0.95 : 0.72;
+  if (u.glossView != 0 && !overflowHighlighted) {
+    float glossPresence = glossPresenceWeight(glossStrengthCue(plotR, plotG, plotB));
+    baseAlpha = 0.01 + 0.97 * glossPresence;
+  }
   colorVals[index] = float4(cr, cg, cb,
-                            luminanceAwareAlpha(overflowHighlighted ? 0.95 : 0.72,
+                            luminanceAwareAlpha(baseAlpha,
                                                 cr,
                                                 cg,
                                                 cb,
@@ -493,6 +610,334 @@ kernel void inputSampleKernel(const device packed_float3* srcVerts [[buffer(0)]]
   packed_float3 src = srcVerts[srcIndex];
   dstVerts[index] = packed_float3(src.x, src.y, src.z);
   dstColors[index] = srcColors[srcIndex];
+}
+
+int glossNeighborhoodRadiusCells(int neighborhoodChoice) {
+  switch (clamp(neighborhoodChoice, 0, 2)) {
+    case 0: return 1;
+    case 2: return 3;
+    case 1:
+    default: return 2;
+  }
+}
+
+float sampleGridClamped(const device float* values, int width, int height, int x, int y) {
+  if (values == nullptr || width <= 0 || height <= 0) return 0.0;
+  x = clamp(x, 0, width - 1);
+  y = clamp(y, 0, height - 1);
+  return values[uint(y * width + x)];
+}
+
+kernel void glossFieldAccumulateKernel(const device float* packedPoints [[buffer(0)]],
+                                       device atomic_uint* occupancyCounts [[buffer(1)]],
+                                       device atomic_uint* sumR [[buffer(2)]],
+                                       device atomic_uint* sumG [[buffer(3)]],
+                                       device atomic_uint* sumB [[buffer(4)]],
+                                       device atomic_uint* sumY [[buffer(5)]],
+                                       device atomic_uint* sumMax [[buffer(6)]],
+                                       device atomic_uint* sumMin [[buffer(7)]],
+                                       device atomic_uint* sumNeutrality [[buffer(8)]],
+                                       constant GlossFieldAccumulateUniforms& u [[buffer(9)]],
+                                       uint index [[thread_position_in_grid]]) {
+  uint total = uint(max(u.pointCount, 0));
+  if (index >= total) return;
+  uint base = index * 6u;
+  float xNorm = clamp(packedPoints[base + 0u], 0.0, 1.0);
+  float yNorm = clamp(packedPoints[base + 1u], 0.0, 1.0);
+  float r = packedPoints[base + 3u];
+  float g = packedPoints[base + 4u];
+  float b = packedPoints[base + 5u];
+  if (u.showOverflow == 0) {
+    r = clamp01(r);
+    g = clamp01(g);
+    b = clamp01(b);
+  }
+  float maxRgb = clamp(max(r, max(g, b)), 0.0, 1.0);
+  float minRgb = clamp(max(0.0, min(r, min(g, b))), 0.0, 1.0);
+  float neutralityValue = maxRgb > 1e-6 ? clamp(minRgb / maxRgb, 0.0, 1.0) : 0.0;
+  float luma = clamp(r * 0.2126 + g * 0.7152 + b * 0.0722, 0.0, 1.0);
+  int x = clamp(int(xNorm * float(u.gridWidth)), 0, max(u.gridWidth - 1, 0));
+  int y = clamp(int((1.0 - yNorm) * float(u.gridHeight)), 0, max(u.gridHeight - 1, 0));
+  uint cellIndex = uint(y * u.gridWidth + x);
+  atomic_fetch_add_explicit(&occupancyCounts[cellIndex], 1u, memory_order_relaxed);
+  atomic_fetch_add_explicit(&sumR[cellIndex], glossEncodeAccum(r), memory_order_relaxed);
+  atomic_fetch_add_explicit(&sumG[cellIndex], glossEncodeAccum(g), memory_order_relaxed);
+  atomic_fetch_add_explicit(&sumB[cellIndex], glossEncodeAccum(b), memory_order_relaxed);
+  atomic_fetch_add_explicit(&sumY[cellIndex], glossEncodeAccum(luma), memory_order_relaxed);
+  atomic_fetch_add_explicit(&sumMax[cellIndex], glossEncodeAccum(maxRgb), memory_order_relaxed);
+  atomic_fetch_add_explicit(&sumMin[cellIndex], glossEncodeAccum(minRgb), memory_order_relaxed);
+  atomic_fetch_add_explicit(&sumNeutrality[cellIndex], glossEncodeAccum(neutralityValue), memory_order_relaxed);
+}
+
+kernel void glossFieldFinalizeKernel(const device atomic_uint* occupancyCounts [[buffer(0)]],
+                                     const device atomic_uint* sumR [[buffer(1)]],
+                                     const device atomic_uint* sumG [[buffer(2)]],
+                                     const device atomic_uint* sumB [[buffer(3)]],
+                                     const device atomic_uint* sumY [[buffer(4)]],
+                                     const device atomic_uint* sumMax [[buffer(5)]],
+                                     const device atomic_uint* sumMin [[buffer(6)]],
+                                     const device atomic_uint* sumNeutrality [[buffer(7)]],
+                                     device float* occupancy [[buffer(8)]],
+                                     device float* meanR [[buffer(9)]],
+                                     device float* meanG [[buffer(10)]],
+                                     device float* meanB [[buffer(11)]],
+                                     device float* carrierY [[buffer(12)]],
+                                     device float* carrierMax [[buffer(13)]],
+                                     device float* carrierMin [[buffer(14)]],
+                                     device float* neutrality [[buffer(15)]],
+                                     constant GlossFieldCellUniforms& u [[buffer(16)]],
+                                     uint index [[thread_position_in_grid]]) {
+  uint total = uint(max(u.cellCount, 0));
+  if (index >= total) return;
+  uint count = atomic_load_explicit(&occupancyCounts[index], memory_order_relaxed);
+  occupancy[index] = float(count);
+  if (count == 0u) {
+    meanR[index] = 0.0;
+    meanG[index] = 0.0;
+    meanB[index] = 0.0;
+    carrierY[index] = 0.0;
+    carrierMax[index] = 0.0;
+    carrierMin[index] = 0.0;
+    neutrality[index] = 0.0;
+    return;
+  }
+  float invCount = 1.0 / float(count);
+  meanR[index] = glossDecodeAccum(atomic_load_explicit(&sumR[index], memory_order_relaxed)) * invCount;
+  meanG[index] = glossDecodeAccum(atomic_load_explicit(&sumG[index], memory_order_relaxed)) * invCount;
+  meanB[index] = glossDecodeAccum(atomic_load_explicit(&sumB[index], memory_order_relaxed)) * invCount;
+  carrierY[index] = glossDecodeAccum(atomic_load_explicit(&sumY[index], memory_order_relaxed)) * invCount;
+  carrierMax[index] = glossDecodeAccum(atomic_load_explicit(&sumMax[index], memory_order_relaxed)) * invCount;
+  carrierMin[index] = glossDecodeAccum(atomic_load_explicit(&sumMin[index], memory_order_relaxed)) * invCount;
+  neutrality[index] = glossDecodeAccum(atomic_load_explicit(&sumNeutrality[index], memory_order_relaxed)) * invCount;
+}
+
+kernel void glossFieldMaxKernel(const device float* values [[buffer(0)]],
+                                device atomic_uint* outBits [[buffer(1)]],
+                                constant GlossFieldCellUniforms& u [[buffer(2)]],
+                                uint index [[thread_position_in_grid]]) {
+  uint total = uint(max(u.cellCount, 0));
+  if (index >= total) return;
+  atomic_fetch_max_explicit(&outBits[0], as_type<uint>(max(values[index], 0.0)), memory_order_relaxed);
+}
+
+kernel void glossFieldNormalizeKernel(const device float* src [[buffer(0)]],
+                                      device float* dst [[buffer(1)]],
+                                      const device atomic_uint* maxBits [[buffer(2)]],
+                                      constant GlossFieldCellUniforms& u [[buffer(3)]],
+                                      uint index [[thread_position_in_grid]]) {
+  uint total = uint(max(u.cellCount, 0));
+  if (index >= total) return;
+  float denom = max(as_type<float>(atomic_load_explicit(&maxBits[0], memory_order_relaxed)), 1e-5);
+  dst[index] = clamp(src[index] / denom, 0.0, 1.0);
+}
+
+kernel void glossFieldBlurKernel(const device float* src [[buffer(0)]],
+                                 device float* dst [[buffer(1)]],
+                                 constant GlossFieldCellUniforms& u [[buffer(2)]],
+                                 uint index [[thread_position_in_grid]]) {
+  uint total = uint(max(u.cellCount, 0));
+  if (index >= total) return;
+  int x = int(index % uint(u.gridWidth));
+  int y = int(index / uint(u.gridWidth));
+  float accum = 0.0;
+  float weight = 0.0;
+  for (int oy = -1; oy <= 1; ++oy) {
+    int yy = y + oy;
+    if (yy < 0 || yy >= u.gridHeight) continue;
+    for (int ox = -1; ox <= 1; ++ox) {
+      int xx = x + ox;
+      if (xx < 0 || xx >= u.gridWidth) continue;
+      float kernel = (ox == 0 && oy == 0) ? 0.30 : ((ox == 0 || oy == 0) ? 0.13 : 0.08);
+      accum += src[uint(yy * u.gridWidth + xx)] * kernel;
+      weight += kernel;
+    }
+  }
+  dst[index] = weight > 1e-6 ? (accum / weight) : 0.0;
+}
+
+kernel void glossFieldBodyKernel(const device float* occupancy [[buffer(0)]],
+                                 const device float* meanR [[buffer(1)]],
+                                 const device float* meanG [[buffer(2)]],
+                                 const device float* meanB [[buffer(3)]],
+                                 const device float* carrierMax [[buffer(4)]],
+                                 device float* body [[buffer(5)]],
+                                 constant GlossFieldCellUniforms& u [[buffer(6)]],
+                                 uint index [[thread_position_in_grid]]) {
+  uint total = uint(max(u.cellCount, 0));
+  if (index >= total) return;
+  if (occupancy[index] <= 0.5) {
+    body[index] = 0.0;
+    return;
+  }
+  int x = int(index % uint(u.gridWidth));
+  int y = int(index / uint(u.gridWidth));
+  int radiusCells = glossNeighborhoodRadiusCells(u.neighborhoodChoice);
+  const int kMaxNeighborhood = 49;
+  float carriers[kMaxNeighborhood];
+  int neighborIndices[kMaxNeighborhood];
+  int count = 0;
+  float centerCarrier = carrierMax[index];
+  float centerR = meanR[index];
+  float centerG = meanG[index];
+  float centerB = meanB[index];
+  for (int oy = -radiusCells; oy <= radiusCells; ++oy) {
+    int yy = y + oy;
+    if (yy < 0 || yy >= u.gridHeight) continue;
+    for (int ox = -radiusCells; ox <= radiusCells; ++ox) {
+      int xx = x + ox;
+      if (xx < 0 || xx >= u.gridWidth) continue;
+      uint neighborIndex = uint(yy * u.gridWidth + xx);
+      if (occupancy[neighborIndex] <= 0.5) continue;
+      float carrier = carrierMax[neighborIndex];
+      float dr = meanR[neighborIndex] - centerR;
+      float dg = meanG[neighborIndex] - centerG;
+      float db = meanB[neighborIndex] - centerB;
+      float colorDistance = sqrt(dr * dr + dg * dg + db * db);
+      if (abs(carrier - centerCarrier) > 0.26 && colorDistance > 0.20) continue;
+      if (count < kMaxNeighborhood) {
+        carriers[count] = carrier;
+        neighborIndices[count] = int(neighborIndex);
+        ++count;
+      }
+    }
+  }
+  if (count <= 0) {
+    body[index] = centerCarrier;
+    return;
+  }
+  for (int i = 1; i < count; ++i) {
+    float keyCarrier = carriers[i];
+    int keyIndex = neighborIndices[i];
+    int j = i - 1;
+    while (j >= 0 && (carriers[j] > keyCarrier || (carriers[j] == keyCarrier && neighborIndices[j] > keyIndex))) {
+      carriers[j + 1] = carriers[j];
+      neighborIndices[j + 1] = neighborIndices[j];
+      --j;
+    }
+    carriers[j + 1] = keyCarrier;
+    neighborIndices[j + 1] = keyIndex;
+  }
+  int trim = count >= 6 ? max(1, count / 6) : 0;
+  int begin = min(trim, count);
+  int end = max(begin + 1, count - trim);
+  float bodySum = 0.0;
+  float bodyWeight = 0.0;
+  for (int i = begin; i < end; ++i) {
+    int neighborIndex = neighborIndices[i];
+    int neighborX = neighborIndex % u.gridWidth;
+    int neighborY = neighborIndex / u.gridWidth;
+    float dx = float(neighborX - x);
+    float dy = float(neighborY - y);
+    float spatialWeight = 1.0 / (1.0 + dx * dx + dy * dy);
+    bodySum += carriers[i] * spatialWeight;
+    bodyWeight += spatialWeight;
+  }
+  body[index] = bodyWeight > 1e-6 ? (bodySum / bodyWeight) : centerCarrier;
+}
+
+kernel void glossFieldRawSignalKernel(const device float* occupancy [[buffer(0)]],
+                                      const device float* carrierMax [[buffer(1)]],
+                                      const device float* body [[buffer(2)]],
+                                      device float* rawSignal [[buffer(3)]],
+                                      device atomic_uint* maxBits [[buffer(4)]],
+                                      constant GlossFieldCellUniforms& u [[buffer(5)]],
+                                      uint index [[thread_position_in_grid]]) {
+  uint total = uint(max(u.cellCount, 0));
+  if (index >= total) return;
+  if (occupancy[index] <= 0.5) {
+    rawSignal[index] = 0.0;
+    return;
+  }
+  float bodyValue = max(body[index], 0.0);
+  float rawPositive = max(0.0, carrierMax[index] - bodyValue);
+  float rawNegative = max(0.0, bodyValue - carrierMax[index]);
+  rawSignal[index] = rawPositive - rawNegative;
+  atomic_fetch_max_explicit(&maxBits[0], as_type<uint>(bodyValue), memory_order_relaxed);
+}
+
+kernel void glossFieldWeightedSignalKernel(const device float* occupancyNorm [[buffer(0)]],
+                                           const device float* body [[buffer(1)]],
+                                           const device float* rawSignal [[buffer(2)]],
+                                           device float* positive [[buffer(3)]],
+                                           device float* negative [[buffer(4)]],
+                                           device float* boundary [[buffer(5)]],
+                                           device float* congruence [[buffer(6)]],
+                                           device float* confidence [[buffer(7)]],
+                                           device float* signal [[buffer(8)]],
+                                           device atomic_uint* maxBits [[buffer(9)]],
+                                           constant GlossFieldCellUniforms& u [[buffer(10)]],
+                                           uint index [[thread_position_in_grid]]) {
+  uint total = uint(max(u.cellCount, 0));
+  if (index >= total) return;
+  int x = int(index % uint(u.gridWidth));
+  int y = int(index / uint(u.gridWidth));
+  float occCenter = sampleGridClamped(occupancyNorm, u.gridWidth, u.gridHeight, x, y);
+  if (occCenter <= 0.0) {
+    positive[index] = 0.0;
+    negative[index] = 0.0;
+    boundary[index] = 0.0;
+    congruence[index] = 0.0;
+    confidence[index] = 0.0;
+    signal[index] = 0.0;
+    return;
+  }
+  float gxCarrier = sampleGridClamped(body, u.gridWidth, u.gridHeight, x + 1, y) -
+                    sampleGridClamped(body, u.gridWidth, u.gridHeight, x - 1, y);
+  float gyCarrier = sampleGridClamped(body, u.gridWidth, u.gridHeight, x, y + 1) -
+                    sampleGridClamped(body, u.gridWidth, u.gridHeight, x, y - 1);
+  float gxSignal = sampleGridClamped(rawSignal, u.gridWidth, u.gridHeight, x + 1, y) -
+                   sampleGridClamped(rawSignal, u.gridWidth, u.gridHeight, x - 1, y);
+  float gySignal = sampleGridClamped(rawSignal, u.gridWidth, u.gridHeight, x, y + 1) -
+                   sampleGridClamped(rawSignal, u.gridWidth, u.gridHeight, x, y - 1);
+  float magCarrier = sqrt(gxCarrier * gxCarrier + gyCarrier * gyCarrier);
+  float magSignal = sqrt(gxSignal * gxSignal + gySignal * gySignal);
+  float localCongruence = 0.0;
+  if (magCarrier > 1e-6 && magSignal > 1e-6) {
+    localCongruence = abs((gxCarrier * gxSignal + gyCarrier * gySignal) / (magCarrier * magSignal));
+  } else if (magSignal > 1e-6) {
+    localCongruence = 0.35;
+  }
+  float occNeighborhood =
+      (occCenter +
+       sampleGridClamped(occupancyNorm, u.gridWidth, u.gridHeight, x + 1, y) +
+       sampleGridClamped(occupancyNorm, u.gridWidth, u.gridHeight, x - 1, y) +
+       sampleGridClamped(occupancyNorm, u.gridWidth, u.gridHeight, x, y + 1) +
+       sampleGridClamped(occupancyNorm, u.gridWidth, u.gridHeight, x, y - 1)) / 5.0;
+  float localConfidence = clamp(sqrt(occCenter) * clamp(0.28 + 0.72 * occNeighborhood, 0.0, 1.0), 0.0, 1.0);
+  float posWeighted = max(0.0, rawSignal[index]) * (0.30 + 0.70 * localCongruence) * localConfidence;
+  float negWeighted = max(0.0, -rawSignal[index]) * (0.30 + 0.70 * localCongruence) * localConfidence;
+  float boundaryValue = clamp(magSignal * 4.0, 0.0, 1.0) * localConfidence;
+  positive[index] = posWeighted;
+  negative[index] = negWeighted;
+  boundary[index] = boundaryValue;
+  congruence[index] = localCongruence;
+  confidence[index] = localConfidence;
+  signal[index] = posWeighted - negWeighted;
+  atomic_fetch_max_explicit(&maxBits[0], as_type<uint>(max(posWeighted, 0.0)), memory_order_relaxed);
+  atomic_fetch_max_explicit(&maxBits[1], as_type<uint>(max(negWeighted, 0.0)), memory_order_relaxed);
+  atomic_fetch_max_explicit(&maxBits[2], as_type<uint>(max(boundaryValue, 0.0)), memory_order_relaxed);
+}
+
+kernel void glossFieldFinalNormalizeKernel(device float* body [[buffer(0)]],
+                                           device float* signal [[buffer(1)]],
+                                           device float* positive [[buffer(2)]],
+                                           device float* negative [[buffer(3)]],
+                                           device float* boundary [[buffer(4)]],
+                                           const device atomic_uint* maxBits [[buffer(5)]],
+                                           constant GlossFieldCellUniforms& u [[buffer(6)]],
+                                           uint index [[thread_position_in_grid]]) {
+  uint total = uint(max(u.cellCount, 0));
+  if (index >= total) return;
+  float maxBody = max(as_type<float>(atomic_load_explicit(&maxBits[0], memory_order_relaxed)), 1e-5);
+  float maxPositive = max(as_type<float>(atomic_load_explicit(&maxBits[1], memory_order_relaxed)), 1e-5);
+  float maxNegative = max(as_type<float>(atomic_load_explicit(&maxBits[2], memory_order_relaxed)), 1e-5);
+  float maxBoundary = max(as_type<float>(atomic_load_explicit(&maxBits[3], memory_order_relaxed)), 1e-5);
+  float maxAbsSignal = max(max(maxPositive, maxNegative), 1e-5);
+  body[index] = clamp(body[index] / maxBody, 0.0, 1.0);
+  positive[index] = clamp(positive[index] / maxPositive, 0.0, 1.0);
+  negative[index] = clamp(negative[index] / maxNegative, 0.0, 1.0);
+  signal[index] = clamp(signal[index] / maxAbsSignal, -1.0, 1.0);
+  boundary[index] = clamp(boundary[index] / maxBoundary, 0.0, 1.0);
 }
 )MSL";
 
@@ -552,6 +997,74 @@ bool ensureContext(std::string* error) {
       c.inputSamplePipeline = [c.device newComputePipelineStateWithFunction:inputSampleFn error:&pipelineError];
       if (c.inputSamplePipeline == nil) {
         c.initError = pipelineError != nil ? [[pipelineError localizedDescription] UTF8String] : "Failed to create input sample Metal pipeline.";
+        return;
+      }
+      auto buildPipeline = [&](NSString* name, id<MTLComputePipelineState>* dst, const char* missingMsg, const char* failMsg) -> bool {
+        pipelineError = nil;
+        id<MTLFunction> fn = [c.library newFunctionWithName:name];
+        if (fn == nil) {
+          c.initError = missingMsg;
+          return false;
+        }
+        *dst = [c.device newComputePipelineStateWithFunction:fn error:&pipelineError];
+        if (*dst == nil) {
+          c.initError = pipelineError != nil ? [[pipelineError localizedDescription] UTF8String] : failMsg;
+          return false;
+        }
+        return true;
+      };
+      if (!buildPipeline(@"glossFieldAccumulateKernel",
+                         &c.glossFieldAccumulatePipeline,
+                         "Missing gloss field accumulate Metal kernel.",
+                         "Failed to create gloss field accumulate Metal pipeline.")) {
+        return;
+      }
+      if (!buildPipeline(@"glossFieldFinalizeKernel",
+                         &c.glossFieldFinalizePipeline,
+                         "Missing gloss field finalize Metal kernel.",
+                         "Failed to create gloss field finalize Metal pipeline.")) {
+        return;
+      }
+      if (!buildPipeline(@"glossFieldMaxKernel",
+                         &c.glossFieldMaxPipeline,
+                         "Missing gloss field max Metal kernel.",
+                         "Failed to create gloss field max Metal pipeline.")) {
+        return;
+      }
+      if (!buildPipeline(@"glossFieldNormalizeKernel",
+                         &c.glossFieldNormalizePipeline,
+                         "Missing gloss field normalize Metal kernel.",
+                         "Failed to create gloss field normalize Metal pipeline.")) {
+        return;
+      }
+      if (!buildPipeline(@"glossFieldBlurKernel",
+                         &c.glossFieldBlurPipeline,
+                         "Missing gloss field blur Metal kernel.",
+                         "Failed to create gloss field blur Metal pipeline.")) {
+        return;
+      }
+      if (!buildPipeline(@"glossFieldBodyKernel",
+                         &c.glossFieldBodyPipeline,
+                         "Missing gloss field body Metal kernel.",
+                         "Failed to create gloss field body Metal pipeline.")) {
+        return;
+      }
+      if (!buildPipeline(@"glossFieldRawSignalKernel",
+                         &c.glossFieldRawSignalPipeline,
+                         "Missing gloss field raw signal Metal kernel.",
+                         "Failed to create gloss field raw signal Metal pipeline.")) {
+        return;
+      }
+      if (!buildPipeline(@"glossFieldWeightedSignalKernel",
+                         &c.glossFieldWeightedSignalPipeline,
+                         "Missing gloss field weighted signal Metal kernel.",
+                         "Failed to create gloss field weighted signal Metal pipeline.")) {
+        return;
+      }
+      if (!buildPipeline(@"glossFieldFinalNormalizeKernel",
+                         &c.glossFieldFinalNormalizePipeline,
+                         "Missing gloss field final normalize Metal kernel.",
+                         "Failed to create gloss field final normalize Metal pipeline.")) {
         return;
       }
       c.ready = true;
@@ -654,6 +1167,49 @@ bool runInputSampleCompute(id<MTLBuffer> srcVertBuffer,
   return true;
 }
 
+template <size_t N>
+bool runComputeBuffers(id<MTLComputePipelineState> pipeline,
+                       const std::array<id<MTLBuffer>, N>& buffers,
+                       NSUInteger threadCount,
+                       std::string* error) {
+  MetalContext& ctx = context();
+  if (!ctx.ready || pipeline == nil) {
+    if (error && error->empty()) *error = ctx.initError.empty() ? "Metal compute pipeline unavailable." : ctx.initError;
+    return false;
+  }
+  @autoreleasepool {
+    id<MTLCommandBuffer> commandBuffer = [ctx.queue commandBuffer];
+    if (commandBuffer == nil) {
+      if (error) *error = "Failed to create Metal command buffer.";
+      return false;
+    }
+    id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
+    if (encoder == nil) {
+      if (error) *error = "Failed to create Metal compute encoder.";
+      return false;
+    }
+    [encoder setComputePipelineState:pipeline];
+    for (NSUInteger i = 0; i < N; ++i) {
+      if (buffers[i] != nil) [encoder setBuffer:buffers[i] offset:0 atIndex:i];
+    }
+    NSUInteger width = pipeline.maxTotalThreadsPerThreadgroup;
+    if (width == 0) width = 64;
+    width = std::min<NSUInteger>(width, 64);
+    MTLSize threadsPerGroup = MTLSizeMake(width, 1, 1);
+    MTLSize threadsPerGrid = MTLSizeMake(threadCount, 1, 1);
+    [encoder dispatchThreads:threadsPerGrid threadsPerThreadgroup:threadsPerGroup];
+    [encoder endEncoding];
+    [commandBuffer commit];
+    [commandBuffer waitUntilCompleted];
+    NSError* cbError = commandBuffer.error;
+    if (cbError != nil) {
+      if (error) *error = [[cbError localizedDescription] UTF8String];
+      return false;
+    }
+  }
+  return true;
+}
+
 template <typename T>
 id<MTLBuffer> makeSharedBuffer(const T* values, size_t count) {
   MetalContext& ctx = context();
@@ -668,6 +1224,11 @@ id<MTLBuffer> makeEmptySharedBuffer(NSUInteger bytes) {
   MetalContext& ctx = context();
   if (!ctx.ready) return nil;
   return [ctx.device newBufferWithLength:bytes options:MTLResourceStorageModeShared];
+}
+
+void clearSharedBuffer(id<MTLBuffer> buffer) {
+  if (buffer == nil) return;
+  std::memset([buffer contents], 0, static_cast<size_t>([buffer length]));
 }
 
 template <typename T>
@@ -793,7 +1354,8 @@ bool buildInputMesh(const InputRequest& request,
     if (outColors) outColors->clear();
     return true;
   }
-  if (rawPoints.size() < pointCount * 3u) {
+  const size_t inputStride = static_cast<size_t>(std::max(request.inputStride, 3));
+  if (rawPoints.size() < pointCount * inputStride) {
     if (error) *error = "Input Metal raw point buffer is undersized.";
     return false;
   }
@@ -801,6 +1363,10 @@ bool buildInputMesh(const InputRequest& request,
   MetalContext& ctx = context();
   InputUniforms uniforms{};
   uniforms.pointCount = request.pointCount;
+  uniforms.inputStride = request.inputStride;
+  uniforms.glossView = request.glossView;
+  uniforms.sourceAspect = request.sourceAspect;
+  uniforms.glossLiftScale = request.glossLiftScale;
   uniforms.showOverflow = request.remap.showOverflow;
   uniforms.highlightOverflow = request.remap.highlightOverflow;
   uniforms.plotMode = request.remap.plotMode;
@@ -811,7 +1377,7 @@ bool buildInputMesh(const InputRequest& request,
   uniforms.denseAlphaBias = request.denseAlphaBias;
   uniforms.colorSaturation = request.colorSaturation;
 
-  id<MTLBuffer> inputBuffer = makeSharedBuffer(reinterpret_cast<const PackedFloat3*>(rawPoints.data()), pointCount);
+  id<MTLBuffer> inputBuffer = makeSharedBuffer(rawPoints.data(), rawPoints.size());
   id<MTLBuffer> vertBuffer = makeEmptySharedBuffer(pointCount * sizeof(PackedFloat3));
   id<MTLBuffer> colorBuffer = makeEmptySharedBuffer(pointCount * sizeof(simd_float4));
   id<MTLBuffer> uniformBuffer = makeSharedBuffer(&uniforms, 1u);
@@ -867,6 +1433,309 @@ bool buildInputSampledMesh(const InputSampleRequest& request,
     }
     copySharedBuffer<PackedFloat3>(dstVertBuffer, visiblePointCount, outVerts);
     copySharedBuffer<simd_float4>(dstColorBuffer, visiblePointCount, outColors);
+  }
+  return true;
+}
+
+bool buildGlossField(const GlossFieldRequest& request,
+                     const std::vector<float>& packedPoints,
+                     GlossFieldResult* out,
+                     std::string* error) {
+  std::string localError;
+  if (!out) {
+    if (error) *error = "Missing Metal gloss-field output.";
+    return false;
+  }
+  if (!ensureContext(&localError)) {
+    if (error) *error = localError;
+    return false;
+  }
+  const int gridWidth = std::max(request.gridWidth, 1);
+  const int gridHeight = std::max(request.gridHeight, 1);
+  const NSUInteger pointCount = static_cast<NSUInteger>(packedPoints.size() / 6u);
+  const NSUInteger cellCount = static_cast<NSUInteger>(gridWidth) * static_cast<NSUInteger>(gridHeight);
+  if (pointCount == 0u || cellCount == 0u) {
+    if (error) *error = "Invalid Metal gloss-field request.";
+    return false;
+  }
+
+  MetalContext& ctx = context();
+  @autoreleasepool {
+    GlossFieldAccumulateUniforms accumulateUniforms{};
+    accumulateUniforms.pointCount = static_cast<int>(pointCount);
+    accumulateUniforms.gridWidth = gridWidth;
+    accumulateUniforms.gridHeight = gridHeight;
+    accumulateUniforms.showOverflow = request.showOverflow;
+
+    GlossFieldCellUniforms cellUniforms{};
+    cellUniforms.cellCount = static_cast<int>(cellCount);
+    cellUniforms.gridWidth = gridWidth;
+    cellUniforms.gridHeight = gridHeight;
+    cellUniforms.neighborhoodChoice = request.neighborhoodChoice;
+
+    id<MTLBuffer> inputBuffer = makeSharedBuffer(packedPoints.data(), packedPoints.size());
+    id<MTLBuffer> occupancyCountsBuffer = makeEmptySharedBuffer(cellCount * sizeof(uint32_t));
+    id<MTLBuffer> sumRBuffer = makeEmptySharedBuffer(cellCount * sizeof(uint32_t));
+    id<MTLBuffer> sumGBuffer = makeEmptySharedBuffer(cellCount * sizeof(uint32_t));
+    id<MTLBuffer> sumBBuffer = makeEmptySharedBuffer(cellCount * sizeof(uint32_t));
+    id<MTLBuffer> sumYBuffer = makeEmptySharedBuffer(cellCount * sizeof(uint32_t));
+    id<MTLBuffer> sumMaxBuffer = makeEmptySharedBuffer(cellCount * sizeof(uint32_t));
+    id<MTLBuffer> sumMinBuffer = makeEmptySharedBuffer(cellCount * sizeof(uint32_t));
+    id<MTLBuffer> sumNeutralityBuffer = makeEmptySharedBuffer(cellCount * sizeof(uint32_t));
+    id<MTLBuffer> occupancyBuffer = makeEmptySharedBuffer(cellCount * sizeof(float));
+    id<MTLBuffer> meanRBuffer = makeEmptySharedBuffer(cellCount * sizeof(float));
+    id<MTLBuffer> meanGBuffer = makeEmptySharedBuffer(cellCount * sizeof(float));
+    id<MTLBuffer> meanBBuffer = makeEmptySharedBuffer(cellCount * sizeof(float));
+    id<MTLBuffer> carrierYBuffer = makeEmptySharedBuffer(cellCount * sizeof(float));
+    id<MTLBuffer> carrierMaxBuffer = makeEmptySharedBuffer(cellCount * sizeof(float));
+    id<MTLBuffer> carrierMinBuffer = makeEmptySharedBuffer(cellCount * sizeof(float));
+    id<MTLBuffer> neutralityBuffer = makeEmptySharedBuffer(cellCount * sizeof(float));
+    id<MTLBuffer> occupancyNormBuffer = makeEmptySharedBuffer(cellCount * sizeof(float));
+    id<MTLBuffer> tempBuffer = makeEmptySharedBuffer(cellCount * sizeof(float));
+    id<MTLBuffer> bodyBuffer = makeEmptySharedBuffer(cellCount * sizeof(float));
+    id<MTLBuffer> rawSignalBuffer = makeEmptySharedBuffer(cellCount * sizeof(float));
+    id<MTLBuffer> positiveBuffer = makeEmptySharedBuffer(cellCount * sizeof(float));
+    id<MTLBuffer> negativeBuffer = makeEmptySharedBuffer(cellCount * sizeof(float));
+    id<MTLBuffer> boundaryBuffer = makeEmptySharedBuffer(cellCount * sizeof(float));
+    id<MTLBuffer> congruenceBuffer = makeEmptySharedBuffer(cellCount * sizeof(float));
+    id<MTLBuffer> confidenceBuffer = makeEmptySharedBuffer(cellCount * sizeof(float));
+    id<MTLBuffer> signalBuffer = makeEmptySharedBuffer(cellCount * sizeof(float));
+    id<MTLBuffer> reductionBuffer = makeEmptySharedBuffer(4u * sizeof(uint32_t));
+    id<MTLBuffer> accumulateUniformBuffer = makeSharedBuffer(&accumulateUniforms, 1u);
+    id<MTLBuffer> cellUniformBuffer = makeSharedBuffer(&cellUniforms, 1u);
+    if (inputBuffer == nil || occupancyCountsBuffer == nil || sumRBuffer == nil || sumGBuffer == nil ||
+        sumBBuffer == nil || sumYBuffer == nil || sumMaxBuffer == nil || sumMinBuffer == nil ||
+        sumNeutralityBuffer == nil || occupancyBuffer == nil || meanRBuffer == nil || meanGBuffer == nil ||
+        meanBBuffer == nil || carrierYBuffer == nil || carrierMaxBuffer == nil || carrierMinBuffer == nil ||
+        neutralityBuffer == nil || occupancyNormBuffer == nil || tempBuffer == nil || bodyBuffer == nil ||
+        rawSignalBuffer == nil || positiveBuffer == nil || negativeBuffer == nil || boundaryBuffer == nil ||
+        congruenceBuffer == nil || confidenceBuffer == nil || signalBuffer == nil || reductionBuffer == nil ||
+        accumulateUniformBuffer == nil || cellUniformBuffer == nil) {
+      if (error) *error = "Failed to allocate Metal gloss-field buffers.";
+      return false;
+    }
+
+    const auto clearReduction = [&]() {
+      clearSharedBuffer(reductionBuffer);
+    };
+    clearSharedBuffer(occupancyCountsBuffer);
+    clearSharedBuffer(sumRBuffer);
+    clearSharedBuffer(sumGBuffer);
+    clearSharedBuffer(sumBBuffer);
+    clearSharedBuffer(sumYBuffer);
+    clearSharedBuffer(sumMaxBuffer);
+    clearSharedBuffer(sumMinBuffer);
+    clearSharedBuffer(sumNeutralityBuffer);
+    clearSharedBuffer(occupancyBuffer);
+    clearSharedBuffer(meanRBuffer);
+    clearSharedBuffer(meanGBuffer);
+    clearSharedBuffer(meanBBuffer);
+    clearSharedBuffer(carrierYBuffer);
+    clearSharedBuffer(carrierMaxBuffer);
+    clearSharedBuffer(carrierMinBuffer);
+    clearSharedBuffer(neutralityBuffer);
+    clearSharedBuffer(occupancyNormBuffer);
+    clearSharedBuffer(tempBuffer);
+    clearSharedBuffer(bodyBuffer);
+    clearSharedBuffer(rawSignalBuffer);
+    clearSharedBuffer(positiveBuffer);
+    clearSharedBuffer(negativeBuffer);
+    clearSharedBuffer(boundaryBuffer);
+    clearSharedBuffer(congruenceBuffer);
+    clearSharedBuffer(confidenceBuffer);
+    clearSharedBuffer(signalBuffer);
+    clearReduction();
+
+    if (!runComputeBuffers(ctx.glossFieldAccumulatePipeline,
+                           std::array<id<MTLBuffer>, 10>{inputBuffer,
+                                                         occupancyCountsBuffer,
+                                                         sumRBuffer,
+                                                         sumGBuffer,
+                                                         sumBBuffer,
+                                                         sumYBuffer,
+                                                         sumMaxBuffer,
+                                                         sumMinBuffer,
+                                                         sumNeutralityBuffer,
+                                                         accumulateUniformBuffer},
+                           pointCount,
+                           &localError)) {
+      if (error) *error = localError;
+      return false;
+    }
+    if (!runComputeBuffers(ctx.glossFieldFinalizePipeline,
+                           std::array<id<MTLBuffer>, 17>{occupancyCountsBuffer,
+                                                         sumRBuffer,
+                                                         sumGBuffer,
+                                                         sumBBuffer,
+                                                         sumYBuffer,
+                                                         sumMaxBuffer,
+                                                         sumMinBuffer,
+                                                         sumNeutralityBuffer,
+                                                         occupancyBuffer,
+                                                         meanRBuffer,
+                                                         meanGBuffer,
+                                                         meanBBuffer,
+                                                         carrierYBuffer,
+                                                         carrierMaxBuffer,
+                                                         carrierMinBuffer,
+                                                         neutralityBuffer,
+                                                         cellUniformBuffer},
+                           cellCount,
+                           &localError)) {
+      if (error) *error = localError;
+      return false;
+    }
+
+    clearReduction();
+    if (!runComputeBuffers(ctx.glossFieldMaxPipeline,
+                           std::array<id<MTLBuffer>, 3>{occupancyBuffer, reductionBuffer, cellUniformBuffer},
+                           cellCount,
+                           &localError) ||
+        !runComputeBuffers(ctx.glossFieldNormalizePipeline,
+                           std::array<id<MTLBuffer>, 4>{occupancyBuffer, occupancyNormBuffer, reductionBuffer, cellUniformBuffer},
+                           cellCount,
+                           &localError) ||
+        !runComputeBuffers(ctx.glossFieldBlurPipeline,
+                           std::array<id<MTLBuffer>, 3>{occupancyNormBuffer, tempBuffer, cellUniformBuffer},
+                           cellCount,
+                           &localError)) {
+      if (error) *error = localError;
+      return false;
+    }
+    std::memcpy([occupancyNormBuffer contents], [tempBuffer contents], static_cast<size_t>(cellCount) * sizeof(float));
+    clearReduction();
+    if (!runComputeBuffers(ctx.glossFieldMaxPipeline,
+                           std::array<id<MTLBuffer>, 3>{occupancyNormBuffer, reductionBuffer, cellUniformBuffer},
+                           cellCount,
+                           &localError) ||
+        !runComputeBuffers(ctx.glossFieldNormalizePipeline,
+                           std::array<id<MTLBuffer>, 4>{occupancyNormBuffer, occupancyNormBuffer, reductionBuffer, cellUniformBuffer},
+                           cellCount,
+                           &localError)) {
+      if (error) *error = localError;
+      return false;
+    }
+
+    const auto blurInPlace = [&](id<MTLBuffer> buffer) -> bool {
+      if (!runComputeBuffers(ctx.glossFieldBlurPipeline,
+                             std::array<id<MTLBuffer>, 3>{buffer, tempBuffer, cellUniformBuffer},
+                             cellCount,
+                             &localError)) {
+        return false;
+      }
+      std::memcpy([buffer contents], [tempBuffer contents], static_cast<size_t>(cellCount) * sizeof(float));
+      return true;
+    };
+    if (!blurInPlace(carrierYBuffer) || !blurInPlace(carrierMaxBuffer) ||
+        !blurInPlace(carrierMinBuffer) || !blurInPlace(neutralityBuffer)) {
+      if (error) *error = localError;
+      return false;
+    }
+
+    if (!runComputeBuffers(ctx.glossFieldBodyPipeline,
+                           std::array<id<MTLBuffer>, 7>{occupancyBuffer,
+                                                        meanRBuffer,
+                                                        meanGBuffer,
+                                                        meanBBuffer,
+                                                        carrierMaxBuffer,
+                                                        bodyBuffer,
+                                                        cellUniformBuffer},
+                           cellCount,
+                           &localError)) {
+      if (error) *error = localError;
+      return false;
+    }
+
+    clearReduction();
+    if (!runComputeBuffers(ctx.glossFieldRawSignalPipeline,
+                           std::array<id<MTLBuffer>, 6>{occupancyBuffer,
+                                                        carrierMaxBuffer,
+                                                        bodyBuffer,
+                                                        rawSignalBuffer,
+                                                        reductionBuffer,
+                                                        cellUniformBuffer},
+                           cellCount,
+                           &localError)) {
+      if (error) *error = localError;
+      return false;
+    }
+    std::array<uint32_t, 4> reductionValues = {0u, 0u, 0u, 0u};
+    std::memcpy(reductionValues.data(), [reductionBuffer contents], sizeof(uint32_t));
+
+    clearReduction();
+    if (!runComputeBuffers(ctx.glossFieldWeightedSignalPipeline,
+                           std::array<id<MTLBuffer>, 11>{occupancyNormBuffer,
+                                                         bodyBuffer,
+                                                         rawSignalBuffer,
+                                                         positiveBuffer,
+                                                         negativeBuffer,
+                                                         boundaryBuffer,
+                                                         congruenceBuffer,
+                                                         confidenceBuffer,
+                                                         signalBuffer,
+                                                         reductionBuffer,
+                                                         cellUniformBuffer},
+                           cellCount,
+                           &localError)) {
+      if (error) *error = localError;
+      return false;
+    }
+    std::array<uint32_t, 4> weightedValues = {reductionValues[0], 0u, 0u, 0u};
+    std::memcpy(weightedValues.data() + 1u, [reductionBuffer contents], 3u * sizeof(uint32_t));
+    std::memcpy([reductionBuffer contents], weightedValues.data(), 4u * sizeof(uint32_t));
+
+    if (!runComputeBuffers(ctx.glossFieldFinalNormalizePipeline,
+                           std::array<id<MTLBuffer>, 7>{bodyBuffer,
+                                                        signalBuffer,
+                                                        positiveBuffer,
+                                                        negativeBuffer,
+                                                        boundaryBuffer,
+                                                        reductionBuffer,
+                                                        cellUniformBuffer},
+                           cellCount,
+                           &localError)) {
+      if (error) *error = localError;
+      return false;
+    }
+
+    out->gridWidth = gridWidth;
+    out->gridHeight = gridHeight;
+    out->occupancy.assign(cellCount, 0.0f);
+    out->meanRgb.assign(cellCount * 3u, 0.0f);
+    out->carrierY.assign(cellCount, 0.0f);
+    out->carrierMax.assign(cellCount, 0.0f);
+    out->carrierMin.assign(cellCount, 0.0f);
+    out->neutrality.assign(cellCount, 0.0f);
+    out->body.assign(cellCount, 0.0f);
+    out->signal.assign(cellCount, 0.0f);
+    out->positive.assign(cellCount, 0.0f);
+    out->negative.assign(cellCount, 0.0f);
+    out->boundary.assign(cellCount, 0.0f);
+    out->congruence.assign(cellCount, 0.0f);
+    out->confidence.assign(cellCount, 0.0f);
+    std::vector<float> meanRHost;
+    std::vector<float> meanGHost;
+    std::vector<float> meanBHost;
+    copySharedBuffer<float>(occupancyBuffer, cellCount, &out->occupancy);
+    copySharedBuffer<float>(meanRBuffer, cellCount, &meanRHost);
+    copySharedBuffer<float>(meanGBuffer, cellCount, &meanGHost);
+    copySharedBuffer<float>(meanBBuffer, cellCount, &meanBHost);
+    copySharedBuffer<float>(carrierYBuffer, cellCount, &out->carrierY);
+    copySharedBuffer<float>(carrierMaxBuffer, cellCount, &out->carrierMax);
+    copySharedBuffer<float>(carrierMinBuffer, cellCount, &out->carrierMin);
+    copySharedBuffer<float>(neutralityBuffer, cellCount, &out->neutrality);
+    copySharedBuffer<float>(bodyBuffer, cellCount, &out->body);
+    copySharedBuffer<float>(signalBuffer, cellCount, &out->signal);
+    copySharedBuffer<float>(positiveBuffer, cellCount, &out->positive);
+    copySharedBuffer<float>(negativeBuffer, cellCount, &out->negative);
+    copySharedBuffer<float>(boundaryBuffer, cellCount, &out->boundary);
+    copySharedBuffer<float>(congruenceBuffer, cellCount, &out->congruence);
+    copySharedBuffer<float>(confidenceBuffer, cellCount, &out->confidence);
+    for (NSUInteger idx = 0; idx < cellCount; ++idx) {
+      out->meanRgb[idx * 3u + 0u] = idx < meanRHost.size() ? meanRHost[idx] : 0.0f;
+      out->meanRgb[idx * 3u + 1u] = idx < meanGHost.size() ? meanGHost[idx] : 0.0f;
+      out->meanRgb[idx * 3u + 2u] = idx < meanBHost.size() ? meanBHost[idx] : 0.0f;
+    }
   }
   return true;
 }

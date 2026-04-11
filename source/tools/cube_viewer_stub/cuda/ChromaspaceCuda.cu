@@ -51,6 +51,10 @@ struct OverlayKernelUniforms {
 
 struct InputKernelUniforms {
   int pointCount;
+  int inputStride;
+  int glossView;
+  float sourceAspect;
+  float glossLiftScale;
   int showOverflow;
   int highlightOverflow;
   int plotMode;
@@ -76,6 +80,8 @@ struct CacheImpl {
   float* deviceInput = nullptr;
   size_t inputCapacityFloats = 0;
   unsigned int* deviceBounds = nullptr;
+  float* deviceFieldWorkspace = nullptr;
+  size_t fieldWorkspaceFloats = 0;
 };
 
 struct SampleCacheImpl {
@@ -167,6 +173,7 @@ void releaseImpl(CacheImpl* impl) {
   if (impl->colorsResource) cudaGraphicsUnregisterResource(impl->colorsResource);
   if (impl->deviceInput) cudaFree(impl->deviceInput);
   if (impl->deviceBounds) cudaFree(impl->deviceBounds);
+  if (impl->deviceFieldWorkspace) cudaFree(impl->deviceFieldWorkspace);
   delete impl;
 }
 
@@ -301,6 +308,23 @@ bool ensureBoundsCapacity(CacheImpl* impl, std::string* error) {
     if (error) *error = std::string("Failed to allocate CUDA bounds buffer: ") + errorString(err);
     return false;
   }
+  return true;
+}
+
+bool ensureFieldWorkspace(CacheImpl* impl, size_t floatCount, std::string* error) {
+  if (!impl) return false;
+  if (floatCount <= impl->fieldWorkspaceFloats && impl->deviceFieldWorkspace != nullptr) return true;
+  if (impl->deviceFieldWorkspace) {
+    cudaFree(impl->deviceFieldWorkspace);
+    impl->deviceFieldWorkspace = nullptr;
+    impl->fieldWorkspaceFloats = 0;
+  }
+  cudaError_t err = cudaMalloc(&impl->deviceFieldWorkspace, floatCount * sizeof(float));
+  if (err != cudaSuccess) {
+    if (error) *error = std::string("Failed to allocate CUDA gloss-field workspace: ") + errorString(err);
+    return false;
+  }
+  impl->fieldWorkspaceFloats = floatCount;
   return true;
 }
 
@@ -502,6 +526,31 @@ inline __device__ bool outOfBounds(float r, float g, float b) {
   return r < 0.0f || r > 1.0f || g < 0.0f || g > 1.0f || b < 0.0f || b > 1.0f;
 }
 
+inline __device__ float glossCommonComponent(float r, float g, float b) {
+  return fmaxf(0.0f, fminf(r, fminf(g, b)));
+}
+
+inline __device__ float glossNeutrality(float r, float g, float b) {
+  const float common = glossCommonComponent(r, g, b);
+  const float maxRgb = fmaxf(r, fmaxf(g, b));
+  return maxRgb > 1e-6f ? fminf(fmaxf(common / maxRgb, 0.0f), 1.0f) : 0.0f;
+}
+
+inline __device__ float glossStrengthCue(float r, float g, float b) {
+  const float common = glossCommonComponent(r, g, b);
+  const float neutrality = glossNeutrality(r, g, b);
+  return fminf(fmaxf(common * (0.75f + 0.85f * neutrality), 0.0f), 1.0f);
+}
+
+inline __device__ float glossPresenceWeight(float glossCue) {
+  const float t = fminf(fmaxf((glossCue - 0.06f) / 0.22f, 0.0f), 1.0f);
+  return t * t * (3.0f - 2.0f * t);
+}
+
+inline __device__ float glossLuma(float r, float g, float b) {
+  return r * 0.2126f + g * 0.7152f + b * 0.0722f;
+}
+
 inline __device__ void mapDisplayColor(float inR, float inG, float inB, float* outR, float* outG, float* outB) {
   *outR = powf(clamp01(inR), 1.0f / 2.2f);
   *outG = powf(clamp01(inG), 1.0f / 2.2f);
@@ -647,16 +696,41 @@ __global__ void inputKernel(float* verts, float* colors, const float* input, Inp
   const unsigned int index = blockIdx.x * blockDim.x + threadIdx.x;
   const unsigned int total = static_cast<unsigned int>(max(u.pointCount, 0));
   if (index >= total) return;
-  const unsigned int ibase = index * 3u;
-  const float r = input[ibase + 0u];
-  const float g = input[ibase + 1u];
-  const float b = input[ibase + 2u];
+  const unsigned int stride = static_cast<unsigned int>(max(u.inputStride, 3));
+  const unsigned int ibase = index * stride;
+  float xNorm = 0.5f;
+  float yNorm = 0.5f;
+  float r = input[ibase + 0u];
+  float g = input[ibase + 1u];
+  float b = input[ibase + 2u];
+  if (u.glossView != 0 && stride >= 6u) {
+    xNorm = fminf(fmaxf(input[ibase + 0u], 0.0f), 1.0f);
+    yNorm = fminf(fmaxf(input[ibase + 1u], 0.0f), 1.0f);
+    r = input[ibase + 3u];
+    g = input[ibase + 4u];
+    b = input[ibase + 5u];
+  }
   const bool overflow = outOfBounds(r, g, b);
   const float plotR = u.showOverflow != 0 ? r : clamp01(r);
   const float plotG = u.showOverflow != 0 ? g : clamp01(g);
   const float plotB = u.showOverflow != 0 ? b : clamp01(b);
   float x, y, z;
   mapPlotPosition(plotR, plotG, plotB, u.plotMode, u.circularHsl, u.circularHsv, u.normConeNormalized, u.showOverflow, &x, &y, &z);
+  if (u.glossView != 0) {
+    const float aspect = fminf(fmaxf(u.sourceAspect, 0.25f), 4.0f);
+    const float halfWidth = aspect >= 1.0f ? 1.22f : (1.22f * aspect);
+    const float halfDepth = aspect >= 1.0f ? (1.22f / aspect) : 1.22f;
+    const float common = glossCommonComponent(plotR, plotG, plotB);
+    const float bodyR = fmaxf(plotR - common, 0.0f);
+    const float bodyG = fmaxf(plotG - common, 0.0f);
+    const float bodyB = fmaxf(plotB - common, 0.0f);
+    const float bodyLuma = fminf(fmaxf(bodyR * 0.2126f + bodyG * 0.7152f + bodyB * 0.0722f, 0.0f), 1.0f);
+    const float glossCue = glossStrengthCue(plotR, plotG, plotB);
+    const float glossPresence = glossPresenceWeight(glossCue);
+    x = -halfWidth + (2.0f * halfWidth * xNorm);
+    z = halfDepth - (2.0f * halfDepth * yNorm);
+    y = -0.92f + bodyLuma * 0.92f + glossCue * glossPresence * u.glossLiftScale * 1.34f;
+  }
   const unsigned int vbase = index * 3u;
   verts[vbase + 0u] = x;
   verts[vbase + 1u] = y;
@@ -669,13 +743,25 @@ __global__ void inputKernel(float* verts, float* colors, const float* input, Inp
   } else {
     mapDisplayColor(r, g, b, &cr, &cg, &cb);
     applyDisplaySaturation(u.colorSaturation, &cr, &cg, &cb);
+    if (u.glossView != 0) {
+      const float glossPresence = glossPresenceWeight(glossStrengthCue(plotR, plotG, plotB));
+      const float neutralBlend = fminf(fmaxf(0.08f + 0.52f * glossPresence, 0.0f), 0.62f);
+      const float brightnessGain = 1.18f + 1.20f * glossPresence;
+      cr = fminf(fmaxf((cr * (1.0f - neutralBlend) + neutralBlend) * brightnessGain, 0.0f), 1.0f);
+      cg = fminf(fmaxf((cg * (1.0f - neutralBlend) + neutralBlend) * brightnessGain, 0.0f), 1.0f);
+      cb = fminf(fmaxf((cb * (1.0f - neutralBlend) + neutralBlend) * brightnessGain, 0.0f), 1.0f);
+    }
   }
   const unsigned int cbase = index * 4u;
   colors[cbase + 0u] = cr;
   colors[cbase + 1u] = cg;
   colors[cbase + 2u] = cb;
   const bool overflowHighlighted = (u.showOverflow != 0 && u.highlightOverflow != 0 && overflow);
-  float alpha = (overflowHighlighted ? 0.95f : 0.72f) * u.pointAlphaScale;
+  float alpha = ((overflowHighlighted ? 0.95f : 0.72f)) * u.pointAlphaScale;
+  if (u.glossView != 0 && !overflowHighlighted) {
+    const float glossPresence = glossPresenceWeight(glossStrengthCue(plotR, plotG, plotB));
+    alpha = (0.01f + 0.97f * glossPresence) * u.pointAlphaScale;
+  }
   if (!overflowHighlighted && u.denseAlphaBias > 0.0f) {
     const float luma = clamp01(cr * 0.2126f + cg * 0.7152f + cb * 0.0722f);
     const float maxRgb = clamp01(fmaxf(cr, fmaxf(cg, cb)));
@@ -734,6 +820,346 @@ __global__ void inputSampleKernel(float* dstVerts,
   dstColors[dstColorBase + 1u] = srcColors[srcColorBase + 1u];
   dstColors[dstColorBase + 2u] = srcColors[srcColorBase + 2u];
   dstColors[dstColorBase + 3u] = srcColors[srcColorBase + 3u];
+}
+
+__global__ void glossFieldAccumulateKernel(const float* packedPoints,
+                                           int pointCount,
+                                           int gridWidth,
+                                           int gridHeight,
+                                           int showOverflow,
+                                           float* occupancy,
+                                           float* sumR,
+                                           float* sumG,
+                                           float* sumB,
+                                           float* sumY,
+                                           float* sumMax,
+                                           float* sumMin,
+                                           float* sumNeutrality) {
+  const unsigned int index = blockIdx.x * blockDim.x + threadIdx.x;
+  const unsigned int total = static_cast<unsigned int>(max(pointCount, 0));
+  if (index >= total) return;
+  const unsigned int base = index * 6u;
+  const float xNorm = fminf(fmaxf(packedPoints[base + 0u], 0.0f), 1.0f);
+  const float yNorm = fminf(fmaxf(packedPoints[base + 1u], 0.0f), 1.0f);
+  float r = packedPoints[base + 3u];
+  float g = packedPoints[base + 4u];
+  float b = packedPoints[base + 5u];
+  if (showOverflow == 0) {
+    r = clamp01(r);
+    g = clamp01(g);
+    b = clamp01(b);
+  }
+  const float maxRgb = clamp01(fmaxf(r, fmaxf(g, b)));
+  const float minRgb = clamp01(fmaxf(0.0f, fminf(r, fminf(g, b))));
+  const float neutrality = maxRgb > 1e-6f ? fminf(fmaxf(minRgb / maxRgb, 0.0f), 1.0f) : 0.0f;
+  const float luma = clamp01(glossLuma(r, g, b));
+  const int x = min(max(static_cast<int>(xNorm * static_cast<float>(gridWidth)), 0), max(gridWidth - 1, 0));
+  const int y =
+      min(max(static_cast<int>((1.0f - yNorm) * static_cast<float>(gridHeight)), 0), max(gridHeight - 1, 0));
+  const unsigned int cellIndex = static_cast<unsigned int>(y * gridWidth + x);
+  atomicAdd(&occupancy[cellIndex], 1.0f);
+  atomicAdd(&sumR[cellIndex], r);
+  atomicAdd(&sumG[cellIndex], g);
+  atomicAdd(&sumB[cellIndex], b);
+  atomicAdd(&sumY[cellIndex], luma);
+  atomicAdd(&sumMax[cellIndex], maxRgb);
+  atomicAdd(&sumMin[cellIndex], minRgb);
+  atomicAdd(&sumNeutrality[cellIndex], neutrality);
+}
+
+__global__ void glossFieldFinalizeKernel(int cellCount,
+                                         const float* occupancy,
+                                         const float* sumR,
+                                         const float* sumG,
+                                         const float* sumB,
+                                         const float* sumY,
+                                         const float* sumMax,
+                                         const float* sumMin,
+                                         const float* sumNeutrality,
+                                         float* meanR,
+                                         float* meanG,
+                                         float* meanB,
+                                         float* carrierY,
+                                         float* carrierMax,
+                                         float* carrierMin,
+                                         float* neutrality) {
+  const unsigned int index = blockIdx.x * blockDim.x + threadIdx.x;
+  const unsigned int total = static_cast<unsigned int>(max(cellCount, 0));
+  if (index >= total) return;
+  const float count = occupancy[index];
+  if (count <= 1e-6f) {
+    meanR[index] = 0.0f;
+    meanG[index] = 0.0f;
+    meanB[index] = 0.0f;
+    carrierY[index] = 0.0f;
+    carrierMax[index] = 0.0f;
+    carrierMin[index] = 0.0f;
+    neutrality[index] = 0.0f;
+    return;
+  }
+  const float invCount = 1.0f / count;
+  meanR[index] = sumR[index] * invCount;
+  meanG[index] = sumG[index] * invCount;
+  meanB[index] = sumB[index] * invCount;
+  carrierY[index] = sumY[index] * invCount;
+  carrierMax[index] = sumMax[index] * invCount;
+  carrierMin[index] = sumMin[index] * invCount;
+  neutrality[index] = sumNeutrality[index] * invCount;
+}
+
+inline __device__ int glossNeighborhoodRadiusCells(int neighborhoodChoice) {
+  switch (max(0, min(neighborhoodChoice, 2))) {
+    case 0: return 1;
+    case 2: return 3;
+    case 1:
+    default: return 2;
+  }
+}
+
+inline __device__ float sampleGridClampedDevice(const float* values, int width, int height, int x, int y) {
+  if (!values || width <= 0 || height <= 0) return 0.0f;
+  x = min(max(x, 0), width - 1);
+  y = min(max(y, 0), height - 1);
+  return values[static_cast<size_t>(y) * static_cast<size_t>(width) + static_cast<size_t>(x)];
+}
+
+__global__ void glossFieldMaxKernel(int cellCount, const float* values, unsigned int* outBits) {
+  const unsigned int index = blockIdx.x * blockDim.x + threadIdx.x;
+  const unsigned int total = static_cast<unsigned int>(max(cellCount, 0));
+  if (index >= total || !outBits) return;
+  const float value = fmaxf(values[index], 0.0f);
+  atomicMax(&outBits[0], __float_as_uint(value));
+}
+
+__global__ void glossFieldNormalizeKernel(int cellCount,
+                                          const float* src,
+                                          float* dst,
+                                          const unsigned int* maxBits,
+                                          int signedValues) {
+  const unsigned int index = blockIdx.x * blockDim.x + threadIdx.x;
+  const unsigned int total = static_cast<unsigned int>(max(cellCount, 0));
+  if (index >= total || !src || !dst || !maxBits) return;
+  const float denom = fmaxf(__uint_as_float(maxBits[0]), 1e-5f);
+  const float scaled = src[index] / denom;
+  dst[index] = signedValues != 0 ? fminf(fmaxf(scaled, -1.0f), 1.0f) : clamp01(scaled);
+}
+
+__global__ void glossFieldBlurKernel(int gridWidth,
+                                     int gridHeight,
+                                     const float* src,
+                                     float* dst) {
+  const unsigned int index = blockIdx.x * blockDim.x + threadIdx.x;
+  const unsigned int total = static_cast<unsigned int>(max(gridWidth * gridHeight, 0));
+  if (index >= total || !src || !dst) return;
+  const int x = static_cast<int>(index % static_cast<unsigned int>(gridWidth));
+  const int y = static_cast<int>(index / static_cast<unsigned int>(gridWidth));
+  float accum = 0.0f;
+  float weight = 0.0f;
+  for (int oy = -1; oy <= 1; ++oy) {
+    const int yy = y + oy;
+    if (yy < 0 || yy >= gridHeight) continue;
+    for (int ox = -1; ox <= 1; ++ox) {
+      const int xx = x + ox;
+      if (xx < 0 || xx >= gridWidth) continue;
+      const float kernel = (ox == 0 && oy == 0) ? 0.30f : ((ox == 0 || oy == 0) ? 0.13f : 0.08f);
+      accum += src[static_cast<size_t>(yy) * static_cast<size_t>(gridWidth) + static_cast<size_t>(xx)] * kernel;
+      weight += kernel;
+    }
+  }
+  dst[index] = weight > 1e-6f ? (accum / weight) : 0.0f;
+}
+
+__global__ void glossFieldBodyKernel(int gridWidth,
+                                     int gridHeight,
+                                     int neighborhoodChoice,
+                                     const float* occupancy,
+                                     const float* meanR,
+                                     const float* meanG,
+                                     const float* meanB,
+                                     const float* carrierMax,
+                                     float* body) {
+  const unsigned int index = blockIdx.x * blockDim.x + threadIdx.x;
+  const unsigned int total = static_cast<unsigned int>(max(gridWidth * gridHeight, 0));
+  if (index >= total || !occupancy || !meanR || !meanG || !meanB || !carrierMax || !body) return;
+  if (occupancy[index] <= 0.5f) {
+    body[index] = 0.0f;
+    return;
+  }
+  const int x = static_cast<int>(index % static_cast<unsigned int>(gridWidth));
+  const int y = static_cast<int>(index / static_cast<unsigned int>(gridWidth));
+  const int radiusCells = glossNeighborhoodRadiusCells(neighborhoodChoice);
+  constexpr int kMaxNeighborhood = 49;
+  float carriers[kMaxNeighborhood];
+  int neighborIndices[kMaxNeighborhood];
+  int count = 0;
+  const float centerCarrier = carrierMax[index];
+  const float centerR = meanR[index];
+  const float centerG = meanG[index];
+  const float centerB = meanB[index];
+  for (int oy = -radiusCells; oy <= radiusCells; ++oy) {
+    const int yy = y + oy;
+    if (yy < 0 || yy >= gridHeight) continue;
+    for (int ox = -radiusCells; ox <= radiusCells; ++ox) {
+      const int xx = x + ox;
+      if (xx < 0 || xx >= gridWidth) continue;
+      const unsigned int neighborIndex = static_cast<unsigned int>(yy * gridWidth + xx);
+      if (occupancy[neighborIndex] <= 0.5f) continue;
+      const float carrier = carrierMax[neighborIndex];
+      const float dr = meanR[neighborIndex] - centerR;
+      const float dg = meanG[neighborIndex] - centerG;
+      const float db = meanB[neighborIndex] - centerB;
+      const float colorDistance = sqrtf(dr * dr + dg * dg + db * db);
+      if (fabsf(carrier - centerCarrier) > 0.26f && colorDistance > 0.20f) continue;
+      if (count < kMaxNeighborhood) {
+        carriers[count] = carrier;
+        neighborIndices[count] = static_cast<int>(neighborIndex);
+        ++count;
+      }
+    }
+  }
+  if (count <= 0) {
+    body[index] = centerCarrier;
+    return;
+  }
+  for (int i = 1; i < count; ++i) {
+    const float keyCarrier = carriers[i];
+    const int keyIndex = neighborIndices[i];
+    int j = i - 1;
+    while (j >= 0 && (carriers[j] > keyCarrier || (carriers[j] == keyCarrier && neighborIndices[j] > keyIndex))) {
+      carriers[j + 1] = carriers[j];
+      neighborIndices[j + 1] = neighborIndices[j];
+      --j;
+    }
+    carriers[j + 1] = keyCarrier;
+    neighborIndices[j + 1] = keyIndex;
+  }
+  const int trim = count >= 6 ? max(1, count / 6) : 0;
+  const int begin = min(trim, count);
+  const int end = max(begin + 1, count - trim);
+  float bodySum = 0.0f;
+  float bodyWeight = 0.0f;
+  for (int i = begin; i < end; ++i) {
+    const int neighborIndex = neighborIndices[i];
+    const int neighborX = neighborIndex % gridWidth;
+    const int neighborY = neighborIndex / gridWidth;
+    const float dx = static_cast<float>(neighborX - x);
+    const float dy = static_cast<float>(neighborY - y);
+    const float spatialWeight = 1.0f / (1.0f + dx * dx + dy * dy);
+    bodySum += carriers[i] * spatialWeight;
+    bodyWeight += spatialWeight;
+  }
+  body[index] = bodyWeight > 1e-6f ? (bodySum / bodyWeight) : centerCarrier;
+}
+
+__global__ void glossFieldRawSignalKernel(int cellCount,
+                                          const float* occupancy,
+                                          const float* carrierMax,
+                                          const float* body,
+                                          float* rawSignal,
+                                          unsigned int* maxBits) {
+  const unsigned int index = blockIdx.x * blockDim.x + threadIdx.x;
+  const unsigned int total = static_cast<unsigned int>(max(cellCount, 0));
+  if (index >= total || !occupancy || !carrierMax || !body || !rawSignal || !maxBits) return;
+  if (occupancy[index] <= 0.5f) {
+    rawSignal[index] = 0.0f;
+    return;
+  }
+  const float bodyValue = fmaxf(body[index], 0.0f);
+  const float rawPositive = fmaxf(0.0f, carrierMax[index] - bodyValue);
+  const float rawNegative = fmaxf(0.0f, bodyValue - carrierMax[index]);
+  rawSignal[index] = rawPositive - rawNegative;
+  atomicMax(&maxBits[0], __float_as_uint(bodyValue));
+}
+
+__global__ void glossFieldWeightedSignalKernel(int gridWidth,
+                                               int gridHeight,
+                                               const float* occupancyNorm,
+                                               const float* body,
+                                               const float* rawSignal,
+                                               float* positive,
+                                               float* negative,
+                                               float* boundary,
+                                               float* congruence,
+                                               float* confidence,
+                                               float* signal,
+                                               unsigned int* maxBits) {
+  const unsigned int index = blockIdx.x * blockDim.x + threadIdx.x;
+  const unsigned int total = static_cast<unsigned int>(max(gridWidth * gridHeight, 0));
+  if (index >= total || !occupancyNorm || !body || !rawSignal || !positive || !negative || !boundary ||
+      !congruence || !confidence || !signal || !maxBits) {
+    return;
+  }
+  const int x = static_cast<int>(index % static_cast<unsigned int>(gridWidth));
+  const int y = static_cast<int>(index / static_cast<unsigned int>(gridWidth));
+  const float occCenter = sampleGridClampedDevice(occupancyNorm, gridWidth, gridHeight, x, y);
+  if (occCenter <= 0.0f) {
+    positive[index] = 0.0f;
+    negative[index] = 0.0f;
+    boundary[index] = 0.0f;
+    congruence[index] = 0.0f;
+    confidence[index] = 0.0f;
+    signal[index] = 0.0f;
+    return;
+  }
+  const float gxCarrier = sampleGridClampedDevice(body, gridWidth, gridHeight, x + 1, y) -
+                          sampleGridClampedDevice(body, gridWidth, gridHeight, x - 1, y);
+  const float gyCarrier = sampleGridClampedDevice(body, gridWidth, gridHeight, x, y + 1) -
+                          sampleGridClampedDevice(body, gridWidth, gridHeight, x, y - 1);
+  const float gxSignal = sampleGridClampedDevice(rawSignal, gridWidth, gridHeight, x + 1, y) -
+                         sampleGridClampedDevice(rawSignal, gridWidth, gridHeight, x - 1, y);
+  const float gySignal = sampleGridClampedDevice(rawSignal, gridWidth, gridHeight, x, y + 1) -
+                         sampleGridClampedDevice(rawSignal, gridWidth, gridHeight, x, y - 1);
+  const float magCarrier = sqrtf(gxCarrier * gxCarrier + gyCarrier * gyCarrier);
+  const float magSignal = sqrtf(gxSignal * gxSignal + gySignal * gySignal);
+  float localCongruence = 0.0f;
+  if (magCarrier > 1e-6f && magSignal > 1e-6f) {
+    localCongruence = fabsf((gxCarrier * gxSignal + gyCarrier * gySignal) / (magCarrier * magSignal));
+  } else if (magSignal > 1e-6f) {
+    localCongruence = 0.35f;
+  }
+  const float occNeighborhood =
+      (occCenter +
+       sampleGridClampedDevice(occupancyNorm, gridWidth, gridHeight, x + 1, y) +
+       sampleGridClampedDevice(occupancyNorm, gridWidth, gridHeight, x - 1, y) +
+       sampleGridClampedDevice(occupancyNorm, gridWidth, gridHeight, x, y + 1) +
+       sampleGridClampedDevice(occupancyNorm, gridWidth, gridHeight, x, y - 1)) /
+      5.0f;
+  const float localConfidence =
+      clamp01(sqrtf(occCenter) * clamp01(0.28f + 0.72f * occNeighborhood));
+  const float posWeighted = fmaxf(0.0f, rawSignal[index]) * (0.30f + 0.70f * localCongruence) * localConfidence;
+  const float negWeighted = fmaxf(0.0f, -rawSignal[index]) * (0.30f + 0.70f * localCongruence) * localConfidence;
+  const float boundaryValue = clamp01(magSignal * 4.0f) * localConfidence;
+  positive[index] = posWeighted;
+  negative[index] = negWeighted;
+  boundary[index] = boundaryValue;
+  congruence[index] = localCongruence;
+  confidence[index] = localConfidence;
+  signal[index] = posWeighted - negWeighted;
+  atomicMax(&maxBits[0], __float_as_uint(fmaxf(posWeighted, 0.0f)));
+  atomicMax(&maxBits[1], __float_as_uint(fmaxf(negWeighted, 0.0f)));
+  atomicMax(&maxBits[2], __float_as_uint(fmaxf(boundaryValue, 0.0f)));
+}
+
+__global__ void glossFieldFinalNormalizeKernel(int cellCount,
+                                               float* body,
+                                               float* signal,
+                                               float* positive,
+                                               float* negative,
+                                               float* boundary,
+                                               const unsigned int* maxBits) {
+  const unsigned int index = blockIdx.x * blockDim.x + threadIdx.x;
+  const unsigned int total = static_cast<unsigned int>(max(cellCount, 0));
+  if (index >= total || !body || !signal || !positive || !negative || !boundary || !maxBits) return;
+  const float maxBody = fmaxf(__uint_as_float(maxBits[0]), 1e-5f);
+  const float maxPositive = fmaxf(__uint_as_float(maxBits[1]), 1e-5f);
+  const float maxNegative = fmaxf(__uint_as_float(maxBits[2]), 1e-5f);
+  const float maxBoundary = fmaxf(__uint_as_float(maxBits[3]), 1e-5f);
+  const float maxAbsSignal = fmaxf(fmaxf(maxPositive, maxNegative), 1e-5f);
+  body[index] = clamp01(body[index] / maxBody);
+  positive[index] = clamp01(positive[index] / maxPositive);
+  negative[index] = clamp01(negative[index] / maxNegative);
+  signal[index] = fminf(fmaxf(signal[index] / maxAbsSignal, -1.0f), 1.0f);
+  boundary[index] = clamp01(boundary[index] / maxBoundary);
 }
 
 template <typename CacheT, typename Uniforms, typename Launcher>
@@ -969,9 +1395,13 @@ bool buildInputMesh(InputCache* cache,
     if (error) *error = "CUDA input cache has no GL buffers.";
     return false;
   }
-  const size_t pointCount = rawPoints.size() / 3u;
+  const size_t pointCount = request.inputStride > 0 ? (rawPoints.size() / static_cast<size_t>(request.inputStride)) : 0u;
   InputKernelUniforms uniforms{};
   uniforms.pointCount = request.pointCount;
+  uniforms.inputStride = request.inputStride;
+  uniforms.glossView = request.glossView;
+  uniforms.sourceAspect = request.sourceAspect;
+  uniforms.glossLiftScale = request.glossLiftScale;
   uniforms.showOverflow = request.remap.showOverflow;
   uniforms.highlightOverflow = request.remap.highlightOverflow;
   uniforms.plotMode = request.remap.plotMode;
@@ -1074,6 +1504,335 @@ bool buildInputSampledMesh(InputCache* sourceCache,
   sampleCache->builtSerial = serial;
   sampleCache->pointCount = request.visiblePointCount;
   sampleCache->available = true;
+  return true;
+}
+
+bool buildGlossField(InputCache* cache,
+                     const GlossFieldRequest& request,
+                     const std::vector<float>& packedPoints,
+                     GlossFieldResult* out,
+                     std::string* error) {
+  if (!cache || !out) {
+    if (error) *error = "Missing CUDA gloss-field output.";
+    return false;
+  }
+  const int gridWidth = max(request.gridWidth, 1);
+  const int gridHeight = max(request.gridHeight, 1);
+  const size_t pointCount = packedPoints.size() / 6u;
+  const size_t cellCount = static_cast<size_t>(gridWidth) * static_cast<size_t>(gridHeight);
+  if (pointCount == 0u || cellCount == 0u) {
+    if (error) *error = "Invalid CUDA gloss-field request.";
+    return false;
+  }
+
+  std::string localError;
+  if (!ensureContext(&localError)) {
+    if (error) *error = localError;
+    return false;
+  }
+  CacheImpl* impl = ensureImpl(cache);
+  if (!impl) {
+    if (error) *error = "Failed to allocate CUDA gloss-field cache.";
+    return false;
+  }
+  if (!ensureInputCapacity(impl, packedPoints.size(), &localError)) {
+    if (error) *error = localError;
+    return false;
+  }
+  if (!ensureBoundsCapacity(impl, &localError)) {
+    if (error) *error = localError;
+    return false;
+  }
+
+  constexpr size_t kWorkspaceArrayCount = 25u;
+  if (!ensureFieldWorkspace(impl, cellCount * kWorkspaceArrayCount, &localError)) {
+    if (error) *error = localError;
+    return false;
+  }
+
+  cudaError_t err = cudaMemcpy(impl->deviceInput,
+                               packedPoints.data(),
+                               packedPoints.size() * sizeof(float),
+                               cudaMemcpyHostToDevice);
+  if (err != cudaSuccess) {
+    if (error) *error = std::string("Failed to upload CUDA gloss-field input: ") + errorString(err);
+    return false;
+  }
+
+  err = cudaMemset(impl->deviceFieldWorkspace, 0, cellCount * kWorkspaceArrayCount * sizeof(float));
+  if (err != cudaSuccess) {
+    if (error) *error = std::string("Failed to clear CUDA gloss-field workspace: ") + errorString(err);
+    return false;
+  }
+
+  float* workspace = impl->deviceFieldWorkspace;
+  float* occupancy = workspace + cellCount * 0u;
+  float* sumR = workspace + cellCount * 1u;
+  float* sumG = workspace + cellCount * 2u;
+  float* sumB = workspace + cellCount * 3u;
+  float* sumY = workspace + cellCount * 4u;
+  float* sumMax = workspace + cellCount * 5u;
+  float* sumMin = workspace + cellCount * 6u;
+  float* sumNeutrality = workspace + cellCount * 7u;
+  float* meanR = workspace + cellCount * 8u;
+  float* meanG = workspace + cellCount * 9u;
+  float* meanB = workspace + cellCount * 10u;
+  float* carrierY = workspace + cellCount * 11u;
+  float* carrierMax = workspace + cellCount * 12u;
+  float* carrierMin = workspace + cellCount * 13u;
+  float* neutrality = workspace + cellCount * 14u;
+  float* occupancyNorm = workspace + cellCount * 15u;
+  float* temp = workspace + cellCount * 16u;
+  float* body = workspace + cellCount * 17u;
+  float* rawSignal = workspace + cellCount * 18u;
+  float* positive = workspace + cellCount * 19u;
+  float* negative = workspace + cellCount * 20u;
+  float* boundary = workspace + cellCount * 21u;
+  float* congruence = workspace + cellCount * 22u;
+  float* confidence = workspace + cellCount * 23u;
+  float* signal = workspace + cellCount * 24u;
+  unsigned int* reductionBits = impl->deviceBounds;
+
+  const unsigned int pointThreads = 256u;
+  constexpr size_t kGlossFieldBatchPointCount = 262144u;
+  for (size_t pointOffset = 0u; pointOffset < pointCount; pointOffset += kGlossFieldBatchPointCount) {
+    const size_t batchPointCount = std::min(kGlossFieldBatchPointCount, pointCount - pointOffset);
+    const unsigned int pointBlocks = static_cast<unsigned int>((batchPointCount + pointThreads - 1u) / pointThreads);
+    glossFieldAccumulateKernel<<<pointBlocks, pointThreads>>>(impl->deviceInput + pointOffset * 6u,
+                                                              static_cast<int>(batchPointCount),
+                                                              gridWidth,
+                                                              gridHeight,
+                                                              request.showOverflow,
+                                                              occupancy,
+                                                              sumR,
+                                                              sumG,
+                                                              sumB,
+                                                              sumY,
+                                                              sumMax,
+                                                              sumMin,
+                                                              sumNeutrality);
+    err = cudaGetLastError();
+    if (err == cudaSuccess) err = cudaDeviceSynchronize();
+    if (err != cudaSuccess) {
+      if (error) {
+        *error = std::string("CUDA gloss-field accumulation failed at batch ") +
+                 std::to_string(pointOffset / kGlossFieldBatchPointCount) + ": " + errorString(err);
+      }
+      return false;
+    }
+  }
+
+  const unsigned int cellThreads = 256u;
+  const unsigned int cellBlocks = static_cast<unsigned int>((cellCount + cellThreads - 1u) / cellThreads);
+  glossFieldFinalizeKernel<<<cellBlocks, cellThreads>>>(static_cast<int>(cellCount),
+                                                        occupancy,
+                                                        sumR,
+                                                        sumG,
+                                                        sumB,
+                                                        sumY,
+                                                        sumMax,
+                                                        sumMin,
+                                                        sumNeutrality,
+                                                        meanR,
+                                                        meanG,
+                                                        meanB,
+                                                        carrierY,
+                                                        carrierMax,
+                                                        carrierMin,
+                                                        neutrality);
+  err = cudaGetLastError();
+  if (err != cudaSuccess) {
+    if (error) *error = std::string("CUDA gloss-field finalize failed: ") + errorString(err);
+    return false;
+  }
+
+  err = cudaMemset(reductionBits, 0, 6u * sizeof(unsigned int));
+  if (err == cudaSuccess) {
+    glossFieldMaxKernel<<<cellBlocks, cellThreads>>>(static_cast<int>(cellCount), occupancy, reductionBits);
+    err = cudaGetLastError();
+  }
+  if (err == cudaSuccess) {
+    glossFieldNormalizeKernel<<<cellBlocks, cellThreads>>>(static_cast<int>(cellCount),
+                                                           occupancy,
+                                                           occupancyNorm,
+                                                           reductionBits,
+                                                           0);
+    err = cudaGetLastError();
+  }
+  if (err == cudaSuccess) {
+    glossFieldBlurKernel<<<cellBlocks, cellThreads>>>(gridWidth, gridHeight, occupancyNorm, temp);
+    err = cudaGetLastError();
+  }
+  if (err == cudaSuccess) {
+    err = cudaMemcpy(occupancyNorm, temp, cellCount * sizeof(float), cudaMemcpyDeviceToDevice);
+  }
+  if (err == cudaSuccess) err = cudaMemset(reductionBits, 0, 6u * sizeof(unsigned int));
+  if (err == cudaSuccess) {
+    glossFieldMaxKernel<<<cellBlocks, cellThreads>>>(static_cast<int>(cellCount), occupancyNorm, reductionBits);
+    err = cudaGetLastError();
+  }
+  if (err == cudaSuccess) {
+    glossFieldNormalizeKernel<<<cellBlocks, cellThreads>>>(static_cast<int>(cellCount),
+                                                           occupancyNorm,
+                                                           occupancyNorm,
+                                                            reductionBits,
+                                                            0);
+    err = cudaGetLastError();
+  }
+  if (err != cudaSuccess) {
+    if (error) *error = std::string("CUDA gloss-field occupancy normalization failed: ") + errorString(err);
+    return false;
+  }
+
+  auto blurInPlace = [&](float* values) -> bool {
+    glossFieldBlurKernel<<<cellBlocks, cellThreads>>>(gridWidth, gridHeight, values, temp);
+    cudaError_t blurErr = cudaGetLastError();
+    if (blurErr != cudaSuccess) {
+      if (error) *error = std::string("CUDA gloss-field blur failed: ") + errorString(blurErr);
+      return false;
+    }
+    blurErr = cudaMemcpy(values, temp, cellCount * sizeof(float), cudaMemcpyDeviceToDevice);
+    if (blurErr != cudaSuccess) {
+      if (error) *error = std::string("CUDA gloss-field blur copy failed: ") + errorString(blurErr);
+      return false;
+    }
+    return true;
+  };
+  if (err == cudaSuccess && !blurInPlace(carrierY)) return false;
+  if (err == cudaSuccess && !blurInPlace(carrierMax)) return false;
+  if (err == cudaSuccess && !blurInPlace(carrierMin)) return false;
+  if (err == cudaSuccess && !blurInPlace(neutrality)) return false;
+
+  glossFieldBodyKernel<<<cellBlocks, cellThreads>>>(gridWidth,
+                                                    gridHeight,
+                                                    request.neighborhoodChoice,
+                                                    occupancy,
+                                                    meanR,
+                                                    meanG,
+                                                    meanB,
+                                                    carrierMax,
+                                                    body);
+  err = cudaGetLastError();
+  if (err != cudaSuccess) {
+    if (error) *error = std::string("CUDA gloss-field body fit failed: ") + errorString(err);
+    return false;
+  }
+
+  err = cudaMemset(reductionBits, 0, 6u * sizeof(unsigned int));
+  if (err == cudaSuccess) {
+    glossFieldRawSignalKernel<<<cellBlocks, cellThreads>>>(static_cast<int>(cellCount),
+                                                           occupancy,
+                                                           carrierMax,
+                                                           body,
+                                                           rawSignal,
+                                                           reductionBits);
+    err = cudaGetLastError();
+  }
+  if (err != cudaSuccess) {
+    if (error) *error = std::string("CUDA gloss-field raw signal failed: ") + errorString(err);
+    return false;
+  }
+
+  unsigned int bodyMaxBitsHost = 0u;
+  err = cudaMemcpy(&bodyMaxBitsHost, reductionBits, sizeof(unsigned int), cudaMemcpyDeviceToHost);
+  if (err != cudaSuccess) {
+    if (error) *error = std::string("Failed to read CUDA gloss-field body max: ") + errorString(err);
+    return false;
+  }
+
+  err = cudaMemset(reductionBits, 0, 6u * sizeof(unsigned int));
+  if (err == cudaSuccess) {
+    glossFieldWeightedSignalKernel<<<cellBlocks, cellThreads>>>(gridWidth,
+                                                                gridHeight,
+                                                                occupancyNorm,
+                                                                body,
+                                                                rawSignal,
+                                                                positive,
+                                                                negative,
+                                                                boundary,
+                                                                congruence,
+                                                                confidence,
+                                                                signal,
+                                                                reductionBits);
+    err = cudaGetLastError();
+  }
+  if (err != cudaSuccess) {
+    if (error) *error = std::string("CUDA gloss-field weighted signal failed: ") + errorString(err);
+    return false;
+  }
+
+  std::array<unsigned int, 4> weightedMaxBitsHost = {bodyMaxBitsHost, 0u, 0u, 0u};
+  err = cudaMemcpy(weightedMaxBitsHost.data() + 1u, reductionBits, 3u * sizeof(unsigned int), cudaMemcpyDeviceToHost);
+  if (err != cudaSuccess) {
+    if (error) *error = std::string("Failed to read CUDA gloss-field maxima: ") + errorString(err);
+    return false;
+  }
+  err = cudaMemcpy(reductionBits, weightedMaxBitsHost.data(), 4u * sizeof(unsigned int), cudaMemcpyHostToDevice);
+  if (err == cudaSuccess) {
+    glossFieldFinalNormalizeKernel<<<cellBlocks, cellThreads>>>(static_cast<int>(cellCount),
+                                                                body,
+                                                                signal,
+                                                                positive,
+                                                                negative,
+                                                                boundary,
+                                                                reductionBits);
+    err = cudaGetLastError();
+  }
+  if (err == cudaSuccess) err = cudaDeviceSynchronize();
+  if (err != cudaSuccess) {
+    if (error) *error = std::string("CUDA gloss-field normalization failed: ") + errorString(err);
+    return false;
+  }
+
+  out->gridWidth = gridWidth;
+  out->gridHeight = gridHeight;
+  out->occupancy.assign(cellCount, 0.0f);
+  out->meanRgb.assign(cellCount * 3u, 0.0f);
+  out->carrierY.assign(cellCount, 0.0f);
+  out->carrierMax.assign(cellCount, 0.0f);
+  out->carrierMin.assign(cellCount, 0.0f);
+  out->neutrality.assign(cellCount, 0.0f);
+  out->body.assign(cellCount, 0.0f);
+  out->signal.assign(cellCount, 0.0f);
+  out->positive.assign(cellCount, 0.0f);
+  out->negative.assign(cellCount, 0.0f);
+  out->boundary.assign(cellCount, 0.0f);
+  out->congruence.assign(cellCount, 0.0f);
+  out->confidence.assign(cellCount, 0.0f);
+
+  auto copyBack = [&](std::vector<float>* dst, const float* src, size_t floatCount, const char* label) -> bool {
+    if (!dst || dst->size() != floatCount) return false;
+    cudaError_t copyErr = cudaMemcpy(dst->data(), src, floatCount * sizeof(float), cudaMemcpyDeviceToHost);
+    if (copyErr != cudaSuccess) {
+      if (error) *error = std::string("Failed to read CUDA gloss-field ") + label + ": " + errorString(copyErr);
+      return false;
+    }
+    return true;
+  };
+
+  if (!copyBack(&out->occupancy, occupancy, cellCount, "occupancy")) return false;
+  std::vector<float> meanRHost(cellCount, 0.0f);
+  std::vector<float> meanGHost(cellCount, 0.0f);
+  std::vector<float> meanBHost(cellCount, 0.0f);
+  if (!copyBack(&meanRHost, meanR, cellCount, "meanR")) return false;
+  if (!copyBack(&meanGHost, meanG, cellCount, "meanG")) return false;
+  if (!copyBack(&meanBHost, meanB, cellCount, "meanB")) return false;
+  if (!copyBack(&out->carrierY, carrierY, cellCount, "carrierY")) return false;
+  if (!copyBack(&out->carrierMax, carrierMax, cellCount, "carrierMax")) return false;
+  if (!copyBack(&out->carrierMin, carrierMin, cellCount, "carrierMin")) return false;
+  if (!copyBack(&out->neutrality, neutrality, cellCount, "neutrality")) return false;
+  if (!copyBack(&out->body, body, cellCount, "body")) return false;
+  if (!copyBack(&out->signal, signal, cellCount, "signal")) return false;
+  if (!copyBack(&out->positive, positive, cellCount, "positive")) return false;
+  if (!copyBack(&out->negative, negative, cellCount, "negative")) return false;
+  if (!copyBack(&out->boundary, boundary, cellCount, "boundary")) return false;
+  if (!copyBack(&out->congruence, congruence, cellCount, "congruence")) return false;
+  if (!copyBack(&out->confidence, confidence, cellCount, "confidence")) return false;
+  for (size_t idx = 0; idx < cellCount; ++idx) {
+    out->meanRgb[idx * 3u + 0u] = meanRHost[idx];
+    out->meanRgb[idx * 3u + 1u] = meanGHost[idx];
+    out->meanRgb[idx * 3u + 2u] = meanBHost[idx];
+  }
   return true;
 }
 

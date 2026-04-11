@@ -37,6 +37,10 @@ struct OverlayRequest {
 
 struct InputRequest {
   int pointCount = 0;
+  int inputStride = 3;
+  int glossView = 0;
+  float sourceAspect = 16.0f / 9.0f;
+  float glossLiftScale = 1.0f;
   float pointAlphaScale = 1.0f;
   float denseAlphaBias = 0.0f;
   float colorSaturation = 1.18f;
@@ -46,6 +50,31 @@ struct InputRequest {
 struct InputSampleRequest {
   int fullPointCount = 0;
   int visiblePointCount = 0;
+};
+
+struct GlossFieldRequest {
+  int gridWidth = 96;
+  int gridHeight = 96;
+  int showOverflow = 0;
+  int neighborhoodChoice = 1;
+};
+
+struct GlossFieldResult {
+  int gridWidth = 0;
+  int gridHeight = 0;
+  std::vector<float> occupancy;
+  std::vector<float> meanRgb;
+  std::vector<float> carrierY;
+  std::vector<float> carrierMax;
+  std::vector<float> carrierMin;
+  std::vector<float> neutrality;
+  std::vector<float> body;
+  std::vector<float> signal;
+  std::vector<float> positive;
+  std::vector<float> negative;
+  std::vector<float> boundary;
+  std::vector<float> congruence;
+  std::vector<float> confidence;
 };
 
 struct OverlayCache {
@@ -98,5 +127,10 @@ bool buildInputSampledMesh(InputCache* sourceCache,
                            const InputSampleRequest& request,
                            unsigned long long serial,
                            std::string* error);
+bool buildGlossField(InputCache* cache,
+                     const GlossFieldRequest& request,
+                     const std::vector<float>& packedPoints,
+                     GlossFieldResult* out,
+                     std::string* error);
 
 }  // namespace ChromaspaceCuda

@@ -53,18 +53,61 @@ function(_chromaspace_text_lib_filename out_var base_name)
   endif()
 endfunction()
 
-function(_chromaspace_require_meson_module)
-  set(Python3_FIND_VIRTUALENV FIRST)
-  set(Python3_FIND_STRATEGY LOCATION)
-  find_package(Python3 REQUIRED COMPONENTS Interpreter)
+function(_chromaspace_python_has_meson python_exe out_var)
+  if(NOT python_exe)
+    set(${out_var} FALSE PARENT_SCOPE)
+    return()
+  endif()
   execute_process(
-    COMMAND "${Python3_EXECUTABLE}" -c "import mesonbuild"
+    COMMAND "${python_exe}" -c "import mesonbuild"
     RESULT_VARIABLE _meson_status
     OUTPUT_QUIET
     ERROR_QUIET)
-  if(NOT _meson_status EQUAL 0)
+  if(_meson_status EQUAL 0)
+    set(${out_var} TRUE PARENT_SCOPE)
+  else()
+    set(${out_var} FALSE PARENT_SCOPE)
+  endif()
+endfunction()
+
+function(_chromaspace_require_meson_module)
+  set(_candidate_interpreters)
+  if(DEFINED Python3_EXECUTABLE AND NOT "${Python3_EXECUTABLE}" STREQUAL "")
+    list(APPEND _candidate_interpreters "${Python3_EXECUTABLE}")
+  endif()
+
+  foreach(_candidate_rel
+      IN ITEMS
+      ".venv-textdeps/Scripts/python.exe"
+      ".meson-venv/Scripts/python.exe"
+      ".venv-textdeps/bin/python"
+      ".meson-venv/bin/python")
+    set(_candidate_abs "${CMAKE_CURRENT_SOURCE_DIR}/${_candidate_rel}")
+    if(EXISTS "${_candidate_abs}")
+      list(APPEND _candidate_interpreters "${_candidate_abs}")
+    endif()
+  endforeach()
+
+  list(REMOVE_DUPLICATES _candidate_interpreters)
+  foreach(_candidate IN LISTS _candidate_interpreters)
+    _chromaspace_python_has_meson("${_candidate}" _candidate_has_meson)
+    if(_candidate_has_meson)
+      set(Python3_EXECUTABLE "${_candidate}" CACHE FILEPATH "Python interpreter with Meson support" FORCE)
+      set(Python3_FIND_VIRTUALENV FIRST)
+      set(Python3_FIND_STRATEGY LOCATION)
+      find_package(Python3 REQUIRED COMPONENTS Interpreter)
+      return()
+    endif()
+  endforeach()
+
+  set(Python3_FIND_VIRTUALENV FIRST)
+  set(Python3_FIND_STRATEGY LOCATION)
+  find_package(Python3 REQUIRED COMPONENTS Interpreter)
+  _chromaspace_python_has_meson("${Python3_EXECUTABLE}" _found_python_has_meson)
+  if(NOT _found_python_has_meson)
     message(FATAL_ERROR
       "Chromaspace bundled text dependencies require Meson's Python module.\n"
+      "CMake checked ${Python3_EXECUTABLE} and the repo-local virtual environments but none had mesonbuild.\n"
       "Install it in a virtual environment, for example:\n"
       "  ${Python3_EXECUTABLE} -m venv .meson-venv\n"
       "  .meson-venv/bin/python -m pip install meson\n"

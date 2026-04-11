@@ -275,6 +275,17 @@ bool viewerParityChecksEnabled() {
   return viewerEnvFlagEnabled("CHROMASPACE_PARITY_CHECK", false);
 }
 
+bool glossViewCudaFieldPathEnabled() {
+  // Hardened CUDA path is enabled by default again, but can still be disabled explicitly for diagnosis.
+  return !viewerEnvFlagEnabled("CHROMASPACE_DISABLE_GLOSS_VIEW_CUDA_FIELD", false);
+}
+
+bool glossViewMetalFieldPathEnabled() {
+  // Safety rollback: the staged Metal Gloss View field path caused a severe black-screen / Resolve-crash report
+  // and stays disabled by default until it has been validated on real macOS hardware.
+  return false;
+}
+
 void logViewerDiagnostic(bool enabled, const std::string& msg) {
   if (!enabled) return;
   logViewerEvent(std::string("[diag] ") + msg);
@@ -543,6 +554,23 @@ void resetChromaticityCamera(CameraState* cam) {
   cam->qw = 1.0f;
 }
 
+void resetGlossLiftCamera(CameraState* cam) {
+  if (!cam) return;
+  cam->orthographic = false;
+  cam->orthographicView = -1;
+  cam->distance = 5.8f;
+  cam->panX = 0.0f;
+  cam->panY = -0.10f;
+  const float deg2rad = 3.14159265358979323846f / 180.0f;
+  const Quat qPitch = axisAngleQ(Vec3{1.0f, 0.0f, 0.0f}, 34.0f * deg2rad);
+  const Quat qYaw = axisAngleQ(Vec3{0.0f, 1.0f, 0.0f}, -36.0f * deg2rad);
+  const Quat q = normalizeQ(mulQ(qPitch, qYaw));
+  cam->qx = q.x;
+  cam->qy = q.y;
+  cam->qz = q.z;
+  cam->qw = q.w;
+}
+
 void resetHslCamera(CameraState* cam) {
   resetCamera(cam);
   if (!cam) return;
@@ -616,6 +644,108 @@ void resetHslTopCamera(CameraState* cam) {
   cam->distance = 5.7f;
 }
 
+constexpr int kGlossViewOrthoLeft = 0;
+constexpr int kGlossViewOrthoFront = 1;
+constexpr int kGlossViewOrthoTop = 2;
+
+void setCameraQuaternion(CameraState* cam, Quat q);
+bool isGlossViewPlotModeString(const std::string& plotMode);
+
+Quat orthographicInspectionQuaternion(int viewIndex) {
+  const float deg2rad = 3.14159265358979323846f / 180.0f;
+  switch (((viewIndex % 3) + 3) % 3) {
+    case 0:
+      return Quat{};
+    case 1:
+      return normalizeQ(axisAngleQ(Vec3{0.0f, 1.0f, 0.0f}, 90.0f * deg2rad));
+    case 2:
+    default:
+      return normalizeQ(axisAngleQ(Vec3{1.0f, 0.0f, 0.0f}, -90.0f * deg2rad));
+  }
+}
+
+Quat glossViewOrthographicQuaternion(int viewIndex) {
+  const float deg2rad = 3.14159265358979323846f / 180.0f;
+  switch (((viewIndex % 3) + 3) % 3) {
+    case kGlossViewOrthoLeft:
+      return normalizeQ(axisAngleQ(Vec3{0.0f, 1.0f, 0.0f}, 90.0f * deg2rad));
+    case kGlossViewOrthoFront:
+      return Quat{};
+    case kGlossViewOrthoTop:
+    default:
+      return normalizeQ(axisAngleQ(Vec3{1.0f, 0.0f, 0.0f}, -90.0f * deg2rad));
+  }
+}
+
+void setGlossViewOrthographicCamera(CameraState* cam, int viewIndex) {
+  if (!cam) return;
+  cam->orthographic = true;
+  cam->orthographicView = ((viewIndex % 3) + 3) % 3;
+  cam->distance = 6.0f;
+  cam->panX = 0.0f;
+  cam->panY = 0.0f;
+  setCameraQuaternion(cam, glossViewOrthographicQuaternion(cam->orthographicView));
+}
+
+Quat orthographicQuaternionForPlotMode(const std::string& plotMode, int viewIndex) {
+  return isGlossViewPlotModeString(plotMode) ? glossViewOrthographicQuaternion(viewIndex)
+                                             : orthographicInspectionQuaternion(viewIndex);
+}
+
+float quaternionAngularDifferenceDegrees(Quat a, Quat b) {
+  a = normalizeQ(a);
+  b = normalizeQ(b);
+  const float dot = clampf(std::fabs(a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w), 0.0f, 1.0f);
+  return 2.0f * std::acos(dot) * 180.0f / 3.14159265358979323846f;
+}
+
+int matchedOrthographicInspectionView(const CameraState& cam, float toleranceDegrees = 1.0f) {
+  if (!cam.orthographic) return -1;
+  const Quat current = normalizeQ(Quat{cam.qx, cam.qy, cam.qz, cam.qw});
+  for (int viewIndex = 0; viewIndex < 3; ++viewIndex) {
+    if (quaternionAngularDifferenceDegrees(current, orthographicInspectionQuaternion(viewIndex)) <= toleranceDegrees) {
+      return viewIndex;
+    }
+  }
+  return -1;
+}
+
+int matchedGlossViewOrthographicView(const CameraState& cam, float toleranceDegrees = 1.0f) {
+  if (!cam.orthographic) return -1;
+  const Quat current = normalizeQ(Quat{cam.qx, cam.qy, cam.qz, cam.qw});
+  for (int viewIndex = 0; viewIndex < 3; ++viewIndex) {
+    if (quaternionAngularDifferenceDegrees(current, glossViewOrthographicQuaternion(viewIndex)) <= toleranceDegrees) {
+      return viewIndex;
+    }
+  }
+  return -1;
+}
+
+void syncOrthographicStateForPlotMode(const std::string& plotMode,
+                                      CameraState* cam,
+                                      float toleranceDegrees = 1.0f) {
+  if (!cam || !cam->orthographic) return;
+  cam->orthographicView =
+      isGlossViewPlotModeString(plotMode)
+          ? matchedGlossViewOrthographicView(*cam, toleranceDegrees)
+          : matchedOrthographicInspectionView(*cam, toleranceDegrees);
+}
+
+void syncGlossViewOrthographicState(CameraState* cam, float toleranceDegrees = 1.0f) {
+  if (!cam || !cam->orthographic) return;
+  cam->orthographicView = matchedGlossViewOrthographicView(*cam, toleranceDegrees);
+}
+
+const char* glossViewOrthographicViewLabel(const CameraState& cam) {
+  if (!cam.orthographic) return nullptr;
+  switch (matchedGlossViewOrthographicView(cam, 1.0f)) {
+    case kGlossViewOrthoLeft: return "Ortho Left";
+    case kGlossViewOrthoFront: return "Ortho Front";
+    case kGlossViewOrthoTop: return "Ortho Top";
+    default: return "Ortho Free";
+  }
+}
+
 void setCameraQuaternion(CameraState* cam, Quat q) {
   if (!cam) return;
   q = normalizeQ(q);
@@ -632,19 +762,25 @@ void setOrthographicInspectionCamera(CameraState* cam, int viewIndex) {
   cam->distance = 6.0f;
   cam->panX = 0.0f;
   cam->panY = 0.0f;
-  const float deg2rad = 3.14159265358979323846f / 180.0f;
-  switch (cam->orthographicView) {
-    case 0:
-      setCameraQuaternion(cam, Quat{});
-      break;
-    case 1:
-      setCameraQuaternion(cam, axisAngleQ(Vec3{0.0f, 1.0f, 0.0f}, 90.0f * deg2rad));
-      break;
-    case 2:
-    default:
-      setCameraQuaternion(cam, axisAngleQ(Vec3{1.0f, 0.0f, 0.0f}, -90.0f * deg2rad));
-      break;
+  setCameraQuaternion(cam, orthographicInspectionQuaternion(cam->orthographicView));
+}
+
+int nearestOrthographicAssistView(const std::string& plotMode,
+                                  Quat orientation,
+                                  float* outAngleDegrees = nullptr) {
+  orientation = normalizeQ(orientation);
+  float bestAngle = std::numeric_limits<float>::max();
+  int bestView = -1;
+  for (int viewIndex = 0; viewIndex < 3; ++viewIndex) {
+    const float angle =
+        quaternionAngularDifferenceDegrees(orientation, orthographicQuaternionForPlotMode(plotMode, viewIndex));
+    if (angle < bestAngle) {
+      bestAngle = angle;
+      bestView = viewIndex;
+    }
   }
+  if (outAngleDegrees) *outAngleDegrees = bestAngle;
+  return bestView;
 }
 
 bool computePointBounds(const float* verts,
@@ -868,7 +1004,7 @@ enum class ViewerComputeBackendKind {
   MetalCompute,
 };
 
-constexpr size_t kPlotModeKindCount = 9u;
+constexpr size_t kPlotModeKindCount = 10u;
 
 const char* backendKindLabel(ViewerComputeBackendKind kind) {
   switch (kind) {
@@ -945,6 +1081,9 @@ struct PointRenderProgramCache {
   GLint colorSaturationLoc = -1;
   GLint brightnessTrimLoc = -1;
   GLint alphaGainLoc = -1;
+  GLint layerAlphaScaleLoc = -1;
+  GLint pointCrispnessLoc = -1;
+  GLint glossModeLoc = -1;
   GLint occlusiveModeLoc = -1;
   bool initAttempted = false;
   bool available = false;
@@ -1033,6 +1172,9 @@ void main() {
 uniform float uColorSaturation;
 uniform float uBrightnessTrim;
 uniform float uAlphaGain;
+uniform float uLayerAlphaScale;
+uniform float uPointCrispness;
+uniform float uGlossMode;
 uniform float uOcclusiveMode;
 varying vec4 vColor;
 float hueToRgbChannel(float p, float q, float t) {
@@ -1093,10 +1235,21 @@ void main() {
   }
   c = clamp(c, 0.0, 1.0);
   c = clamp(c * uBrightnessTrim, 0.0, 1.0);
+  float layerAlpha = clamp(uLayerAlphaScale, 0.0, 1.0);
+  float alpha = clamp(vColor.a * uAlphaGain * layerAlpha, 0.0, 1.0);
+  if (uGlossMode > 0.5) {
+    vec2 pc = gl_PointCoord.xy * 2.0 - 1.0;
+    float radius = length(pc);
+    float crisp = clamp(uPointCrispness, 0.0, 1.0);
+    float edgeSoftness = mix(0.38, 0.05, crisp);
+    float edgeStart = max(0.0, 1.0 - edgeSoftness);
+    float mask = 1.0 - smoothstep(edgeStart, 1.0, radius);
+    float safeMaskFloor = mix(1.0, 0.28, crisp);
+    alpha *= clamp(mask, safeMaskFloor, 1.0);
+  }
   if (uOcclusiveMode > 0.5) {
     gl_FragColor = vec4(c, 1.0);
   } else {
-    float alpha = clamp(vColor.a * uAlphaGain, 0.0, 1.0);
     gl_FragColor = vec4(c * alpha, alpha);
   }
 }
@@ -1155,11 +1308,17 @@ void main() {
   cache->colorSaturationLoc = api.getUniformLocation(program, "uColorSaturation");
   cache->brightnessTrimLoc = api.getUniformLocation(program, "uBrightnessTrim");
   cache->alphaGainLoc = api.getUniformLocation(program, "uAlphaGain");
+  cache->layerAlphaScaleLoc = api.getUniformLocation(program, "uLayerAlphaScale");
+  cache->pointCrispnessLoc = api.getUniformLocation(program, "uPointCrispness");
+  cache->glossModeLoc = api.getUniformLocation(program, "uGlossMode");
   cache->occlusiveModeLoc = api.getUniformLocation(program, "uOcclusiveMode");
   cache->available = cache->pointSizeLoc >= 0 &&
                      cache->colorSaturationLoc >= 0 &&
                      cache->brightnessTrimLoc >= 0 &&
                      cache->alphaGainLoc >= 0 &&
+                     cache->layerAlphaScaleLoc >= 0 &&
+                     cache->pointCrispnessLoc >= 0 &&
+                     cache->glossModeLoc >= 0 &&
                      cache->occlusiveModeLoc >= 0;
   if (!cache->available) {
     api.deleteProgram(program);
@@ -1245,6 +1404,36 @@ struct MeshData {
   std::vector<float> pointVerts;
   std::vector<float> pointColors;
   size_t pointCount = 0;
+  bool hasGlossField = false;
+  int glossFieldWidth = 0;
+  int glossFieldHeight = 0;
+  std::vector<float> glossFieldMeanRgb;
+  std::vector<float> glossFieldBody;
+  std::vector<float> glossFieldSignal;
+  std::vector<float> glossFieldPositive;
+  std::vector<float> glossFieldNegative;
+  std::vector<float> glossFieldBoundary;
+  std::vector<float> glossFieldCongruence;
+  std::vector<float> glossFieldConfidence;
+  std::vector<float> glossFieldCarrierMax;
+  std::vector<float> glossFieldCarrierY;
+  std::vector<float> glossFieldCarrierMin;
+  std::vector<float> glossFieldNeutrality;
+  std::vector<uint32_t> glossFieldPointCellIndices;
+  std::vector<float> glossBodyGuideVerts;
+  std::vector<float> glossBodyGuideColors;
+  size_t glossBodyGuidePointCount = 0;
+  size_t glossBodyPointCount = 0;
+  size_t glossHighlightPointCount = 0;
+  std::vector<float> lineVerts;
+  std::vector<float> lineColors;
+  size_t lineVertexCount = 0;
+  bool hasGlossInset = false;
+  int glossInsetWidth = 0;
+  int glossInsetHeight = 0;
+  std::vector<float> glossInsetOccupancy;
+  std::vector<float> glossInsetLift;
+  std::vector<float> glossInsetBoundary;
   bool hasFitBounds = false;
   Vec3 fitMin{};
   Vec3 fitMax{};
@@ -1310,6 +1499,10 @@ struct InputCloudComputeCache {
   GLint pointAlphaScaleLoc = -1;
   GLint denseAlphaBiasLoc = -1;
   GLint colorSaturationLoc = -1;
+  GLint inputStrideLoc = -1;
+  GLint glossViewLoc = -1;
+  GLint sourceAspectLoc = -1;
+  GLint glossLiftScaleLoc = -1;
   uint64_t builtSerial = 0;
   GLsizei pointCount = 0;
   bool available = false;
@@ -1351,6 +1544,10 @@ struct PointSelectionSpec {
   uint64_t sourceSerial = 0;
   size_t fullPointCount = 0;
   size_t visiblePointCount = 0;
+  size_t fullGlossBodyPointCount = 0;
+  size_t fullGlossHighlightPointCount = 0;
+  size_t visibleGlossBodyPointCount = 0;
+  size_t visibleGlossHighlightPointCount = 0;
   bool needsThinning = false;
 };
 
@@ -1360,9 +1557,29 @@ struct PointDrawBuffers {
   size_t pointCount = 0;
   uint64_t sourceSerial = 0;
   size_t visiblePointCount = 0;
+  size_t visibleGlossBodyPointCount = 0;
+  size_t visibleGlossHighlightPointCount = 0;
   bool available = false;
   std::vector<float> cpuVerts;
   std::vector<float> cpuColors;
+};
+
+enum class GlossViewPresentationMode {
+  Field2D = 0,
+  Projection3D = 1,
+};
+
+enum class GlossViewColorMode {
+  SemanticSignal = 0,
+  SourceHueTint = 1,
+};
+
+enum class GlossViewDebugFieldMode {
+  Signal = 0,
+  CarrierMax = 1,
+  CarrierY = 2,
+  CarrierMin = 3,
+  Neutrality = 4,
 };
 
 struct InputCloudSampleComputeCache {
@@ -1371,9 +1588,15 @@ struct InputCloudSampleComputeCache {
   GLuint program = 0;
   GLint fullPointCountLoc = -1;
   GLint visiblePointCountLoc = -1;
+  GLint fullBodyPointCountLoc = -1;
+  GLint visibleBodyPointCountLoc = -1;
+  GLint fullHighlightPointCountLoc = -1;
+  GLint visibleHighlightPointCountLoc = -1;
   uint64_t builtSerial = 0;
   GLsizei pointCount = 0;
   size_t visiblePointCount = 0;
+  size_t visibleGlossBodyPointCount = 0;
+  size_t visibleGlossHighlightPointCount = 0;
   bool available = false;
 };
 
@@ -1722,6 +1945,7 @@ void drawChenGuide();
 void drawMappedBoundaryGuide(const ResolvedPayload& payload);
 void drawReuleauxGuide();
 void drawRgbGuide(const ResolvedPayload& payload);
+void drawGlossLiftGuide(const ResolvedPayload& payload);
 
 bool canUseOverlayComputePath(const ResolvedPayload& payload);
 bool ensureOverlayComputeProgram(OverlayComputeCache* cache);
@@ -1758,6 +1982,9 @@ bool ensureInputCloudBoundsProgram(InputCloudComputeCache* cache);
 bool parseInputCloudSamples(const InputCloudPayload& cloud, std::vector<InputCloudSample>* samples);
 bool cubeSliceContainsPoint(const PlotRemapSpec& spec, float r, float g, float b);
 bool cubeSliceContainsPoint(const ResolvedPayload& payload, float r, float g, float b);
+bool parseInputCloudSamples(const InputCloudPayload& cloud, std::vector<InputCloudSample>* samples);
+void filterInputCloudSamples(const ResolvedPayload& payload, std::vector<InputCloudSample>* samples);
+void expandGlossViewFitBounds(const ResolvedPayload& payload, MeshData* mesh);
 float pointAlphaScaleForPlot(float pointSize, float pointDensity, int resolution);
 float denseAlphaBiasForPlot(float pointSize, float pointDensity, int resolution);
 float denseLumaProtectedAlpha(float baseAlpha, float pointSize, float pointDensity, int resolution,
@@ -1773,6 +2000,7 @@ bool buildInputCloudMeshOnGpu(const ResolvedPayload& payload,
                               ComputeSessionState* sessionState,
                               const InputCloudPayload& cloud,
                               const std::vector<float>& rawPoints,
+                              const std::vector<InputCloudSample>* glossSamples,
                               InputCloudComputeCache* cache,
                               MeshData* out
 #if defined(CHROMASPACE_VIEWER_HAS_CUDA) && !defined(__APPLE__)
@@ -1830,6 +2058,7 @@ enum class PlotModeKind {
   NormCone = 6,
   Reuleaux = 7,
   Chromaticity = 8,
+  GlossLift = 9,
 };
 
 struct PlotRemapSpec {
@@ -1907,6 +2136,9 @@ struct ResolvedPayload {
   bool circularHsl = false;
   bool circularHsv = false;
   bool normConeNormalized = true;
+  bool plotDisplayLinear = false;
+  int plotDisplayLinearTransfer = 0;
+  float sourceAspect = 16.0f / 9.0f;
   bool alwaysOnTop = true;
   std::string quality = "Low";
   int resolution = 25;
@@ -1915,6 +2147,12 @@ struct ResolvedPayload {
   float colorSaturation = 2.0f;
   std::string plotStyle = "Plain Scope";
   std::string pointShape = "Circle";
+  int glossNeighborhood = 1;
+  float glossLiftScale = 1.0f;
+  bool glossSpatialInset = true;
+  float glossBodyOpacity = 0.10f;
+  float glossHighlightOpacity = 0.42f;
+  float glossPointCrispness = 0.72f;
   bool showOverflow = false;
   bool highlightOverflow = true;
   bool cubeSlicingEnabled = false;
@@ -1978,7 +2216,14 @@ struct InputCloudSample {
 };
 
 bool canUseOverlayComputePath(const ResolvedPayload& payload) {
-  return payload.identityOverlayEnabled && payload.plotMode != "chromaticity";
+  return payload.identityOverlayEnabled &&
+         payload.plotMode != "chromaticity" &&
+         payload.plotMode != "gloss_lift" &&
+         payload.plotMode != "gloss_view";
+}
+
+bool isGlossViewPlotModeString(const std::string& plotMode) {
+  return plotMode == "gloss_view" || plotMode == "gloss_lift";
 }
 
 PlotModeKind classifyPlotMode(const ResolvedPayload& payload) {
@@ -1990,6 +2235,7 @@ PlotModeKind classifyPlotMode(const ResolvedPayload& payload) {
   if (payload.plotMode == "norm_cone") return PlotModeKind::NormCone;
   if (payload.plotMode == "reuleaux") return PlotModeKind::Reuleaux;
   if (payload.plotMode == "chromaticity") return PlotModeKind::Chromaticity;
+  if (isGlossViewPlotModeString(payload.plotMode)) return PlotModeKind::GlossLift;
   return PlotModeKind::Rgb;
 }
 
@@ -2093,6 +2339,7 @@ const char* plotModeLabel(const ResolvedPayload& payload) {
     case PlotModeKind::NormCone: return payload.normConeNormalized ? "Norm-Cone" : "Cone Chroma";
     case PlotModeKind::Reuleaux: return "Reuleaux";
     case PlotModeKind::Chromaticity: return "Chromaticity";
+    case PlotModeKind::GlossLift: return "Gloss View";
     case PlotModeKind::Rgb:
     default: return "Cube";
   }
@@ -2142,6 +2389,9 @@ void drawGuideForPlotMode(const ResolvedPayload& payload,
     case PlotModeKind::Chromaticity:
       drawChromaticityGuide(payload, cam, viewportHeight, fovyDegrees, hudText);
       break;
+    case PlotModeKind::GlossLift:
+      drawGlossLiftGuide(payload);
+      break;
     case PlotModeKind::Rgb:
     default:
       drawRgbGuide(payload);
@@ -2149,7 +2399,8 @@ void drawGuideForPlotMode(const ResolvedPayload& payload,
   }
   if (payload.cubeSlicingEnabled &&
       classifyPlotMode(payload) != PlotModeKind::Rgb &&
-      classifyPlotMode(payload) != PlotModeKind::Chromaticity) {
+      classifyPlotMode(payload) != PlotModeKind::Chromaticity &&
+      classifyPlotMode(payload) != PlotModeKind::GlossLift) {
     drawVolumeSliceHueGuides(payload);
   }
 }
@@ -2888,6 +3139,28 @@ std::string inputCloudComputeReason(const ResolvedPayload& payload,
                                     const ComputeSessionState* state) {
   if (payload.sourceMode != "input") return std::string("source-") + payload.sourceMode;
   if (classifyPlotMode(payload) == PlotModeKind::Chromaticity) return "cpu-chromaticity";
+  if (classifyPlotMode(payload) == PlotModeKind::GlossLift) {
+#if defined(__APPLE__)
+    if (!gpuCaps.inputComputeEnabled) return gpuCaps.metalQueueReady ? "gloss-metal-disabled" : "no-metal-compute";
+    if (!glossViewMetalFieldPathEnabled()) return "cpu-gloss-field-safety";
+    return "metal-gloss-field";
+#else
+    if (sessionWantsCuda(gpuCaps)) {
+      if (!glossViewCudaFieldPathEnabled()) return "cpu-gloss-field-safety";
+      if (!gpuCaps.cudaComputeEnabled) {
+        const std::string reason = !gpuCaps.cudaStartupReason.empty() ? gpuCaps.cudaStartupReason : gpuCaps.cudaReason;
+        return "cuda-fallback-" + (reason.empty() ? std::string("startup") : reason);
+      }
+      const PlotRemapSpec remap = makePlotRemapSpec(payload);
+      if (state) {
+        if (state->inputCudaFamilyDemoted) return "cuda-demoted-family";
+        if (state->inputCudaPlotDemoted[plotModeSlot(remap)]) return "cuda-demoted-plot";
+      }
+      return "cuda-gloss-field";
+    }
+    return "cpu-gloss-field";
+#endif
+  }
 #if defined(__APPLE__)
   if (!gpuCaps.inputComputeEnabled) return gpuCaps.metalQueueReady ? "input-metal-disabled" : "no-metal-compute";
 #else
@@ -2934,6 +3207,10 @@ uniform int uNormConeNormalized;
 uniform float uPointAlphaScale;
 uniform float uDenseAlphaBias;
 uniform float uColorSaturation;
+uniform int uInputStride;
+uniform int uGlossView;
+uniform float uSourceAspect;
+uniform float uGlossLiftScale;
 
 const float kTau = 6.28318530717958647692;
 const float kPi = 3.14159265358979323846;
@@ -3101,6 +3378,27 @@ vec3 mapPlotPosition(float r, float g, float b) {
   return vec3(r * 2.0 - 1.0, g * 2.0 - 1.0, b * 2.0 - 1.0);
 }
 
+float glossCommonComponent(float r, float g, float b) {
+  return max(0.0, min(r, min(g, b)));
+}
+
+float glossNeutrality(float r, float g, float b) {
+  float common = glossCommonComponent(r, g, b);
+  float maxRgb = max(r, max(g, b));
+  return maxRgb > 1e-6 ? clamp(common / maxRgb, 0.0, 1.0) : 0.0;
+}
+
+float glossStrengthCue(float r, float g, float b) {
+  float common = glossCommonComponent(r, g, b);
+  float neutrality = glossNeutrality(r, g, b);
+  return clamp(common * (0.75 + 0.85 * neutrality), 0.0, 1.0);
+}
+
+float glossPresenceWeight(float glossCue) {
+  float t = clamp((glossCue - 0.06) / 0.22, 0.0, 1.0);
+  return t * t * (3.0 - 2.0 * t);
+}
+
 bool outOfBounds(float r, float g, float b) {
   return r < 0.0 || r > 1.0 || g < 0.0 || g > 1.0 || b < 0.0 || b > 1.0;
 }
@@ -3216,10 +3514,20 @@ float luminanceAwareAlpha(float baseAlpha, float cr, float cg, float cb, bool ov
 void main() {
   uint index = gl_GlobalInvocationID.x;
   if (index >= uint(max(uPointCount, 0))) return;
-  uint inBase = index * 3u;
+  uint stride = uint(max(uInputStride, 3));
+  uint inBase = index * stride;
+  float xNorm = 0.5;
+  float yNorm = 0.5;
   float r = inputVals[inBase + 0u];
   float g = inputVals[inBase + 1u];
   float b = inputVals[inBase + 2u];
+  if (uGlossView != 0 && stride >= 6u) {
+    xNorm = clamp(inputVals[inBase + 0u], 0.0, 1.0);
+    yNorm = clamp(inputVals[inBase + 1u], 0.0, 1.0);
+    r = inputVals[inBase + 3u];
+    g = inputVals[inBase + 4u];
+    b = inputVals[inBase + 5u];
+  }
   bool overflowPoint = outOfBounds(r, g, b);
   float plotR = (uShowOverflow != 0) ? r : clamp01(r);
   float plotG = (uShowOverflow != 0) ? g : clamp01(g);
@@ -3228,6 +3536,22 @@ void main() {
   uint vertBase = index * 3u;
   uint colorBase = index * 4u;
   vec3 pos = mapPlotPosition(plotR, plotG, plotB);
+  if (uGlossView != 0) {
+    float aspect = clamp(uSourceAspect, 0.25, 4.0);
+    float halfWidth = aspect >= 1.0 ? 1.22 : (1.22 * aspect);
+    float halfDepth = aspect >= 1.0 ? (1.22 / aspect) : 1.22;
+    float common = glossCommonComponent(plotR, plotG, plotB);
+    float bodyR = max(plotR - common, 0.0);
+    float bodyG = max(plotG - common, 0.0);
+    float bodyB = max(plotB - common, 0.0);
+    float bodyLuma = clamp(bodyR * 0.2126 + bodyG * 0.7152 + bodyB * 0.0722, 0.0, 1.0);
+    float glossCue = glossStrengthCue(plotR, plotG, plotB);
+    float glossPresence = glossPresenceWeight(glossCue);
+    float xPos = -halfWidth + (2.0 * halfWidth * xNorm);
+    float zPos = halfDepth - (2.0 * halfDepth * yNorm);
+    float yPos = -0.92 + bodyLuma * 0.92 + glossCue * glossPresence * uGlossLiftScale * 1.34;
+    pos = vec3(xPos, yPos, zPos);
+  }
   vertVals[vertBase + 0u] = pos.x;
   vertVals[vertBase + 1u] = pos.y;
   vertVals[vertBase + 2u] = pos.z;
@@ -3242,13 +3566,25 @@ void main() {
   } else {
     mapDisplayColor(r, g, b, cr, cg, cb);
     applyDisplaySaturation(cr, cg, cb);
+    if (uGlossView != 0) {
+      float glossCue = glossStrengthCue(plotR, plotG, plotB);
+      float glossPresence = glossPresenceWeight(glossCue);
+      float neutralBlend = clamp(0.08 + 0.52 * glossPresence, 0.0, 0.62);
+      float brightnessGain = 1.18 + 1.20 * glossPresence;
+      cr = clamp((cr * (1.0 - neutralBlend) + neutralBlend) * brightnessGain, 0.0, 1.0);
+      cg = clamp((cg * (1.0 - neutralBlend) + neutralBlend) * brightnessGain, 0.0, 1.0);
+      cb = clamp((cb * (1.0 - neutralBlend) + neutralBlend) * brightnessGain, 0.0, 1.0);
+    }
   }
   colorVals[colorBase + 0u] = cr;
   colorVals[colorBase + 1u] = cg;
   colorVals[colorBase + 2u] = cb;
-  colorVals[colorBase + 3u] =
-      luminanceAwareAlpha(((uShowOverflow != 0 && uHighlightOverflow != 0 && overflowPoint) ? 0.95 : 0.72),
-                          cr, cg, cb, overflowPoint);
+  float baseAlpha = (uShowOverflow != 0 && uHighlightOverflow != 0 && overflowPoint) ? 0.95 : 0.72;
+  if (uGlossView != 0) {
+    float glossPresence = glossPresenceWeight(glossStrengthCue(plotR, plotG, plotB));
+    baseAlpha = mix(0.01, 0.98, glossPresence);
+  }
+  colorVals[colorBase + 3u] = luminanceAwareAlpha(baseAlpha, cr, cg, cb, overflowPoint);
 }
 )GLSL";
 
@@ -3292,6 +3628,10 @@ void main() {
   cache->pointAlphaScaleLoc = api.getUniformLocation(program, "uPointAlphaScale");
   cache->denseAlphaBiasLoc = api.getUniformLocation(program, "uDenseAlphaBias");
   cache->colorSaturationLoc = api.getUniformLocation(program, "uColorSaturation");
+  cache->inputStrideLoc = api.getUniformLocation(program, "uInputStride");
+  cache->glossViewLoc = api.getUniformLocation(program, "uGlossView");
+  cache->sourceAspectLoc = api.getUniformLocation(program, "uSourceAspect");
+  cache->glossLiftScaleLoc = api.getUniformLocation(program, "uGlossLiftScale");
   cache->available = cache->pointCountLoc >= 0 &&
                      cache->showOverflowLoc >= 0 &&
                      cache->highlightOverflowLoc >= 0 &&
@@ -3301,7 +3641,11 @@ void main() {
                      cache->normConeNormalizedLoc >= 0 &&
                      cache->pointAlphaScaleLoc >= 0 &&
                      cache->denseAlphaBiasLoc >= 0 &&
-                     cache->colorSaturationLoc >= 0;
+                     cache->colorSaturationLoc >= 0 &&
+                     cache->inputStrideLoc >= 0 &&
+                     cache->glossViewLoc >= 0 &&
+                     cache->sourceAspectLoc >= 0 &&
+                     cache->glossLiftScaleLoc >= 0;
   if (!cache->available) {
     logViewerEvent("Input-cloud compute program missing one or more uniforms; falling back to CPU.");
     releaseInputCloudComputeCache(cache);
@@ -3607,6 +3951,7 @@ bool buildInputCloudMeshOnGpu(const ResolvedPayload& payload,
                               ComputeSessionState* sessionState,
                               const InputCloudPayload& cloud,
                               const std::vector<float>& rawPoints,
+                              const std::vector<InputCloudSample>* glossSamples,
                               InputCloudComputeCache* cache,
                               MeshData* out
 #if defined(CHROMASPACE_VIEWER_HAS_CUDA) && !defined(__APPLE__)
@@ -3617,11 +3962,39 @@ bool buildInputCloudMeshOnGpu(const ResolvedPayload& payload,
   if (!canUseInputCloudComputePath(payload)) return false;
   const PlotRemapSpec remap = makePlotRemapSpec(payload);
   const ComputeRemapUniforms uniforms = makeComputeRemapUniforms(remap);
+  const bool glossViewMode = isGlossViewPlotModeString(payload.plotMode);
+  std::vector<float> glossPackedScratch;
+  const std::vector<float>* inputFloats = &rawPoints;
+  int inputStride = 3;
+  size_t pointCount = rawPoints.size() / 3u;
+  if (glossViewMode) {
+    inputStride = 6;
+    if (!cloud.packedPoints.empty()) {
+      inputFloats = &cloud.packedPoints;
+    } else if (glossSamples) {
+      glossPackedScratch.reserve(glossSamples->size() * 6u);
+      for (const auto& sample : *glossSamples) {
+        glossPackedScratch.push_back(clampf(sample.xNorm, 0.0f, 1.0f));
+        glossPackedScratch.push_back(clampf(sample.yNorm, 0.0f, 1.0f));
+        glossPackedScratch.push_back(0.0f);
+        glossPackedScratch.push_back(sample.r);
+        glossPackedScratch.push_back(sample.g);
+        glossPackedScratch.push_back(sample.b);
+      }
+      inputFloats = &glossPackedScratch;
+    } else {
+      return false;
+    }
+    pointCount = inputFloats->size() / 6u;
+  }
 #if defined(__APPLE__)
-  const size_t pointCount = rawPoints.size() / 3u;
   if (pointCount == 0) return false;
   ChromaspaceMetal::InputRequest request{};
   request.pointCount = static_cast<int>(pointCount);
+  request.inputStride = inputStride;
+  request.glossView = glossViewMode ? 1 : 0;
+  request.sourceAspect = payload.sourceAspect;
+  request.glossLiftScale = payload.glossLiftScale;
   request.pointAlphaScale = pointAlphaScaleForPlot(payload.pointSize, payload.pointDensity, payload.resolution);
   request.denseAlphaBias = denseAlphaBiasForPlot(payload.pointSize, payload.pointDensity, payload.resolution);
   request.colorSaturation = bakedColorSaturationForPlot(payload);
@@ -3632,20 +4005,20 @@ bool buildInputCloudMeshOnGpu(const ResolvedPayload& payload,
   mesh.paramHash = cloud.paramHash;
   mesh.serial = nextMeshSerial();
   std::string error;
-  if (!ChromaspaceMetal::buildInputMesh(request, rawPoints, &mesh.pointVerts, &mesh.pointColors, &error)) {
+  if (!ChromaspaceMetal::buildInputMesh(request, *inputFloats, &mesh.pointVerts, &mesh.pointColors, &error)) {
     if (!error.empty()) logViewerEvent(std::string("Metal input compute failed: ") + error);
     return false;
   }
   mesh.pointCount = mesh.pointVerts.size() / 3u;
   if (mesh.pointCount == 0 || mesh.pointColors.size() != mesh.pointCount * 4u) return false;
   setMeshFitBoundsFromVerts(&mesh);
+  if (glossViewMode) expandGlossViewFitBounds(payload, &mesh);
   *out = std::move(mesh);
   cache->builtSerial = out->serial;
   cache->pointCount = static_cast<GLsizei>(out->pointCount);
   runInputParityCheck(payload, cloud, rawPoints, *cache, *out, viewerParityChecksEnabled());
   return true;
 #else
-  const size_t pointCount = rawPoints.size() / 3u;
   if (pointCount == 0) return false;
 #if defined(CHROMASPACE_VIEWER_HAS_CUDA)
   if (canUseCudaInputPath(gpuCaps, sessionState, remap) && cudaCache) {
@@ -3670,16 +4043,20 @@ bool buildInputCloudMeshOnGpu(const ResolvedPayload& payload,
       bufferApi.bindBuffer(GL_ARRAY_BUFFER, 0);
       ChromaspaceCuda::InputRequest request{};
       request.pointCount = static_cast<int>(pointCount);
+      request.inputStride = inputStride;
+      request.glossView = glossViewMode ? 1 : 0;
+      request.sourceAspect = payload.sourceAspect;
+      request.glossLiftScale = payload.glossLiftScale;
       request.pointAlphaScale = pointAlphaScaleForPlot(payload.pointSize, payload.pointDensity, payload.resolution);
       request.denseAlphaBias = denseAlphaBiasForPlot(payload.pointSize, payload.pointDensity, payload.resolution);
       request.colorSaturation = bakedColorSaturationForPlot(payload);
       request.remap = makeCudaRemapUniforms(uniforms);
       std::string error;
       if (ChromaspaceCuda::buildInputMesh(reinterpret_cast<ChromaspaceCuda::InputCache*>(cudaCache),
-                                           request,
-                                           rawPoints,
-                                           nextMeshSerial(),
-                                           &error)) {
+                                            request,
+                                            *inputFloats,
+                                            nextMeshSerial(),
+                                            &error)) {
         MeshData mesh{};
         mesh.resolution = cloud.resolution <= 25 ? 25 : (cloud.resolution <= 41 ? 41 : 57);
         mesh.quality = cloud.quality;
@@ -3691,6 +4068,7 @@ bool buildInputCloudMeshOnGpu(const ResolvedPayload& payload,
           mesh.fitMin = Vec3{cudaCache->fitMin[0], cudaCache->fitMin[1], cudaCache->fitMin[2]};
           mesh.fitMax = Vec3{cudaCache->fitMax[0], cudaCache->fitMax[1], cudaCache->fitMax[2]};
         }
+        if (glossViewMode) expandGlossViewFitBounds(payload, &mesh);
         *out = std::move(mesh);
         const bool parityOk = runInputParityCheckWithBuffers(payload, cloud, rawPoints, cudaCache->verts, cudaCache->colors, *out, viewerParityChecksEnabled());
         if (!parityOk) {
@@ -3720,8 +4098,8 @@ bool buildInputCloudMeshOnGpu(const ResolvedPayload& payload,
 
   bufferApi.bindBuffer(GL_SHADER_STORAGE_BUFFER, cache->input);
   bufferApi.bufferData(GL_SHADER_STORAGE_BUFFER,
-                       static_cast<ViewerGLsizeiptr>(rawPoints.size() * sizeof(float)),
-                       rawPoints.data(),
+                       static_cast<ViewerGLsizeiptr>(inputFloats->size() * sizeof(float)),
+                       inputFloats->data(),
                        GL_DYNAMIC_DRAW);
   bufferApi.bindBuffer(GL_SHADER_STORAGE_BUFFER, cache->verts);
   bufferApi.bufferData(GL_SHADER_STORAGE_BUFFER,
@@ -3742,6 +4120,10 @@ bool buildInputCloudMeshOnGpu(const ResolvedPayload& payload,
   computeApi.uniform1i(cache->circularHslLoc, uniforms.circularHsl);
   computeApi.uniform1i(cache->circularHsvLoc, uniforms.circularHsv);
   computeApi.uniform1i(cache->normConeNormalizedLoc, uniforms.normConeNormalized);
+  computeApi.uniform1i(cache->inputStrideLoc, inputStride);
+  computeApi.uniform1i(cache->glossViewLoc, glossViewMode ? 1 : 0);
+  computeApi.uniform1f(cache->sourceAspectLoc, payload.sourceAspect);
+  computeApi.uniform1f(cache->glossLiftScaleLoc, payload.glossLiftScale);
   computeApi.uniform1f(cache->pointAlphaScaleLoc,
                        pointAlphaScaleForPlot(payload.pointSize, payload.pointDensity, payload.resolution));
   computeApi.uniform1f(cache->denseAlphaBiasLoc,
@@ -3769,6 +4151,7 @@ bool buildInputCloudMeshOnGpu(const ResolvedPayload& payload,
     mesh.fitMin = gpuMin;
     mesh.fitMax = gpuMax;
   }
+  if (glossViewMode) expandGlossViewFitBounds(payload, &mesh);
   *out = std::move(mesh);
   cache->builtSerial = out->serial;
   cache->pointCount = static_cast<GLsizei>(pointCount);
@@ -3887,6 +4270,11 @@ bool parseParamsMessage(const std::string& line, ResolvedPayload* out) {
   int normConeNormalized = 1;
   extractInt(line, "normConeNormalized", &normConeNormalized);
   p.normConeNormalized = (normConeNormalized != 0);
+  int plotDisplayLinear = 0;
+  extractInt(line, "plotDisplayLinear", &plotDisplayLinear);
+  p.plotDisplayLinear = (plotDisplayLinear != 0);
+  extractInt(line, "plotDisplayLinearTransfer", &p.plotDisplayLinearTransfer);
+  extractFloat(line, "sourceAspect", &p.sourceAspect);
   int showOverflow = 0;
   extractInt(line, "showOverflow", &showOverflow);
   p.showOverflow = (showOverflow != 0);
@@ -3927,6 +4315,14 @@ bool parseParamsMessage(const std::string& line, ResolvedPayload* out) {
   extractFloat(line, "pointSize", &p.pointSize);
   extractFloat(line, "pointDensity", &p.pointDensity);
   extractFloat(line, "colorSaturation", &p.colorSaturation);
+  extractInt(line, "glossNeighborhood", &p.glossNeighborhood);
+  extractFloat(line, "glossLiftScale", &p.glossLiftScale);
+  int glossSpatialInset = 1;
+  extractInt(line, "glossSpatialInset", &glossSpatialInset);
+  p.glossSpatialInset = (glossSpatialInset != 0);
+  extractFloat(line, "glossBodyOpacity", &p.glossBodyOpacity);
+  extractFloat(line, "glossHighlightOpacity", &p.glossHighlightOpacity);
+  extractFloat(line, "glossPointCrispness", &p.glossPointCrispness);
   int identityOverlayEnabled = 0;
   extractInt(line, "identityOverlayEnabled", &identityOverlayEnabled);
   p.identityOverlayEnabled = (identityOverlayEnabled != 0);
@@ -3948,6 +4344,14 @@ bool parseParamsMessage(const std::string& line, ResolvedPayload* out) {
   p.pointSize = clampf(p.pointSize, 0.35f, 3.0f);
   p.pointDensity = clampf(p.pointDensity, 0.1f, 4.0f);
   p.colorSaturation = clampf(p.colorSaturation, 1.0f, 6.0f);
+  p.glossNeighborhood = std::clamp(p.glossNeighborhood, 0, 2);
+  p.glossLiftScale = clampf(p.glossLiftScale, 0.25f, 3.0f);
+  p.glossBodyOpacity = clampf(p.glossBodyOpacity, 0.0f, 1.0f);
+  p.glossHighlightOpacity = clampf(p.glossHighlightOpacity, 0.0f, 1.0f);
+  p.glossPointCrispness = clampf(p.glossPointCrispness, 0.0f, 1.0f);
+  p.plotDisplayLinearTransfer =
+      std::clamp(p.plotDisplayLinearTransfer, 0, static_cast<int>(WorkshopColor::transferFunctionCount()) - 1);
+  p.sourceAspect = clampf(p.sourceAspect, 0.25f, 4.0f);
   p.neutralRadius = clampf(p.neutralRadius, 0.0f, 1.0f);
   p.overflowHighlightR = clamp01(p.overflowHighlightR);
   p.overflowHighlightG = clamp01(p.overflowHighlightG);
@@ -4090,7 +4494,8 @@ float normalizedNeutralRadiusForPoint(const PlotRemapSpec& spec, float r, float 
   constexpr float kChenPolarScale = 1.0467733744265997f;
 
   switch (spec.plotMode) {
-    case PlotModeKind::Rgb: {
+    case PlotModeKind::Rgb:
+    case PlotModeKind::GlossLift: {
       const float rr = clamp01(r);
       const float gg = clamp01(g);
       const float bb = clamp01(b);
@@ -4184,7 +4589,7 @@ bool cubeSliceContainsPoint(const PlotRemapSpec& spec, float r, float g, float b
                                  spec.cubeSliceCyan || spec.cubeSliceYellow || spec.cubeSliceMagenta;
   if (!spec.cubeSlicingEnabled) return true;
   if (!anyRegionSelected) return false;
-  if (spec.plotMode == PlotModeKind::Rgb) {
+  if (spec.plotMode == PlotModeKind::Rgb || spec.plotMode == PlotModeKind::GlossLift) {
     constexpr float kEps = 1e-6f;
     const auto ge = [&](float a, float c) { return a + kEps >= c; };
     if (spec.cubeSliceRed && ge(r, g) && ge(g, b)) return true;
@@ -4373,6 +4778,7 @@ void rgbToPlotCircularHsv(float r, float g, float b, float* outH, float* outRadi
 bool overflowHighlightApplies(const PlotRemapSpec& spec, float r, float g, float b) {
   if (!spec.showOverflow || !spec.highlightOverflow) return false;
   if (spec.plotMode != PlotModeKind::Rgb &&
+      spec.plotMode != PlotModeKind::GlossLift &&
       spec.plotMode != PlotModeKind::Hsl &&
       spec.plotMode != PlotModeKind::Hsv &&
       spec.plotMode != PlotModeKind::Chen &&
@@ -4667,6 +5073,9 @@ Vec3 mapPointToPlotMode(const PlotRemapSpec& spec, float r, float g, float b) {
     const float angle = hue * kTau;
     const Vec3 out{std::cos(angle) * sat, value * 2.0f - 1.0f, std::sin(angle) * sat};
     return std::isfinite(out.x) && std::isfinite(out.y) && std::isfinite(out.z) ? out : Vec3{};
+  }
+  if (spec.plotMode == PlotModeKind::GlossLift) {
+    return Vec3{r * 2.0f - 1.0f, g * 2.0f - 1.0f, b * 2.0f - 1.0f};
   }
   return Vec3{r * 2.0f - 1.0f, g * 2.0f - 1.0f, b * 2.0f - 1.0f};
 }
@@ -4964,6 +5373,1255 @@ bool buildIdentityMesh(const ResolvedPayload& payload, MeshData* out) {
   return true;
 }
 
+inline Vec3 add3(Vec3 a, Vec3 b) {
+  return Vec3{a.x + b.x, a.y + b.y, a.z + b.z};
+}
+
+inline Vec3 sub3(Vec3 a, Vec3 b) {
+  return Vec3{a.x - b.x, a.y - b.y, a.z - b.z};
+}
+
+inline Vec3 scale3(Vec3 v, float s) {
+  return Vec3{v.x * s, v.y * s, v.z * s};
+}
+
+inline Vec3 mix3(Vec3 a, Vec3 b, float t) {
+  const float k = clampf(t, 0.0f, 1.0f);
+  return Vec3{a.x + (b.x - a.x) * k, a.y + (b.y - a.y) * k, a.z + (b.z - a.z) * k};
+}
+
+inline float glossLuma(Vec3 rgb) {
+  return rgb.x * 0.2126f + rgb.y * 0.7152f + rgb.z * 0.0722f;
+}
+
+float glossNeighborhoodRadiusForChoice(int choice) {
+  switch (std::clamp(choice, 0, 2)) {
+    case 0: return 0.035f;
+    case 2: return 0.085f;
+    case 1:
+    default: return 0.055f;
+  }
+}
+
+const char* glossViewPresentationLabel(GlossViewPresentationMode mode) {
+  switch (mode) {
+    case GlossViewPresentationMode::Projection3D: return "3D Projection";
+    case GlossViewPresentationMode::Field2D:
+    default: return "2D Field";
+  }
+}
+
+const char* glossViewColorModeLabel(GlossViewColorMode mode) {
+  switch (mode) {
+    case GlossViewColorMode::SourceHueTint: return "Source Hue Tint";
+    case GlossViewColorMode::SemanticSignal:
+    default: return "Semantic Signal";
+  }
+}
+
+const char* glossViewDebugFieldLabel(GlossViewDebugFieldMode mode) {
+  switch (mode) {
+    case GlossViewDebugFieldMode::CarrierMax: return "Carrier maxRGB";
+    case GlossViewDebugFieldMode::CarrierY: return "Carrier Y";
+    case GlossViewDebugFieldMode::CarrierMin: return "Carrier min/shared";
+    case GlossViewDebugFieldMode::Neutrality: return "Carrier neutrality";
+    case GlossViewDebugFieldMode::Signal:
+    default: return "Signed signal";
+  }
+}
+
+void glossViewResolvedDisplaySignals(const MeshData& mesh,
+                                     size_t idx,
+                                     GlossViewDebugFieldMode debugMode,
+                                     float* outBase,
+                                     float* outPositive,
+                                     float* outNegative,
+                                     float* outSignedValue);
+Vec3 glossViewSourceHueColor(const MeshData& mesh, size_t idx, const ResolvedPayload& payload);
+void glossViewCellDisplayStyle(const MeshData& mesh,
+                               size_t idx,
+                               const ResolvedPayload& payload,
+                               GlossViewColorMode colorMode,
+                               GlossViewDebugFieldMode debugMode,
+                               float* outR,
+                               float* outG,
+                               float* outB,
+                               float* outA);
+
+bool meshHasGlossLayers(const MeshData& mesh) {
+  return mesh.glossBodyPointCount > 0 &&
+         (mesh.glossBodyPointCount + mesh.glossHighlightPointCount) == mesh.pointCount;
+}
+
+size_t glossNeighborhoodSampleCapForChoice(int choice) {
+  switch (std::clamp(choice, 0, 2)) {
+    case 0: return 96u;
+    case 2: return 192u;
+    case 1:
+    default: return 144u;
+  }
+}
+
+struct GlossNeighborhoodLookup {
+  int gridWidth = 1;
+  int gridHeight = 1;
+  float radius = 0.055f;
+  float radiusSq = 0.055f * 0.055f;
+  std::vector<size_t> offsets;
+  std::vector<uint32_t> indices;
+};
+
+GlossNeighborhoodLookup buildGlossNeighborhoodLookup(const std::vector<InputCloudSample>& samples,
+                                                     int neighborhoodChoice) {
+  GlossNeighborhoodLookup lookup{};
+  lookup.radius = glossNeighborhoodRadiusForChoice(neighborhoodChoice);
+  lookup.radiusSq = lookup.radius * lookup.radius;
+  lookup.gridWidth = std::max(1, static_cast<int>(std::ceil(1.0f / std::max(0.01f, lookup.radius))));
+  lookup.gridHeight = lookup.gridWidth;
+  const size_t binCount = static_cast<size_t>(lookup.gridWidth) * static_cast<size_t>(lookup.gridHeight);
+  std::vector<size_t> counts(binCount, 0u);
+  auto binIndex = [&](float xNorm, float yNorm) {
+    const int bx = std::clamp(static_cast<int>(xNorm * static_cast<float>(lookup.gridWidth)), 0, lookup.gridWidth - 1);
+    const int by = std::clamp(static_cast<int>(yNorm * static_cast<float>(lookup.gridHeight)), 0, lookup.gridHeight - 1);
+    return static_cast<size_t>(by) * static_cast<size_t>(lookup.gridWidth) + static_cast<size_t>(bx);
+  };
+  for (const auto& sample : samples) {
+    counts[binIndex(sample.xNorm, sample.yNorm)] += 1u;
+  }
+  lookup.offsets.resize(binCount + 1u, 0u);
+  for (size_t i = 0; i < binCount; ++i) {
+    lookup.offsets[i + 1u] = lookup.offsets[i] + counts[i];
+  }
+  lookup.indices.resize(samples.size(), 0u);
+  std::vector<size_t> cursor = lookup.offsets;
+  for (size_t i = 0; i < samples.size(); ++i) {
+    const size_t bin = binIndex(samples[i].xNorm, samples[i].yNorm);
+    lookup.indices[cursor[bin]++] = static_cast<uint32_t>(i);
+  }
+  return lookup;
+}
+
+void gatherGlossNeighborhoodIndices(const GlossNeighborhoodLookup& lookup,
+                                    const std::vector<InputCloudSample>& samples,
+                                    size_t sampleIndex,
+                                    size_t maxSamples,
+                                    std::vector<std::pair<float, size_t>>* candidateScratch,
+                                    std::vector<size_t>* out) {
+  if (!candidateScratch || !out || sampleIndex >= samples.size()) return;
+  candidateScratch->clear();
+  out->clear();
+  const InputCloudSample& center = samples[sampleIndex];
+  const int bx =
+      std::clamp(static_cast<int>(center.xNorm * static_cast<float>(lookup.gridWidth)), 0, lookup.gridWidth - 1);
+  const int by =
+      std::clamp(static_cast<int>(center.yNorm * static_cast<float>(lookup.gridHeight)), 0, lookup.gridHeight - 1);
+  for (int oy = -1; oy <= 1; ++oy) {
+    const int ny = by + oy;
+    if (ny < 0 || ny >= lookup.gridHeight) continue;
+    for (int ox = -1; ox <= 1; ++ox) {
+      const int nx = bx + ox;
+      if (nx < 0 || nx >= lookup.gridWidth) continue;
+      const size_t bin =
+          static_cast<size_t>(ny) * static_cast<size_t>(lookup.gridWidth) + static_cast<size_t>(nx);
+      const size_t start = lookup.offsets[bin];
+      const size_t end = lookup.offsets[bin + 1u];
+      for (size_t pos = start; pos < end; ++pos) {
+        const size_t neighborIndex = static_cast<size_t>(lookup.indices[pos]);
+        const InputCloudSample& neighbor = samples[neighborIndex];
+        const float dx = neighbor.xNorm - center.xNorm;
+        const float dy = neighbor.yNorm - center.yNorm;
+        const float distSq = dx * dx + dy * dy;
+        if (distSq <= lookup.radiusSq + 1e-9f) {
+          candidateScratch->push_back({distSq, neighborIndex});
+        }
+      }
+    }
+  }
+  if (candidateScratch->empty()) {
+    out->push_back(sampleIndex);
+    return;
+  }
+  const auto byDistance = [](const std::pair<float, size_t>& a, const std::pair<float, size_t>& b) {
+    return (a.first < b.first) || (a.first == b.first && a.second < b.second);
+  };
+  if (candidateScratch->size() > maxSamples) {
+    std::nth_element(candidateScratch->begin(),
+                     candidateScratch->begin() + static_cast<std::ptrdiff_t>(maxSamples),
+                     candidateScratch->end(),
+                     byDistance);
+    candidateScratch->resize(maxSamples);
+  }
+  std::sort(candidateScratch->begin(), candidateScratch->end(), byDistance);
+  out->reserve(candidateScratch->size());
+  for (const auto& item : *candidateScratch) {
+    out->push_back(item.second);
+  }
+}
+
+Vec3 covarianceMultiply(float cxx, float cxy, float cxz, float cyy, float cyz, float czz, Vec3 v) {
+  return Vec3{
+      cxx * v.x + cxy * v.y + cxz * v.z,
+      cxy * v.x + cyy * v.y + cyz * v.z,
+      cxz * v.x + cyz * v.y + czz * v.z};
+}
+
+Vec3 dominantCovarianceAxis(float cxx,
+                            float cxy,
+                            float cxz,
+                            float cyy,
+                            float cyz,
+                            float czz,
+                            Vec3 fallbackAxis) {
+  Vec3 axis = normalize3(fallbackAxis);
+  if (dot3(axis, axis) <= 1e-8f) {
+    axis = normalize3(Vec3{cxx + cxy + cxz, cxy + cyy + cyz, cxz + cyz + czz});
+  }
+  if (dot3(axis, axis) <= 1e-8f) {
+    axis = Vec3{0.57735026919f, 0.57735026919f, 0.57735026919f};
+  }
+  for (int iter = 0; iter < 6; ++iter) {
+    const Vec3 next = covarianceMultiply(cxx, cxy, cxz, cyy, cyz, czz, axis);
+    const float nextLen = length3(next);
+    if (nextLen <= 1e-8f) break;
+    axis = scale3(next, 1.0f / nextLen);
+  }
+  return normalize3(axis);
+}
+
+void appendGlossMeshPoint(MeshData* mesh, const Vec3& pos, float cr, float cg, float cb, float alpha) {
+  if (!mesh) return;
+  mesh->pointVerts.push_back(pos.x);
+  mesh->pointVerts.push_back(pos.y);
+  mesh->pointVerts.push_back(pos.z);
+  mesh->pointColors.push_back(clampf(cr, 0.0f, 1.0f));
+  mesh->pointColors.push_back(clampf(cg, 0.0f, 1.0f));
+  mesh->pointColors.push_back(clampf(cb, 0.0f, 1.0f));
+  mesh->pointColors.push_back(clampf(alpha, 0.0f, 1.0f));
+}
+
+struct GlossLiftDescriptor {
+  size_t sampleIndex = 0u;
+  bool valid = false;
+  Vec3 bodyRgb{};
+  Vec3 observedRgb{};
+  float xNorm = 0.5f;
+  float yNorm = 0.5f;
+  float bodyLuma = 0.0f;
+  float effectiveLift = 0.0f;
+  float coherence = 0.0f;
+  float boundaryStrength = 0.0f;
+  bool overflowObserved = false;
+};
+
+void blurScalarGrid(int width, int height, std::vector<float>* values) {
+  if (!values || width <= 0 || height <= 0) return;
+  if (values->size() != static_cast<size_t>(width) * static_cast<size_t>(height)) return;
+  std::vector<float> source = *values;
+  for (int y = 0; y < height; ++y) {
+    for (int x = 0; x < width; ++x) {
+      float accum = 0.0f;
+      float weight = 0.0f;
+      for (int oy = -1; oy <= 1; ++oy) {
+        const int yy = y + oy;
+        if (yy < 0 || yy >= height) continue;
+        for (int ox = -1; ox <= 1; ++ox) {
+          const int xx = x + ox;
+          if (xx < 0 || xx >= width) continue;
+          const float kernel = (ox == 0 && oy == 0) ? 0.30f : ((ox == 0 || oy == 0) ? 0.13f : 0.08f);
+          accum += source[static_cast<size_t>(yy) * static_cast<size_t>(width) + static_cast<size_t>(xx)] * kernel;
+          weight += kernel;
+        }
+      }
+      (*values)[static_cast<size_t>(y) * static_cast<size_t>(width) + static_cast<size_t>(x)] =
+          weight > 1e-6f ? (accum / weight) : 0.0f;
+    }
+  }
+}
+
+void normalizeScalarGrid(std::vector<float>* values) {
+  if (!values || values->empty()) return;
+  float maxValue = 0.0f;
+  for (const float v : *values) maxValue = std::max(maxValue, v);
+  if (maxValue <= 1e-6f) return;
+  for (float& v : *values) v = clampf(v / maxValue, 0.0f, 1.0f);
+}
+
+inline float glossCommonComponent(Vec3 rgb) {
+  return std::max(0.0f, std::min(rgb.x, std::min(rgb.y, rgb.z)));
+}
+
+inline Vec3 glossBodyComponent(Vec3 rgb) {
+  const float common = glossCommonComponent(rgb);
+  return Vec3{std::max(0.0f, rgb.x - common),
+              std::max(0.0f, rgb.y - common),
+              std::max(0.0f, rgb.z - common)};
+}
+
+inline float glossNeutrality(Vec3 rgb) {
+  const float maxRgb = std::max(rgb.x, std::max(rgb.y, rgb.z));
+  if (maxRgb <= 1e-6f) return 0.0f;
+  return clampf(glossCommonComponent(rgb) / maxRgb, 0.0f, 1.0f);
+}
+
+inline float glossStrengthCue(Vec3 rgb) {
+  const float common = glossCommonComponent(rgb);
+  const float neutrality = glossNeutrality(rgb);
+  return clampf(common * (0.75f + 0.85f * neutrality), 0.0f, 1.0f);
+}
+
+inline float glossPresenceWeight(float glossCue) {
+  const float t = clampf((glossCue - 0.06f) / 0.22f, 0.0f, 1.0f);
+  return t * t * (3.0f - 2.0f * t);
+}
+
+bool glossViewWantsSupportData(const ResolvedPayload& payload) {
+  return payload.glossSpatialInset || payload.glossBodyOpacity > 1e-4f;
+}
+
+void glossViewHalfExtents(float sourceAspect, float* outHalfWidth, float* outHalfDepth) {
+  const float aspect = clampf(sourceAspect, 0.25f, 4.0f);
+  constexpr float kMajorHalf = 1.22f;
+  if (aspect >= 1.0f) {
+    if (outHalfWidth) *outHalfWidth = kMajorHalf;
+    if (outHalfDepth) *outHalfDepth = kMajorHalf / aspect;
+  } else {
+    if (outHalfWidth) *outHalfWidth = kMajorHalf * aspect;
+    if (outHalfDepth) *outHalfDepth = kMajorHalf;
+  }
+}
+
+void expandGlossViewFitBounds(const ResolvedPayload& payload, MeshData* mesh) {
+  if (!mesh) return;
+  float halfWidth = 1.22f;
+  float halfDepth = 0.69f;
+  glossViewHalfExtents(payload.sourceAspect, &halfWidth, &halfDepth);
+  Vec3 guideMin{-halfWidth, -0.92f, -halfDepth};
+  Vec3 guideMax{halfWidth, -0.92f + 0.92f + payload.glossLiftScale * 1.28f, halfDepth};
+  if (mesh->hasGlossField) {
+    guideMin = Vec3{-halfWidth, -3.25f, -halfDepth};
+    guideMax = Vec3{halfWidth, 3.25f, halfDepth};
+  }
+  if (!mesh->hasFitBounds) {
+    mesh->fitMin = guideMin;
+    mesh->fitMax = guideMax;
+    mesh->hasFitBounds = true;
+    return;
+  }
+  mesh->fitMin.x = std::min(mesh->fitMin.x, guideMin.x);
+  mesh->fitMin.y = std::min(mesh->fitMin.y, guideMin.y);
+  mesh->fitMin.z = std::min(mesh->fitMin.z, guideMin.z);
+  mesh->fitMax.x = std::max(mesh->fitMax.x, guideMax.x);
+  mesh->fitMax.y = std::max(mesh->fitMax.y, guideMax.y);
+  mesh->fitMax.z = std::max(mesh->fitMax.z, guideMax.z);
+}
+
+int glossFieldLongSideForPayload(const ResolvedPayload& payload) {
+  int longSide = 112;
+  if (payload.resolution >= 57) {
+    longSide = 184;
+  } else if (payload.resolution >= 41) {
+    longSide = 148;
+  }
+  if (payload.glossNeighborhood <= 0) {
+    longSide = static_cast<int>(std::lround(static_cast<float>(longSide) * 0.92f));
+  } else if (payload.glossNeighborhood >= 2) {
+    longSide = static_cast<int>(std::lround(static_cast<float>(longSide) * 1.08f));
+  }
+  return std::clamp(longSide, 72, 224);
+}
+
+void glossFieldDimensionsForPayload(const ResolvedPayload& payload, int* outWidth, int* outHeight) {
+  const int longSide = glossFieldLongSideForPayload(payload);
+  const float aspect = clampf(payload.sourceAspect, 0.25f, 4.0f);
+  int width = longSide;
+  int height = longSide;
+  if (aspect >= 1.0f) {
+    width = longSide;
+    height = static_cast<int>(std::lround(static_cast<float>(longSide) / aspect));
+  } else {
+    width = static_cast<int>(std::lround(static_cast<float>(longSide) * aspect));
+    height = longSide;
+  }
+  if (outWidth) *outWidth = std::clamp(width, 48, 224);
+  if (outHeight) *outHeight = std::clamp(height, 48, 224);
+}
+
+int glossFieldGpuPerCellBudget(const ResolvedPayload& payload) {
+  int budget = 12;
+  if (payload.resolution >= 57) {
+    budget = 18;
+  } else if (payload.resolution >= 41) {
+    budget = 15;
+  }
+  if (payload.glossNeighborhood <= 0) {
+    budget = std::max(8, budget - 2);
+  } else if (payload.glossNeighborhood >= 2) {
+    budget += 2;
+  }
+  return std::clamp(budget, 8, 24);
+}
+
+void reduceGlossFieldSamplesForGpu(const std::vector<InputCloudSample>& samples,
+                                   int gridWidth,
+                                   int gridHeight,
+                                   int perCellBudget,
+                                   std::vector<InputCloudSample>* out) {
+  if (!out) return;
+  if (samples.empty() || gridWidth <= 0 || gridHeight <= 0 || perCellBudget <= 0) {
+    out->clear();
+    return;
+  }
+  const size_t cellCount = static_cast<size_t>(gridWidth) * static_cast<size_t>(gridHeight);
+  std::vector<uint32_t> counts(cellCount, 0u);
+  auto cellIndexForSample = [&](const InputCloudSample& sample) -> size_t {
+    const int x = std::clamp(static_cast<int>(sample.xNorm * static_cast<float>(gridWidth)), 0, gridWidth - 1);
+    const int y =
+        std::clamp(static_cast<int>((1.0f - sample.yNorm) * static_cast<float>(gridHeight)), 0, gridHeight - 1);
+    return static_cast<size_t>(y) * static_cast<size_t>(gridWidth) + static_cast<size_t>(x);
+  };
+  for (const auto& sample : samples) {
+    ++counts[cellIndexForSample(sample)];
+  }
+  size_t targetTotal = 0u;
+  for (const uint32_t count : counts) {
+    targetTotal += static_cast<size_t>(std::min<uint32_t>(count, static_cast<uint32_t>(perCellBudget)));
+  }
+  if (targetTotal >= samples.size()) {
+    *out = samples;
+    return;
+  }
+  std::vector<uint32_t> seen(cellCount, 0u);
+  std::vector<uint32_t> kept(cellCount, 0u);
+  out->clear();
+  out->reserve(targetTotal);
+  for (const auto& sample : samples) {
+    const size_t cellIdx = cellIndexForSample(sample);
+    const uint32_t count = counts[cellIdx];
+    if (count == 0u) continue;
+    const uint32_t target = std::min<uint32_t>(count, static_cast<uint32_t>(perCellBudget));
+    const uint32_t seenBefore = seen[cellIdx]++;
+    const uint64_t prevBucket = (static_cast<uint64_t>(seenBefore) * static_cast<uint64_t>(target)) / static_cast<uint64_t>(count);
+    const uint64_t nextBucket =
+        (static_cast<uint64_t>(seenBefore + 1u) * static_cast<uint64_t>(target)) / static_cast<uint64_t>(count);
+    if (nextBucket != prevBucket && kept[cellIdx] < target) {
+      out->push_back(sample);
+      ++kept[cellIdx];
+    }
+  }
+}
+
+int glossNeighborhoodRadiusCells(int neighborhoodChoice) {
+  switch (std::clamp(neighborhoodChoice, 0, 2)) {
+    case 0: return 1;
+    case 2: return 3;
+    case 1:
+    default: return 2;
+  }
+}
+
+float sampleScalarGridClamped(const std::vector<float>& values, int width, int height, int x, int y) {
+  if (values.empty() || width <= 0 || height <= 0) return 0.0f;
+  x = std::clamp(x, 0, width - 1);
+  y = std::clamp(y, 0, height - 1);
+  return values[static_cast<size_t>(y) * static_cast<size_t>(width) + static_cast<size_t>(x)];
+}
+
+struct GlossFieldNeighborhoodEntry {
+  float carrier = 0.0f;
+  size_t index = 0u;
+};
+
+bool buildGlossViewFieldMeshFromFinalFields(const ResolvedPayload& payload,
+                                            const InputCloudPayload& cloud,
+                                            int gridWidth,
+                                            int gridHeight,
+                                            const std::vector<float>& occupancy,
+                                            const std::vector<float>& meanRgb,
+                                            const std::vector<float>& carrierY,
+                                            const std::vector<float>& carrierMax,
+                                            const std::vector<float>& carrierMin,
+                                            const std::vector<float>& neutrality,
+                                            const std::vector<float>& body,
+                                            const std::vector<float>& signal,
+                                            const std::vector<float>& positive,
+                                            const std::vector<float>& negative,
+                                            const std::vector<float>& boundary,
+                                            const std::vector<float>& congruence,
+                                            const std::vector<float>& confidence,
+                                            MeshData* out) {
+  if (!out || gridWidth <= 0 || gridHeight <= 0) return false;
+  const size_t cellCount = static_cast<size_t>(gridWidth) * static_cast<size_t>(gridHeight);
+  if (occupancy.size() != cellCount ||
+      meanRgb.size() != cellCount * 3u ||
+      carrierY.size() != cellCount ||
+      carrierMax.size() != cellCount ||
+      carrierMin.size() != cellCount ||
+      neutrality.size() != cellCount ||
+      body.size() != cellCount ||
+      signal.size() != cellCount ||
+      positive.size() != cellCount ||
+      negative.size() != cellCount ||
+      boundary.size() != cellCount ||
+      congruence.size() != cellCount ||
+      confidence.size() != cellCount) {
+    return false;
+  }
+
+  MeshData mesh{};
+  mesh.resolution = cloud.resolution <= 25 ? 25 : (cloud.resolution <= 41 ? 41 : 57);
+  mesh.quality = cloud.quality;
+  mesh.paramHash = cloud.paramHash;
+  mesh.serial = nextMeshSerial();
+  mesh.hasGlossField = true;
+  mesh.glossFieldWidth = gridWidth;
+  mesh.glossFieldHeight = gridHeight;
+  mesh.glossFieldMeanRgb = meanRgb;
+  mesh.glossFieldBody = body;
+  mesh.glossFieldSignal = signal;
+  mesh.glossFieldPositive = positive;
+  mesh.glossFieldNegative = negative;
+  mesh.glossFieldBoundary = boundary;
+  mesh.glossFieldCongruence = congruence;
+  mesh.glossFieldConfidence = confidence;
+  mesh.glossFieldCarrierMax = carrierMax;
+  mesh.glossFieldCarrierY = carrierY;
+  mesh.glossFieldCarrierMin = carrierMin;
+  mesh.glossFieldNeutrality = neutrality;
+
+  float halfWidth = 1.22f;
+  float halfDepth = 0.69f;
+  glossViewHalfExtents(payload.sourceAspect, &halfWidth, &halfDepth);
+  mesh.pointVerts.clear();
+  mesh.pointColors.clear();
+  mesh.glossFieldPointCellIndices.clear();
+  mesh.pointVerts.reserve(cellCount * 3u);
+  mesh.pointColors.reserve(cellCount * 4u);
+  mesh.glossFieldPointCellIndices.reserve(cellCount);
+  for (int y = 0; y < gridHeight; ++y) {
+    for (int x = 0; x < gridWidth; ++x) {
+      const size_t idx = static_cast<size_t>(y) * static_cast<size_t>(gridWidth) + static_cast<size_t>(x);
+      const float cellConfidence = confidence[idx];
+      if (occupancy[idx] <= 0.5f || cellConfidence <= 0.02f) continue;
+      const float xNorm = (static_cast<float>(x) + 0.5f) / static_cast<float>(gridWidth);
+      const float yNormInv = (static_cast<float>(y) + 0.5f) / static_cast<float>(gridHeight);
+      const float xPos = -halfWidth + (2.0f * halfWidth * xNorm);
+      const float zPos = halfDepth - (2.0f * halfDepth * yNormInv);
+      const float yPos = signal[idx];
+      const float rawR = meanRgb[idx * 3u + 0u];
+      const float rawG = meanRgb[idx * 3u + 1u];
+      const float rawB = meanRgb[idx * 3u + 2u];
+      float cr = 0.0f;
+      float cg = 0.0f;
+      float cb = 0.0f;
+      mapDisplayColor(rawR, rawG, rawB, &cr, &cg, &cb);
+      appendGlossMeshPoint(&mesh, Vec3{xPos, yPos, zPos}, cr, cg, cb, cellConfidence);
+      mesh.glossFieldPointCellIndices.push_back(static_cast<uint32_t>(idx));
+    }
+  }
+  mesh.pointCount = mesh.pointVerts.size() / 3u;
+  mesh.glossBodyPointCount = 0u;
+  mesh.glossHighlightPointCount = mesh.pointCount;
+  setMeshFitBoundsFromVerts(&mesh);
+  expandGlossViewFitBounds(payload, &mesh);
+  const bool ok = mesh.hasGlossField && (mesh.pointCount > 0 || !mesh.glossFieldSignal.empty());
+  if (ok) {
+    *out = std::move(mesh);
+  }
+  return ok;
+}
+
+bool buildGlossViewFieldMeshFromCellStats(const ResolvedPayload& payload,
+                                          const InputCloudPayload& cloud,
+                                          int gridWidth,
+                                          int gridHeight,
+                                          const std::vector<float>& occupancy,
+                                          const std::vector<float>& meanRgb,
+                                          const std::vector<float>& carrierY,
+                                          const std::vector<float>& carrierMax,
+                                          const std::vector<float>& carrierMin,
+                                          const std::vector<float>& neutrality,
+                                          MeshData* out) {
+  if (!out || gridWidth <= 0 || gridHeight <= 0) return false;
+  const size_t cellCount = static_cast<size_t>(gridWidth) * static_cast<size_t>(gridHeight);
+  if (occupancy.size() != cellCount ||
+      meanRgb.size() != cellCount * 3u ||
+      carrierY.size() != cellCount ||
+      carrierMax.size() != cellCount ||
+      carrierMin.size() != cellCount ||
+      neutrality.size() != cellCount) {
+    return false;
+  }
+  MeshData mesh{};
+  mesh.resolution = cloud.resolution <= 25 ? 25 : (cloud.resolution <= 41 ? 41 : 57);
+  mesh.quality = cloud.quality;
+  mesh.paramHash = cloud.paramHash;
+  mesh.serial = nextMeshSerial();
+  mesh.hasGlossField = true;
+  mesh.glossFieldWidth = gridWidth;
+  mesh.glossFieldHeight = gridHeight;
+  mesh.glossFieldMeanRgb = meanRgb;
+  mesh.glossFieldBody.assign(cellCount, 0.0f);
+  mesh.glossFieldSignal.assign(cellCount, 0.0f);
+  mesh.glossFieldPositive.assign(cellCount, 0.0f);
+  mesh.glossFieldNegative.assign(cellCount, 0.0f);
+  mesh.glossFieldBoundary.assign(cellCount, 0.0f);
+  mesh.glossFieldCongruence.assign(cellCount, 0.0f);
+  mesh.glossFieldConfidence.assign(cellCount, 0.0f);
+  mesh.glossFieldCarrierMax = carrierMax;
+  mesh.glossFieldCarrierY = carrierY;
+  mesh.glossFieldCarrierMin = carrierMin;
+  mesh.glossFieldNeutrality = neutrality;
+
+  std::vector<float> occupancyNorm = occupancy;
+  normalizeScalarGrid(&occupancyNorm);
+  blurScalarGrid(gridWidth, gridHeight, &occupancyNorm);
+  normalizeScalarGrid(&occupancyNorm);
+
+  blurScalarGrid(gridWidth, gridHeight, &mesh.glossFieldCarrierY);
+  blurScalarGrid(gridWidth, gridHeight, &mesh.glossFieldCarrierMax);
+  blurScalarGrid(gridWidth, gridHeight, &mesh.glossFieldCarrierMin);
+  blurScalarGrid(gridWidth, gridHeight, &mesh.glossFieldNeutrality);
+
+  const int radiusCells = glossNeighborhoodRadiusCells(payload.glossNeighborhood);
+  std::vector<GlossFieldNeighborhoodEntry> neighborhoodScratch;
+  neighborhoodScratch.reserve(static_cast<size_t>((radiusCells * 2 + 1) * (radiusCells * 2 + 1)));
+  for (int y = 0; y < gridHeight; ++y) {
+    for (int x = 0; x < gridWidth; ++x) {
+      const size_t idx = static_cast<size_t>(y) * static_cast<size_t>(gridWidth) + static_cast<size_t>(x);
+      if (occupancy[idx] <= 0.5f) continue;
+      neighborhoodScratch.clear();
+      const float centerCarrier = mesh.glossFieldCarrierMax[idx];
+      const float centerR = mesh.glossFieldMeanRgb[idx * 3u + 0u];
+      const float centerG = mesh.glossFieldMeanRgb[idx * 3u + 1u];
+      const float centerB = mesh.glossFieldMeanRgb[idx * 3u + 2u];
+      for (int oy = -radiusCells; oy <= radiusCells; ++oy) {
+        const int yy = y + oy;
+        if (yy < 0 || yy >= gridHeight) continue;
+        for (int ox = -radiusCells; ox <= radiusCells; ++ox) {
+          const int xx = x + ox;
+          if (xx < 0 || xx >= gridWidth) continue;
+          const size_t neighborIdx =
+              static_cast<size_t>(yy) * static_cast<size_t>(gridWidth) + static_cast<size_t>(xx);
+          if (occupancy[neighborIdx] <= 0.5f) continue;
+          const float carrier = mesh.glossFieldCarrierMax[neighborIdx];
+          const float nr = mesh.glossFieldMeanRgb[neighborIdx * 3u + 0u];
+          const float ng = mesh.glossFieldMeanRgb[neighborIdx * 3u + 1u];
+          const float nb = mesh.glossFieldMeanRgb[neighborIdx * 3u + 2u];
+          const float colorDistance =
+              std::sqrt((nr - centerR) * (nr - centerR) + (ng - centerG) * (ng - centerG) +
+                        (nb - centerB) * (nb - centerB));
+          if (std::fabs(carrier - centerCarrier) > 0.26f && colorDistance > 0.20f) continue;
+          neighborhoodScratch.push_back({carrier, neighborIdx});
+        }
+      }
+      if (neighborhoodScratch.empty()) {
+        mesh.glossFieldBody[idx] = centerCarrier;
+        continue;
+      }
+      std::sort(neighborhoodScratch.begin(),
+                neighborhoodScratch.end(),
+                [](const GlossFieldNeighborhoodEntry& a, const GlossFieldNeighborhoodEntry& b) {
+                  return (a.carrier < b.carrier) || (a.carrier == b.carrier && a.index < b.index);
+                });
+      const size_t trim = neighborhoodScratch.size() >= 6u ? std::max<size_t>(1u, neighborhoodScratch.size() / 6u) : 0u;
+      const size_t begin = std::min(trim, neighborhoodScratch.size());
+      const size_t end = std::max(begin + size_t{1}, neighborhoodScratch.size() - trim);
+      float bodySum = 0.0f;
+      float bodyWeight = 0.0f;
+      for (size_t i = begin; i < end; ++i) {
+        const size_t neighborIdx = neighborhoodScratch[i].index;
+        const int neighborX = static_cast<int>(neighborIdx % static_cast<size_t>(gridWidth));
+        const int neighborY = static_cast<int>(neighborIdx / static_cast<size_t>(gridWidth));
+        const float dx = static_cast<float>(neighborX - x);
+        const float dy = static_cast<float>(neighborY - y);
+        const float spatialWeight = 1.0f / (1.0f + dx * dx + dy * dy);
+        bodySum += neighborhoodScratch[i].carrier * spatialWeight;
+        bodyWeight += spatialWeight;
+      }
+      mesh.glossFieldBody[idx] = bodyWeight > 1e-6f ? (bodySum / bodyWeight) : centerCarrier;
+    }
+  }
+
+  std::vector<float> rawSignal(cellCount, 0.0f);
+  float maxPositive = 0.0f;
+  float maxNegative = 0.0f;
+  float maxBody = 0.0f;
+  for (int y = 0; y < gridHeight; ++y) {
+    for (int x = 0; x < gridWidth; ++x) {
+      const size_t idx = static_cast<size_t>(y) * static_cast<size_t>(gridWidth) + static_cast<size_t>(x);
+      if (occupancy[idx] <= 0.5f) continue;
+      maxBody = std::max(maxBody, mesh.glossFieldBody[idx]);
+      const float rawPositive = std::max(0.0f, mesh.glossFieldCarrierMax[idx] - mesh.glossFieldBody[idx]);
+      const float rawNegative = std::max(0.0f, mesh.glossFieldBody[idx] - mesh.glossFieldCarrierMax[idx]);
+      rawSignal[idx] = rawPositive - rawNegative;
+    }
+  }
+
+  for (int y = 0; y < gridHeight; ++y) {
+    for (int x = 0; x < gridWidth; ++x) {
+      const size_t idx = static_cast<size_t>(y) * static_cast<size_t>(gridWidth) + static_cast<size_t>(x);
+      if (occupancy[idx] <= 0.5f) continue;
+      const float gxCarrier = sampleScalarGridClamped(mesh.glossFieldBody, gridWidth, gridHeight, x + 1, y) -
+                              sampleScalarGridClamped(mesh.glossFieldBody, gridWidth, gridHeight, x - 1, y);
+      const float gyCarrier = sampleScalarGridClamped(mesh.glossFieldBody, gridWidth, gridHeight, x, y + 1) -
+                              sampleScalarGridClamped(mesh.glossFieldBody, gridWidth, gridHeight, x, y - 1);
+      const float gxSignal = sampleScalarGridClamped(rawSignal, gridWidth, gridHeight, x + 1, y) -
+                             sampleScalarGridClamped(rawSignal, gridWidth, gridHeight, x - 1, y);
+      const float gySignal = sampleScalarGridClamped(rawSignal, gridWidth, gridHeight, x, y + 1) -
+                             sampleScalarGridClamped(rawSignal, gridWidth, gridHeight, x, y - 1);
+      const float magCarrier = std::sqrt(gxCarrier * gxCarrier + gyCarrier * gyCarrier);
+      const float magSignal = std::sqrt(gxSignal * gxSignal + gySignal * gySignal);
+      float congruence = 0.0f;
+      if (magCarrier > 1e-6f && magSignal > 1e-6f) {
+        congruence = std::fabs((gxCarrier * gxSignal + gyCarrier * gySignal) / (magCarrier * magSignal));
+      } else if (magSignal > 1e-6f) {
+        congruence = 0.35f;
+      }
+      const float occNeighborhood =
+          (sampleScalarGridClamped(occupancyNorm, gridWidth, gridHeight, x, y) +
+           sampleScalarGridClamped(occupancyNorm, gridWidth, gridHeight, x + 1, y) +
+           sampleScalarGridClamped(occupancyNorm, gridWidth, gridHeight, x - 1, y) +
+           sampleScalarGridClamped(occupancyNorm, gridWidth, gridHeight, x, y + 1) +
+           sampleScalarGridClamped(occupancyNorm, gridWidth, gridHeight, x, y - 1)) /
+          5.0f;
+      const float confidence =
+          clampf(std::sqrt(sampleScalarGridClamped(occupancyNorm, gridWidth, gridHeight, x, y)) *
+                     clampf(0.28f + 0.72f * occNeighborhood, 0.0f, 1.0f),
+                 0.0f,
+                 1.0f);
+      const float posWeighted = std::max(0.0f, rawSignal[idx]) * (0.30f + 0.70f * congruence) * confidence;
+      const float negWeighted = std::max(0.0f, -rawSignal[idx]) * (0.30f + 0.70f * congruence) * confidence;
+      mesh.glossFieldPositive[idx] = posWeighted;
+      mesh.glossFieldNegative[idx] = negWeighted;
+      mesh.glossFieldCongruence[idx] = congruence;
+      mesh.glossFieldConfidence[idx] = confidence;
+      mesh.glossFieldBoundary[idx] = clampf(magSignal * 4.0f, 0.0f, 1.0f) * confidence;
+      mesh.glossFieldSignal[idx] = posWeighted - negWeighted;
+      maxPositive = std::max(maxPositive, posWeighted);
+      maxNegative = std::max(maxNegative, negWeighted);
+    }
+  }
+
+  const float maxAbsSignal = std::max(1e-5f, std::max(maxPositive, maxNegative));
+  const float safeMaxBody = std::max(1e-5f, maxBody);
+  const auto normalizeBy = [](std::vector<float>* values, float denom, bool signedValues) {
+    if (!values || values->empty()) return;
+    const float safe = std::max(1e-5f, denom);
+    for (float& v : *values) {
+      v = signedValues ? clampf(v / safe, -1.0f, 1.0f) : clampf(v / safe, 0.0f, 1.0f);
+    }
+  };
+  normalizeBy(&mesh.glossFieldBody, safeMaxBody, false);
+  normalizeBy(&mesh.glossFieldPositive, std::max(1e-5f, maxPositive), false);
+  normalizeBy(&mesh.glossFieldNegative, std::max(1e-5f, maxNegative), false);
+  normalizeBy(&mesh.glossFieldSignal, maxAbsSignal, true);
+  normalizeScalarGrid(&mesh.glossFieldBoundary);
+  return buildGlossViewFieldMeshFromFinalFields(payload,
+                                                cloud,
+                                                gridWidth,
+                                                gridHeight,
+                                                occupancy,
+                                                mesh.glossFieldMeanRgb,
+                                                mesh.glossFieldCarrierY,
+                                                mesh.glossFieldCarrierMax,
+                                                mesh.glossFieldCarrierMin,
+                                                mesh.glossFieldNeutrality,
+                                                mesh.glossFieldBody,
+                                                mesh.glossFieldSignal,
+                                                mesh.glossFieldPositive,
+                                                mesh.glossFieldNegative,
+                                                mesh.glossFieldBoundary,
+                                                mesh.glossFieldCongruence,
+                                                mesh.glossFieldConfidence,
+                                                out);
+}
+
+bool glossViewFieldLooksDegenerate(const ResolvedPayload& payload,
+                                   const std::vector<InputCloudSample>& samples,
+                                   int gridWidth,
+                                   int gridHeight,
+                                   const std::vector<float>& occupancy) {
+  if (payload.volumeSlicingEnabled || payload.cubeSlicingEnabled || payload.neutralRadiusEnabled) return false;
+  if (samples.empty() || gridWidth <= 0 || gridHeight <= 0) return false;
+  const size_t cellCount = static_cast<size_t>(gridWidth) * static_cast<size_t>(gridHeight);
+  if (occupancy.size() != cellCount) return true;
+
+  float minX = 1.0f;
+  float minY = 1.0f;
+  float maxX = 0.0f;
+  float maxY = 0.0f;
+  for (const auto& sample : samples) {
+    minX = std::min(minX, clampf(sample.xNorm, 0.0f, 1.0f));
+    minY = std::min(minY, clampf(1.0f - sample.yNorm, 0.0f, 1.0f));
+    maxX = std::max(maxX, clampf(sample.xNorm, 0.0f, 1.0f));
+    maxY = std::max(maxY, clampf(1.0f - sample.yNorm, 0.0f, 1.0f));
+  }
+
+  const int minCellX = std::clamp(static_cast<int>(std::floor(minX * static_cast<float>(gridWidth))), 0, gridWidth - 1);
+  const int maxCellX = std::clamp(static_cast<int>(std::floor(maxX * static_cast<float>(gridWidth))), 0, gridWidth - 1);
+  const int minCellY = std::clamp(static_cast<int>(std::floor(minY * static_cast<float>(gridHeight))), 0, gridHeight - 1);
+  const int maxCellY = std::clamp(static_cast<int>(std::floor(maxY * static_cast<float>(gridHeight))), 0, gridHeight - 1);
+  const int bboxWidth = std::max(1, maxCellX - minCellX + 1);
+  const int bboxHeight = std::max(1, maxCellY - minCellY + 1);
+  const size_t bboxArea = static_cast<size_t>(bboxWidth) * static_cast<size_t>(bboxHeight);
+
+  size_t occupiedInside = 0u;
+  for (int y = minCellY; y <= maxCellY; ++y) {
+    for (int x = minCellX; x <= maxCellX; ++x) {
+      const size_t idx = static_cast<size_t>(y) * static_cast<size_t>(gridWidth) + static_cast<size_t>(x);
+      if (occupancy[idx] > 0.5f) ++occupiedInside;
+    }
+  }
+
+  const float samplesPerCell = static_cast<float>(samples.size()) / static_cast<float>(std::max<size_t>(1u, bboxArea));
+  const float occupiedRatio = static_cast<float>(occupiedInside) / static_cast<float>(std::max<size_t>(1u, bboxArea));
+  return samplesPerCell >= 1.15f && occupiedRatio < 0.38f;
+}
+
+bool buildGlossViewFieldMeshCpu(const ResolvedPayload& payload,
+                                const InputCloudPayload& cloud,
+                                const std::vector<InputCloudSample>& samples,
+                                MeshData* out) {
+  if (!out || samples.empty()) return false;
+  int gridWidth = 96;
+  int gridHeight = 96;
+  glossFieldDimensionsForPayload(payload, &gridWidth, &gridHeight);
+  const size_t cellCount = static_cast<size_t>(gridWidth) * static_cast<size_t>(gridHeight);
+  std::vector<float> occupancy(cellCount, 0.0f);
+  std::vector<float> sumR(cellCount, 0.0f);
+  std::vector<float> sumG(cellCount, 0.0f);
+  std::vector<float> sumB(cellCount, 0.0f);
+  std::vector<float> sumY(cellCount, 0.0f);
+  std::vector<float> sumMax(cellCount, 0.0f);
+  std::vector<float> sumMin(cellCount, 0.0f);
+  std::vector<float> sumNeutrality(cellCount, 0.0f);
+
+  const auto cellIndexForNorm = [&](float xNorm, float yNorm) {
+    const int x = std::clamp(static_cast<int>(xNorm * static_cast<float>(gridWidth)), 0, gridWidth - 1);
+    const int y =
+        std::clamp(static_cast<int>((1.0f - yNorm) * static_cast<float>(gridHeight)), 0, gridHeight - 1);
+    return static_cast<size_t>(y) * static_cast<size_t>(gridWidth) + static_cast<size_t>(x);
+  };
+
+  for (const auto& sample : samples) {
+    const Vec3 rgb{payload.showOverflow ? sample.r : clampf(sample.r, 0.0f, 1.0f),
+                   payload.showOverflow ? sample.g : clampf(sample.g, 0.0f, 1.0f),
+                   payload.showOverflow ? sample.b : clampf(sample.b, 0.0f, 1.0f)};
+    const float maxRgb = std::max(rgb.x, std::max(rgb.y, rgb.z));
+    const float minRgb = std::max(0.0f, std::min(rgb.x, std::min(rgb.y, rgb.z)));
+    const float luma = clampf(glossLuma(rgb), 0.0f, 1.0f);
+    const float neutralityValue = maxRgb > 1e-6f ? clampf(minRgb / maxRgb, 0.0f, 1.0f) : 0.0f;
+    const size_t idx = cellIndexForNorm(sample.xNorm, sample.yNorm);
+    occupancy[idx] += 1.0f;
+    sumR[idx] += rgb.x;
+    sumG[idx] += rgb.y;
+    sumB[idx] += rgb.z;
+    sumY[idx] += luma;
+    sumMax[idx] += clampf(maxRgb, 0.0f, 1.0f);
+    sumMin[idx] += clampf(minRgb, 0.0f, 1.0f);
+    sumNeutrality[idx] += neutralityValue;
+  }
+
+  std::vector<float> meanRgb(cellCount * 3u, 0.0f);
+  std::vector<float> carrierY(cellCount, 0.0f);
+  std::vector<float> carrierMax(cellCount, 0.0f);
+  std::vector<float> carrierMin(cellCount, 0.0f);
+  std::vector<float> neutrality(cellCount, 0.0f);
+  for (size_t idx = 0; idx < cellCount; ++idx) {
+    const float count = occupancy[idx];
+    if (count <= 1e-6f) continue;
+    meanRgb[idx * 3u + 0u] = sumR[idx] / count;
+    meanRgb[idx * 3u + 1u] = sumG[idx] / count;
+    meanRgb[idx * 3u + 2u] = sumB[idx] / count;
+    carrierY[idx] = sumY[idx] / count;
+    carrierMax[idx] = sumMax[idx] / count;
+    carrierMin[idx] = sumMin[idx] / count;
+    neutrality[idx] = sumNeutrality[idx] / count;
+  }
+
+  return buildGlossViewFieldMeshFromCellStats(payload,
+                                              cloud,
+                                              gridWidth,
+                                              gridHeight,
+                                              occupancy,
+                                              meanRgb,
+                                              carrierY,
+                                              carrierMax,
+                                              carrierMin,
+                                              neutrality,
+                                              out);
+}
+
+#if defined(CHROMASPACE_VIEWER_HAS_CUDA) && !defined(__APPLE__)
+bool buildGlossViewFieldMeshCuda(const ResolvedPayload& payload,
+                                 const InputCloudPayload& cloud,
+                                 const std::vector<InputCloudSample>& samples,
+                                 InputCloudCudaCache* cudaCache,
+                                 MeshData* out) {
+  if (!cudaCache || !out || samples.empty()) return false;
+  int gridWidth = 96;
+  int gridHeight = 96;
+  glossFieldDimensionsForPayload(payload, &gridWidth, &gridHeight);
+  std::vector<InputCloudSample> gpuSamples;
+  reduceGlossFieldSamplesForGpu(samples, gridWidth, gridHeight, glossFieldGpuPerCellBudget(payload), &gpuSamples);
+  const std::vector<InputCloudSample>& fieldSamples = gpuSamples.empty() ? samples : gpuSamples;
+  std::vector<float> packedPoints;
+  packedPoints.reserve(fieldSamples.size() * 6u);
+  for (const auto& sample : fieldSamples) {
+    packedPoints.push_back(clampf(sample.xNorm, 0.0f, 1.0f));
+    packedPoints.push_back(clampf(sample.yNorm, 0.0f, 1.0f));
+    packedPoints.push_back(0.0f);
+    packedPoints.push_back(sample.r);
+    packedPoints.push_back(sample.g);
+    packedPoints.push_back(sample.b);
+  }
+  ChromaspaceCuda::GlossFieldRequest request{};
+  request.gridWidth = gridWidth;
+  request.gridHeight = gridHeight;
+  request.showOverflow = payload.showOverflow ? 1 : 0;
+  request.neighborhoodChoice = payload.glossNeighborhood;
+  ChromaspaceCuda::GlossFieldResult result{};
+  std::string error;
+  if (!ChromaspaceCuda::buildGlossField(reinterpret_cast<ChromaspaceCuda::InputCache*>(cudaCache),
+                                        request,
+                                        packedPoints,
+                                        &result,
+                                        &error)) {
+    if (!error.empty()) {
+      logViewerEvent(std::string("CUDA gloss-field build failed: ") + error);
+    }
+    return false;
+  }
+  if (glossViewFieldLooksDegenerate(payload, fieldSamples, result.gridWidth, result.gridHeight, result.occupancy)) {
+    logViewerEvent("CUDA gloss-field validation rejected degenerate spatial field; falling back to CPU.");
+    return false;
+  }
+  return buildGlossViewFieldMeshFromFinalFields(payload,
+                                                cloud,
+                                                result.gridWidth,
+                                                result.gridHeight,
+                                                result.occupancy,
+                                                result.meanRgb,
+                                                result.carrierY,
+                                                result.carrierMax,
+                                                result.carrierMin,
+                                                result.neutrality,
+                                                result.body,
+                                                result.signal,
+                                                result.positive,
+                                                result.negative,
+                                                result.boundary,
+                                                result.congruence,
+                                                result.confidence,
+                                                out);
+}
+#endif
+
+#if defined(__APPLE__)
+bool buildGlossViewFieldMeshMetal(const ResolvedPayload& payload,
+                                  const InputCloudPayload& cloud,
+                                  const std::vector<InputCloudSample>& samples,
+                                  MeshData* out) {
+  if (!out || samples.empty()) return false;
+  int gridWidth = 96;
+  int gridHeight = 96;
+  glossFieldDimensionsForPayload(payload, &gridWidth, &gridHeight);
+  std::vector<float> packedPoints;
+  packedPoints.reserve(samples.size() * 6u);
+  for (const auto& sample : samples) {
+    packedPoints.push_back(clampf(sample.xNorm, 0.0f, 1.0f));
+    packedPoints.push_back(clampf(sample.yNorm, 0.0f, 1.0f));
+    packedPoints.push_back(0.0f);
+    packedPoints.push_back(sample.r);
+    packedPoints.push_back(sample.g);
+    packedPoints.push_back(sample.b);
+  }
+  ChromaspaceMetal::GlossFieldRequest request{};
+  request.gridWidth = gridWidth;
+  request.gridHeight = gridHeight;
+  request.showOverflow = payload.showOverflow ? 1 : 0;
+  request.neighborhoodChoice = payload.glossNeighborhood;
+  ChromaspaceMetal::GlossFieldResult result{};
+  std::string error;
+  if (!ChromaspaceMetal::buildGlossField(request, packedPoints, &result, &error)) {
+    if (!error.empty()) {
+      logViewerEvent(std::string("Metal gloss-field build failed: ") + error);
+    }
+    return false;
+  }
+  if (glossViewFieldLooksDegenerate(payload, samples, result.gridWidth, result.gridHeight, result.occupancy)) {
+    logViewerEvent("Metal gloss-field validation rejected degenerate spatial field; falling back to CPU.");
+    return false;
+  }
+  return buildGlossViewFieldMeshFromFinalFields(payload,
+                                                cloud,
+                                                result.gridWidth,
+                                                result.gridHeight,
+                                                result.occupancy,
+                                                result.meanRgb,
+                                                result.carrierY,
+                                                result.carrierMax,
+                                                result.carrierMin,
+                                                result.neutrality,
+                                                result.body,
+                                                result.signal,
+                                                result.positive,
+                                                result.negative,
+                                                result.boundary,
+                                                result.congruence,
+                                                result.confidence,
+                                                out);
+}
+#endif
+
+void buildGlossViewProjectionCpuDrawArrays(const MeshData& mesh,
+                                           const ResolvedPayload& payload,
+                                           GlossViewColorMode colorMode,
+                                           GlossViewDebugFieldMode debugMode,
+                                           std::vector<float>* outVerts,
+                                           std::vector<float>* outColors) {
+  if (!outVerts || !outColors) return;
+  outVerts->clear();
+  outColors->clear();
+  if (!mesh.hasGlossField || mesh.pointCount == 0 || mesh.glossFieldPointCellIndices.size() != mesh.pointCount ||
+      mesh.pointVerts.size() < mesh.pointCount * 3u) {
+    return;
+  }
+  outVerts->reserve(mesh.pointCount * 3u);
+  outColors->reserve(mesh.pointCount * 4u);
+  for (size_t pointIndex = 0; pointIndex < mesh.pointCount; ++pointIndex) {
+    const size_t cellIdx = static_cast<size_t>(mesh.glossFieldPointCellIndices[pointIndex]);
+    const size_t vertOffset = pointIndex * 3u;
+    const float x = mesh.pointVerts[vertOffset + 0u];
+    const float imageY = mesh.pointVerts[vertOffset + 2u];
+    float base = 0.0f;
+    float positive = 0.0f;
+    float negative = 0.0f;
+    float signedValue = 0.0f;
+    glossViewResolvedDisplaySignals(mesh, cellIdx, debugMode, &base, &positive, &negative, &signedValue);
+    // Present the 3D projection as an upright image card with relief coming off the image plane.
+    // This keeps the footprint aligned with the source image and avoids the "terrain on the floor"
+    // reading where highlights can feel like they sag below the body.
+    const float y = imageY;
+    const float z = debugMode == GlossViewDebugFieldMode::Signal ? signedValue : std::max(0.0f, signedValue);
+    float r = 0.0f;
+    float g = 0.0f;
+    float b = 0.0f;
+    float a = 0.0f;
+    glossViewCellDisplayStyle(mesh, cellIdx, payload, colorMode, debugMode, &r, &g, &b, &a);
+    outVerts->push_back(x);
+    outVerts->push_back(y);
+    outVerts->push_back(z);
+    outColors->push_back(r);
+    outColors->push_back(g);
+    outColors->push_back(b);
+    outColors->push_back(a);
+  }
+}
+
+void buildGlossViewSupportData(const ResolvedPayload& payload,
+                               const std::vector<InputCloudSample>& samples,
+                               MeshData* mesh) {
+  if (!mesh || samples.empty() || !glossViewWantsSupportData(payload)) return;
+  float footprintHalfWidth = 1.22f;
+  float footprintHalfDepth = 0.69f;
+  glossViewHalfExtents(payload.sourceAspect, &footprintHalfWidth, &footprintHalfDepth);
+  constexpr float kBaseY = -0.92f;
+  constexpr float kBodyHeightScale = 0.92f;
+  const float aspect = clampf(payload.sourceAspect, 0.25f, 4.0f);
+  const int gridWidth = std::clamp(aspect >= 1.0f ? 96 : static_cast<int>(std::lround(96.0f * aspect)), 32, 128);
+  const int gridHeight = std::clamp(aspect >= 1.0f ? static_cast<int>(std::lround(96.0f / aspect)) : 96, 32, 128);
+  const size_t cellCount = static_cast<size_t>(gridWidth) * static_cast<size_t>(gridHeight);
+  std::vector<float> occupancy(cellCount, 0.0f);
+  std::vector<float> bodyLumaSum(cellCount, 0.0f);
+  std::vector<float> glossSum(cellCount, 0.0f);
+  std::vector<float> bodyRSum(cellCount, 0.0f);
+  std::vector<float> bodyGSum(cellCount, 0.0f);
+  std::vector<float> bodyBSum(cellCount, 0.0f);
+  const auto cellIndexForSample = [&](const InputCloudSample& sample) {
+    const int x = std::clamp(static_cast<int>(sample.xNorm * static_cast<float>(gridWidth)), 0, gridWidth - 1);
+    const int y =
+        std::clamp(static_cast<int>((1.0f - sample.yNorm) * static_cast<float>(gridHeight)), 0, gridHeight - 1);
+    return static_cast<size_t>(y) * static_cast<size_t>(gridWidth) + static_cast<size_t>(x);
+  };
+  const size_t maxSupportSamples = 120000u;
+  const size_t sampleStep = std::max<size_t>(1u, (samples.size() + maxSupportSamples - 1u) / maxSupportSamples);
+  for (size_t sampleIndex = 0; sampleIndex < samples.size(); sampleIndex += sampleStep) {
+    const auto& sample = samples[sampleIndex];
+    const Vec3 rgb{sample.r, sample.g, sample.b};
+    const Vec3 body = glossBodyComponent(rgb);
+    const float bodyLuma = glossLuma(body);
+    const float glossCue = glossPresenceWeight(glossStrengthCue(rgb));
+    const size_t idx = cellIndexForSample(sample);
+    occupancy[idx] += 1.0f;
+    bodyLumaSum[idx] += bodyLuma;
+    glossSum[idx] += glossCue;
+    bodyRSum[idx] += body.x;
+    bodyGSum[idx] += body.y;
+    bodyBSum[idx] += body.z;
+  }
+  std::vector<float> bodyLumaAvg(cellCount, 0.0f);
+  std::vector<float> glossAvg(cellCount, 0.0f);
+  std::vector<float> occupancyNorm = occupancy;
+  for (size_t i = 0; i < cellCount; ++i) {
+    const float count = occupancy[i];
+    if (count > 1e-6f) {
+      bodyLumaAvg[i] = bodyLumaSum[i] / count;
+      glossAvg[i] = glossSum[i] / count;
+    }
+  }
+  normalizeScalarGrid(&occupancyNorm);
+  blurScalarGrid(gridWidth, gridHeight, &occupancyNorm);
+  blurScalarGrid(gridWidth, gridHeight, &bodyLumaAvg);
+  blurScalarGrid(gridWidth, gridHeight, &glossAvg);
+  normalizeScalarGrid(&occupancyNorm);
+  normalizeScalarGrid(&glossAvg);
+
+  std::vector<float> boundary(cellCount, 0.0f);
+  for (int y = 0; y < gridHeight; ++y) {
+    for (int x = 0; x < gridWidth; ++x) {
+      const auto sampleGrid = [&](const std::vector<float>& values, int sx, int sy) {
+        sx = std::clamp(sx, 0, gridWidth - 1);
+        sy = std::clamp(sy, 0, gridHeight - 1);
+        return values[static_cast<size_t>(sy) * static_cast<size_t>(gridWidth) + static_cast<size_t>(sx)];
+      };
+      const float gx = sampleGrid(glossAvg, x + 1, y) - sampleGrid(glossAvg, x - 1, y);
+      const float gy = sampleGrid(glossAvg, x, y + 1) - sampleGrid(glossAvg, x, y - 1);
+      const size_t idx = static_cast<size_t>(y) * static_cast<size_t>(gridWidth) + static_cast<size_t>(x);
+      boundary[idx] = std::sqrt(gx * gx + gy * gy) * clampf(0.30f + 0.70f * occupancyNorm[idx], 0.0f, 1.0f);
+    }
+  }
+  blurScalarGrid(gridWidth, gridHeight, &boundary);
+  normalizeScalarGrid(&boundary);
+
+  const float bakedSaturation = bakedColorSaturationForPlot(payload);
+  mesh->glossBodyGuideVerts.clear();
+  mesh->glossBodyGuideColors.clear();
+  mesh->glossBodyGuideVerts.reserve(cellCount * 3u);
+  mesh->glossBodyGuideColors.reserve(cellCount * 4u);
+  for (int y = 0; y < gridHeight; ++y) {
+    for (int x = 0; x < gridWidth; ++x) {
+      const size_t idx = static_cast<size_t>(y) * static_cast<size_t>(gridWidth) + static_cast<size_t>(x);
+      const float occ = occupancyNorm[idx];
+      if (occ <= 0.04f || occupancy[idx] <= 0.5f) continue;
+      const float xNorm = (static_cast<float>(x) + 0.5f) / static_cast<float>(gridWidth);
+      const float yNormInv = (static_cast<float>(y) + 0.5f) / static_cast<float>(gridHeight);
+      const float xPos = -footprintHalfWidth + (2.0f * footprintHalfWidth * xNorm);
+      const float zPos = footprintHalfDepth - (2.0f * footprintHalfDepth * yNormInv);
+      const float bodyHeight = kBaseY + clampf(bodyLumaAvg[idx], 0.0f, 1.0f) * kBodyHeightScale;
+      const float count = std::max(1.0f, occupancy[idx]);
+      float cr = 0.0f;
+      float cg = 0.0f;
+      float cb = 0.0f;
+      mapDisplayColor(bodyRSum[idx] / count, bodyGSum[idx] / count, bodyBSum[idx] / count, &cr, &cg, &cb);
+      applyDisplaySaturation(std::max(1.0f, bakedSaturation * 0.72f), &cr, &cg, &cb);
+      const float neutral = clampf(0.22f + bodyLumaAvg[idx] * 0.46f, 0.0f, 1.0f);
+      cr = clampf(neutral * 0.78f + cr * 0.22f, 0.0f, 1.0f);
+      cg = clampf(neutral * 0.78f + cg * 0.22f, 0.0f, 1.0f);
+      cb = clampf(neutral * 0.78f + cb * 0.22f, 0.0f, 1.0f);
+      const float alpha = clampf(occ * 0.70f, 0.08f, 0.70f);
+      mesh->glossBodyGuideVerts.push_back(xPos);
+      mesh->glossBodyGuideVerts.push_back(bodyHeight);
+      mesh->glossBodyGuideVerts.push_back(zPos);
+      mesh->glossBodyGuideColors.push_back(cr);
+      mesh->glossBodyGuideColors.push_back(cg);
+      mesh->glossBodyGuideColors.push_back(cb);
+      mesh->glossBodyGuideColors.push_back(alpha);
+    }
+  }
+  mesh->glossBodyGuidePointCount = mesh->glossBodyGuideVerts.size() / 3u;
+
+  if (payload.glossSpatialInset) {
+    mesh->glossInsetWidth = gridWidth;
+    mesh->glossInsetHeight = gridHeight;
+    mesh->glossInsetOccupancy = occupancyNorm;
+    mesh->glossInsetLift = glossAvg;
+    mesh->glossInsetBoundary = boundary;
+    mesh->hasGlossInset = true;
+  }
+}
+
+bool buildGlossLiftMeshCpu(const ResolvedPayload& payload,
+                           const InputCloudPayload& cloud,
+                           const std::vector<InputCloudSample>& samples,
+                           MeshData* out) {
+  if (!out || samples.empty()) return false;
+  const PlotRemapSpec remap = makePlotRemapSpec(payload);
+  MeshData mesh{};
+  mesh.resolution = cloud.resolution <= 25 ? 25 : (cloud.resolution <= 41 ? 41 : 57);
+  mesh.quality = cloud.quality;
+  mesh.paramHash = cloud.paramHash;
+  mesh.serial = nextMeshSerial();
+  float footprintHalfWidth = 1.22f;
+  float footprintHalfDepth = 0.69f;
+  glossViewHalfExtents(payload.sourceAspect, &footprintHalfWidth, &footprintHalfDepth);
+  constexpr float kBaseY = -0.92f;
+  constexpr float kBodyHeightScale = 0.92f;
+  const float bakedSaturation = bakedColorSaturationForPlot(payload);
+  mesh.pointVerts.reserve(samples.size() * 3u);
+  mesh.pointColors.reserve(samples.size() * 4u);
+  for (const auto& sample : samples) {
+    Vec3 observed{sample.r, sample.g, sample.b};
+    if (!payload.showOverflow) {
+      observed.x = clampf(observed.x, 0.0f, 1.0f);
+      observed.y = clampf(observed.y, 0.0f, 1.0f);
+      observed.z = clampf(observed.z, 0.0f, 1.0f);
+    }
+    const Vec3 body = glossBodyComponent(observed);
+    const float bodyLuma = glossLuma(body);
+    const float glossCue = glossStrengthCue(observed);
+    const float glossPresence = glossPresenceWeight(glossCue);
+    const float xPos = -footprintHalfWidth + (2.0f * footprintHalfWidth * sample.xNorm);
+    const float zPos = footprintHalfDepth - (2.0f * footprintHalfDepth * sample.yNorm);
+    const float yPos =
+        kBaseY + bodyLuma * kBodyHeightScale + glossCue * glossPresence * payload.glossLiftScale * 1.34f;
+    float cr = 0.0f;
+    float cg = 0.0f;
+    float cb = 0.0f;
+    const bool overflowPoint = overflowHighlightApplies(remap, observed.x, observed.y, observed.z);
+    if (overflowPoint) {
+      cr = remap.overflowHighlightR;
+      cg = remap.overflowHighlightG;
+      cb = remap.overflowHighlightB;
+    } else {
+      mapDisplayColor(observed.x, observed.y, observed.z, &cr, &cg, &cb);
+      applyDisplaySaturation(bakedSaturation, &cr, &cg, &cb);
+      const float neutralBlend = clampf(0.08f + 0.52f * glossPresence, 0.0f, 0.62f);
+      const float brightnessGain = 1.18f + 1.20f * glossPresence;
+      cr = clampf((cr * (1.0f - neutralBlend) + neutralBlend) * brightnessGain, 0.0f, 1.0f);
+      cg = clampf((cg * (1.0f - neutralBlend) + neutralBlend) * brightnessGain, 0.0f, 1.0f);
+      cb = clampf((cb * (1.0f - neutralBlend) + neutralBlend) * brightnessGain, 0.0f, 1.0f);
+    }
+    const float alpha =
+        denseLumaProtectedAlpha(overflowPoint ? 0.96f : 0.88f,
+                                payload.pointSize,
+                                payload.pointDensity,
+                                payload.resolution,
+                                cr,
+                                cg,
+                                cb,
+                                overflowPoint) *
+        (overflowPoint ? 1.0f : std::pow(glossPresence, 0.78f));
+    if (!overflowPoint && alpha <= 0.012f) continue;
+    mesh.pointVerts.push_back(xPos);
+    mesh.pointVerts.push_back(yPos);
+    mesh.pointVerts.push_back(zPos);
+    mesh.pointColors.push_back(cr);
+    mesh.pointColors.push_back(cg);
+    mesh.pointColors.push_back(cb);
+    mesh.pointColors.push_back(clampf(alpha, 0.0f, 1.0f));
+  }
+  mesh.pointCount = mesh.pointVerts.size() / 3u;
+  buildGlossViewSupportData(payload, samples, &mesh);
+  if (mesh.pointCount > 0) {
+    setMeshFitBoundsFromVerts(&mesh);
+  }
+  expandGlossViewFitBounds(payload, &mesh);
+  if (mesh.pointCount == 0 && mesh.glossBodyGuidePointCount == 0) return false;
+  *out = std::move(mesh);
+  return true;
+}
+
 // Serialized clouds carry RGB values as both position and color payloads; the viewer ignores the transmitted
 // xyz for now and remaps from RGB locally so plot-model changes can be applied without rebuilding the source cloud.
 bool buildInputCloudMeshCpu(const ResolvedPayload& payload,
@@ -4971,6 +6629,12 @@ bool buildInputCloudMeshCpu(const ResolvedPayload& payload,
                             const std::vector<float>& rawPoints,
                             MeshData* out) {
   if (!out) return false;
+  if (classifyPlotMode(payload) == PlotModeKind::GlossLift) {
+    std::vector<InputCloudSample> samples;
+    if (!parseInputCloudSamples(cloud, &samples)) return false;
+    filterInputCloudSamples(payload, &samples);
+    return buildGlossViewFieldMeshCpu(payload, cloud, samples, out);
+  }
   const PlotRemapSpec remap = makePlotRemapSpec(payload);
   MeshData mesh{};
   mesh.resolution = cloud.resolution <= 25 ? 25 : (cloud.resolution <= 41 ? 41 : 57);
@@ -5021,6 +6685,19 @@ bool buildInputCloudFitMeshCpu(const ResolvedPayload& payload,
   std::vector<InputCloudSample> samples;
   if (!parseInputCloudSamples(cloud, &samples)) return false;
   filterInputCloudSamples(payload, &samples);
+  if (classifyPlotMode(payload) == PlotModeKind::GlossLift) {
+    if (samples.empty()) {
+      MeshData mesh{};
+      mesh.resolution = cloud.resolution <= 25 ? 25 : (cloud.resolution <= 41 ? 41 : 57);
+      mesh.quality = cloud.quality;
+      mesh.paramHash = cloud.paramHash;
+      mesh.serial = nextMeshSerial();
+      mesh.pointCount = 0;
+      *out = std::move(mesh);
+      return true;
+    }
+    return buildGlossViewFieldMeshCpu(payload, cloud, samples, out);
+  }
   std::vector<float> rawPoints;
   rawPoints.reserve(samples.size() * 3u);
   for (const auto& sample : samples) {
@@ -5062,24 +6739,55 @@ bool buildInputCloudMesh(const ResolvedPayload& payload,
                          const InputCloudPayload& cloud,
                          MeshData* out) {
   if (!out) return false;
+  if (classifyPlotMode(payload) == PlotModeKind::GlossLift) {
+    std::vector<InputCloudSample> samples;
+    if (!parseInputCloudSamples(cloud, &samples)) return false;
+    filterInputCloudSamples(payload, &samples);
+    if (samples.empty()) {
+      buildEmptyInputCloudMesh(cloud, out);
+      return true;
+    }
+#if defined(__APPLE__)
+    if (gpuCaps.inputComputeEnabled &&
+        gpuCaps.sessionBackend == ViewerComputeBackendKind::MetalCompute &&
+        glossViewMetalFieldPathEnabled() &&
+        buildGlossViewFieldMeshMetal(payload, cloud, samples, out)) {
+      return true;
+    }
+#endif
+#if defined(CHROMASPACE_VIEWER_HAS_CUDA) && !defined(__APPLE__)
+    const PlotRemapSpec remap = makePlotRemapSpec(payload);
+    if (sessionWantsCuda(gpuCaps) &&
+        glossViewCudaFieldPathEnabled() &&
+        canUseCudaInputPath(gpuCaps, sessionState, remap) &&
+        cudaCache &&
+        buildGlossViewFieldMeshCuda(payload, cloud, samples, cudaCache, out)) {
+      return true;
+    }
+    if (sessionWantsCuda(gpuCaps) && canUseCudaInputPath(gpuCaps, sessionState, remap)) {
+      demoteCudaInputPath(remap, sessionState, "gloss-field-runtime-failure");
+    }
+#endif
+    return buildGlossViewFieldMeshCpu(payload, cloud, samples, out);
+  }
   std::vector<InputCloudSample> samples;
   std::vector<float> rawPoints;
   if (!parseInputCloudSamples(cloud, &samples)) return false;
   filterInputCloudSamples(payload, &samples);
+  if (samples.empty()) {
+    buildEmptyInputCloudMesh(cloud, out);
+    return true;
+  }
   rawPoints.reserve(samples.size() * 3u);
   for (const auto& sample : samples) {
     rawPoints.push_back(sample.r);
     rawPoints.push_back(sample.g);
     rawPoints.push_back(sample.b);
   }
-  if (rawPoints.empty()) {
-    buildEmptyInputCloudMesh(cloud, out);
-    return true;
-  }
   if (gpuCaps.inputComputeEnabled && computeCache && canUseInputCloudComputePath(payload) &&
-      buildInputCloudMeshOnGpu(payload, gpuCaps, sessionState, cloud, rawPoints, computeCache, out
+      buildInputCloudMeshOnGpu(payload, gpuCaps, sessionState, cloud, rawPoints, nullptr, computeCache, out
 #if defined(CHROMASPACE_VIEWER_HAS_CUDA) && !defined(__APPLE__)
-                               , cudaCache
+                                , cudaCache
 #endif
                                )) {
     return true;
@@ -5087,19 +6795,29 @@ bool buildInputCloudMesh(const ResolvedPayload& payload,
   return buildInputCloudMeshCpu(payload, cloud, rawPoints, out);
 }
 
-PointSelectionSpec makePointSelectionSpec(uint64_t sourceSerial,
-                                         size_t fullPointCount,
+PointSelectionSpec makePointSelectionSpec(const MeshData& mesh,
                                          float densityForView) {
   PointSelectionSpec spec{};
-  spec.sourceSerial = sourceSerial;
-  spec.fullPointCount = fullPointCount;
-  spec.visiblePointCount = fullPointCount == 0
-                               ? 0
-                               : std::min(fullPointCount,
-                                          std::max<size_t>(1, static_cast<size_t>(std::lround(
-                                              static_cast<double>(fullPointCount) *
-                                              clampf(densityForView, 0.1f, 4.0f)))));
-  spec.needsThinning = spec.visiblePointCount > 0 && spec.visiblePointCount < fullPointCount;
+  spec.sourceSerial = mesh.serial;
+  spec.fullPointCount = mesh.pointCount;
+  const auto thinCount = [densityForView](size_t fullCount) {
+    return fullCount == 0
+               ? size_t{0}
+               : std::min(fullCount,
+                          std::max<size_t>(1, static_cast<size_t>(std::lround(
+                              static_cast<double>(fullCount) *
+                              clampf(densityForView, 0.1f, 4.0f)))));
+  };
+  if (meshHasGlossLayers(mesh)) {
+    spec.fullGlossBodyPointCount = mesh.glossBodyPointCount;
+    spec.fullGlossHighlightPointCount = mesh.glossHighlightPointCount;
+    spec.visibleGlossBodyPointCount = thinCount(spec.fullGlossBodyPointCount);
+    spec.visibleGlossHighlightPointCount = thinCount(spec.fullGlossHighlightPointCount);
+    spec.visiblePointCount = spec.visibleGlossBodyPointCount + spec.visibleGlossHighlightPointCount;
+  } else {
+    spec.visiblePointCount = thinCount(spec.fullPointCount);
+  }
+  spec.needsThinning = spec.visiblePointCount > 0 && spec.visiblePointCount < spec.fullPointCount;
   return spec;
 }
 
@@ -5115,25 +6833,38 @@ bool buildCpuSampledPointDrawBuffers(const MeshData& mesh,
   out->available = false;
   out->sourceSerial = spec.sourceSerial;
   out->visiblePointCount = spec.visiblePointCount;
+  out->visibleGlossBodyPointCount = spec.visibleGlossBodyPointCount;
+  out->visibleGlossHighlightPointCount = spec.visibleGlossHighlightPointCount;
   if (!spec.needsThinning || mesh.pointCount == 0 || mesh.pointVerts.size() < mesh.pointCount * 3u ||
       mesh.pointColors.size() < mesh.pointCount * 4u) {
     return false;
   }
   out->cpuVerts.reserve(spec.visiblePointCount * 3u);
   out->cpuColors.reserve(spec.visiblePointCount * 4u);
-  const double maxIndex = static_cast<double>(mesh.pointCount - 1);
-  const double denom = static_cast<double>(std::max<size_t>(1, spec.visiblePointCount - 1));
-  for (size_t i = 0; i < spec.visiblePointCount; ++i) {
-    const size_t srcIndex = static_cast<size_t>(std::llround((static_cast<double>(i) / denom) * maxIndex));
-    const size_t clampedIndex = std::min(srcIndex, mesh.pointCount - 1);
-    const size_t vertOffset = clampedIndex * 3u;
-    const size_t colorOffset = clampedIndex * 4u;
-    out->cpuVerts.insert(out->cpuVerts.end(),
-                         mesh.pointVerts.begin() + static_cast<std::ptrdiff_t>(vertOffset),
-                         mesh.pointVerts.begin() + static_cast<std::ptrdiff_t>(vertOffset + 3u));
-    out->cpuColors.insert(out->cpuColors.end(),
-                          mesh.pointColors.begin() + static_cast<std::ptrdiff_t>(colorOffset),
-                          mesh.pointColors.begin() + static_cast<std::ptrdiff_t>(colorOffset + 4u));
+  auto appendSampledRange = [&](size_t srcOffset, size_t fullCount, size_t visibleCount) {
+    if (fullCount == 0 || visibleCount == 0) return;
+    const double maxIndex = static_cast<double>(fullCount - 1);
+    const double denom = static_cast<double>(std::max<size_t>(1, visibleCount - 1));
+    for (size_t i = 0; i < visibleCount; ++i) {
+      const size_t srcIndex = static_cast<size_t>(std::llround((static_cast<double>(i) / denom) * maxIndex));
+      const size_t clampedIndex = srcOffset + std::min(srcIndex, fullCount - 1);
+      const size_t vertOffset = clampedIndex * 3u;
+      const size_t colorOffset = clampedIndex * 4u;
+      out->cpuVerts.insert(out->cpuVerts.end(),
+                           mesh.pointVerts.begin() + static_cast<std::ptrdiff_t>(vertOffset),
+                           mesh.pointVerts.begin() + static_cast<std::ptrdiff_t>(vertOffset + 3u));
+      out->cpuColors.insert(out->cpuColors.end(),
+                            mesh.pointColors.begin() + static_cast<std::ptrdiff_t>(colorOffset),
+                            mesh.pointColors.begin() + static_cast<std::ptrdiff_t>(colorOffset + 4u));
+    }
+  };
+  if (meshHasGlossLayers(mesh)) {
+    appendSampledRange(0u, spec.fullGlossBodyPointCount, spec.visibleGlossBodyPointCount);
+    appendSampledRange(spec.fullGlossBodyPointCount,
+                       spec.fullGlossHighlightPointCount,
+                       spec.visibleGlossHighlightPointCount);
+  } else {
+    appendSampledRange(0u, spec.fullPointCount, spec.visiblePointCount);
   }
   out->pointCount = spec.visiblePointCount;
   out->available = !out->cpuVerts.empty() && !out->cpuColors.empty();
@@ -5154,13 +6885,35 @@ layout(std430, binding = 2) writeonly buffer DstVertBuffer { float dstVertVals[]
 layout(std430, binding = 3) writeonly buffer DstColorBuffer { float dstColorVals[]; };
 uniform int uFullPointCount;
 uniform int uVisiblePointCount;
+uniform int uFullBodyPointCount;
+uniform int uVisibleBodyPointCount;
+uniform int uFullHighlightPointCount;
+uniform int uVisibleHighlightPointCount;
 void main() {
   uint index = gl_GlobalInvocationID.x;
   uint visible = uint(max(uVisiblePointCount, 0));
   uint full = uint(max(uFullPointCount, 0));
   if (index >= visible) return;
   uint srcIndex = 0u;
-  if (visible > 1u && full > 1u) {
+  uint fullBody = uint(max(uFullBodyPointCount, 0));
+  uint visibleBody = uint(max(uVisibleBodyPointCount, 0));
+  uint fullHighlight = uint(max(uFullHighlightPointCount, 0));
+  uint visibleHighlight = uint(max(uVisibleHighlightPointCount, 0));
+  if (fullBody + fullHighlight == full && visibleBody + visibleHighlight == visible && fullBody > 0u) {
+    if (index < visibleBody) {
+      if (visibleBody > 1u && fullBody > 1u) {
+        float t = float(index) / float(visibleBody - 1u);
+        srcIndex = min(uint(floor(t * float(fullBody - 1u) + 0.5)), fullBody - 1u);
+      }
+    } else {
+      uint highlightIndex = index - visibleBody;
+      srcIndex = fullBody;
+      if (visibleHighlight > 1u && fullHighlight > 1u) {
+        float t = float(highlightIndex) / float(visibleHighlight - 1u);
+        srcIndex += min(uint(floor(t * float(fullHighlight - 1u) + 0.5)), fullHighlight - 1u);
+      }
+    }
+  } else if (visible > 1u && full > 1u) {
     float t = float(index) / float(visible - 1u);
     srcIndex = min(uint(floor(t * float(full - 1u) + 0.5)), full - 1u);
   }
@@ -5205,7 +6958,16 @@ void main() {
   cache->program = program;
   cache->fullPointCountLoc = api.getUniformLocation(program, "uFullPointCount");
   cache->visiblePointCountLoc = api.getUniformLocation(program, "uVisiblePointCount");
+  cache->fullBodyPointCountLoc = api.getUniformLocation(program, "uFullBodyPointCount");
+  cache->visibleBodyPointCountLoc = api.getUniformLocation(program, "uVisibleBodyPointCount");
+  cache->fullHighlightPointCountLoc = api.getUniformLocation(program, "uFullHighlightPointCount");
+  cache->visibleHighlightPointCountLoc = api.getUniformLocation(program, "uVisibleHighlightPointCount");
   cache->available = cache->fullPointCountLoc >= 0 && cache->visiblePointCountLoc >= 0;
+  cache->available = cache->available &&
+                     cache->fullBodyPointCountLoc >= 0 &&
+                     cache->visibleBodyPointCountLoc >= 0 &&
+                     cache->fullHighlightPointCountLoc >= 0 &&
+                     cache->visibleHighlightPointCountLoc >= 0;
   if (!cache->available) {
     logViewerEvent("Input-cloud thinning program missing one or more uniforms; falling back to CPU.");
     releaseInputCloudSampleComputeCache(cache);
@@ -5219,6 +6981,8 @@ bool buildInputCloudSampledGlBuffers(const InputCloudComputeCache& sourceCache,
                                      std::string* error) {
   if (!cache || !spec.needsThinning || sourceCache.verts == 0 || sourceCache.colors == 0) return false;
   if (cache->available && cache->builtSerial == spec.sourceSerial && cache->visiblePointCount == spec.visiblePointCount &&
+      cache->visibleGlossBodyPointCount == spec.visibleGlossBodyPointCount &&
+      cache->visibleGlossHighlightPointCount == spec.visibleGlossHighlightPointCount &&
       cache->verts != 0 && cache->colors != 0 && cache->pointCount == static_cast<GLsizei>(spec.visiblePointCount)) {
     return true;
   }
@@ -5246,6 +7010,10 @@ bool buildInputCloudSampledGlBuffers(const InputCloudComputeCache& sourceCache,
   computeApi.useProgram(cache->program);
   computeApi.uniform1i(cache->fullPointCountLoc, static_cast<GLint>(spec.fullPointCount));
   computeApi.uniform1i(cache->visiblePointCountLoc, static_cast<GLint>(spec.visiblePointCount));
+  computeApi.uniform1i(cache->fullBodyPointCountLoc, static_cast<GLint>(spec.fullGlossBodyPointCount));
+  computeApi.uniform1i(cache->visibleBodyPointCountLoc, static_cast<GLint>(spec.visibleGlossBodyPointCount));
+  computeApi.uniform1i(cache->fullHighlightPointCountLoc, static_cast<GLint>(spec.fullGlossHighlightPointCount));
+  computeApi.uniform1i(cache->visibleHighlightPointCountLoc, static_cast<GLint>(spec.visibleGlossHighlightPointCount));
   computeApi.bindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, sourceCache.verts);
   computeApi.bindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, sourceCache.colors);
   computeApi.bindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, cache->verts);
@@ -5257,6 +7025,8 @@ bool buildInputCloudSampledGlBuffers(const InputCloudComputeCache& sourceCache,
   bufferApi.bindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
   cache->builtSerial = spec.sourceSerial;
   cache->visiblePointCount = spec.visiblePointCount;
+  cache->visibleGlossBodyPointCount = spec.visibleGlossBodyPointCount;
+  cache->visibleGlossHighlightPointCount = spec.visibleGlossHighlightPointCount;
   cache->pointCount = static_cast<GLsizei>(spec.visiblePointCount);
   cache->available = true;
   return true;
@@ -5268,6 +7038,10 @@ bool buildInputCloudSampledCudaBuffers(InputCloudCudaCache* sourceCache,
                                        const PointSelectionSpec& spec,
                                        std::string* error) {
   if (!sourceCache || !sampleCache || !spec.needsThinning || sourceCache->verts == 0 || sourceCache->colors == 0) return false;
+  if (spec.fullGlossBodyPointCount > 0 || spec.fullGlossHighlightPointCount > 0) {
+    if (error) *error = "cuda-gloss-layer-thinning-unsupported";
+    return false;
+  }
   if (sampleCache->available && sampleCache->builtSerial == spec.sourceSerial &&
       sampleCache->pointCount == static_cast<GLsizei>(spec.visiblePointCount) &&
       sampleCache->verts != 0 && sampleCache->colors != 0) {
@@ -5310,6 +7084,9 @@ bool buildInputCloudSampledMetalBuffers(const MeshData& mesh,
                                         std::string* error) {
 #if defined(__APPLE__)
   if (!cache || !spec.needsThinning) return false;
+  if (meshHasGlossLayers(mesh)) {
+    return buildCpuSampledPointDrawBuffers(mesh, spec, &cache->draw);
+  }
   if (cache->draw.available && cache->draw.sourceSerial == spec.sourceSerial &&
       cache->draw.visiblePointCount == spec.visiblePointCount && cache->draw.pointCount == spec.visiblePointCount) {
     return true;
@@ -5379,6 +7156,8 @@ bool buildInputPointDrawBuffers(const MeshData& mesh,
       out->pointCount = spec.visiblePointCount;
       out->sourceSerial = spec.sourceSerial;
       out->visiblePointCount = spec.visiblePointCount;
+      out->visibleGlossBodyPointCount = spec.visibleGlossBodyPointCount;
+      out->visibleGlossHighlightPointCount = spec.visibleGlossHighlightPointCount;
       out->available = true;
       if (diagnosticsEnabled) logViewerDiagnostic(true, "Input thinning backend: cuda-sampled");
       return true;
@@ -5400,6 +7179,8 @@ bool buildInputPointDrawBuffers(const MeshData& mesh,
       out->pointCount = spec.visiblePointCount;
       out->sourceSerial = spec.sourceSerial;
       out->visiblePointCount = spec.visiblePointCount;
+      out->visibleGlossBodyPointCount = spec.visibleGlossBodyPointCount;
+      out->visibleGlossHighlightPointCount = spec.visibleGlossHighlightPointCount;
       out->available = true;
       if (diagnosticsEnabled) logViewerDiagnostic(true, "Input thinning backend: gl-sampled");
       return true;
@@ -5510,6 +7291,9 @@ struct AppState {
   CameraState cam;
   Quat modelOrientation;
   std::string plotMode = "rgb";
+  GlossViewPresentationMode glossViewPresentation = GlossViewPresentationMode::Field2D;
+  GlossViewColorMode glossViewColorMode = GlossViewColorMode::SemanticSignal;
+  GlossViewDebugFieldMode glossViewDebugFieldMode = GlossViewDebugFieldMode::Signal;
   int orientAxisLock = 0;
   double orientAxisFeedbackUntil = 0.0;
   double slowFeedbackUntil = 0.0;
@@ -5546,8 +7330,34 @@ struct AppState {
   bool superHeld = false;
   bool rollKeyHeld = false;
   bool fitVolumeRequested = false;
+  bool glossOrthoAutoFitRequested = false;
+  Quat glossOrthoSnapAnchor;
+  bool glossOrthoSnapAnchorValid = false;
+  float glossOrthoSnapAccumAngle = 0.0f;
+  bool glossOrthoSnapEngaged = false;
+  int glossOrthoSnapQuarterTurns = 0;
+  Quat orthographicAssistTarget;
+  bool orthographicAssistTargetValid = false;
+  int orthographicAssistTargetView = -1;
   double lastHoverActivationAttempt = -10.0;
 };
+
+void resetGlossViewOrthoInteractionState(AppState* app) {
+  if (!app) return;
+  app->glossOrthoSnapAnchor = Quat{};
+  app->glossOrthoSnapAnchorValid = false;
+  app->glossOrthoSnapAccumAngle = 0.0f;
+  app->glossOrthoSnapEngaged = false;
+  app->glossOrthoSnapQuarterTurns = 0;
+  app->orthographicAssistTarget = Quat{};
+  app->orthographicAssistTargetValid = false;
+  app->orthographicAssistTargetView = -1;
+}
+
+void requestGlossViewOrthoInspectionFit(AppState* app) {
+  if (!app) return;
+  app->glossOrthoAutoFitRequested = true;
+}
 
 bool platformRollModifierPressed(const AppState& app) {
   if (app.rollKeyHeld) return true;
@@ -5708,6 +7518,31 @@ void keyCallback(GLFWwindow* window, int key, int, int action, int) {
   AppState* app = reinterpret_cast<AppState*>(glfwGetWindowUserPointer(window));
   if (!app) return;
   refreshModifierState(window, app);
+  if (action == GLFW_PRESS && isGlossViewPlotModeString(app->plotMode)) {
+    if (key == GLFW_KEY_TAB || key == GLFW_KEY_V) {
+      app->glossViewPresentation =
+          app->glossViewPresentation == GlossViewPresentationMode::Field2D
+              ? GlossViewPresentationMode::Projection3D
+              : GlossViewPresentationMode::Field2D;
+      if (app->glossViewPresentation == GlossViewPresentationMode::Projection3D &&
+          app->cam.orthographic && app->cam.orthographicView == kGlossViewOrthoTop) {
+        requestGlossViewOrthoInspectionFit(app);
+      }
+      return;
+    }
+    if (key == GLFW_KEY_C) {
+      app->glossViewColorMode =
+          app->glossViewColorMode == GlossViewColorMode::SemanticSignal
+              ? GlossViewColorMode::SourceHueTint
+              : GlossViewColorMode::SemanticSignal;
+      return;
+    }
+    if (key == GLFW_KEY_B) {
+      const int nextMode = (static_cast<int>(app->glossViewDebugFieldMode) + 1) % 5;
+      app->glossViewDebugFieldMode = static_cast<GlossViewDebugFieldMode>(nextMode);
+      return;
+    }
+  }
   if (action == GLFW_PRESS && key == GLFW_KEY_F) {
     app->fitVolumeRequested = true;
     app->fitFeedbackUntil = glfwGetTime() + 0.55;
@@ -5830,6 +7665,103 @@ void drawRgbGuide(const ResolvedPayload& payload) {
   }
   glDisableClientState(GL_VERTEX_ARRAY);
   drawRgbAxesAndNeutralAxis();
+}
+
+void drawGlossLiftGuide(const ResolvedPayload& payload) {
+  float halfWidth = 1.22f;
+  float halfHeight = 0.69f;
+  glossViewHalfExtents(payload.sourceAspect, &halfWidth, &halfHeight);
+  const float kXMin = -halfWidth;
+  const float kXMax = halfWidth;
+  const float kYMin = -halfHeight;
+  const float kYMax = halfHeight;
+  constexpr int kGridStepsX = 9;
+  constexpr int kGridStepsY = 6;
+  constexpr float kPlaneZ = 0.0f;
+  constexpr float kFrontZ = 1.55f;
+  constexpr float kBackZ = -1.55f;
+
+  glLineWidth(1.0f);
+  glColor4f(0.90f, 0.92f, 0.95f, 0.18f);
+  glBegin(GL_LINES);
+  for (int i = 0; i < kGridStepsX; ++i) {
+    const float t = static_cast<float>(i) / static_cast<float>(std::max(1, kGridStepsX - 1));
+    const float x = kXMin + (kXMax - kXMin) * t;
+    glVertex3f(x, kYMin, kPlaneZ);
+    glVertex3f(x, kYMax, kPlaneZ);
+  }
+  for (int i = 0; i < kGridStepsY; ++i) {
+    const float t = static_cast<float>(i) / static_cast<float>(std::max(1, kGridStepsY - 1));
+    const float y = kYMin + (kYMax - kYMin) * t;
+    glVertex3f(kXMin, y, kPlaneZ);
+    glVertex3f(kXMax, y, kPlaneZ);
+  }
+  glEnd();
+
+  glLineWidth(1.2f);
+  glColor4f(0.96f, 0.97f, 0.99f, 0.50f);
+  glBegin(GL_LINE_LOOP);
+  glVertex3f(kXMin, kYMin, kPlaneZ);
+  glVertex3f(kXMax, kYMin, kPlaneZ);
+  glVertex3f(kXMax, kYMax, kPlaneZ);
+  glVertex3f(kXMin, kYMax, kPlaneZ);
+  glEnd();
+
+  glLineWidth(1.3f);
+  glColor4f(0.96f, 0.97f, 0.99f, 0.36f);
+  glBegin(GL_LINES);
+  glVertex3f(0.0f, kYMin, kPlaneZ);
+  glVertex3f(0.0f, kYMax, kPlaneZ);
+  glVertex3f(kXMin, 0.0f, kPlaneZ);
+  glVertex3f(kXMax, 0.0f, kPlaneZ);
+  glEnd();
+
+  glLineWidth(2.0f);
+  glColor4f(0.98f, 0.98f, 0.99f, 0.58f);
+  glBegin(GL_LINES);
+  glVertex3f(kXMax, kYMax + 0.06f, kPlaneZ);
+  glVertex3f(kXMax, kYMax + 0.22f, kPlaneZ);
+  glEnd();
+
+  glLineWidth(1.8f);
+  glBegin(GL_LINES);
+  // Match the 2D field markers exactly: orange = top edge, cyan = left edge.
+  glColor4f(1.0f, 0.84f, 0.58f, 0.70f);
+  glVertex3f(kXMin, kYMax, kPlaneZ);
+  glVertex3f(kXMax, kYMax, kPlaneZ);
+  glColor4f(0.68f, 0.92f, 1.0f, 0.70f);
+  glVertex3f(kXMin, kYMin, kPlaneZ);
+  glVertex3f(kXMin, kYMax, kPlaneZ);
+  glEnd();
+
+  glColor4f(1.0f, 0.88f, 0.42f, 0.82f);
+  glBegin(GL_LINES);
+  glVertex3f(kXMax + 0.14f, kYMax, kPlaneZ);
+  glVertex3f(kXMax + 0.14f, kYMax, kFrontZ);
+  glEnd();
+  glColor4f(0.30f, 0.74f, 1.0f, 0.82f);
+  glBegin(GL_LINES);
+  glVertex3f(kXMax + 0.14f, kYMax, kPlaneZ);
+  glVertex3f(kXMax + 0.14f, kYMax, kBackZ);
+  glEnd();
+
+  glLineWidth(1.0f);
+  glColor4f(1.0f, 0.88f, 0.42f, 0.38f);
+  glBegin(GL_LINES);
+  for (int i = 1; i <= 4; ++i) {
+    const float z = kPlaneZ + (kFrontZ - kPlaneZ) * (static_cast<float>(i) / 4.0f);
+    glVertex3f(kXMax + 0.08f, kYMax, z);
+    glVertex3f(kXMax + 0.20f, kYMax, z);
+  }
+  glEnd();
+  glColor4f(0.30f, 0.74f, 1.0f, 0.38f);
+  glBegin(GL_LINES);
+  for (int i = 1; i <= 4; ++i) {
+    const float z = kPlaneZ + (kBackZ - kPlaneZ) * (static_cast<float>(i) / 4.0f);
+    glVertex3f(kXMax + 0.08f, kYMax, z);
+    glVertex3f(kXMax + 0.20f, kYMax, z);
+  }
+  glEnd();
 }
 
 void drawChromaticityTriangle(const PlotRemapSpec& spec,
@@ -6353,6 +8285,542 @@ void drawChromaticityInfoOverlay(const PlotRemapSpec& spec,
     drawScreenText(referenceLine, rightX, line1Y, scale);
     glColor4f(0.96f, 0.91f, 0.82f, rightAlpha);
     drawScreenText(overlayLine, rightX, line2Y, scale);
+  }
+
+  glDisable(GL_BLEND);
+  glEnable(GL_DEPTH_TEST);
+  glPopMatrix();
+  glMatrixMode(GL_PROJECTION);
+  glPopMatrix();
+  glMatrixMode(GL_MODELVIEW);
+}
+
+void glossViewResolvedDisplaySignals(const MeshData& mesh,
+                                     size_t idx,
+                                     GlossViewDebugFieldMode debugMode,
+                                     float* outBase,
+                                     float* outPositive,
+                                     float* outNegative,
+                                     float* outSignedValue) {
+  if (outBase) *outBase = idx < mesh.glossFieldBody.size() ? mesh.glossFieldBody[idx] : 0.0f;
+  if (outPositive) *outPositive = idx < mesh.glossFieldPositive.size() ? mesh.glossFieldPositive[idx] : 0.0f;
+  if (outNegative) *outNegative = idx < mesh.glossFieldNegative.size() ? mesh.glossFieldNegative[idx] : 0.0f;
+  if (outSignedValue) *outSignedValue = idx < mesh.glossFieldSignal.size() ? mesh.glossFieldSignal[idx] : 0.0f;
+  if (debugMode == GlossViewDebugFieldMode::Signal) return;
+  float scalar = 0.0f;
+  switch (debugMode) {
+    case GlossViewDebugFieldMode::CarrierMax:
+      scalar = idx < mesh.glossFieldCarrierMax.size() ? mesh.glossFieldCarrierMax[idx] : 0.0f;
+      break;
+    case GlossViewDebugFieldMode::CarrierY:
+      scalar = idx < mesh.glossFieldCarrierY.size() ? mesh.glossFieldCarrierY[idx] : 0.0f;
+      break;
+    case GlossViewDebugFieldMode::CarrierMin:
+      scalar = idx < mesh.glossFieldCarrierMin.size() ? mesh.glossFieldCarrierMin[idx] : 0.0f;
+      break;
+    case GlossViewDebugFieldMode::Neutrality:
+      scalar = idx < mesh.glossFieldNeutrality.size() ? mesh.glossFieldNeutrality[idx] : 0.0f;
+      break;
+    case GlossViewDebugFieldMode::Signal:
+    default:
+      break;
+  }
+  if (outPositive) *outPositive = clampf(scalar, 0.0f, 1.0f);
+  if (outNegative) *outNegative = 0.0f;
+  if (outSignedValue) *outSignedValue = clampf(scalar, 0.0f, 1.0f);
+}
+
+Vec3 glossViewSourceHueColor(const MeshData& mesh, size_t idx, const ResolvedPayload& payload) {
+  if (idx * 3u + 2u >= mesh.glossFieldMeanRgb.size()) return Vec3{0.5f, 0.5f, 0.5f};
+  float cr = 0.0f;
+  float cg = 0.0f;
+  float cb = 0.0f;
+  mapDisplayColor(mesh.glossFieldMeanRgb[idx * 3u + 0u],
+                  mesh.glossFieldMeanRgb[idx * 3u + 1u],
+                  mesh.glossFieldMeanRgb[idx * 3u + 2u],
+                  &cr,
+                  &cg,
+                  &cb);
+  applyDisplaySaturation(std::min(3.0f, payload.colorSaturation), &cr, &cg, &cb);
+  return Vec3{cr, cg, cb};
+}
+
+void glossViewCellUnderlayStyle(const MeshData& mesh,
+                                size_t idx,
+                                const ResolvedPayload& payload,
+                                GlossViewColorMode colorMode,
+                                float* outR,
+                                float* outG,
+                                float* outB,
+                                float* outA) {
+  if (!outR || !outG || !outB || !outA) return;
+  *outR = 0.0f;
+  *outG = 0.0f;
+  *outB = 0.0f;
+  *outA = 0.0f;
+  if (idx * 3u + 2u >= mesh.glossFieldMeanRgb.size()) return;
+
+  float mr = mesh.glossFieldMeanRgb[idx * 3u + 0u];
+  float mg = mesh.glossFieldMeanRgb[idx * 3u + 1u];
+  float mb = mesh.glossFieldMeanRgb[idx * 3u + 2u];
+  float sr = 0.0f;
+  float sg = 0.0f;
+  float sb = 0.0f;
+  mapDisplayColor(mr, mg, mb, &sr, &sg, &sb);
+  const float sourceLuma = clampf(0.2126f * sr + 0.7152f * sg + 0.0722f * sb, 0.0f, 1.0f);
+  const float sourcePresence = clampf(std::max(mr, std::max(mg, mb)), 0.0f, 1.0f);
+  const float confidence =
+      idx < mesh.glossFieldConfidence.size() ? clampf(mesh.glossFieldConfidence[idx], 0.0f, 1.0f) : 0.0f;
+  const float bodyValue =
+      idx < mesh.glossFieldBody.size() ? clampf(mesh.glossFieldBody[idx], 0.0f, 1.0f) : sourceLuma;
+  const float structure = std::max(std::sqrt(confidence), std::sqrt(sourcePresence));
+  const float bodyGain = 0.34f + 0.66f * payload.glossBodyOpacity;
+
+  Vec3 color{};
+  if (colorMode == GlossViewColorMode::SourceHueTint) {
+    const Vec3 sourceHue = glossViewSourceHueColor(mesh, idx, payload);
+    const Vec3 neutralBase{0.10f + 0.52f * std::pow(sourceLuma, 0.85f),
+                           0.10f + 0.50f * std::pow(sourceLuma, 0.85f),
+                           0.11f + 0.46f * std::pow(sourceLuma, 0.85f)};
+    color = mix3(neutralBase, sourceHue, 0.42f);
+  } else {
+    const float gray = 0.11f + 0.62f * std::pow(std::max(sourceLuma, 0.35f * bodyValue), 0.84f);
+    color = Vec3{gray * 0.98f, gray * 0.985f, gray};
+  }
+  const float alpha = clampf((0.10f + 0.48f * structure) * bodyGain, 0.0f, 0.68f);
+  *outR = clampf(color.x, 0.0f, 1.0f);
+  *outG = clampf(color.y, 0.0f, 1.0f);
+  *outB = clampf(color.z, 0.0f, 1.0f);
+  *outA = alpha;
+}
+
+void glossViewCellDisplayStyle(const MeshData& mesh,
+                               size_t idx,
+                               const ResolvedPayload& payload,
+                               GlossViewColorMode colorMode,
+                               GlossViewDebugFieldMode debugMode,
+                               float* outR,
+                               float* outG,
+                               float* outB,
+                               float* outA) {
+  if (!outR || !outG || !outB || !outA) return;
+  float base = 0.0f;
+  float positive = 0.0f;
+  float negative = 0.0f;
+  float signedValue = 0.0f;
+  glossViewResolvedDisplaySignals(mesh, idx, debugMode, &base, &positive, &negative, &signedValue);
+  const float confidence =
+      idx < mesh.glossFieldConfidence.size() ? clampf(mesh.glossFieldConfidence[idx], 0.0f, 1.0f) : 0.0f;
+  const float congruence =
+      idx < mesh.glossFieldCongruence.size() ? clampf(mesh.glossFieldCongruence[idx], 0.0f, 1.0f) : 0.0f;
+  const float boundary =
+      idx < mesh.glossFieldBoundary.size() ? clampf(mesh.glossFieldBoundary[idx], 0.0f, 1.0f) : 0.0f;
+  const float signalScale = std::max(1.0f, payload.glossLiftScale);
+  positive = clampf(positive * signalScale, 0.0f, 1.0f);
+  negative = clampf(negative * signalScale, 0.0f, 1.0f);
+
+  const auto smoothSignal = [](float value, float knee) {
+    const float t = clampf((value - knee) / std::max(1e-5f, 1.0f - knee), 0.0f, 1.0f);
+    return t * t * (3.0f - 2.0f * t);
+  };
+  const float positiveDisplay = smoothSignal(positive, 0.035f);
+  const float negativeDisplay = smoothSignal(negative, 0.035f);
+  const float signalPresence = std::max(positiveDisplay, negativeDisplay);
+  const float structureStrength = std::max(congruence, boundary);
+
+  Vec3 color{0.08f, 0.08f, 0.09f};
+  if (colorMode == GlossViewColorMode::SourceHueTint) {
+    const Vec3 sourceHue = glossViewSourceHueColor(mesh, idx, payload);
+    const float baseMix =
+        clampf(payload.glossBodyOpacity * (0.22f + 0.78f * confidence) * (0.86f - 0.22f * signalPresence), 0.0f, 1.0f);
+    const Vec3 neutralBase{0.16f + 0.60f * std::pow(base, 0.78f),
+                           0.16f + 0.58f * std::pow(base, 0.78f),
+                           0.17f + 0.54f * std::pow(base, 0.78f)};
+    color = mix3(Vec3{0.03f, 0.03f, 0.04f}, mix3(neutralBase, sourceHue, 0.68f), baseMix);
+    if (positiveDisplay > 0.0f) {
+      const Vec3 warm = mix3(sourceHue, Vec3{1.0f, 0.95f, 0.86f}, 0.54f);
+      color = mix3(color,
+                   warm,
+                   clampf(payload.glossHighlightOpacity * positiveDisplay * (0.22f + 0.78f * structureStrength),
+                          0.0f,
+                          1.0f));
+    }
+    if (negativeDisplay > 0.0f) {
+      const Vec3 cool = mix3(sourceHue, Vec3{0.08f, 0.14f, 0.24f}, 0.74f);
+      color = mix3(color,
+                   cool,
+                   clampf(payload.glossHighlightOpacity * negativeDisplay * (0.22f + 0.78f * structureStrength),
+                          0.0f,
+                          1.0f));
+    }
+  } else {
+    const Vec3 neutralBase{0.16f + 0.64f * std::pow(base, 0.78f),
+                           0.16f + 0.64f * std::pow(base, 0.78f),
+                           0.17f + 0.60f * std::pow(base, 0.78f)};
+    color = mix3(Vec3{0.03f, 0.03f, 0.04f},
+                 neutralBase,
+                 clampf(payload.glossBodyOpacity * (0.22f + 0.78f * confidence) * (0.86f - 0.22f * signalPresence),
+                        0.0f,
+                        1.0f));
+    if (positiveDisplay > 0.0f) {
+      color = mix3(color,
+                   Vec3{1.0f, 0.89f, 0.36f},
+                   clampf(payload.glossHighlightOpacity * positiveDisplay * (0.22f + 0.78f * structureStrength),
+                          0.0f,
+                          1.0f));
+    }
+    if (negativeDisplay > 0.0f) {
+      color = mix3(color,
+                   Vec3{0.22f, 0.76f, 1.0f},
+                   clampf(payload.glossHighlightOpacity * negativeDisplay * (0.22f + 0.78f * structureStrength),
+                          0.0f,
+                          1.0f));
+    }
+  }
+  if (boundary > 0.0f) {
+    color = mix3(color, Vec3{0.98f, 0.98f, 0.94f}, clampf(0.10f + 0.26f * boundary, 0.0f, 0.34f));
+  }
+  const float alpha =
+      clampf(payload.glossBodyOpacity * (0.12f + 0.62f * confidence) * (0.82f - 0.18f * signalPresence) +
+                 payload.glossHighlightOpacity * signalPresence * (0.16f + 0.84f * structureStrength),
+             0.018f,
+             1.0f);
+  *outR = clampf(color.x, 0.0f, 1.0f);
+  *outG = clampf(color.y, 0.0f, 1.0f);
+  *outB = clampf(color.z, 0.0f, 1.0f);
+  *outA = alpha;
+}
+
+void drawGlossViewFieldOrientationMarkers(float left,
+                                          float bottom,
+                                          float right,
+                                          float top,
+                                          bool compact) {
+  glLineWidth(compact ? 1.6f : 2.0f);
+  glBegin(GL_LINES);
+  glColor4f(1.0f, 0.84f, 0.58f, compact ? 0.78f : 0.86f);
+  glVertex2f(left, top);
+  glVertex2f(right, top);
+  glColor4f(0.68f, 0.92f, 1.0f, compact ? 0.78f : 0.86f);
+  glVertex2f(left, bottom);
+  glVertex2f(left, top);
+  glEnd();
+  if (compact) return;
+
+  const float labelScale = 4.8f;
+  const std::string topLabel = "T";
+  const std::string bottomLabel = "B";
+  const std::string leftLabel = "L";
+  const std::string rightLabel = "R";
+  const float topLabelX = 0.5f * (left + right) - 0.5f * bitmapTextWidth(topLabel, labelScale);
+  const float bottomLabelX = 0.5f * (left + right) - 0.5f * bitmapTextWidth(bottomLabel, labelScale);
+  const float centerLabelY = 0.5f * (bottom + top) - 0.5f * labelScale;
+  glColor4f(1.0f, 0.84f, 0.58f, 0.84f);
+  drawScreenText(topLabel, topLabelX, top + 7.0f, labelScale);
+  glColor4f(0.80f, 0.84f, 0.90f, 0.62f);
+  drawScreenText(bottomLabel, bottomLabelX, bottom - 11.0f, labelScale);
+  glColor4f(0.68f, 0.92f, 1.0f, 0.84f);
+  drawScreenText(leftLabel, left - 11.0f, centerLabelY, labelScale);
+  glColor4f(0.80f, 0.84f, 0.90f, 0.62f);
+  drawScreenText(rightLabel, right + 6.0f, centerLabelY, labelScale);
+}
+
+void drawGlossViewFieldRect(float left,
+                            float bottom,
+                            float right,
+                            float top,
+                            const MeshData& mesh,
+                            const ResolvedPayload& payload,
+                            GlossViewColorMode colorMode,
+                            GlossViewDebugFieldMode debugMode) {
+  if (!mesh.hasGlossField || mesh.glossFieldWidth <= 0 || mesh.glossFieldHeight <= 0) return;
+  const float cellW = (right - left) / static_cast<float>(mesh.glossFieldWidth);
+  const float cellH = (top - bottom) / static_cast<float>(mesh.glossFieldHeight);
+  glBegin(GL_QUADS);
+  for (int y = 0; y < mesh.glossFieldHeight; ++y) {
+    for (int x = 0; x < mesh.glossFieldWidth; ++x) {
+      const size_t idx =
+          static_cast<size_t>(y) * static_cast<size_t>(mesh.glossFieldWidth) + static_cast<size_t>(x);
+      float r = 0.0f;
+      float g = 0.0f;
+      float b = 0.0f;
+      float a = 0.0f;
+      glossViewCellUnderlayStyle(mesh, idx, payload, colorMode, &r, &g, &b, &a);
+      if (a <= 0.01f) continue;
+      const float x0 = left + static_cast<float>(x) * cellW;
+      const float x1 = x0 + cellW + 0.4f;
+      const float y1 = top - static_cast<float>(y) * cellH;
+      const float y0 = y1 - cellH - 0.4f;
+      glColor4f(r, g, b, a);
+      glVertex2f(x0, y0);
+      glVertex2f(x1, y0);
+      glVertex2f(x1, y1);
+      glVertex2f(x0, y1);
+    }
+  }
+  glEnd();
+
+  glBegin(GL_QUADS);
+  for (int y = 0; y < mesh.glossFieldHeight; ++y) {
+    for (int x = 0; x < mesh.glossFieldWidth; ++x) {
+      const size_t idx =
+          static_cast<size_t>(y) * static_cast<size_t>(mesh.glossFieldWidth) + static_cast<size_t>(x);
+      const float confidence =
+          idx < mesh.glossFieldConfidence.size() ? clampf(mesh.glossFieldConfidence[idx], 0.0f, 1.0f) : 0.0f;
+      const float sourcePresence =
+          idx * 3u + 2u < mesh.glossFieldMeanRgb.size()
+              ? clampf(std::max(mesh.glossFieldMeanRgb[idx * 3u + 0u],
+                                std::max(mesh.glossFieldMeanRgb[idx * 3u + 1u], mesh.glossFieldMeanRgb[idx * 3u + 2u])),
+                       0.0f,
+                       1.0f)
+              : 0.0f;
+      if (confidence <= 0.01f && sourcePresence <= 0.01f) continue;
+      float r = 0.0f;
+      float g = 0.0f;
+      float b = 0.0f;
+      float a = 0.0f;
+      glossViewCellDisplayStyle(mesh, idx, payload, colorMode, debugMode, &r, &g, &b, &a);
+      if (a <= 0.01f) continue;
+      const float x0 = left + static_cast<float>(x) * cellW;
+      const float x1 = x0 + cellW + 0.4f;
+      const float y1 = top - static_cast<float>(y) * cellH;
+      const float y0 = y1 - cellH - 0.4f;
+      glColor4f(r, g, b, a);
+      glVertex2f(x0, y0);
+      glVertex2f(x1, y0);
+      glVertex2f(x1, y1);
+      glVertex2f(x0, y1);
+    }
+  }
+  glEnd();
+
+  glLineWidth(1.0f);
+  glColor4f(0.94f, 0.95f, 0.98f, 0.34f);
+  glBegin(GL_LINE_LOOP);
+  glVertex2f(left, bottom);
+  glVertex2f(right, bottom);
+  glVertex2f(right, top);
+  glVertex2f(left, top);
+  glEnd();
+  glColor4f(0.94f, 0.95f, 0.98f, 0.20f);
+  glBegin(GL_LINES);
+  const float midX = 0.5f * (left + right);
+  const float midY = 0.5f * (bottom + top);
+  glVertex2f(midX, bottom);
+  glVertex2f(midX, top);
+  glVertex2f(left, midY);
+  glVertex2f(right, midY);
+  glEnd();
+}
+
+void drawGlossLiftSpatialInsetOverlay(int width,
+                                      int height,
+                                      const ResolvedPayload& payload,
+                                      const MeshData& mesh,
+                                      const HudTextRenderer& renderer,
+                                      GlossViewColorMode colorMode,
+                                      GlossViewDebugFieldMode debugMode) {
+  if (width <= 0 || height <= 0 || !mesh.hasGlossField || !payload.glossSpatialInset) {
+    return;
+  }
+
+  const float insetSize = clampf(static_cast<float>(std::min(width, height)) * 0.22f, 120.0f, 180.0f);
+  const float left = static_cast<float>(width) - insetSize - 18.0f;
+  const float bottom = static_cast<float>(height) - insetSize - 22.0f;
+  const float right = left + insetSize;
+  const float top = bottom + insetSize;
+  drawHudBackdrop(left - 8.0f, bottom - 22.0f, right + 8.0f, top + 8.0f, 0.10f);
+  glDisable(GL_TEXTURE_2D);
+  glBegin(GL_QUADS);
+  glColor4f(0.05f, 0.06f, 0.07f, 0.84f);
+  glVertex2f(left, bottom);
+  glVertex2f(right, bottom);
+  glVertex2f(right, top);
+  glVertex2f(left, top);
+  glEnd();
+  drawGlossViewFieldRect(left, bottom, right, top, mesh, payload, colorMode, debugMode);
+  drawGlossViewFieldOrientationMarkers(left, bottom, right, top, true);
+
+  const std::string label = "Linked 2D Field";
+  const float scale = renderer.available ? 0.92f : 5.6f;
+  const float labelX = left;
+  const float labelY = bottom - (renderer.available ? 7.0f : 3.0f);
+  if (renderer.available) {
+    drawHudTextLine(renderer, label, labelX, labelY, scale, 0.66f, 0.94f, 0.95f, 0.98f);
+  } else {
+    glColor4f(0.94f, 0.95f, 0.98f, 0.66f);
+    drawScreenText(label, labelX, labelY, scale);
+  }
+}
+
+void drawGlossViewFieldOverlay(int width,
+                               int height,
+                               const ResolvedPayload& payload,
+                               const MeshData& mesh,
+                               GlossViewColorMode colorMode,
+                               GlossViewDebugFieldMode debugMode) {
+  if (width <= 0 || height <= 0 || !mesh.hasGlossField || mesh.glossFieldWidth <= 0 || mesh.glossFieldHeight <= 0) {
+    return;
+  }
+  glMatrixMode(GL_PROJECTION);
+  glPushMatrix();
+  glLoadIdentity();
+  glOrtho(0.0, static_cast<double>(width), 0.0, static_cast<double>(height), -1.0, 1.0);
+  glMatrixMode(GL_MODELVIEW);
+  glPushMatrix();
+  glLoadIdentity();
+  glDisable(GL_DEPTH_TEST);
+  glEnable(GL_BLEND);
+  glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+  const float padX = 24.0f;
+  const float padY = 24.0f;
+  const float availW = std::max(64.0f, static_cast<float>(width) - padX * 2.0f);
+  const float availH = std::max(64.0f, static_cast<float>(height) - padY * 2.0f);
+  const float fieldAspect = static_cast<float>(mesh.glossFieldWidth) / static_cast<float>(std::max(1, mesh.glossFieldHeight));
+  float fieldW = availW;
+  float fieldH = availW / std::max(0.001f, fieldAspect);
+  if (fieldH > availH) {
+    fieldH = availH;
+    fieldW = fieldH * fieldAspect;
+  }
+  const float left = (static_cast<float>(width) - fieldW) * 0.5f;
+  const float bottom = (static_cast<float>(height) - fieldH) * 0.5f;
+  const float right = left + fieldW;
+  const float top = bottom + fieldH;
+  drawHudBackdrop(left - 8.0f, bottom - 8.0f, right + 8.0f, top + 8.0f, 0.10f);
+  glDisable(GL_TEXTURE_2D);
+  glBegin(GL_QUADS);
+  glColor4f(0.07f, 0.08f, 0.10f, 0.96f);
+  glVertex2f(left, bottom);
+  glVertex2f(right, bottom);
+  glVertex2f(right, top);
+  glVertex2f(left, top);
+  glEnd();
+  drawGlossViewFieldRect(left, bottom, right, top, mesh, payload, colorMode, debugMode);
+  drawGlossViewFieldOrientationMarkers(left, bottom, right, top, false);
+  glDisable(GL_BLEND);
+  glEnable(GL_DEPTH_TEST);
+  glPopMatrix();
+  glMatrixMode(GL_PROJECTION);
+  glPopMatrix();
+  glMatrixMode(GL_MODELVIEW);
+}
+
+void drawGlossLiftInfoOverlay(int width,
+                              int height,
+                              const ResolvedPayload& payload,
+                              const MeshData& mesh,
+                              const HudTextRenderer& renderer,
+                              GlossViewPresentationMode presentationMode,
+                              GlossViewColorMode colorMode,
+                              GlossViewDebugFieldMode debugMode) {
+  if (width <= 0 || height <= 0) return;
+
+  const std::string line1 = "Gloss View";
+  const std::string line2 = std::string("View = ") + glossViewPresentationLabel(presentationMode);
+  const std::string line3 = std::string("Color = ") + glossViewColorModeLabel(colorMode);
+  const std::string line4 = std::string("Field = ") + glossViewDebugFieldLabel(debugMode);
+  const bool signedSignalField = debugMode == GlossViewDebugFieldMode::Signal;
+  const std::string line5 =
+      presentationMode == GlossViewPresentationMode::Field2D
+          ? (signedSignalField
+                 ? "Gray underlay = source footprint | Warm = + excursion  Cool = - excursion"
+                 : "Gray underlay = source footprint | Brighter = higher selected field")
+          : (signedSignalField
+                 ? "Positive relief comes off the image plane  Negative relief goes behind it"
+                 : "Relief = selected field value coming off the image plane | Debug basis");
+  const std::string line6 = presentationMode == GlossViewPresentationMode::Field2D
+                                  ? "Top/Left markers match image | Tab or V = toggle 2D/3D | C = color | B = basis"
+                                  : (payload.glossSpatialInset
+                                         ? (signedSignalField
+                                               ? "Inset = linked 2D field | Front ortho matches the 2D footprint"
+                                               : "Inset = linked 2D field | Front ortho matches the 2D footprint")
+                                         : "Front ortho matches the 2D footprint");
+  const bool showLinearHint = !payload.plotDisplayLinear;
+  const std::string line7 = "Plot in Linear recommended";
+
+  glMatrixMode(GL_PROJECTION);
+  glPushMatrix();
+  glLoadIdentity();
+  glOrtho(0.0, static_cast<double>(width), 0.0, static_cast<double>(height), -1.0, 1.0);
+  glMatrixMode(GL_MODELVIEW);
+  glPushMatrix();
+  glLoadIdentity();
+  glDisable(GL_DEPTH_TEST);
+  glEnable(GL_BLEND);
+  glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+
+  const float scale = renderer.available ? 1.0f : 6.4f;
+  const float leftX = 16.0f;
+  const float bottomY = 8.0f;
+  const float lineAdvance = renderer.available ? static_cast<float>(renderer.atlas.lineHeight) + 1.0f : 11.5f;
+  const float line7Y = renderer.available
+                           ? bottomY + static_cast<float>(renderer.atlas.descent + 1)
+                           : bottomY + 5.0f;
+  const float line6Y = line7Y + lineAdvance;
+  const float line5Y = line6Y + lineAdvance;
+  const float line4Y = line5Y + lineAdvance;
+  const float line3Y = line4Y + lineAdvance;
+  const float line2Y = line3Y + lineAdvance;
+  const float line1Y = line2Y + lineAdvance;
+  float blockWidth = 0.0f;
+  auto accumulateWidth = [&](const std::string& text) {
+    const float widthValue = renderer.available
+                                 ? WorkshopText::measureTextWidth(renderer.atlas, text, scale)
+                                 : bitmapTextWidth(text, scale);
+    blockWidth = std::max(blockWidth, widthValue);
+  };
+  accumulateWidth(line1);
+  accumulateWidth(line2);
+  accumulateWidth(line3);
+  accumulateWidth(line4);
+  accumulateWidth(line5);
+  accumulateWidth(line6);
+  if (showLinearHint) {
+    accumulateWidth(line7);
+  }
+  drawHudBackdrop(leftX - 8.0f,
+                  line7Y - 6.0f,
+                  leftX + blockWidth + 10.0f,
+                  line1Y + 8.0f,
+                  0.11f);
+
+  if (renderer.available) {
+    drawHudTextLine(renderer, line1, leftX, line1Y, scale, 0.74f, 0.93f, 0.95f, 0.98f);
+    drawHudTextLine(renderer, line2, leftX, line2Y, scale, 0.66f, 0.89f, 0.94f, 0.94f);
+    drawHudTextLine(renderer, line3, leftX, line3Y, scale, 0.62f, 0.87f, 0.90f, 0.92f);
+    drawHudTextLine(renderer, line4, leftX, line4Y, scale, 0.62f, 0.87f, 0.90f, 0.92f);
+    drawHudTextLine(renderer, line5, leftX, line5Y, scale, 0.60f, 0.85f, 0.88f, 0.90f);
+    drawHudTextLine(renderer, line6, leftX, line6Y, scale, 0.58f, 0.83f, 0.86f, 0.84f);
+    if (showLinearHint) {
+      drawHudTextLine(renderer, line7, leftX, line7Y, scale, 0.56f, 0.96f, 0.88f, 0.78f);
+    }
+  } else {
+    glColor4f(0.0f, 0.0f, 0.0f, 0.32f);
+    drawScreenText(line1, leftX + 1.5f, line1Y - 1.5f, scale);
+    drawScreenText(line2, leftX + 1.5f, line2Y - 1.5f, scale);
+    drawScreenText(line3, leftX + 1.5f, line3Y - 1.5f, scale);
+    drawScreenText(line4, leftX + 1.5f, line4Y - 1.5f, scale);
+    drawScreenText(line5, leftX + 1.5f, line5Y - 1.5f, scale);
+    drawScreenText(line6, leftX + 1.5f, line6Y - 1.5f, scale);
+    if (showLinearHint) drawScreenText(line7, leftX + 1.5f, line7Y - 1.5f, scale);
+    glColor4f(0.93f, 0.95f, 0.98f, 0.74f);
+    drawScreenText(line1, leftX, line1Y, scale);
+    glColor4f(0.85f, 0.88f, 0.93f, 0.60f);
+    drawScreenText(line2, leftX, line2Y, scale);
+    drawScreenText(line3, leftX, line3Y, scale);
+    drawScreenText(line4, leftX, line4Y, scale);
+    drawScreenText(line5, leftX, line5Y, scale);
+    glColor4f(0.82f, 0.86f, 0.89f, 0.58f);
+    drawScreenText(line6, leftX, line6Y, scale);
+    if (showLinearHint) {
+      glColor4f(0.96f, 0.88f, 0.78f, 0.56f);
+      drawScreenText(line7, leftX, line7Y, scale);
+    }
+  }
+
+  if (presentationMode == GlossViewPresentationMode::Projection3D && payload.glossSpatialInset) {
+    drawGlossLiftSpatialInsetOverlay(width, height, payload, mesh, renderer, colorMode, debugMode);
   }
 
   glDisable(GL_BLEND);
@@ -7192,8 +9660,19 @@ void mouseButtonCallback(GLFWwindow* window, int button, int action, int mods) {
                        glfwGetKey(window, GLFW_KEY_RIGHT_SHIFT) == GLFW_PRESS ||
                        nativeShiftModifierPressed();
     if (shift) {
-      const int nextOrthoView = app->cam.orthographic ? (app->cam.orthographicView + 1) : 0;
-      setOrthographicInspectionCamera(&app->cam, nextOrthoView);
+      if (isGlossViewPlotModeString(app->plotMode)) {
+        if (app->cam.orthographic) syncGlossViewOrthographicState(&app->cam);
+        const int nextOrthoView =
+            (!app->cam.orthographic || app->cam.orthographicView < 0) ? kGlossViewOrthoLeft
+                                                                       : ((app->cam.orthographicView + 1) % 3);
+        setGlossViewOrthographicCamera(&app->cam, nextOrthoView);
+        requestGlossViewOrthoInspectionFit(app);
+      } else {
+        if (app->cam.orthographic) syncOrthographicStateForPlotMode(app->plotMode, &app->cam);
+        const int nextOrthoView =
+            (!app->cam.orthographic || app->cam.orthographicView < 0) ? 0 : ((app->cam.orthographicView + 1) % 3);
+        setOrthographicInspectionCamera(&app->cam, nextOrthoView);
+      }
     } else {
       app->modelOrientation = Quat{};
       if (ctrl) {
@@ -7203,6 +9682,8 @@ void mouseButtonCallback(GLFWwindow* window, int button, int action, int mods) {
         resetVectorscopeCamera(&app->cam);
       } else if (app->plotMode == "chromaticity") {
         resetChromaticityVectorscopeCamera(&app->cam);
+      } else if (isGlossViewPlotModeString(app->plotMode)) {
+        resetGlossLiftCamera(&app->cam);
       } else if (app->plotMode == "chen") {
         resetChenVectorscopeCamera(&app->cam);
       } else if (app->plotMode == "jp_conical" || app->plotMode == "reuleaux") {
@@ -7215,6 +9696,8 @@ void mouseButtonCallback(GLFWwindow* window, int button, int action, int mods) {
         resetHslCamera(&app->cam);
       } else if (app->plotMode == "chromaticity") {
         resetChromaticityCamera(&app->cam);
+      } else if (isGlossViewPlotModeString(app->plotMode)) {
+        resetGlossLiftCamera(&app->cam);
       } else if (app->plotMode == "chen") {
         resetChenCamera(&app->cam);
       } else {
@@ -7232,6 +9715,7 @@ void mouseButtonCallback(GLFWwindow* window, int button, int action, int mods) {
     app->orientAxisLock = 0;
     app->orientAxisFeedbackUntil = 0.0;
     app->rollFeedbackUntil = 0.0;
+    resetGlossViewOrthoInteractionState(app);
   }
   app->lastClick = now;
 }
@@ -7274,6 +9758,7 @@ void cursorPosCallback(GLFWwindow* window, double xpos, double ypos) {
     app->panVelocityY = 0.0f;
     app->orientAxisLock = 0;
     app->orientAxisFeedbackUntil = 0.0;
+    resetGlossViewOrthoInteractionState(app);
   } else if (!anyDown && app->leftDown) {
     app->leftDown = false;
     app->panMode = false;
@@ -7285,6 +9770,7 @@ void cursorPosCallback(GLFWwindow* window, double xpos, double ypos) {
     app->orientAxisLock = 0;
     app->orientAxisFeedbackUntil = 0.0;
     app->rollFeedbackUntil = 0.0;
+    resetGlossViewOrthoInteractionState(app);
   }
 
   if (!app->leftDown) return;
@@ -7390,6 +9876,63 @@ void cursorPosCallback(GLFWwindow* window, double xpos, double ypos) {
     app->cam.qw = q.w;
   };
   if (lockView) {
+    const bool orthographicSnapMode = app->cam.orthographic;
+    if (orthographicSnapMode) {
+      syncOrthographicStateForPlotMode(app->plotMode, &app->cam);
+      if (app->cam.orthographicView >= 0) {
+        if (!app->glossOrthoSnapAnchorValid) {
+          app->glossOrthoSnapAnchor = orthographicQuaternionForPlotMode(app->plotMode, app->cam.orthographicView);
+          app->glossOrthoSnapAnchorValid = true;
+          app->glossOrthoSnapAccumAngle = 0.0f;
+          app->glossOrthoSnapEngaged = true;
+          app->glossOrthoSnapQuarterTurns = 0;
+        }
+        float yawAngle =
+            (dx * 3.14159265358979323846f / static_cast<float>(std::max(1, width))) * angleScale;
+        float pitchAngle =
+            (dy * 3.14159265358979323846f / static_cast<float>(std::max(1, height))) * angleScale;
+        const float absDx = std::fabs(dx);
+        const float absDy = std::fabs(dy);
+        int nextAxisLock = app->orientAxisLock;
+        if (nextAxisLock == 0) {
+          nextAxisLock = (absDx >= absDy) ? 1 : 2;
+        }
+        if (app->orientAxisLock != nextAxisLock) {
+          app->orientAxisLock = nextAxisLock;
+          app->orientAxisFeedbackUntil = glfwGetTime() + 0.18;
+        }
+        const float deltaAngle = nextAxisLock == 1 ? yawAngle : pitchAngle;
+        app->glossOrthoSnapAccumAngle += deltaAngle;
+        constexpr float kQuarterTurn = 3.14159265358979323846f * 0.5f;
+        constexpr float kSnapEngage = 8.0f * 3.14159265358979323846f / 180.0f;
+        constexpr float kSnapRelease = 12.0f * 3.14159265358979323846f / 180.0f;
+        if (app->glossOrthoSnapEngaged) {
+          const float snappedTarget = static_cast<float>(app->glossOrthoSnapQuarterTurns) * kQuarterTurn;
+          if (std::fabs(app->glossOrthoSnapAccumAngle - snappedTarget) > kSnapRelease) {
+            app->glossOrthoSnapEngaged = false;
+          }
+        }
+        if (!app->glossOrthoSnapEngaged) {
+          const int candidateQuarterTurns =
+              static_cast<int>(std::lround(app->glossOrthoSnapAccumAngle / kQuarterTurn));
+          const float snappedTarget = static_cast<float>(candidateQuarterTurns) * kQuarterTurn;
+          if (std::fabs(app->glossOrthoSnapAccumAngle - snappedTarget) <= kSnapEngage) {
+            app->glossOrthoSnapEngaged = true;
+            app->glossOrthoSnapQuarterTurns = candidateQuarterTurns;
+          }
+        }
+        const float effectiveAngle =
+            app->glossOrthoSnapEngaged
+                ? (static_cast<float>(app->glossOrthoSnapQuarterTurns) * kQuarterTurn)
+                : app->glossOrthoSnapAccumAngle;
+        const Vec3 rotationAxis = nextAxisLock == 1 ? Vec3{0.0f, 1.0f, 0.0f} : Vec3{1.0f, 0.0f, 0.0f};
+        const Quat delta = axisAngleQ(rotationAxis, effectiveAngle);
+        commitOrientation(normalizeQ(mulQ(delta, app->glossOrthoSnapAnchor)));
+        syncOrthographicStateForPlotMode(app->plotMode, &app->cam);
+        return;
+      }
+      resetGlossViewOrthoInteractionState(app);
+    }
     Quat next = cur;
     float yawAngle = (dx * 3.14159265358979323846f / static_cast<float>(std::max(1, width))) * angleScale;
     float pitchAngle = (dy * 3.14159265358979323846f / static_cast<float>(std::max(1, height))) * angleScale;
@@ -7426,6 +9969,27 @@ void cursorPosCallback(GLFWwindow* window, double xpos, double ypos) {
     if (std::fabs(pitchAngle) > 1e-6f) {
       const Quat qViewPitch = axisAngleQ(Vec3{1.0f, 0.0f, 0.0f}, pitchAngle);
       next = normalizeQ(mulQ(qViewPitch, next));
+    }
+    constexpr float kAssistSnapEngage = 8.0f;
+    constexpr float kAssistSnapRelease = 12.0f;
+    if (app->orthographicAssistTargetValid) {
+      const float activeAngle = quaternionAngularDifferenceDegrees(next, app->orthographicAssistTarget);
+      if (activeAngle <= kAssistSnapRelease) {
+        next = app->orthographicAssistTarget;
+      } else {
+        app->orthographicAssistTargetValid = false;
+        app->orthographicAssistTargetView = -1;
+      }
+    }
+    if (!app->orthographicAssistTargetValid) {
+      float nearestAngle = std::numeric_limits<float>::max();
+      const int nearestView = nearestOrthographicAssistView(app->plotMode, next, &nearestAngle);
+      if (nearestView >= 0 && nearestAngle <= kAssistSnapEngage) {
+        app->orthographicAssistTarget = orthographicQuaternionForPlotMode(app->plotMode, nearestView);
+        app->orthographicAssistTargetValid = true;
+        app->orthographicAssistTargetView = nearestView;
+        next = app->orthographicAssistTarget;
+      }
     }
     commitOrientation(next);
     return;
@@ -7895,6 +10459,21 @@ int main() {
             app.panMode = false;
             app.shiftPanGesture = false;
             logViewerEvent("Applied default orthographic chart view for chromaticity mode.");
+          } else if (prevPlotMode != resolved.plotMode && isGlossViewPlotModeString(resolved.plotMode)) {
+            resetGlossLiftCamera(&app.cam);
+            app.glossViewPresentation = GlossViewPresentationMode::Field2D;
+            app.glossViewColorMode = GlossViewColorMode::SemanticSignal;
+            app.glossViewDebugFieldMode = GlossViewDebugFieldMode::Signal;
+            app.modelOrientation = Quat{};
+            app.panVelocityX = 0.0f;
+            app.panVelocityY = 0.0f;
+            app.orientAxisLock = 0;
+            app.orientAxisFeedbackUntil = 0.0;
+            app.rollMode = false;
+            app.zoomMode = false;
+            app.panMode = false;
+            app.shiftPanGesture = false;
+            logViewerEvent("Applied default spatial view for Gloss View mode.");
           }
           if (app.diagTransitions && prevSourceMode != resolved.sourceMode) {
             std::ostringstream os;
@@ -8125,7 +10704,23 @@ int main() {
       title << " | Overlay " << resolved.identityOverlaySize << "^3";
       if (resolved.identityOverlayRamp) title << " + Ramp";
     }
-    if (const char* orthoLabel = orthographicViewLabel(app.cam)) {
+    const bool glossViewModeForTitle = isGlossViewPlotModeString(resolved.plotMode);
+    const bool glossProjection3DForTitle =
+        glossViewModeForTitle && app.glossViewPresentation == GlossViewPresentationMode::Projection3D;
+    if (glossViewModeForTitle) {
+      title << " | " << glossViewPresentationLabel(app.glossViewPresentation);
+      if (app.glossViewDebugFieldMode != GlossViewDebugFieldMode::Signal) {
+        title << " | " << glossViewDebugFieldLabel(app.glossViewDebugFieldMode);
+      }
+    }
+    if (app.cam.orthographic && (!glossViewModeForTitle || glossProjection3DForTitle)) {
+      syncOrthographicStateForPlotMode(resolved.plotMode, &app.cam);
+    }
+    const char* orthoLabel =
+        (glossViewModeForTitle && !glossProjection3DForTitle)
+            ? nullptr
+            : (glossViewModeForTitle ? glossViewOrthographicViewLabel(app.cam) : orthographicViewLabel(app.cam));
+    if (orthoLabel != nullptr) {
       title << " | " << orthoLabel;
     }
     if (!mesh.paramHash.empty()) title << " | hash " << mesh.paramHash;
@@ -8209,39 +10804,66 @@ int main() {
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
     const HudTextRenderer* overlayTextRenderer = preferredHudRenderer(&hudText, &hudSymbolText);
-    drawGuideForPlotMode(resolved, app.cam, height, fovy, overlayTextRenderer);
+    const bool glossViewMode = isGlossViewPlotModeString(resolved.plotMode);
+    const bool glossField2DMode =
+        glossViewMode && app.glossViewPresentation == GlossViewPresentationMode::Field2D;
+    const bool glossProjection3DMode =
+        glossViewMode && app.glossViewPresentation == GlossViewPresentationMode::Projection3D;
+    if (!glossField2DMode) {
+      drawGuideForPlotMode(resolved, app.cam, height, fovy, overlayTextRenderer);
+    }
 
     // Viewer-side draw tuning intentionally stays separate from OFX sampling quality:
     // density controls how many received points are shown, while point size/halo keep the cloud legible.
     const float densityForView = std::max(0.35f, resolved.pointDensity);
-    const PointSelectionSpec pointSelection =
-        makePointSelectionSpec(mesh.serial, mesh.pointCount, densityForView);
+    PointSelectionSpec pointSelection{};
     const float* activePointVerts = mesh.pointVerts.empty() ? nullptr : mesh.pointVerts.data();
     const float* activePointColors = mesh.pointColors.empty() ? nullptr : mesh.pointColors.data();
     size_t activePointCount = mesh.pointCount;
-    const bool sampledDrawReady =
-        buildInputPointDrawBuffers(mesh,
-                                   pointSelection,
-                                   app.gpuCaps,
-                                   &app.computeSession,
-                                   inputCloudComputeCache,
-                                   &inputCloudSampleComputeCache,
+    std::vector<float> glossProjectionVerts;
+    std::vector<float> glossProjectionColors;
+    bool sampledDrawReady = false;
+    bool useSampledCpuArrays = false;
+    if (glossProjection3DMode) {
+      buildGlossViewProjectionCpuDrawArrays(mesh,
+                                            resolved,
+                                            app.glossViewColorMode,
+                                            app.glossViewDebugFieldMode,
+                                            &glossProjectionVerts,
+                                            &glossProjectionColors);
+      activePointVerts = glossProjectionVerts.empty() ? nullptr : glossProjectionVerts.data();
+      activePointColors = glossProjectionColors.empty() ? nullptr : glossProjectionColors.data();
+      activePointCount = glossProjectionVerts.size() / 3u;
+    } else if (!glossViewMode) {
+      pointSelection = makePointSelectionSpec(mesh, densityForView);
+      sampledDrawReady =
+          buildInputPointDrawBuffers(mesh,
+                                     pointSelection,
+                                     app.gpuCaps,
+                                     &app.computeSession,
+                                     inputCloudComputeCache,
+                                     &inputCloudSampleComputeCache,
 #if defined(CHROMASPACE_VIEWER_HAS_CUDA) && !defined(__APPLE__)
-                                   &inputCloudCudaCache,
-                                   &inputCloudSampleCudaCache,
+                                     &inputCloudCudaCache,
+                                     &inputCloudSampleCudaCache,
 #endif
-                                   &inputCloudSampleMetalCache,
-                                   app.diagTransitions,
-                                   &sampledPointDraw);
-    const bool useSampledCpuArrays = sampledDrawReady && sampledPointDraw.available &&
-                                     sampledPointDraw.verts == 0 && sampledPointDraw.colors == 0 &&
-                                     !sampledPointDraw.cpuVerts.empty() && !sampledPointDraw.cpuColors.empty();
-    if (useSampledCpuArrays) {
-      activePointVerts = sampledPointDraw.cpuVerts.data();
-      activePointColors = sampledPointDraw.cpuColors.data();
-      activePointCount = sampledPointDraw.pointCount;
-    } else if (pointSelection.needsThinning && sampledDrawReady) {
-      activePointCount = sampledPointDraw.pointCount;
+                                     &inputCloudSampleMetalCache,
+                                     app.diagTransitions,
+                                     &sampledPointDraw);
+      useSampledCpuArrays = sampledDrawReady && sampledPointDraw.available &&
+                            sampledPointDraw.verts == 0 && sampledPointDraw.colors == 0 &&
+                            !sampledPointDraw.cpuVerts.empty() && !sampledPointDraw.cpuColors.empty();
+      if (useSampledCpuArrays) {
+        activePointVerts = sampledPointDraw.cpuVerts.data();
+        activePointColors = sampledPointDraw.cpuColors.data();
+        activePointCount = sampledPointDraw.pointCount;
+      } else if (pointSelection.needsThinning && sampledDrawReady) {
+        activePointCount = sampledPointDraw.pointCount;
+      }
+    } else {
+      activePointVerts = nullptr;
+      activePointColors = nullptr;
+      activePointCount = 0;
     }
     float pointSize = 2.5f;
     if (mesh.resolution <= 25) pointSize = 3.3f;
@@ -8249,9 +10871,12 @@ int main() {
     pointSize *= std::max(0.5f, resolved.pointSize);
     pointSize *= std::pow(densityForView, -0.12f);
     // Compensate for perspective zoom without over-growing points at close distances.
-    const float zoomComp = clampf(std::pow(6.0f / std::max(0.2f, app.cam.distance), 0.52f), 0.90f, 2.35f);
+    const float zoomComp =
+        (glossViewMode && app.cam.orthographic)
+            ? 1.0f
+            : clampf(std::pow(6.0f / std::max(0.2f, app.cam.distance), 0.52f), 0.90f, 2.35f);
     pointSize = clampf(pointSize * zoomComp, 1.0f, 24.0f);
-    const bool useSquarePoints = resolved.pointShape == "Square";
+    const bool useSquarePoints = !glossViewMode && resolved.pointShape == "Square";
     const bool plainScopeStyle = resolved.plotStyle != "Space";
     const float drawCoverage =
         estimatedPointCoverage(pointSize, activePointCount, width, height, useSquarePoints);
@@ -8293,6 +10918,7 @@ int main() {
         overlayMesh.pointCount > 0 && ensurePointBufferCacheUploaded(overlayMesh, &overlayPointBufferCache);
 #if defined(CHROMASPACE_VIEWER_HAS_CUDA) && !defined(__APPLE__)
     const bool useInputCudaBuffers =
+        !glossViewMode &&
         !pointSelection.needsThinning &&
         activePointCount == mesh.pointCount && app.gpuCaps.cudaComputeEnabled &&
         inputCloudCudaCache.available &&
@@ -8300,6 +10926,7 @@ int main() {
         inputCloudCudaCache.verts != 0 && inputCloudCudaCache.colors != 0 &&
         inputCloudCudaCache.pointCount > 0;
     const bool useInputSampledCudaBuffers =
+        !glossViewMode &&
         pointSelection.needsThinning && sampledDrawReady && sampledPointDraw.available &&
         app.gpuCaps.cudaComputeEnabled &&
         sampledPointDraw.verts != 0 && sampledPointDraw.colors != 0 &&
@@ -8309,6 +10936,7 @@ int main() {
     const bool useInputSampledCudaBuffers = false;
 #endif
     const bool useInputComputeBuffers =
+        !glossViewMode &&
         !useInputCudaBuffers &&
         !useInputSampledCudaBuffers &&
         !pointSelection.needsThinning &&
@@ -8319,11 +10947,13 @@ int main() {
         inputCloudComputeCache.colors != 0 &&
         inputCloudComputeCache.pointCount > 0;
     const bool useInputSampledComputeBuffers =
+        !glossViewMode &&
         !useInputSampledCudaBuffers &&
         pointSelection.needsThinning && sampledDrawReady && sampledPointDraw.available &&
         sampledPointDraw.verts != 0 && sampledPointDraw.colors != 0 &&
         sampledPointDraw.pointCount == activePointCount;
     const bool usePointBuffers =
+        !glossViewMode &&
         !useInputCudaBuffers &&
         !useInputComputeBuffers &&
         !useInputSampledCudaBuffers &&
@@ -8333,25 +10963,32 @@ int main() {
     const bool haveDrawablePointSource = useInputSampledCudaBuffers || useInputSampledComputeBuffers ||
                                          useInputCudaBuffers || useInputComputeBuffers || usePointBuffers ||
                                          (activePointVerts != nullptr && activePointColors != nullptr);
+    std::vector<float> glossBodyGuideDrawColors;
     const float drawColorSaturation =
         effectiveColorSaturationForPlot(resolved.colorSaturation, resolved.pointSize, densityForView, mesh.resolution);
-    const float drawBrightnessTrim =
+    float drawBrightnessTrim =
         displaySaturationBrightnessTrim(drawColorSaturation, resolved.pointSize, densityForView, mesh.resolution);
-    const float drawAlphaGain =
+    if (glossViewMode) drawBrightnessTrim = std::max(0.96f, drawBrightnessTrim * 1.08f);
+    float drawAlphaGain =
         drawAlphaGainForPointSize(pointSize, densityForView, mesh.resolution, activePointCount, width, height, useSquarePoints) *
-        (plainScopeStyle ? 1.0f : 0.84f);
+        (glossViewMode ? 1.0f : (plainScopeStyle ? 1.0f : 0.84f));
+    if (glossViewMode) drawAlphaGain = std::max(1.12f, drawAlphaGain * 1.24f);
     const bool usePointRenderProgram =
-        plainScopeStyle && haveDrawablePointSource && ensurePointRenderProgram(&pointRenderProgramCache);
-    const bool occlusiveInputCloud = resolved.sourceMode == "input" && plainScopeStyle;
-    if (useSquarePoints || usePointRenderProgram) {
+        haveDrawablePointSource && ensurePointRenderProgram(&pointRenderProgramCache) &&
+        (glossViewMode || plainScopeStyle);
+    const bool occlusiveInputCloud = resolved.sourceMode == "input" && plainScopeStyle && !glossViewMode;
+    if (useSquarePoints || usePointRenderProgram || glossViewMode) {
       glDisable(GL_POINT_SMOOTH);
     } else {
       glEnable(GL_POINT_SMOOTH);
       glHint(GL_POINT_SMOOTH_HINT, GL_NICEST);
     }
-    if (app.fitVolumeRequested) {
+    auto applyCurrentCameraFit = [&]() -> bool {
       bool fitApplied = false;
-      if (mesh.hasFitBounds) {
+      if (glossProjection3DMode && activePointVerts != nullptr && activePointCount > 0) {
+        fitCameraToPoints(&app.cam, app.modelOrientation, activePointVerts, activePointCount, width, height);
+        fitApplied = true;
+      } else if (mesh.hasFitBounds) {
         fitApplied = fitCameraToBounds(&app.cam, app.modelOrientation, mesh.fitMin, mesh.fitMax, width, height);
       }
       const float* fitVerts = mesh.pointVerts.empty() ? activePointVerts : mesh.pointVerts.data();
@@ -8367,8 +11004,25 @@ int main() {
           cloudMatchesResolved(resolved, currentCloud) &&
           buildInputCloudFitMeshCpu(resolved, currentCloud, &fitMesh) &&
           fitMesh.hasFitBounds) {
-        fitCameraToBounds(&app.cam, app.modelOrientation, fitMesh.fitMin, fitMesh.fitMax, width, height);
+        fitApplied = fitCameraToBounds(&app.cam, app.modelOrientation, fitMesh.fitMin, fitMesh.fitMax, width, height);
       }
+      return fitApplied;
+    };
+    if (app.glossOrthoAutoFitRequested &&
+        (!isGlossViewPlotModeString(resolved.plotMode) || !app.cam.orthographic)) {
+      app.glossOrthoAutoFitRequested = false;
+    }
+    if (app.glossOrthoAutoFitRequested &&
+        isGlossViewPlotModeString(resolved.plotMode) &&
+        app.cam.orthographic &&
+        applyCurrentCameraFit()) {
+      app.cam.distance = clampf(app.cam.distance * 1.20f,
+                                minCameraDistanceForView(app.cam),
+                                kMaxCameraDistance);
+      app.glossOrthoAutoFitRequested = false;
+    }
+    if (app.fitVolumeRequested) {
+      applyCurrentCameraFit();
       app.fitVolumeRequested = false;
     }
     const std::string drawSourceLabel = pointDrawSourceLabel(useInputCudaBuffers,
@@ -8388,17 +11042,58 @@ int main() {
       app.lastDrawSourceLabel = drawSourceLabel;
     }
     glPointSize(pointSize);
+    auto drawGlossBodyGuide = [&]() {
+      if (!glossViewMode || mesh.hasGlossField ||
+          mesh.glossBodyGuidePointCount == 0 || mesh.glossBodyGuideVerts.empty() ||
+          mesh.glossBodyGuideColors.empty() || resolved.glossBodyOpacity <= 1e-4f) {
+        return;
+      }
+      glossBodyGuideDrawColors = mesh.glossBodyGuideColors;
+      for (size_t i = 3u; i < glossBodyGuideDrawColors.size(); i += 4u) {
+        glossBodyGuideDrawColors[i] = clampf(glossBodyGuideDrawColors[i] * resolved.glossBodyOpacity, 0.0f, 1.0f);
+      }
+      glBufferApi.bindBuffer(GL_ARRAY_BUFFER, 0);
+      glVertexPointer(3, GL_FLOAT, 0, mesh.glossBodyGuideVerts.data());
+      glColorPointer(4, GL_FLOAT, 0, glossBodyGuideDrawColors.data());
+      glDisable(GL_POINT_SMOOTH);
+      glEnable(GL_BLEND);
+      glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+      glEnable(GL_DEPTH_TEST);
+      glDepthMask(GL_TRUE);
+      glPointSize(clampf(std::max(1.5f, pointSize * 0.90f), 1.5f, 9.0f));
+      glDrawArrays(GL_POINTS, 0, static_cast<GLsizei>(mesh.glossBodyGuidePointCount));
+      glPointSize(pointSize);
+    };
+    if (!glossField2DMode) {
+      drawGlossBodyGuide();
+    }
     if (usePointRenderProgram) {
       const ViewerGlComputeApi& renderApi = viewerGlComputeApi();
       glEnable(GL_VERTEX_PROGRAM_POINT_SIZE);
+#ifdef GL_POINT_SPRITE
+      glEnable(GL_POINT_SPRITE);
+#ifdef GL_COORD_REPLACE
+      glTexEnvi(GL_POINT_SPRITE, GL_COORD_REPLACE, GL_TRUE);
+#endif
+#endif
       renderApi.useProgram(pointRenderProgramCache.program);
       renderApi.uniform1f(pointRenderProgramCache.pointSizeLoc, pointSize);
       renderApi.uniform1f(pointRenderProgramCache.colorSaturationLoc, drawColorSaturation);
       renderApi.uniform1f(pointRenderProgramCache.brightnessTrimLoc, drawBrightnessTrim);
       renderApi.uniform1f(pointRenderProgramCache.alphaGainLoc, drawAlphaGain);
+      renderApi.uniform1f(pointRenderProgramCache.layerAlphaScaleLoc, 1.0f);
+      renderApi.uniform1f(pointRenderProgramCache.pointCrispnessLoc, glossViewMode ? resolved.glossPointCrispness : 0.0f);
+      renderApi.uniform1f(pointRenderProgramCache.glossModeLoc, glossViewMode ? 1.0f : 0.0f);
       renderApi.uniform1f(pointRenderProgramCache.occlusiveModeLoc, occlusiveInputCloud ? 1.0f : 0.0f);
     }
-    if (plainScopeStyle) {
+    if (glossProjection3DMode) {
+      glEnable(GL_BLEND);
+      glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+      glEnable(GL_DEPTH_TEST);
+      glDepthMask(GL_TRUE);
+    } else if (glossField2DMode) {
+      glDepthMask(GL_FALSE);
+    } else if (plainScopeStyle) {
       glDepthMask(occlusiveInputCloud ? GL_TRUE : GL_FALSE);
       if (occlusiveInputCloud) {
         glDisable(GL_BLEND);
@@ -8441,18 +11136,41 @@ int main() {
       glVertexPointer(3, GL_FLOAT, 0, activePointVerts);
       glColorPointer(4, GL_FLOAT, 0, activePointColors);
     }
-    if (activePointCount > 0 && haveDrawablePointSource) {
+    auto drawPointRange = [&](size_t first, size_t count) {
+      if (count == 0 || !haveDrawablePointSource) return;
+      glDrawArrays(GL_POINTS,
+                   static_cast<GLint>(std::min(first, activePointCount)),
+                   static_cast<GLsizei>(std::min(count, activePointCount - std::min(first, activePointCount))));
+    };
+    if (glossProjection3DMode) {
+      const ViewerGlComputeApi& renderApi = viewerGlComputeApi();
+      if (usePointRenderProgram) {
+        renderApi.uniform1f(pointRenderProgramCache.layerAlphaScaleLoc, resolved.glossHighlightOpacity);
+        renderApi.uniform1f(pointRenderProgramCache.pointCrispnessLoc, resolved.glossPointCrispness);
+        renderApi.uniform1f(pointRenderProgramCache.glossModeLoc, 1.0f);
+      }
+      glDepthMask(GL_TRUE);
+      drawPointRange(0u, activePointCount);
+    } else if (activePointCount > 0 && haveDrawablePointSource) {
       glDrawArrays(GL_POINTS, 0, static_cast<GLsizei>(activePointCount));
     }
     if (usePointRenderProgram) {
       const ViewerGlComputeApi& renderApi = viewerGlComputeApi();
+      renderApi.uniform1f(pointRenderProgramCache.layerAlphaScaleLoc, 1.0f);
+      renderApi.uniform1f(pointRenderProgramCache.glossModeLoc, 0.0f);
       renderApi.useProgram(0);
+#ifdef GL_POINT_SPRITE
+#ifdef GL_COORD_REPLACE
+      glTexEnvi(GL_POINT_SPRITE, GL_COORD_REPLACE, GL_FALSE);
+#endif
+      glDisable(GL_POINT_SPRITE);
+#endif
       glDisable(GL_VERTEX_PROGRAM_POINT_SIZE);
       if (!occlusiveInputCloud) glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
     }
     if (occlusiveInputCloud) glEnable(GL_BLEND);
     glDepthMask(GL_TRUE);
-    if (activePointCount > 0 && haveDrawablePointSource) {
+    if (!glossViewMode && activePointCount > 0 && haveDrawablePointSource) {
       glDisable(GL_DEPTH_TEST);
       glDisableClientState(GL_COLOR_ARRAY);
       if (!plainScopeStyle) {
@@ -8492,7 +11210,28 @@ int main() {
       glEnableClientState(GL_COLOR_ARRAY);
       glEnable(GL_DEPTH_TEST);
     }
-    if (resolved.showOverflow && resolved.highlightOverflow &&
+    if (mesh.lineVertexCount > 0 &&
+        mesh.lineVerts.size() >= mesh.lineVertexCount * 3u &&
+        mesh.lineColors.size() >= mesh.lineVertexCount * 4u) {
+      if (useOverlayCudaBuffers || useOverlayComputeBuffers || useOverlayPointBuffers ||
+          useInputSampledCudaBuffers || useInputSampledComputeBuffers ||
+          useInputCudaBuffers || useInputComputeBuffers || usePointBuffers) {
+        glBufferApi.bindBuffer(GL_ARRAY_BUFFER, 0);
+      }
+      glEnable(GL_BLEND);
+      glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+      glEnable(GL_DEPTH_TEST);
+      glDepthMask(GL_FALSE);
+      glEnable(GL_LINE_SMOOTH);
+      glHint(GL_LINE_SMOOTH_HINT, GL_NICEST);
+      glLineWidth(clampf(0.95f + pointSize * 0.18f, 0.9f, 1.8f));
+      glVertexPointer(3, GL_FLOAT, 0, mesh.lineVerts.data());
+      glColorPointer(4, GL_FLOAT, 0, mesh.lineColors.data());
+      glDrawArrays(GL_LINES, 0, static_cast<GLsizei>(mesh.lineVertexCount));
+      glDisable(GL_LINE_SMOOTH);
+      glDepthMask(GL_TRUE);
+    }
+    if (!glossViewMode && resolved.showOverflow && resolved.highlightOverflow &&
         activePointCount > 0 &&
         activePointVerts != nullptr && activePointColors != nullptr) {
       std::vector<float> overflowVerts;
@@ -8566,6 +11305,15 @@ int main() {
     glDisableClientState(GL_COLOR_ARRAY);
     glDisableClientState(GL_VERTEX_ARRAY);
 
+    if (glossField2DMode) {
+      drawGlossViewFieldOverlay(width,
+                                height,
+                                resolved,
+                                mesh,
+                                app.glossViewColorMode,
+                                app.glossViewDebugFieldMode);
+    }
+
     if (resolved.plotMode == "chromaticity") {
       const double hoverScaleX = static_cast<double>(width) / static_cast<double>(std::max(1, windowWidth));
       const double hoverScaleY = static_cast<double>(height) / static_cast<double>(std::max(1, windowHeight));
@@ -8575,6 +11323,16 @@ int main() {
                                   app.hoverX * hoverScaleX,
                                   app.hoverY * hoverScaleY,
                                   overlayTextRenderer ? *overlayTextRenderer : hudText);
+    }
+    if (isGlossViewPlotModeString(resolved.plotMode)) {
+      drawGlossLiftInfoOverlay(width,
+                               height,
+                               resolved,
+                               mesh,
+                               overlayTextRenderer ? *overlayTextRenderer : hudText,
+                               app.glossViewPresentation,
+                               app.glossViewColorMode,
+                               app.glossViewDebugFieldMode);
     }
 
     int indicatorSlot = 0;
