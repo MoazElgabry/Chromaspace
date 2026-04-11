@@ -329,7 +329,7 @@ void notifyExistingViewerBringToFront() {
 }
 #endif
 
-const char* kViewerVersionString = "v1.0.7Beta";
+const char* kViewerVersionString = "v1.0.8 Beta";
 
 #if !defined(_WIN32)
 bool sendAllSocket(int fd, const char* data, size_t size) {
