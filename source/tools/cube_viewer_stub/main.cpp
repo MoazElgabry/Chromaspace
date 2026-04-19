@@ -10,6 +10,7 @@
 #include <cstring>
 #include <filesystem>
 #include <mutex>
+#include <numeric>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -281,9 +282,8 @@ bool glossViewCudaFieldPathEnabled() {
 }
 
 bool glossViewMetalFieldPathEnabled() {
-  // Safety rollback: the staged Metal Gloss View field path caused a severe black-screen / Resolve-crash report
-  // and stays disabled by default until it has been validated on real macOS hardware.
-  return false;
+  // Metal Gloss View is enabled by default again, but can still be disabled explicitly for diagnosis.
+  return !viewerEnvFlagEnabled("CHROMASPACE_DISABLE_GLOSS_VIEW_METAL_FIELD", false);
 }
 
 void logViewerDiagnostic(bool enabled, const std::string& msg) {
@@ -329,7 +329,7 @@ void notifyExistingViewerBringToFront() {
 }
 #endif
 
-const char* kViewerVersionString = "v1.0.8 Beta";
+const char* kViewerVersionString = "v1.0.9 Beta";
 
 #if !defined(_WIN32)
 bool sendAllSocket(int fd, const char* data, size_t size) {
@@ -644,43 +644,62 @@ void resetHslTopCamera(CameraState* cam) {
   cam->distance = 5.7f;
 }
 
-constexpr int kGlossViewOrthoLeft = 0;
-constexpr int kGlossViewOrthoFront = 1;
-constexpr int kGlossViewOrthoTop = 2;
+constexpr int kOrthoFaceFront = 0;
+constexpr int kOrthoFaceLeft = 1;
+constexpr int kOrthoFaceTop = 2;
+constexpr int kOrthoFaceBack = 3;
+constexpr int kOrthoFaceRight = 4;
+constexpr int kOrthoFaceBottom = 5;
+
+constexpr int kGlossViewOrthoLeft = kOrthoFaceLeft;
+constexpr int kGlossViewOrthoFront = kOrthoFaceFront;
+constexpr int kGlossViewOrthoTop = kOrthoFaceTop;
 
 void setCameraQuaternion(CameraState* cam, Quat q);
 bool isGlossViewPlotModeString(const std::string& plotMode);
 
 Quat orthographicInspectionQuaternion(int viewIndex) {
   const float deg2rad = 3.14159265358979323846f / 180.0f;
-  switch (((viewIndex % 3) + 3) % 3) {
-    case 0:
+  switch (((viewIndex % 6) + 6) % 6) {
+    case kOrthoFaceFront:
       return Quat{};
-    case 1:
+    case kOrthoFaceLeft:
       return normalizeQ(axisAngleQ(Vec3{0.0f, 1.0f, 0.0f}, 90.0f * deg2rad));
-    case 2:
-    default:
+    case kOrthoFaceTop:
       return normalizeQ(axisAngleQ(Vec3{1.0f, 0.0f, 0.0f}, -90.0f * deg2rad));
+    case kOrthoFaceBack:
+      return normalizeQ(axisAngleQ(Vec3{0.0f, 1.0f, 0.0f}, 180.0f * deg2rad));
+    case kOrthoFaceRight:
+      return normalizeQ(axisAngleQ(Vec3{0.0f, 1.0f, 0.0f}, -90.0f * deg2rad));
+    case kOrthoFaceBottom:
+    default:
+      return normalizeQ(axisAngleQ(Vec3{1.0f, 0.0f, 0.0f}, 90.0f * deg2rad));
   }
 }
 
 Quat glossViewOrthographicQuaternion(int viewIndex) {
   const float deg2rad = 3.14159265358979323846f / 180.0f;
-  switch (((viewIndex % 3) + 3) % 3) {
+  switch (((viewIndex % 6) + 6) % 6) {
     case kGlossViewOrthoLeft:
       return normalizeQ(axisAngleQ(Vec3{0.0f, 1.0f, 0.0f}, 90.0f * deg2rad));
     case kGlossViewOrthoFront:
       return Quat{};
     case kGlossViewOrthoTop:
-    default:
       return normalizeQ(axisAngleQ(Vec3{1.0f, 0.0f, 0.0f}, -90.0f * deg2rad));
+    case kOrthoFaceBack:
+      return normalizeQ(axisAngleQ(Vec3{0.0f, 1.0f, 0.0f}, 180.0f * deg2rad));
+    case kOrthoFaceRight:
+      return normalizeQ(axisAngleQ(Vec3{0.0f, 1.0f, 0.0f}, -90.0f * deg2rad));
+    case kOrthoFaceBottom:
+    default:
+      return normalizeQ(axisAngleQ(Vec3{1.0f, 0.0f, 0.0f}, 90.0f * deg2rad));
   }
 }
 
 void setGlossViewOrthographicCamera(CameraState* cam, int viewIndex) {
   if (!cam) return;
   cam->orthographic = true;
-  cam->orthographicView = ((viewIndex % 3) + 3) % 3;
+  cam->orthographicView = ((viewIndex % 6) + 6) % 6;
   cam->distance = 6.0f;
   cam->panX = 0.0f;
   cam->panY = 0.0f;
@@ -690,6 +709,18 @@ void setGlossViewOrthographicCamera(CameraState* cam, int viewIndex) {
 Quat orthographicQuaternionForPlotMode(const std::string& plotMode, int viewIndex) {
   return isGlossViewPlotModeString(plotMode) ? glossViewOrthographicQuaternion(viewIndex)
                                              : orthographicInspectionQuaternion(viewIndex);
+}
+
+Quat orthographicRolledQuaternionForPlotMode(const std::string& plotMode,
+                                             int viewIndex,
+                                             int quarterTurns) {
+  constexpr float kQuarterTurn = 3.14159265358979323846f * 0.5f;
+  const Quat base = orthographicQuaternionForPlotMode(plotMode, viewIndex);
+  const int wrappedQuarterTurns = ((quarterTurns % 4) + 4) % 4;
+  if (wrappedQuarterTurns == 0) return base;
+  const Quat qRoll = axisAngleQ(Vec3{0.0f, 0.0f, 1.0f},
+                                static_cast<float>(wrappedQuarterTurns) * kQuarterTurn);
+  return normalizeQ(mulQ(qRoll, base));
 }
 
 float quaternionAngularDifferenceDegrees(Quat a, Quat b) {
@@ -702,9 +733,13 @@ float quaternionAngularDifferenceDegrees(Quat a, Quat b) {
 int matchedOrthographicInspectionView(const CameraState& cam, float toleranceDegrees = 1.0f) {
   if (!cam.orthographic) return -1;
   const Quat current = normalizeQ(Quat{cam.qx, cam.qy, cam.qz, cam.qw});
-  for (int viewIndex = 0; viewIndex < 3; ++viewIndex) {
-    if (quaternionAngularDifferenceDegrees(current, orthographicInspectionQuaternion(viewIndex)) <= toleranceDegrees) {
-      return viewIndex;
+  for (int viewIndex = 0; viewIndex < 6; ++viewIndex) {
+    for (int quarterTurns = 0; quarterTurns < 4; ++quarterTurns) {
+      if (quaternionAngularDifferenceDegrees(current,
+                                             orthographicRolledQuaternionForPlotMode("rgb", viewIndex, quarterTurns)) <=
+          toleranceDegrees) {
+        return viewIndex;
+      }
     }
   }
   return -1;
@@ -713,9 +748,14 @@ int matchedOrthographicInspectionView(const CameraState& cam, float toleranceDeg
 int matchedGlossViewOrthographicView(const CameraState& cam, float toleranceDegrees = 1.0f) {
   if (!cam.orthographic) return -1;
   const Quat current = normalizeQ(Quat{cam.qx, cam.qy, cam.qz, cam.qw});
-  for (int viewIndex = 0; viewIndex < 3; ++viewIndex) {
-    if (quaternionAngularDifferenceDegrees(current, glossViewOrthographicQuaternion(viewIndex)) <= toleranceDegrees) {
-      return viewIndex;
+  for (int viewIndex = 0; viewIndex < 6; ++viewIndex) {
+    for (int quarterTurns = 0; quarterTurns < 4; ++quarterTurns) {
+      if (quaternionAngularDifferenceDegrees(current,
+                                             orthographicRolledQuaternionForPlotMode("gloss_view", viewIndex,
+                                                                                     quarterTurns)) <=
+          toleranceDegrees) {
+        return viewIndex;
+      }
     }
   }
   return -1;
@@ -742,6 +782,9 @@ const char* glossViewOrthographicViewLabel(const CameraState& cam) {
     case kGlossViewOrthoLeft: return "Ortho Left";
     case kGlossViewOrthoFront: return "Ortho Front";
     case kGlossViewOrthoTop: return "Ortho Top";
+    case kOrthoFaceRight: return "Ortho Right";
+    case kOrthoFaceBack: return "Ortho Back";
+    case kOrthoFaceBottom: return "Ortho Bottom";
     default: return "Ortho Free";
   }
 }
@@ -758,29 +801,37 @@ void setCameraQuaternion(CameraState* cam, Quat q) {
 void setOrthographicInspectionCamera(CameraState* cam, int viewIndex) {
   if (!cam) return;
   cam->orthographic = true;
-  cam->orthographicView = ((viewIndex % 3) + 3) % 3;
+  cam->orthographicView = ((viewIndex % 6) + 6) % 6;
   cam->distance = 6.0f;
   cam->panX = 0.0f;
   cam->panY = 0.0f;
   setCameraQuaternion(cam, orthographicInspectionQuaternion(cam->orthographicView));
 }
 
-int nearestOrthographicAssistView(const std::string& plotMode,
-                                  Quat orientation,
-                                  float* outAngleDegrees = nullptr) {
+struct OrthographicAssistMatch {
+  Quat orientation{};
+  int face = -1;
+  int quarterTurns = 0;
+  float angleDegrees = std::numeric_limits<float>::max();
+};
+
+OrthographicAssistMatch nearestOrthographicAssistMatch(const std::string& plotMode,
+                                                       Quat orientation) {
   orientation = normalizeQ(orientation);
-  float bestAngle = std::numeric_limits<float>::max();
-  int bestView = -1;
-  for (int viewIndex = 0; viewIndex < 3; ++viewIndex) {
-    const float angle =
-        quaternionAngularDifferenceDegrees(orientation, orthographicQuaternionForPlotMode(plotMode, viewIndex));
-    if (angle < bestAngle) {
-      bestAngle = angle;
-      bestView = viewIndex;
+  OrthographicAssistMatch best{};
+  for (int viewIndex = 0; viewIndex < 6; ++viewIndex) {
+    for (int quarterTurns = 0; quarterTurns < 4; ++quarterTurns) {
+      const Quat candidate = orthographicRolledQuaternionForPlotMode(plotMode, viewIndex, quarterTurns);
+      const float angle = quaternionAngularDifferenceDegrees(orientation, candidate);
+      if (angle < best.angleDegrees) {
+        best.orientation = candidate;
+        best.face = viewIndex;
+        best.quarterTurns = quarterTurns;
+        best.angleDegrees = angle;
+      }
     }
   }
-  if (outAngleDegrees) *outAngleDegrees = bestAngle;
-  return bestView;
+  return best;
 }
 
 bool computePointBounds(const float* verts,
@@ -953,9 +1004,12 @@ bool fitCameraToPoints(CameraState* cam,
 const char* orthographicViewLabel(const CameraState& cam) {
   if (!cam.orthographic) return nullptr;
   switch (cam.orthographicView) {
-    case 0: return "Ortho Front";
-    case 1: return "Ortho Side";
-    case 2: return "Ortho Top";
+    case kOrthoFaceFront: return "Ortho Front";
+    case kOrthoFaceLeft: return "Ortho Left";
+    case kOrthoFaceTop: return "Ortho Top";
+    case kOrthoFaceBack: return "Ortho Back";
+    case kOrthoFaceRight: return "Ortho Right";
+    case kOrthoFaceBottom: return "Ortho Bottom";
     default: return "Ortho";
   }
 }
@@ -1028,6 +1082,7 @@ struct ViewerGpuCapabilities {
   bool cudaStartupValidated = false;
   bool metalViewerAvailable = false;
   bool metalQueueReady = false;
+  bool metalGlossFieldStartupValidated = false;
   ViewerComputeBackendKind sessionBackend = ViewerComputeBackendKind::CpuRef;
   std::string activeBackendLabel = "cpu-ref";
   std::string roadmapLabel = "cpu-ref";
@@ -1036,6 +1091,7 @@ struct ViewerGpuCapabilities {
   std::string cudaReason;
   std::string cudaStartupReason;
   std::string metalDeviceName;
+  std::string metalGlossFieldStartupReason;
 };
 
 const ViewerGlBufferApi& viewerGlBufferApi() {
@@ -1331,6 +1387,9 @@ void main() {
 #if defined(CHROMASPACE_VIEWER_HAS_CUDA) && !defined(__APPLE__)
 bool runViewerCudaStartupSelfTest(std::string* reason);
 #endif
+#if defined(__APPLE__)
+bool runViewerMetalGlossFieldStartupSelfTest(std::string* reason);
+#endif
 
 ViewerGpuCapabilities detectViewerGpuCapabilities() {
   ViewerGpuCapabilities caps{};
@@ -1344,6 +1403,11 @@ ViewerGpuCapabilities detectViewerGpuCapabilities() {
   caps.metalViewerAvailable = metalProbe.available;
   caps.metalQueueReady = metalProbe.queueReady;
   caps.metalDeviceName = metalProbe.deviceName != nullptr ? metalProbe.deviceName : "";
+  if (caps.metalQueueReady && inputRequested && glossViewMetalFieldPathEnabled()) {
+    std::string startupReason;
+    caps.metalGlossFieldStartupValidated = runViewerMetalGlossFieldStartupSelfTest(&startupReason);
+    caps.metalGlossFieldStartupReason = startupReason;
+  }
   caps.overlayComputeEnabled = caps.metalQueueReady && overlayRequested;
   caps.inputComputeEnabled = caps.metalQueueReady && inputRequested;
   caps.sessionBackend = caps.metalQueueReady ? ViewerComputeBackendKind::MetalCompute
@@ -1395,6 +1459,35 @@ ViewerGpuCapabilities detectViewerGpuCapabilities() {
   return caps;
 }
 
+struct GlossFieldSolution {
+  std::vector<float> body;
+  std::vector<float> signal;
+  std::vector<float> positive;
+  std::vector<float> negative;
+  std::vector<float> boundary;
+  std::vector<float> congruence;
+  std::vector<float> confidence;
+  std::vector<float> ambiguity;
+  std::vector<float> agreement;
+};
+
+struct GlossFieldBasis {
+  int gridWidth = 0;
+  int gridHeight = 0;
+  std::vector<float> occupancy;
+  std::vector<float> occupancySupport;
+  std::vector<float> meanRgb;
+  std::vector<float> carrierY;
+  std::vector<float> carrierMax;
+  std::vector<float> carrierMin;
+  std::vector<float> neutrality;
+};
+
+struct GlossFieldSolutionPair {
+  GlossFieldSolution candidate1;
+  GlossFieldSolution candidate2;
+};
+
 struct MeshData {
   int resolution = 25;
   std::string quality = "Low";
@@ -1407,18 +1500,14 @@ struct MeshData {
   bool hasGlossField = false;
   int glossFieldWidth = 0;
   int glossFieldHeight = 0;
+  std::vector<float> glossFieldOccupancy;
   std::vector<float> glossFieldMeanRgb;
-  std::vector<float> glossFieldBody;
-  std::vector<float> glossFieldSignal;
-  std::vector<float> glossFieldPositive;
-  std::vector<float> glossFieldNegative;
-  std::vector<float> glossFieldBoundary;
-  std::vector<float> glossFieldCongruence;
-  std::vector<float> glossFieldConfidence;
   std::vector<float> glossFieldCarrierMax;
   std::vector<float> glossFieldCarrierY;
   std::vector<float> glossFieldCarrierMin;
   std::vector<float> glossFieldNeutrality;
+  GlossFieldSolution glossFieldCandidate1;
+  GlossFieldSolution glossFieldCandidate2;
   std::vector<uint32_t> glossFieldPointCellIndices;
   std::vector<float> glossBodyGuideVerts;
   std::vector<float> glossBodyGuideColors;
@@ -1580,6 +1669,17 @@ enum class GlossViewDebugFieldMode {
   CarrierY = 2,
   CarrierMin = 3,
   Neutrality = 4,
+};
+
+enum class GlossViewFieldAlgorithm {
+  Candidate1 = 0,
+  Candidate2 = 1,
+};
+
+enum class GlossViewDiagnosticOverlay {
+  Off = 0,
+  Confidence = 1,
+  Ambiguity = 2,
 };
 
 struct InputCloudSampleComputeCache {
@@ -1837,6 +1937,112 @@ bool runViewerCudaStartupSelfTest(std::string* reason) {
 }
 #endif
 
+#if defined(__APPLE__)
+bool glossFieldVectorMatchesSize(const std::vector<float>& values,
+                                 size_t expectedSize,
+                                 const char* label,
+                                 std::string* reason) {
+  if (values.size() == expectedSize) return true;
+  if (reason) {
+    std::ostringstream os;
+    os << label << " size mismatch expected=" << expectedSize << " actual=" << values.size();
+    *reason = os.str();
+  }
+  return false;
+}
+
+bool glossFieldVectorFinite(const std::vector<float>& values,
+                            const char* label,
+                            std::string* reason) {
+  for (size_t i = 0; i < values.size(); ++i) {
+    if (std::isfinite(values[i])) continue;
+    if (reason) {
+      std::ostringstream os;
+      os << label << " contains non-finite value at " << i;
+      *reason = os.str();
+    }
+    return false;
+  }
+  return true;
+}
+
+bool validateGlossFieldResult(const ChromaspaceMetal::GlossFieldResult& result,
+                              std::string* reason) {
+  if (result.gridWidth <= 0 || result.gridHeight <= 0) {
+    if (reason) *reason = "invalid grid dimensions";
+    return false;
+  }
+  const size_t cellCount = static_cast<size_t>(result.gridWidth) * static_cast<size_t>(result.gridHeight);
+  if (!glossFieldVectorMatchesSize(result.occupancy, cellCount, "occupancy", reason) ||
+      !glossFieldVectorMatchesSize(result.meanRgb, cellCount * 3u, "meanRgb", reason) ||
+      !glossFieldVectorMatchesSize(result.carrierY, cellCount, "carrierY", reason) ||
+      !glossFieldVectorMatchesSize(result.carrierMax, cellCount, "carrierMax", reason) ||
+      !glossFieldVectorMatchesSize(result.carrierMin, cellCount, "carrierMin", reason) ||
+      !glossFieldVectorMatchesSize(result.neutrality, cellCount, "neutrality", reason) ||
+      !glossFieldVectorMatchesSize(result.body, cellCount, "body", reason) ||
+      !glossFieldVectorMatchesSize(result.signal, cellCount, "signal", reason) ||
+      !glossFieldVectorMatchesSize(result.positive, cellCount, "positive", reason) ||
+      !glossFieldVectorMatchesSize(result.negative, cellCount, "negative", reason) ||
+      !glossFieldVectorMatchesSize(result.boundary, cellCount, "boundary", reason) ||
+      !glossFieldVectorMatchesSize(result.congruence, cellCount, "congruence", reason) ||
+      !glossFieldVectorMatchesSize(result.confidence, cellCount, "confidence", reason)) {
+    return false;
+  }
+  if (!glossFieldVectorFinite(result.occupancy, "occupancy", reason) ||
+      !glossFieldVectorFinite(result.meanRgb, "meanRgb", reason) ||
+      !glossFieldVectorFinite(result.carrierY, "carrierY", reason) ||
+      !glossFieldVectorFinite(result.carrierMax, "carrierMax", reason) ||
+      !glossFieldVectorFinite(result.carrierMin, "carrierMin", reason) ||
+      !glossFieldVectorFinite(result.neutrality, "neutrality", reason) ||
+      !glossFieldVectorFinite(result.body, "body", reason) ||
+      !glossFieldVectorFinite(result.signal, "signal", reason) ||
+      !glossFieldVectorFinite(result.positive, "positive", reason) ||
+      !glossFieldVectorFinite(result.negative, "negative", reason) ||
+      !glossFieldVectorFinite(result.boundary, "boundary", reason) ||
+      !glossFieldVectorFinite(result.congruence, "congruence", reason) ||
+      !glossFieldVectorFinite(result.confidence, "confidence", reason)) {
+    return false;
+  }
+  const float occupancyMax = result.occupancy.empty() ? 0.0f
+                                                      : *std::max_element(result.occupancy.begin(), result.occupancy.end());
+  if (!(occupancyMax > 0.0f)) {
+    if (reason) *reason = "occupancy grid is empty";
+    return false;
+  }
+  return true;
+}
+
+bool runViewerMetalGlossFieldStartupSelfTest(std::string* reason) {
+  const std::vector<float> packedPoints = {
+      0.20f, 0.20f, 0.0f, 0.14f, 0.14f, 0.14f,
+      0.26f, 0.22f, 0.0f, 0.52f, 0.48f, 0.47f,
+      0.62f, 0.58f, 0.0f, 0.18f, 0.24f, 0.42f,
+      0.66f, 0.60f, 0.0f, 0.74f, 0.70f, 0.68f,
+      0.68f, 0.63f, 0.0f, 0.10f, 0.12f, 0.18f,
+      0.78f, 0.32f, 0.0f, 0.64f, 0.32f, 0.18f,
+      0.82f, 0.36f, 0.0f, 0.88f, 0.86f, 0.80f,
+      0.38f, 0.74f, 0.0f, 0.30f, 0.30f, 0.30f
+  };
+  ChromaspaceMetal::GlossFieldRequest request{};
+  request.gridWidth = 12;
+  request.gridHeight = 10;
+  request.showOverflow = 0;
+  request.neighborhoodChoice = 1;
+  ChromaspaceMetal::GlossFieldResult result{};
+  std::string localReason;
+  if (!ChromaspaceMetal::buildGlossField(request, packedPoints, &result, &localReason)) {
+    if (reason) *reason = localReason.empty() ? std::string("Metal gloss-field startup dispatch failed.") : localReason;
+    return false;
+  }
+  if (!validateGlossFieldResult(result, &localReason)) {
+    if (reason) *reason = localReason.empty() ? std::string("Metal gloss-field startup validation failed.") : localReason;
+    return false;
+  }
+  if (reason) *reason = "validated";
+  return true;
+}
+#endif
+
 bool ensurePointBufferCacheUploaded(const MeshData& mesh, PointBufferCache* cache) {
   if (!cache) return false;
   const ViewerGlBufferApi& api = viewerGlBufferApi();
@@ -2027,6 +2233,11 @@ bool runOverlayParityCheckWithBuffers(const ResolvedPayload& payload,
                                       GLuint colorsBuffer,
                                       const MeshData& gpuMesh,
                                       bool enabled);
+bool runGlossFieldParityCheck(const ResolvedPayload& payload,
+                              const InputCloudPayload& cloud,
+                              const std::vector<InputCloudSample>& samples,
+                              const MeshData& gpuMesh,
+                              bool enabled);
 bool runInputParityCheck(const ResolvedPayload& payload,
                          const InputCloudPayload& cloud,
                          const std::vector<float>& rawPoints,
@@ -2110,8 +2321,10 @@ struct ComputeSessionState {
   bool inputCudaSamplingDemoted = false;
   bool inputGlSamplingDemoted = false;
   bool inputMetalSamplingDemoted = false;
+  bool glossViewMetalFamilyDemoted = false;
   std::array<bool, kPlotModeKindCount> overlayCudaPlotDemoted{};
   std::array<bool, kPlotModeKindCount> inputCudaPlotDemoted{};
+  std::string glossViewMetalFallbackReason;
 };
 
 struct ComputeRemapUniforms {
@@ -3101,6 +3314,51 @@ void demoteCudaInputPath(const PlotRemapSpec& remap,
   logViewerEvent(std::string("CUDA input demoted to CPU: ") + reason);
 }
 
+void demoteMetalGlossFieldPath(ComputeSessionState* state, const std::string& reason) {
+  if (!state) return;
+  state->glossViewMetalFamilyDemoted = true;
+  state->glossViewMetalFallbackReason = reason;
+  logViewerEvent(std::string("Metal gloss-field demoted to CPU: ") + reason);
+}
+
+bool canUseMetalGlossFieldPath(const ViewerGpuCapabilities& gpuCaps,
+                               const ComputeSessionState* state,
+                               std::string* reason) {
+#if defined(__APPLE__)
+  if (!glossViewMetalFieldPathEnabled()) {
+    if (reason) *reason = "metal-disabled-by-env";
+    return false;
+  }
+  if (!gpuCaps.inputComputeEnabled) {
+    if (reason) *reason = gpuCaps.metalQueueReady ? "gloss-metal-disabled" : "no-metal-compute";
+    return false;
+  }
+  if (!gpuCaps.metalGlossFieldStartupValidated) {
+    if (reason) {
+      *reason = gpuCaps.metalGlossFieldStartupReason.empty()
+                    ? std::string("metal-startup-validation-failed")
+                    : std::string("metal-startup-") + gpuCaps.metalGlossFieldStartupReason;
+    }
+    return false;
+  }
+  if (state && state->glossViewMetalFamilyDemoted) {
+    if (reason) {
+      *reason = state->glossViewMetalFallbackReason.empty()
+                    ? std::string("metal-demoted-family")
+                    : std::string("metal-demoted-") + state->glossViewMetalFallbackReason;
+    }
+    return false;
+  }
+  if (reason) *reason = "metal-gloss-field";
+  return true;
+#else
+  (void)gpuCaps;
+  (void)state;
+  if (reason) *reason = "not-apple";
+  return false;
+#endif
+}
+
 std::string overlayComputeReason(const ResolvedPayload& payload,
                                  const ViewerGpuCapabilities& gpuCaps,
                                  const ComputeSessionState* state) {
@@ -3141,9 +3399,9 @@ std::string inputCloudComputeReason(const ResolvedPayload& payload,
   if (classifyPlotMode(payload) == PlotModeKind::Chromaticity) return "cpu-chromaticity";
   if (classifyPlotMode(payload) == PlotModeKind::GlossLift) {
 #if defined(__APPLE__)
-    if (!gpuCaps.inputComputeEnabled) return gpuCaps.metalQueueReady ? "gloss-metal-disabled" : "no-metal-compute";
-    if (!glossViewMetalFieldPathEnabled()) return "cpu-gloss-field-safety";
-    return "metal-gloss-field";
+    std::string reason;
+    if (canUseMetalGlossFieldPath(gpuCaps, state, &reason)) return reason;
+    return reason.empty() ? std::string("cpu-gloss-field-safety") : std::string("cpu-gloss-field-safety-") + reason;
 #else
     if (sessionWantsCuda(gpuCaps)) {
       if (!glossViewCudaFieldPathEnabled()) return "cpu-gloss-field-safety";
@@ -5430,8 +5688,26 @@ const char* glossViewDebugFieldLabel(GlossViewDebugFieldMode mode) {
   }
 }
 
+const char* glossViewFieldAlgorithmLabel(GlossViewFieldAlgorithm algorithm) {
+  switch (algorithm) {
+    case GlossViewFieldAlgorithm::Candidate2: return "Candidate 2";
+    case GlossViewFieldAlgorithm::Candidate1:
+    default: return "Candidate 1";
+  }
+}
+
+const char* glossViewDiagnosticOverlayLabel(GlossViewDiagnosticOverlay mode) {
+  switch (mode) {
+    case GlossViewDiagnosticOverlay::Confidence: return "Confidence";
+    case GlossViewDiagnosticOverlay::Ambiguity: return "Ambiguity";
+    case GlossViewDiagnosticOverlay::Off:
+    default: return "Off";
+  }
+}
+
 void glossViewResolvedDisplaySignals(const MeshData& mesh,
                                      size_t idx,
+                                     GlossViewFieldAlgorithm algorithm,
                                      GlossViewDebugFieldMode debugMode,
                                      float* outBase,
                                      float* outPositive,
@@ -5441,12 +5717,22 @@ Vec3 glossViewSourceHueColor(const MeshData& mesh, size_t idx, const ResolvedPay
 void glossViewCellDisplayStyle(const MeshData& mesh,
                                size_t idx,
                                const ResolvedPayload& payload,
+                               GlossViewFieldAlgorithm algorithm,
                                GlossViewColorMode colorMode,
                                GlossViewDebugFieldMode debugMode,
+                               GlossViewDiagnosticOverlay diagnosticMode,
                                float* outR,
                                float* outG,
                                float* outB,
                                float* outA);
+GlossFieldSolution assembleGlossViewUnifiedSolution(int gridWidth,
+                                                    int gridHeight,
+                                                    const std::vector<float>& body,
+                                                    const std::vector<float>& positiveRaw,
+                                                    const std::vector<float>& negativeRaw,
+                                                    const std::vector<float>& confidence,
+                                                    const std::vector<float>& ambiguity,
+                                                    const std::vector<float>& agreement);
 
 bool meshHasGlossLayers(const MeshData& mesh) {
   return mesh.glossBodyPointCount > 0 &&
@@ -5831,39 +6117,605 @@ struct GlossFieldNeighborhoodEntry {
   size_t index = 0u;
 };
 
-bool buildGlossViewFieldMeshFromFinalFields(const ResolvedPayload& payload,
-                                            const InputCloudPayload& cloud,
-                                            int gridWidth,
-                                            int gridHeight,
-                                            const std::vector<float>& occupancy,
-                                            const std::vector<float>& meanRgb,
-                                            const std::vector<float>& carrierY,
-                                            const std::vector<float>& carrierMax,
-                                            const std::vector<float>& carrierMin,
-                                            const std::vector<float>& neutrality,
-                                            const std::vector<float>& body,
-                                            const std::vector<float>& signal,
-                                            const std::vector<float>& positive,
-                                            const std::vector<float>& negative,
-                                            const std::vector<float>& boundary,
-                                            const std::vector<float>& congruence,
-                                            const std::vector<float>& confidence,
-                                            MeshData* out) {
-  if (!out || gridWidth <= 0 || gridHeight <= 0) return false;
+bool glossFieldSolutionHasData(const GlossFieldSolution& solution, size_t cellCount) {
+  return solution.body.size() == cellCount &&
+         solution.signal.size() == cellCount &&
+         solution.positive.size() == cellCount &&
+         solution.negative.size() == cellCount &&
+         solution.boundary.size() == cellCount &&
+         solution.congruence.size() == cellCount &&
+         solution.confidence.size() == cellCount;
+}
+
+void initializeGlossFieldSolution(size_t cellCount, GlossFieldSolution* out) {
+  if (!out) return;
+  out->body.assign(cellCount, 0.0f);
+  out->signal.assign(cellCount, 0.0f);
+  out->positive.assign(cellCount, 0.0f);
+  out->negative.assign(cellCount, 0.0f);
+  out->boundary.assign(cellCount, 0.0f);
+  out->congruence.assign(cellCount, 0.0f);
+  out->confidence.assign(cellCount, 0.0f);
+  out->ambiguity.assign(cellCount, 0.0f);
+  out->agreement.assign(cellCount, 0.0f);
+}
+
+const GlossFieldSolution& glossViewFieldSolution(const MeshData& mesh, GlossViewFieldAlgorithm algorithm) {
+  const size_t cellCount =
+      static_cast<size_t>(std::max(0, mesh.glossFieldWidth)) * static_cast<size_t>(std::max(0, mesh.glossFieldHeight));
+  static const GlossFieldSolution empty{};
+  const GlossFieldSolution& preferred = algorithm == GlossViewFieldAlgorithm::Candidate2
+                                            ? mesh.glossFieldCandidate2
+                                            : mesh.glossFieldCandidate1;
+  const GlossFieldSolution& fallback = algorithm == GlossViewFieldAlgorithm::Candidate2
+                                           ? mesh.glossFieldCandidate1
+                                           : mesh.glossFieldCandidate2;
+  if (glossFieldSolutionHasData(preferred, cellCount)) return preferred;
+  if (glossFieldSolutionHasData(fallback, cellCount)) return fallback;
+  return empty;
+}
+
+void normalizePositiveGrid(std::vector<float>* values) {
+  if (!values || values->empty()) return;
+  float maxValue = 0.0f;
+  for (float v : *values) maxValue = std::max(maxValue, v);
+  if (maxValue <= 1e-5f) {
+    std::fill(values->begin(), values->end(), 0.0f);
+    return;
+  }
+  for (float& v : *values) v = clampf(v / maxValue, 0.0f, 1.0f);
+}
+
+void normalizeSignedGrid(std::vector<float>* values) {
+  if (!values || values->empty()) return;
+  float maxAbsValue = 0.0f;
+  for (float v : *values) maxAbsValue = std::max(maxAbsValue, std::fabs(v));
+  if (maxAbsValue <= 1e-5f) {
+    std::fill(values->begin(), values->end(), 0.0f);
+    return;
+  }
+  for (float& v : *values) v = clampf(v / maxAbsValue, -1.0f, 1.0f);
+}
+
+std::vector<float> normalizedPositiveGrid(std::vector<float> values) {
+  normalizePositiveGrid(&values);
+  return values;
+}
+
+int glossFieldAnalysisRadiusCells(int neighborhoodChoice) {
+  switch (std::clamp(neighborhoodChoice, 0, 2)) {
+    case 0: return 3;
+    case 2: return 10;
+    case 1:
+    default: return 6;
+  }
+}
+
+std::vector<float> repeatedBlurredGrid(const std::vector<float>& values, int width, int height, int passCount) {
+  std::vector<float> result = values;
+  const int passes = std::clamp(passCount, 1, 24);
+  for (int i = 0; i < passes; ++i) {
+    blurScalarGrid(width, height, &result);
+  }
+  return result;
+}
+
+std::vector<float> localPercentileGrid(const std::vector<float>& values,
+                                       const std::vector<float>& occupancy,
+                                       int width,
+                                       int height,
+                                       int radiusCells,
+                                       float percentile) {
+  const size_t cellCount = static_cast<size_t>(std::max(0, width)) * static_cast<size_t>(std::max(0, height));
+  std::vector<float> result(cellCount, 0.0f);
+  if (values.size() != cellCount || width <= 0 || height <= 0) return result;
+  const bool hasOccupancy = occupancy.size() == cellCount;
+  const int radius = std::max(1, radiusCells);
+  std::vector<float> scratch;
+  scratch.reserve(static_cast<size_t>((radius * 2 + 1) * (radius * 2 + 1)));
+  for (int y = 0; y < height; ++y) {
+    for (int x = 0; x < width; ++x) {
+      const size_t idx = static_cast<size_t>(y) * static_cast<size_t>(width) + static_cast<size_t>(x);
+      if (hasOccupancy && occupancy[idx] <= 0.5f) continue;
+      scratch.clear();
+      for (int yy = std::max(0, y - radius); yy <= std::min(height - 1, y + radius); ++yy) {
+        for (int xx = std::max(0, x - radius); xx <= std::min(width - 1, x + radius); ++xx) {
+          const size_t nidx = static_cast<size_t>(yy) * static_cast<size_t>(width) + static_cast<size_t>(xx);
+          if (hasOccupancy && occupancy[nidx] <= 0.5f) continue;
+          scratch.push_back(values[nidx]);
+        }
+      }
+      if (scratch.empty()) {
+        result[idx] = values[idx];
+        continue;
+      }
+      const float clampedPercentile = clampf(percentile, 0.0f, 100.0f);
+      const size_t kth = std::min(scratch.size() - 1u,
+                                  static_cast<size_t>(std::lround((clampedPercentile / 100.0f) *
+                                                                  static_cast<float>(scratch.size() - 1u))));
+      std::nth_element(scratch.begin(), scratch.begin() + static_cast<std::vector<float>::difference_type>(kth), scratch.end());
+      result[idx] = scratch[kth];
+    }
+  }
+  return result;
+}
+
+std::vector<float> gradientMagnitudeGrid(const std::vector<float>& values, int width, int height) {
+  const size_t cellCount = static_cast<size_t>(std::max(0, width)) * static_cast<size_t>(std::max(0, height));
+  std::vector<float> result(cellCount, 0.0f);
+  if (values.size() != cellCount || width <= 0 || height <= 0) return result;
+  for (int y = 0; y < height; ++y) {
+    for (int x = 0; x < width; ++x) {
+      const float gx = 0.5f * (sampleScalarGridClamped(values, width, height, x + 1, y) -
+                               sampleScalarGridClamped(values, width, height, x - 1, y));
+      const float gy = 0.5f * (sampleScalarGridClamped(values, width, height, x, y + 1) -
+                               sampleScalarGridClamped(values, width, height, x, y - 1));
+      result[static_cast<size_t>(y) * static_cast<size_t>(width) + static_cast<size_t>(x)] =
+          std::sqrt(gx * gx + gy * gy);
+    }
+  }
+  return result;
+}
+
+std::vector<float> gradientCongruenceGrid(const std::vector<float>& body,
+                                          const std::vector<float>& signal,
+                                          int width,
+                                          int height) {
+  const size_t cellCount = static_cast<size_t>(std::max(0, width)) * static_cast<size_t>(std::max(0, height));
+  std::vector<float> result(cellCount, 0.0f);
+  if (body.size() != cellCount || signal.size() != cellCount || width <= 0 || height <= 0) return result;
+  for (int y = 0; y < height; ++y) {
+    for (int x = 0; x < width; ++x) {
+      const size_t idx = static_cast<size_t>(y) * static_cast<size_t>(width) + static_cast<size_t>(x);
+      const float gxBody = 0.5f * (sampleScalarGridClamped(body, width, height, x + 1, y) -
+                                   sampleScalarGridClamped(body, width, height, x - 1, y));
+      const float gyBody = 0.5f * (sampleScalarGridClamped(body, width, height, x, y + 1) -
+                                   sampleScalarGridClamped(body, width, height, x, y - 1));
+      const float gxSignal = 0.5f * (sampleScalarGridClamped(signal, width, height, x + 1, y) -
+                                     sampleScalarGridClamped(signal, width, height, x - 1, y));
+      const float gySignal = 0.5f * (sampleScalarGridClamped(signal, width, height, x, y + 1) -
+                                     sampleScalarGridClamped(signal, width, height, x, y - 1));
+      const float magBody = std::sqrt(gxBody * gxBody + gyBody * gyBody);
+      const float magSignal = std::sqrt(gxSignal * gxSignal + gySignal * gySignal);
+      if (magBody > 1e-6f && magSignal > 1e-6f) {
+        result[idx] = clampf(std::fabs((gxBody * gxSignal + gyBody * gySignal) / (magBody * magSignal)), 0.0f, 1.0f);
+      } else if (magSignal > 1e-6f) {
+        result[idx] = 0.35f;
+      }
+    }
+  }
+  return result;
+}
+
+std::vector<float> localSupportGrid(const std::vector<float>& values, int width, int height, int radiusCells) {
+  std::vector<float> positive = values;
+  for (float& v : positive) v = std::max(0.0f, v);
+  std::vector<float> support = repeatedBlurredGrid(positive, width, height, std::max(1, radiusCells));
+  normalizePositiveGrid(&support);
+  return support;
+}
+
+std::vector<float> agreementMapGrid(std::vector<float> a, std::vector<float> b) {
+  for (float& v : a) v = std::max(0.0f, v);
+  for (float& v : b) v = std::max(0.0f, v);
+  normalizePositiveGrid(&a);
+  normalizePositiveGrid(&b);
+  const size_t count = std::min(a.size(), b.size());
+  std::vector<float> result(count, 0.0f);
+  for (size_t i = 0; i < count; ++i) {
+    result[i] = clampf(1.0f - std::fabs(a[i] - b[i]), 0.0f, 1.0f);
+  }
+  return result;
+}
+
+std::vector<float> buildGlossViewTrimmedBodyEstimateGrid(const GlossFieldBasis& basis,
+                                                         const std::vector<float>& carrier,
+                                                         int radiusCells) {
+  const int gridWidth = basis.gridWidth;
+  const int gridHeight = basis.gridHeight;
+  const size_t cellCount = static_cast<size_t>(std::max(0, gridWidth)) * static_cast<size_t>(std::max(0, gridHeight));
+  std::vector<float> body(cellCount, 0.0f);
+  if (carrier.size() != cellCount || basis.meanRgb.size() != cellCount * 3u ||
+      basis.occupancy.size() != cellCount || gridWidth <= 0 || gridHeight <= 0) {
+    return body;
+  }
+  const int radius = std::max(1, radiusCells);
+  std::vector<GlossFieldNeighborhoodEntry> neighborhoodScratch;
+  neighborhoodScratch.reserve(static_cast<size_t>((radius * 2 + 1) * (radius * 2 + 1)));
+  for (int y = 0; y < gridHeight; ++y) {
+    for (int x = 0; x < gridWidth; ++x) {
+      const size_t idx = static_cast<size_t>(y) * static_cast<size_t>(gridWidth) + static_cast<size_t>(x);
+      if (basis.occupancy[idx] <= 0.5f) continue;
+      neighborhoodScratch.clear();
+      const float centerCarrier = carrier[idx];
+      const float centerR = basis.meanRgb[idx * 3u + 0u];
+      const float centerG = basis.meanRgb[idx * 3u + 1u];
+      const float centerB = basis.meanRgb[idx * 3u + 2u];
+      for (int oy = -radius; oy <= radius; ++oy) {
+        const int yy = y + oy;
+        if (yy < 0 || yy >= gridHeight) continue;
+        for (int ox = -radius; ox <= radius; ++ox) {
+          const int xx = x + ox;
+          if (xx < 0 || xx >= gridWidth) continue;
+          const size_t neighborIdx =
+              static_cast<size_t>(yy) * static_cast<size_t>(gridWidth) + static_cast<size_t>(xx);
+          if (basis.occupancy[neighborIdx] <= 0.5f) continue;
+          const float neighborCarrier = carrier[neighborIdx];
+          const float nr = basis.meanRgb[neighborIdx * 3u + 0u];
+          const float ng = basis.meanRgb[neighborIdx * 3u + 1u];
+          const float nb = basis.meanRgb[neighborIdx * 3u + 2u];
+          const float colorDistance =
+              std::sqrt((nr - centerR) * (nr - centerR) + (ng - centerG) * (ng - centerG) +
+                        (nb - centerB) * (nb - centerB));
+          if (std::fabs(neighborCarrier - centerCarrier) > 0.26f && colorDistance > 0.20f) continue;
+          neighborhoodScratch.push_back({neighborCarrier, neighborIdx});
+        }
+      }
+      if (neighborhoodScratch.empty()) {
+        body[idx] = centerCarrier;
+        continue;
+      }
+      std::sort(neighborhoodScratch.begin(),
+                neighborhoodScratch.end(),
+                [](const GlossFieldNeighborhoodEntry& a, const GlossFieldNeighborhoodEntry& b) {
+                  return (a.carrier < b.carrier) || (a.carrier == b.carrier && a.index < b.index);
+                });
+      const size_t trim = neighborhoodScratch.size() >= 6u ? std::max<size_t>(1u, neighborhoodScratch.size() / 6u) : 0u;
+      const size_t begin = std::min(trim, neighborhoodScratch.size());
+      const size_t end = std::max(begin + size_t{1}, neighborhoodScratch.size() - trim);
+      float bodySum = 0.0f;
+      float bodyWeight = 0.0f;
+      for (size_t i = begin; i < end; ++i) {
+        const size_t neighborIdx = neighborhoodScratch[i].index;
+        const int neighborX = static_cast<int>(neighborIdx % static_cast<size_t>(gridWidth));
+        const int neighborY = static_cast<int>(neighborIdx / static_cast<size_t>(gridWidth));
+        const float dx = static_cast<float>(neighborX - x);
+        const float dy = static_cast<float>(neighborY - y);
+        const float spatialWeight = 1.0f / (1.0f + dx * dx + dy * dy);
+        bodySum += neighborhoodScratch[i].carrier * spatialWeight;
+        bodyWeight += spatialWeight;
+      }
+      body[idx] = bodyWeight > 1e-6f ? (bodySum / bodyWeight) : centerCarrier;
+    }
+  }
+  return body;
+}
+
+std::vector<float> buildGlossViewHybridCarrierGrid(const GlossFieldBasis& basis) {
+  const size_t cellCount =
+      static_cast<size_t>(std::max(0, basis.gridWidth)) * static_cast<size_t>(std::max(0, basis.gridHeight));
+  std::vector<float> carrier(cellCount, 0.0f);
+  if (basis.carrierMax.size() != cellCount || basis.carrierY.size() != cellCount || basis.carrierMin.size() != cellCount) {
+    return carrier;
+  }
+  for (size_t idx = 0; idx < cellCount; ++idx) {
+    carrier[idx] = 0.70f * basis.carrierMax[idx] + 0.20f * basis.carrierY[idx] + 0.10f * basis.carrierMin[idx];
+  }
+  return carrier;
+}
+
+GlossFieldSolution solveGlossViewFillGuardHybridField(const ResolvedPayload& payload,
+                                                      const GlossFieldBasis& basis) {
+  const int gridWidth = basis.gridWidth;
+  const int gridHeight = basis.gridHeight;
+  const size_t cellCount = static_cast<size_t>(std::max(0, gridWidth)) * static_cast<size_t>(std::max(0, gridHeight));
+  GlossFieldSolution empty{};
+  initializeGlossFieldSolution(cellCount, &empty);
+  if (basis.carrierMax.size() != cellCount || basis.carrierY.size() != cellCount ||
+      basis.carrierMin.size() != cellCount || basis.occupancy.size() != cellCount ||
+      basis.occupancySupport.size() != cellCount || gridWidth <= 0 || gridHeight <= 0) {
+    return empty;
+  }
+
+  const int trimmedRadius = glossNeighborhoodRadiusCells(payload.glossNeighborhood);
+  const int analysisRadius = glossFieldAnalysisRadiusCells(payload.glossNeighborhood);
+  const std::vector<float> carrier = buildGlossViewHybridCarrierGrid(basis);
+  const std::vector<float> viewerBody = buildGlossViewTrimmedBodyEstimateGrid(basis, carrier, trimmedRadius);
+  const std::vector<float> bodyCore =
+      localPercentileGrid(carrier, basis.occupancy, gridWidth, gridHeight, analysisRadius, 45.0f);
+  const std::vector<float> bodyContext =
+      repeatedBlurredGrid(carrier, gridWidth, gridHeight, std::max(1, analysisRadius));
+  std::vector<float> adaptiveBody(cellCount, 0.0f);
+  std::vector<float> basePositive(cellCount, 0.0f);
+  std::vector<float> baseNegative(cellCount, 0.0f);
+  std::vector<float> consensusPositive(cellCount, 0.0f);
+  for (size_t idx = 0; idx < cellCount; ++idx) {
+    if (basis.occupancy[idx] <= 0.5f) continue;
+    adaptiveBody[idx] = 0.72f * viewerBody[idx] + 0.20f * bodyCore[idx] + 0.08f * bodyContext[idx];
+    basePositive[idx] = std::max(0.0f, carrier[idx] - adaptiveBody[idx]);
+    baseNegative[idx] = std::max(0.0f, adaptiveBody[idx] - carrier[idx]);
+    const float compactBody = std::min(viewerBody[idx], bodyCore[idx]);
+    consensusPositive[idx] = std::max(0.0f, carrier[idx] - compactBody);
+  }
+
+  const std::vector<float> positiveSupport = localSupportGrid(basePositive, gridWidth, gridHeight, analysisRadius);
+  const std::vector<float> consensusSupport =
+      localSupportGrid(consensusPositive, gridWidth, gridHeight, analysisRadius);
+  const std::vector<float> bodyAgreement = agreementMapGrid(viewerBody, bodyCore);
+  const std::vector<float> positiveAgreement = agreementMapGrid(basePositive, consensusPositive);
+  const std::vector<float> positiveBodyCongruence =
+      gradientCongruenceGrid(adaptiveBody, basePositive, gridWidth, gridHeight);
+  std::vector<float> positiveRaw(cellCount, 0.0f);
+  std::vector<float> negativeRaw(cellCount, 0.0f);
+  std::vector<float> confidence(cellCount, 0.0f);
+  std::vector<float> ambiguity(cellCount, 0.0f);
+  std::vector<float> agreement(cellCount, 0.0f);
+  std::vector<float> fillGuard(cellCount, 0.0f);
+  std::vector<float> attachment(cellCount, 0.0f);
+  for (size_t idx = 0; idx < cellCount; ++idx) {
+    fillGuard[idx] = clampf(0.30f * positiveSupport[idx] +
+                                0.20f * consensusSupport[idx] +
+                                0.18f * positiveAgreement[idx] +
+                                0.16f * bodyAgreement[idx] +
+                                0.16f * positiveBodyCongruence[idx],
+                            0.0f,
+                            1.0f);
+    positiveRaw[idx] = (0.60f * consensusPositive[idx] + 0.40f * basePositive[idx]) *
+                       (0.14f + 0.86f * fillGuard[idx]);
+    negativeRaw[idx] = baseNegative[idx] * (0.38f + 0.62f * bodyAgreement[idx]);
+    attachment[idx] = clampf(0.42f * positiveBodyCongruence[idx] +
+                                 0.26f * positiveSupport[idx] +
+                                 0.20f * positiveAgreement[idx] +
+                                 0.12f * bodyAgreement[idx],
+                             0.0f,
+                             1.0f);
+    const float support = std::sqrt(clampf(basis.occupancySupport[idx], 0.0f, 1.0f));
+    confidence[idx] = clampf((0.18f + 0.82f * (0.38f * fillGuard[idx] +
+                                               0.22f * bodyAgreement[idx] +
+                                               0.20f * positiveAgreement[idx] +
+                                               0.20f * attachment[idx])) *
+                                  (0.28f + 0.72f * support),
+                              0.0f,
+                              1.0f);
+    agreement[idx] = clampf(0.50f * bodyAgreement[idx] + 0.50f * positiveAgreement[idx], 0.0f, 1.0f);
+    ambiguity[idx] =
+        clampf(1.0f - (0.46f * fillGuard[idx] + 0.30f * attachment[idx] + 0.24f * agreement[idx]), 0.0f, 1.0f);
+  }
+
+  return assembleGlossViewUnifiedSolution(gridWidth,
+                                          gridHeight,
+                                          adaptiveBody,
+                                          positiveRaw,
+                                          negativeRaw,
+                                          confidence,
+                                          ambiguity,
+                                          agreement);
+}
+
+GlossFieldSolution assembleGlossViewUnifiedSolution(int gridWidth,
+                                                   int gridHeight,
+                                                   const std::vector<float>& body,
+                                                   const std::vector<float>& positiveRaw,
+                                                   const std::vector<float>& negativeRaw,
+                                                   const std::vector<float>& confidence,
+                                                   const std::vector<float>& ambiguity,
+                                                   const std::vector<float>& agreement) {
+  const size_t cellCount = static_cast<size_t>(std::max(0, gridWidth)) * static_cast<size_t>(std::max(0, gridHeight));
+  GlossFieldSolution solution{};
+  initializeGlossFieldSolution(cellCount, &solution);
+  if (body.size() != cellCount || positiveRaw.size() != cellCount || negativeRaw.size() != cellCount ||
+      confidence.size() != cellCount || ambiguity.size() != cellCount || agreement.size() != cellCount) {
+    return solution;
+  }
+
+  std::vector<float> rawSignal(cellCount, 0.0f);
+  for (size_t idx = 0; idx < cellCount; ++idx) {
+    rawSignal[idx] = positiveRaw[idx] - negativeRaw[idx];
+  }
+  solution.congruence = gradientCongruenceGrid(body, rawSignal, gridWidth, gridHeight);
+  std::vector<float> boundary = gradientMagnitudeGrid(rawSignal, gridWidth, gridHeight);
+  for (float& v : boundary) v *= 4.0f;
+
+  solution.body = body;
+  solution.confidence = confidence;
+  solution.ambiguity = ambiguity;
+  solution.agreement = agreement;
+  for (size_t idx = 0; idx < cellCount; ++idx) {
+    const float weight = (0.35f + 0.65f * clampf(solution.congruence[idx], 0.0f, 1.0f)) *
+                         (0.45f + 0.55f * clampf(confidence[idx], 0.0f, 1.0f));
+    solution.positive[idx] = std::max(0.0f, positiveRaw[idx]) * weight;
+    solution.negative[idx] = std::max(0.0f, negativeRaw[idx]) * weight;
+    solution.signal[idx] = solution.positive[idx] - solution.negative[idx];
+  }
+  solution.boundary = boundary;
+  normalizePositiveGrid(&solution.body);
+  normalizePositiveGrid(&solution.positive);
+  normalizePositiveGrid(&solution.negative);
+  normalizeSignedGrid(&solution.signal);
+  normalizePositiveGrid(&solution.boundary);
+  return solution;
+}
+
+GlossFieldSolution solveGlossViewContourRetinexDogYField(const ResolvedPayload& payload,
+                                                         const GlossFieldBasis& basis) {
+  const int gridWidth = basis.gridWidth;
+  const int gridHeight = basis.gridHeight;
+  const size_t cellCount = static_cast<size_t>(std::max(0, gridWidth)) * static_cast<size_t>(std::max(0, gridHeight));
+  GlossFieldSolution empty{};
+  initializeGlossFieldSolution(cellCount, &empty);
+  if (basis.carrierY.size() != cellCount || basis.meanRgb.size() != cellCount * 3u ||
+      basis.occupancy.size() != cellCount || basis.occupancySupport.size() != cellCount ||
+      gridWidth <= 0 || gridHeight <= 0) {
+    return empty;
+  }
+
+  // Live port of the offline contour_retinex_dog_y branch: keep Y as the carrier,
+  // preserve the broad contour-conditioned support blend, and add restrained Retinex
+  // and DoG borrowing instead of collapsing everything into a single local body fit.
+  const int trimmedRadius = glossNeighborhoodRadiusCells(payload.glossNeighborhood);
+  const int analysisRadius = glossFieldAnalysisRadiusCells(payload.glossNeighborhood);
+  const std::vector<float>& carrier = basis.carrierY;
+  const std::vector<float> viewerBody = buildGlossViewTrimmedBodyEstimateGrid(basis, carrier, trimmedRadius);
+  const std::vector<float> bodyCore = localPercentileGrid(carrier,
+                                                          basis.occupancy,
+                                                          gridWidth,
+                                                          gridHeight,
+                                                          analysisRadius,
+                                                          50.0f);
+  const std::vector<float> bodyContext = repeatedBlurredGrid(carrier,
+                                                             gridWidth,
+                                                             gridHeight,
+                                                             analysisRadius * 2);
+  std::vector<float> hybridBody(cellCount, 0.0f);
+  std::vector<float> viewerPositive(cellCount, 0.0f);
+  std::vector<float> viewerNegative(cellCount, 0.0f);
+  std::vector<float> hybridPositive(cellCount, 0.0f);
+  std::vector<float> hybridNegative(cellCount, 0.0f);
+  std::vector<float> chromaSpread(cellCount, 0.0f);
+  for (size_t idx = 0; idx < cellCount; ++idx) {
+    hybridBody[idx] = 0.65f * bodyCore[idx] + 0.35f * bodyContext[idx];
+    viewerPositive[idx] = std::max(0.0f, carrier[idx] - viewerBody[idx]);
+    viewerNegative[idx] = std::max(0.0f, viewerBody[idx] - carrier[idx]);
+    hybridPositive[idx] = std::max(0.0f, carrier[idx] - bodyCore[idx]);
+    hybridNegative[idx] = std::max(0.0f, bodyContext[idx] - carrier[idx]);
+    if (idx * 3u + 2u < basis.meanRgb.size()) {
+      const float r = basis.meanRgb[idx * 3u + 0u];
+      const float g = basis.meanRgb[idx * 3u + 1u];
+      const float b = basis.meanRgb[idx * 3u + 2u];
+      chromaSpread[idx] = std::max(r, std::max(g, b)) - std::min(r, std::min(g, b));
+    }
+  }
+
+  std::vector<float> shapeSupport = gradientMagnitudeGrid(bodyContext, gridWidth, gridHeight);
+  normalizePositiveGrid(&shapeSupport);
+  std::vector<float> chromaSupport = chromaSpread;
+  normalizePositiveGrid(&chromaSupport);
+  std::vector<float> ambiguity(cellCount, 0.0f);
+  std::vector<float> adaptiveBody(cellCount, 0.0f);
+  for (size_t idx = 0; idx < cellCount; ++idx) {
+    ambiguity[idx] = clampf(1.0f - (0.72f * shapeSupport[idx] + 0.28f * chromaSupport[idx]), 0.0f, 1.0f);
+    adaptiveBody[idx] = ambiguity[idx] * viewerBody[idx] + (1.0f - ambiguity[idx]) * hybridBody[idx];
+  }
+
+  const std::vector<float> bodyAgreement = agreementMapGrid(viewerBody, hybridBody);
+  const std::vector<float> positiveAgreement = agreementMapGrid(viewerPositive, hybridPositive);
+  const std::vector<float> hybridPositiveSupport = normalizedPositiveGrid(hybridPositive);
+  const std::vector<float> localPositiveSupport = localSupportGrid(hybridPositive, gridWidth, gridHeight, analysisRadius);
+  std::vector<float> positiveRaw(cellCount, 0.0f);
+  std::vector<float> negativeRaw(cellCount, 0.0f);
+  const std::vector<float> retinexBody =
+      localPercentileGrid(carrier, basis.occupancy, gridWidth, gridHeight, analysisRadius, 35.0f);
+  std::vector<float> retinexResidual(cellCount, 0.0f);
+  for (size_t idx = 0; idx < cellCount; ++idx) {
+    retinexResidual[idx] = carrier[idx] - retinexBody[idx];
+  }
+  const std::vector<float> dogLow = repeatedBlurredGrid(carrier, gridWidth, gridHeight, std::max(1, analysisRadius / 2));
+  const std::vector<float> dogHigh = repeatedBlurredGrid(carrier, gridWidth, gridHeight, std::max(2, analysisRadius * 2));
+  std::vector<float> dogResidual(cellCount, 0.0f);
+  std::vector<float> dogPositive(cellCount, 0.0f);
+  std::vector<float> dogNegative(cellCount, 0.0f);
+  for (size_t idx = 0; idx < cellCount; ++idx) {
+    dogResidual[idx] = dogLow[idx] - dogHigh[idx];
+    dogPositive[idx] = std::max(0.0f, dogResidual[idx]);
+    dogNegative[idx] = std::max(0.0f, -dogResidual[idx]);
+  }
+  const std::vector<float> dogPositiveAgreement = agreementMapGrid(dogPositive, hybridPositive);
+  const std::vector<float> dogNegativeAgreement = agreementMapGrid(dogNegative, hybridNegative);
+  std::vector<float> permission(cellCount, 0.0f);
+  for (size_t idx = 0; idx < cellCount; ++idx) {
+    const float consensusPositive = viewerPositive[idx] * (0.25f + 0.75f * hybridPositiveSupport[idx]);
+    const float panelMix =
+        clampf(std::sqrt(std::max(0.0f, ambiguity[idx])) * (0.55f + 0.45f * positiveAgreement[idx]), 0.0f, 1.0f);
+    permission[idx] = clampf(0.32f * positiveAgreement[idx] +
+                                 0.24f * bodyAgreement[idx] +
+                                 0.24f * shapeSupport[idx] +
+                                 0.20f * localPositiveSupport[idx],
+                             0.0f,
+                             1.0f);
+    const float positiveRetinexGate = clampf(0.18f +
+                                                 0.34f * permission[idx] +
+                                                 0.18f * positiveAgreement[idx] +
+                                                 0.16f * shapeSupport[idx] +
+                                                 0.14f * localPositiveSupport[idx],
+                                             0.0f,
+                                             1.0f);
+    const float negativeRetinexGate = clampf(0.30f +
+                                                 0.40f * (1.0f - ambiguity[idx]) +
+                                                 0.18f * bodyAgreement[idx] +
+                                                 0.12f * permission[idx],
+                                             0.0f,
+                                             1.0f);
+    const float dogPositiveGate = clampf(0.16f +
+                                             0.30f * permission[idx] +
+                                             0.18f * positiveAgreement[idx] +
+                                             0.16f * shapeSupport[idx] +
+                                             0.12f * dogPositiveAgreement[idx] +
+                                             0.08f * localPositiveSupport[idx],
+                                         0.0f,
+                                         1.0f);
+    const float dogNegativeGate = clampf(0.30f +
+                                             0.36f * (1.0f - ambiguity[idx]) +
+                                             0.20f * bodyAgreement[idx] +
+                                             0.14f * dogNegativeAgreement[idx],
+                                         0.0f,
+                                         1.0f);
+    positiveRaw[idx] = (1.0f - panelMix) * hybridPositive[idx] +
+                       panelMix * consensusPositive +
+                       0.20f * positiveRetinexGate * std::max(0.0f, retinexResidual[idx]) +
+                       0.18f * dogPositiveGate * dogPositive[idx];
+    negativeRaw[idx] = (1.0f - ambiguity[idx]) * hybridNegative[idx] +
+                       ambiguity[idx] * (0.55f * hybridNegative[idx] + 0.45f * viewerNegative[idx]) +
+                       0.16f * negativeRetinexGate * std::max(0.0f, -retinexResidual[idx]) +
+                       0.12f * dogNegativeGate * dogNegative[idx];
+  }
+
+  std::vector<float> rawSignal(cellCount, 0.0f);
+  for (size_t idx = 0; idx < cellCount; ++idx) rawSignal[idx] = positiveRaw[idx] - negativeRaw[idx];
+  const std::vector<float> gradientAttachment = gradientCongruenceGrid(adaptiveBody, rawSignal, gridWidth, gridHeight);
+  const std::vector<float> positiveSupport = localSupportGrid(positiveRaw, gridWidth, gridHeight, analysisRadius);
+
+  std::vector<float> attachment(cellCount, 0.0f);
+  std::vector<float> confidence(cellCount, 0.0f);
+  std::vector<float> agreement(cellCount, 0.0f);
+  for (size_t idx = 0; idx < cellCount; ++idx) {
+    attachment[idx] = clampf(0.31f * gradientAttachment[idx] +
+                                 0.21f * positiveSupport[idx] +
+                                 0.20f * permission[idx] +
+                                 0.20f * positiveAgreement[idx] +
+                                 0.08f * bodyAgreement[idx],
+                             0.0f,
+                             1.0f);
+    const float support = std::sqrt(clampf(basis.occupancySupport[idx], 0.0f, 1.0f));
+    confidence[idx] = clampf((0.10f + 0.90f * (0.28f * bodyAgreement[idx] +
+                                               0.22f * positiveAgreement[idx] +
+                                               0.20f * permission[idx] +
+                                               0.15f * (1.0f - ambiguity[idx]) +
+                                               0.15f * attachment[idx])) *
+                                  (0.30f + 0.70f * support),
+                              0.0f,
+                              1.0f);
+    agreement[idx] = clampf(0.40f * bodyAgreement[idx] + 0.35f * positiveAgreement[idx] + 0.25f * permission[idx],
+                            0.0f,
+                            1.0f);
+  }
+
+  return assembleGlossViewUnifiedSolution(gridWidth,
+                                          gridHeight,
+                                          adaptiveBody,
+                                          positiveRaw,
+                                          negativeRaw,
+                                          confidence,
+                                          ambiguity,
+                                          agreement);
+}
+
+bool buildGlossViewFieldMeshFromSolvedFields(const ResolvedPayload& payload,
+                                             const InputCloudPayload& cloud,
+                                             const GlossFieldBasis& basis,
+                                             const GlossFieldSolutionPair& solutions,
+                                             MeshData* out) {
+  if (!out || basis.gridWidth <= 0 || basis.gridHeight <= 0) return false;
+  const int gridWidth = basis.gridWidth;
+  const int gridHeight = basis.gridHeight;
   const size_t cellCount = static_cast<size_t>(gridWidth) * static_cast<size_t>(gridHeight);
-  if (occupancy.size() != cellCount ||
-      meanRgb.size() != cellCount * 3u ||
-      carrierY.size() != cellCount ||
-      carrierMax.size() != cellCount ||
-      carrierMin.size() != cellCount ||
-      neutrality.size() != cellCount ||
-      body.size() != cellCount ||
-      signal.size() != cellCount ||
-      positive.size() != cellCount ||
-      negative.size() != cellCount ||
-      boundary.size() != cellCount ||
-      congruence.size() != cellCount ||
-      confidence.size() != cellCount) {
+  if (basis.occupancy.size() != cellCount ||
+      basis.meanRgb.size() != cellCount * 3u ||
+      basis.carrierY.size() != cellCount ||
+      basis.carrierMax.size() != cellCount ||
+      basis.carrierMin.size() != cellCount ||
+      basis.neutrality.size() != cellCount ||
+      !glossFieldSolutionHasData(solutions.candidate1, cellCount) ||
+      !glossFieldSolutionHasData(solutions.candidate2, cellCount)) {
     return false;
   }
 
@@ -5875,18 +6727,14 @@ bool buildGlossViewFieldMeshFromFinalFields(const ResolvedPayload& payload,
   mesh.hasGlossField = true;
   mesh.glossFieldWidth = gridWidth;
   mesh.glossFieldHeight = gridHeight;
-  mesh.glossFieldMeanRgb = meanRgb;
-  mesh.glossFieldBody = body;
-  mesh.glossFieldSignal = signal;
-  mesh.glossFieldPositive = positive;
-  mesh.glossFieldNegative = negative;
-  mesh.glossFieldBoundary = boundary;
-  mesh.glossFieldCongruence = congruence;
-  mesh.glossFieldConfidence = confidence;
-  mesh.glossFieldCarrierMax = carrierMax;
-  mesh.glossFieldCarrierY = carrierY;
-  mesh.glossFieldCarrierMin = carrierMin;
-  mesh.glossFieldNeutrality = neutrality;
+  mesh.glossFieldOccupancy = basis.occupancy;
+  mesh.glossFieldMeanRgb = basis.meanRgb;
+  mesh.glossFieldCarrierMax = basis.carrierMax;
+  mesh.glossFieldCarrierY = basis.carrierY;
+  mesh.glossFieldCarrierMin = basis.carrierMin;
+  mesh.glossFieldNeutrality = basis.neutrality;
+  mesh.glossFieldCandidate1 = solutions.candidate1;
+  mesh.glossFieldCandidate2 = solutions.candidate2;
 
   float halfWidth = 1.22f;
   float halfDepth = 0.69f;
@@ -5900,16 +6748,31 @@ bool buildGlossViewFieldMeshFromFinalFields(const ResolvedPayload& payload,
   for (int y = 0; y < gridHeight; ++y) {
     for (int x = 0; x < gridWidth; ++x) {
       const size_t idx = static_cast<size_t>(y) * static_cast<size_t>(gridWidth) + static_cast<size_t>(x);
-      const float cellConfidence = confidence[idx];
-      if (occupancy[idx] <= 0.5f || cellConfidence <= 0.02f) continue;
+      const float cellConfidence = std::max(mesh.glossFieldCandidate1.confidence[idx],
+                                            mesh.glossFieldCandidate2.confidence[idx]);
+      const float sourcePresence =
+          idx * 3u + 2u < mesh.glossFieldMeanRgb.size()
+              ? clampf(std::max(mesh.glossFieldMeanRgb[idx * 3u + 0u],
+                                std::max(mesh.glossFieldMeanRgb[idx * 3u + 1u],
+                                         mesh.glossFieldMeanRgb[idx * 3u + 2u])),
+                       0.0f,
+                       1.0f)
+              : 0.0f;
+      if (basis.occupancy[idx] <= 0.5f || (cellConfidence <= 0.01f && sourcePresence <= 0.01f)) continue;
       const float xNorm = (static_cast<float>(x) + 0.5f) / static_cast<float>(gridWidth);
       const float yNormInv = (static_cast<float>(y) + 0.5f) / static_cast<float>(gridHeight);
       const float xPos = -halfWidth + (2.0f * halfWidth * xNorm);
       const float zPos = halfDepth - (2.0f * halfDepth * yNormInv);
-      const float yPos = signal[idx];
-      const float rawR = meanRgb[idx * 3u + 0u];
-      const float rawG = meanRgb[idx * 3u + 1u];
-      const float rawB = meanRgb[idx * 3u + 2u];
+      // Keep the cached mesh envelope stable enough for fit bounds and cell presence
+      // without hard-wiring the visible relief to one algorithm. The actual 3D draw
+      // path rebuilds per-candidate projection arrays at draw time.
+      const float candidate1Signal = mesh.glossFieldCandidate1.signal[idx];
+      const float candidate2Signal = mesh.glossFieldCandidate2.signal[idx];
+      const float yPos =
+          std::fabs(candidate2Signal) > std::fabs(candidate1Signal) ? candidate2Signal : candidate1Signal;
+      const float rawR = mesh.glossFieldMeanRgb[idx * 3u + 0u];
+      const float rawG = mesh.glossFieldMeanRgb[idx * 3u + 1u];
+      const float rawB = mesh.glossFieldMeanRgb[idx * 3u + 2u];
       float cr = 0.0f;
       float cg = 0.0f;
       float cb = 0.0f;
@@ -5923,7 +6786,9 @@ bool buildGlossViewFieldMeshFromFinalFields(const ResolvedPayload& payload,
   mesh.glossHighlightPointCount = mesh.pointCount;
   setMeshFitBoundsFromVerts(&mesh);
   expandGlossViewFitBounds(payload, &mesh);
-  const bool ok = mesh.hasGlossField && (mesh.pointCount > 0 || !mesh.glossFieldSignal.empty());
+  const bool ok = mesh.hasGlossField &&
+                  (mesh.pointCount > 0 || !mesh.glossFieldCandidate1.signal.empty() ||
+                   !mesh.glossFieldCandidate2.signal.empty());
   if (ok) {
     *out = std::move(mesh);
   }
@@ -5951,189 +6816,28 @@ bool buildGlossViewFieldMeshFromCellStats(const ResolvedPayload& payload,
       neutrality.size() != cellCount) {
     return false;
   }
-  MeshData mesh{};
-  mesh.resolution = cloud.resolution <= 25 ? 25 : (cloud.resolution <= 41 ? 41 : 57);
-  mesh.quality = cloud.quality;
-  mesh.paramHash = cloud.paramHash;
-  mesh.serial = nextMeshSerial();
-  mesh.hasGlossField = true;
-  mesh.glossFieldWidth = gridWidth;
-  mesh.glossFieldHeight = gridHeight;
-  mesh.glossFieldMeanRgb = meanRgb;
-  mesh.glossFieldBody.assign(cellCount, 0.0f);
-  mesh.glossFieldSignal.assign(cellCount, 0.0f);
-  mesh.glossFieldPositive.assign(cellCount, 0.0f);
-  mesh.glossFieldNegative.assign(cellCount, 0.0f);
-  mesh.glossFieldBoundary.assign(cellCount, 0.0f);
-  mesh.glossFieldCongruence.assign(cellCount, 0.0f);
-  mesh.glossFieldConfidence.assign(cellCount, 0.0f);
-  mesh.glossFieldCarrierMax = carrierMax;
-  mesh.glossFieldCarrierY = carrierY;
-  mesh.glossFieldCarrierMin = carrierMin;
-  mesh.glossFieldNeutrality = neutrality;
+  GlossFieldBasis basis{};
+  basis.gridWidth = gridWidth;
+  basis.gridHeight = gridHeight;
+  basis.occupancy = occupancy;
+  basis.occupancySupport = occupancy;
+  normalizeScalarGrid(&basis.occupancySupport);
+  blurScalarGrid(gridWidth, gridHeight, &basis.occupancySupport);
+  normalizeScalarGrid(&basis.occupancySupport);
+  basis.meanRgb = meanRgb;
+  basis.carrierY = carrierY;
+  basis.carrierMax = carrierMax;
+  basis.carrierMin = carrierMin;
+  basis.neutrality = neutrality;
+  blurScalarGrid(gridWidth, gridHeight, &basis.carrierY);
+  blurScalarGrid(gridWidth, gridHeight, &basis.carrierMax);
+  blurScalarGrid(gridWidth, gridHeight, &basis.carrierMin);
+  blurScalarGrid(gridWidth, gridHeight, &basis.neutrality);
 
-  std::vector<float> occupancyNorm = occupancy;
-  normalizeScalarGrid(&occupancyNorm);
-  blurScalarGrid(gridWidth, gridHeight, &occupancyNorm);
-  normalizeScalarGrid(&occupancyNorm);
-
-  blurScalarGrid(gridWidth, gridHeight, &mesh.glossFieldCarrierY);
-  blurScalarGrid(gridWidth, gridHeight, &mesh.glossFieldCarrierMax);
-  blurScalarGrid(gridWidth, gridHeight, &mesh.glossFieldCarrierMin);
-  blurScalarGrid(gridWidth, gridHeight, &mesh.glossFieldNeutrality);
-
-  const int radiusCells = glossNeighborhoodRadiusCells(payload.glossNeighborhood);
-  std::vector<GlossFieldNeighborhoodEntry> neighborhoodScratch;
-  neighborhoodScratch.reserve(static_cast<size_t>((radiusCells * 2 + 1) * (radiusCells * 2 + 1)));
-  for (int y = 0; y < gridHeight; ++y) {
-    for (int x = 0; x < gridWidth; ++x) {
-      const size_t idx = static_cast<size_t>(y) * static_cast<size_t>(gridWidth) + static_cast<size_t>(x);
-      if (occupancy[idx] <= 0.5f) continue;
-      neighborhoodScratch.clear();
-      const float centerCarrier = mesh.glossFieldCarrierMax[idx];
-      const float centerR = mesh.glossFieldMeanRgb[idx * 3u + 0u];
-      const float centerG = mesh.glossFieldMeanRgb[idx * 3u + 1u];
-      const float centerB = mesh.glossFieldMeanRgb[idx * 3u + 2u];
-      for (int oy = -radiusCells; oy <= radiusCells; ++oy) {
-        const int yy = y + oy;
-        if (yy < 0 || yy >= gridHeight) continue;
-        for (int ox = -radiusCells; ox <= radiusCells; ++ox) {
-          const int xx = x + ox;
-          if (xx < 0 || xx >= gridWidth) continue;
-          const size_t neighborIdx =
-              static_cast<size_t>(yy) * static_cast<size_t>(gridWidth) + static_cast<size_t>(xx);
-          if (occupancy[neighborIdx] <= 0.5f) continue;
-          const float carrier = mesh.glossFieldCarrierMax[neighborIdx];
-          const float nr = mesh.glossFieldMeanRgb[neighborIdx * 3u + 0u];
-          const float ng = mesh.glossFieldMeanRgb[neighborIdx * 3u + 1u];
-          const float nb = mesh.glossFieldMeanRgb[neighborIdx * 3u + 2u];
-          const float colorDistance =
-              std::sqrt((nr - centerR) * (nr - centerR) + (ng - centerG) * (ng - centerG) +
-                        (nb - centerB) * (nb - centerB));
-          if (std::fabs(carrier - centerCarrier) > 0.26f && colorDistance > 0.20f) continue;
-          neighborhoodScratch.push_back({carrier, neighborIdx});
-        }
-      }
-      if (neighborhoodScratch.empty()) {
-        mesh.glossFieldBody[idx] = centerCarrier;
-        continue;
-      }
-      std::sort(neighborhoodScratch.begin(),
-                neighborhoodScratch.end(),
-                [](const GlossFieldNeighborhoodEntry& a, const GlossFieldNeighborhoodEntry& b) {
-                  return (a.carrier < b.carrier) || (a.carrier == b.carrier && a.index < b.index);
-                });
-      const size_t trim = neighborhoodScratch.size() >= 6u ? std::max<size_t>(1u, neighborhoodScratch.size() / 6u) : 0u;
-      const size_t begin = std::min(trim, neighborhoodScratch.size());
-      const size_t end = std::max(begin + size_t{1}, neighborhoodScratch.size() - trim);
-      float bodySum = 0.0f;
-      float bodyWeight = 0.0f;
-      for (size_t i = begin; i < end; ++i) {
-        const size_t neighborIdx = neighborhoodScratch[i].index;
-        const int neighborX = static_cast<int>(neighborIdx % static_cast<size_t>(gridWidth));
-        const int neighborY = static_cast<int>(neighborIdx / static_cast<size_t>(gridWidth));
-        const float dx = static_cast<float>(neighborX - x);
-        const float dy = static_cast<float>(neighborY - y);
-        const float spatialWeight = 1.0f / (1.0f + dx * dx + dy * dy);
-        bodySum += neighborhoodScratch[i].carrier * spatialWeight;
-        bodyWeight += spatialWeight;
-      }
-      mesh.glossFieldBody[idx] = bodyWeight > 1e-6f ? (bodySum / bodyWeight) : centerCarrier;
-    }
-  }
-
-  std::vector<float> rawSignal(cellCount, 0.0f);
-  float maxPositive = 0.0f;
-  float maxNegative = 0.0f;
-  float maxBody = 0.0f;
-  for (int y = 0; y < gridHeight; ++y) {
-    for (int x = 0; x < gridWidth; ++x) {
-      const size_t idx = static_cast<size_t>(y) * static_cast<size_t>(gridWidth) + static_cast<size_t>(x);
-      if (occupancy[idx] <= 0.5f) continue;
-      maxBody = std::max(maxBody, mesh.glossFieldBody[idx]);
-      const float rawPositive = std::max(0.0f, mesh.glossFieldCarrierMax[idx] - mesh.glossFieldBody[idx]);
-      const float rawNegative = std::max(0.0f, mesh.glossFieldBody[idx] - mesh.glossFieldCarrierMax[idx]);
-      rawSignal[idx] = rawPositive - rawNegative;
-    }
-  }
-
-  for (int y = 0; y < gridHeight; ++y) {
-    for (int x = 0; x < gridWidth; ++x) {
-      const size_t idx = static_cast<size_t>(y) * static_cast<size_t>(gridWidth) + static_cast<size_t>(x);
-      if (occupancy[idx] <= 0.5f) continue;
-      const float gxCarrier = sampleScalarGridClamped(mesh.glossFieldBody, gridWidth, gridHeight, x + 1, y) -
-                              sampleScalarGridClamped(mesh.glossFieldBody, gridWidth, gridHeight, x - 1, y);
-      const float gyCarrier = sampleScalarGridClamped(mesh.glossFieldBody, gridWidth, gridHeight, x, y + 1) -
-                              sampleScalarGridClamped(mesh.glossFieldBody, gridWidth, gridHeight, x, y - 1);
-      const float gxSignal = sampleScalarGridClamped(rawSignal, gridWidth, gridHeight, x + 1, y) -
-                             sampleScalarGridClamped(rawSignal, gridWidth, gridHeight, x - 1, y);
-      const float gySignal = sampleScalarGridClamped(rawSignal, gridWidth, gridHeight, x, y + 1) -
-                             sampleScalarGridClamped(rawSignal, gridWidth, gridHeight, x, y - 1);
-      const float magCarrier = std::sqrt(gxCarrier * gxCarrier + gyCarrier * gyCarrier);
-      const float magSignal = std::sqrt(gxSignal * gxSignal + gySignal * gySignal);
-      float congruence = 0.0f;
-      if (magCarrier > 1e-6f && magSignal > 1e-6f) {
-        congruence = std::fabs((gxCarrier * gxSignal + gyCarrier * gySignal) / (magCarrier * magSignal));
-      } else if (magSignal > 1e-6f) {
-        congruence = 0.35f;
-      }
-      const float occNeighborhood =
-          (sampleScalarGridClamped(occupancyNorm, gridWidth, gridHeight, x, y) +
-           sampleScalarGridClamped(occupancyNorm, gridWidth, gridHeight, x + 1, y) +
-           sampleScalarGridClamped(occupancyNorm, gridWidth, gridHeight, x - 1, y) +
-           sampleScalarGridClamped(occupancyNorm, gridWidth, gridHeight, x, y + 1) +
-           sampleScalarGridClamped(occupancyNorm, gridWidth, gridHeight, x, y - 1)) /
-          5.0f;
-      const float confidence =
-          clampf(std::sqrt(sampleScalarGridClamped(occupancyNorm, gridWidth, gridHeight, x, y)) *
-                     clampf(0.28f + 0.72f * occNeighborhood, 0.0f, 1.0f),
-                 0.0f,
-                 1.0f);
-      const float posWeighted = std::max(0.0f, rawSignal[idx]) * (0.30f + 0.70f * congruence) * confidence;
-      const float negWeighted = std::max(0.0f, -rawSignal[idx]) * (0.30f + 0.70f * congruence) * confidence;
-      mesh.glossFieldPositive[idx] = posWeighted;
-      mesh.glossFieldNegative[idx] = negWeighted;
-      mesh.glossFieldCongruence[idx] = congruence;
-      mesh.glossFieldConfidence[idx] = confidence;
-      mesh.glossFieldBoundary[idx] = clampf(magSignal * 4.0f, 0.0f, 1.0f) * confidence;
-      mesh.glossFieldSignal[idx] = posWeighted - negWeighted;
-      maxPositive = std::max(maxPositive, posWeighted);
-      maxNegative = std::max(maxNegative, negWeighted);
-    }
-  }
-
-  const float maxAbsSignal = std::max(1e-5f, std::max(maxPositive, maxNegative));
-  const float safeMaxBody = std::max(1e-5f, maxBody);
-  const auto normalizeBy = [](std::vector<float>* values, float denom, bool signedValues) {
-    if (!values || values->empty()) return;
-    const float safe = std::max(1e-5f, denom);
-    for (float& v : *values) {
-      v = signedValues ? clampf(v / safe, -1.0f, 1.0f) : clampf(v / safe, 0.0f, 1.0f);
-    }
-  };
-  normalizeBy(&mesh.glossFieldBody, safeMaxBody, false);
-  normalizeBy(&mesh.glossFieldPositive, std::max(1e-5f, maxPositive), false);
-  normalizeBy(&mesh.glossFieldNegative, std::max(1e-5f, maxNegative), false);
-  normalizeBy(&mesh.glossFieldSignal, maxAbsSignal, true);
-  normalizeScalarGrid(&mesh.glossFieldBoundary);
-  return buildGlossViewFieldMeshFromFinalFields(payload,
-                                                cloud,
-                                                gridWidth,
-                                                gridHeight,
-                                                occupancy,
-                                                mesh.glossFieldMeanRgb,
-                                                mesh.glossFieldCarrierY,
-                                                mesh.glossFieldCarrierMax,
-                                                mesh.glossFieldCarrierMin,
-                                                mesh.glossFieldNeutrality,
-                                                mesh.glossFieldBody,
-                                                mesh.glossFieldSignal,
-                                                mesh.glossFieldPositive,
-                                                mesh.glossFieldNegative,
-                                                mesh.glossFieldBoundary,
-                                                mesh.glossFieldCongruence,
-                                                mesh.glossFieldConfidence,
-                                                out);
+  GlossFieldSolutionPair solutions{};
+  solutions.candidate1 = solveGlossViewFillGuardHybridField(payload, basis);
+  solutions.candidate2 = solveGlossViewContourRetinexDogYField(payload, basis);
+  return buildGlossViewFieldMeshFromSolvedFields(payload, cloud, basis, solutions, out);
 }
 
 bool glossViewFieldLooksDegenerate(const ResolvedPayload& payload,
@@ -6296,24 +7000,17 @@ bool buildGlossViewFieldMeshCuda(const ResolvedPayload& payload,
     logViewerEvent("CUDA gloss-field validation rejected degenerate spatial field; falling back to CPU.");
     return false;
   }
-  return buildGlossViewFieldMeshFromFinalFields(payload,
-                                                cloud,
-                                                result.gridWidth,
-                                                result.gridHeight,
-                                                result.occupancy,
-                                                result.meanRgb,
-                                                result.carrierY,
-                                                result.carrierMax,
-                                                result.carrierMin,
-                                                result.neutrality,
-                                                result.body,
-                                                result.signal,
-                                                result.positive,
-                                                result.negative,
-                                                result.boundary,
-                                                result.congruence,
-                                                result.confidence,
-                                                out);
+  return buildGlossViewFieldMeshFromCellStats(payload,
+                                              cloud,
+                                              result.gridWidth,
+                                              result.gridHeight,
+                                              result.occupancy,
+                                              result.meanRgb,
+                                              result.carrierY,
+                                              result.carrierMax,
+                                              result.carrierMin,
+                                              result.neutrality,
+                                              out);
 }
 #endif
 
@@ -6321,14 +7018,18 @@ bool buildGlossViewFieldMeshCuda(const ResolvedPayload& payload,
 bool buildGlossViewFieldMeshMetal(const ResolvedPayload& payload,
                                   const InputCloudPayload& cloud,
                                   const std::vector<InputCloudSample>& samples,
-                                  MeshData* out) {
+                                  MeshData* out,
+                                  std::string* reason = nullptr) {
   if (!out || samples.empty()) return false;
   int gridWidth = 96;
   int gridHeight = 96;
   glossFieldDimensionsForPayload(payload, &gridWidth, &gridHeight);
+  std::vector<InputCloudSample> gpuSamples;
+  reduceGlossFieldSamplesForGpu(samples, gridWidth, gridHeight, glossFieldGpuPerCellBudget(payload), &gpuSamples);
+  const std::vector<InputCloudSample>& fieldSamples = gpuSamples.empty() ? samples : gpuSamples;
   std::vector<float> packedPoints;
-  packedPoints.reserve(samples.size() * 6u);
-  for (const auto& sample : samples) {
+  packedPoints.reserve(fieldSamples.size() * 6u);
+  for (const auto& sample : fieldSamples) {
     packedPoints.push_back(clampf(sample.xNorm, 0.0f, 1.0f));
     packedPoints.push_back(clampf(sample.yNorm, 0.0f, 1.0f));
     packedPoints.push_back(0.0f);
@@ -6347,37 +7048,50 @@ bool buildGlossViewFieldMeshMetal(const ResolvedPayload& payload,
     if (!error.empty()) {
       logViewerEvent(std::string("Metal gloss-field build failed: ") + error);
     }
+    if (reason) *reason = error.empty() ? std::string("runtime-failure") : error;
     return false;
   }
-  if (glossViewFieldLooksDegenerate(payload, samples, result.gridWidth, result.gridHeight, result.occupancy)) {
+  if (!validateGlossFieldResult(result, &error)) {
+    logViewerEvent(std::string("Metal gloss-field validation rejected malformed field result: ") + error);
+    if (reason) *reason = error.empty() ? std::string("malformed-result") : error;
+    return false;
+  }
+  if (glossViewFieldLooksDegenerate(payload, fieldSamples, result.gridWidth, result.gridHeight, result.occupancy)) {
     logViewerEvent("Metal gloss-field validation rejected degenerate spatial field; falling back to CPU.");
+    if (reason) *reason = "degenerate-spatial-field";
     return false;
   }
-  return buildGlossViewFieldMeshFromFinalFields(payload,
-                                                cloud,
-                                                result.gridWidth,
-                                                result.gridHeight,
-                                                result.occupancy,
-                                                result.meanRgb,
-                                                result.carrierY,
-                                                result.carrierMax,
-                                                result.carrierMin,
-                                                result.neutrality,
-                                                result.body,
-                                                result.signal,
-                                                result.positive,
-                                                result.negative,
-                                                result.boundary,
-                                                result.congruence,
-                                                result.confidence,
-                                                out);
+  const bool built = buildGlossViewFieldMeshFromCellStats(payload,
+                                                          cloud,
+                                                          result.gridWidth,
+                                                          result.gridHeight,
+                                                          result.occupancy,
+                                                          result.meanRgb,
+                                                          result.carrierY,
+                                                          result.carrierMax,
+                                                          result.carrierMin,
+                                                          result.neutrality,
+                                                          out);
+  if (!built) {
+    if (reason) *reason = "cell-stats-build-failed";
+    return false;
+  }
+  const bool parityOk = runGlossFieldParityCheck(payload, cloud, samples, *out, viewerParityChecksEnabled());
+  if (!parityOk) {
+    if (reason) *reason = "parity-mismatch";
+    return false;
+  }
+  if (reason) *reason = "metal-gloss-field";
+  return true;
 }
 #endif
 
 void buildGlossViewProjectionCpuDrawArrays(const MeshData& mesh,
                                            const ResolvedPayload& payload,
+                                           GlossViewFieldAlgorithm algorithm,
                                            GlossViewColorMode colorMode,
                                            GlossViewDebugFieldMode debugMode,
+                                           GlossViewDiagnosticOverlay diagnosticMode,
                                            std::vector<float>* outVerts,
                                            std::vector<float>* outColors) {
   if (!outVerts || !outColors) return;
@@ -6398,7 +7112,7 @@ void buildGlossViewProjectionCpuDrawArrays(const MeshData& mesh,
     float positive = 0.0f;
     float negative = 0.0f;
     float signedValue = 0.0f;
-    glossViewResolvedDisplaySignals(mesh, cellIdx, debugMode, &base, &positive, &negative, &signedValue);
+    glossViewResolvedDisplaySignals(mesh, cellIdx, algorithm, debugMode, &base, &positive, &negative, &signedValue);
     // Present the 3D projection as an upright image card with relief coming off the image plane.
     // This keeps the footprint aligned with the source image and avoids the "terrain on the floor"
     // reading where highlights can feel like they sag below the body.
@@ -6408,7 +7122,7 @@ void buildGlossViewProjectionCpuDrawArrays(const MeshData& mesh,
     float g = 0.0f;
     float b = 0.0f;
     float a = 0.0f;
-    glossViewCellDisplayStyle(mesh, cellIdx, payload, colorMode, debugMode, &r, &g, &b, &a);
+    glossViewCellDisplayStyle(mesh, cellIdx, payload, algorithm, colorMode, debugMode, diagnosticMode, &r, &g, &b, &a);
     outVerts->push_back(x);
     outVerts->push_back(y);
     outVerts->push_back(z);
@@ -6748,11 +7462,15 @@ bool buildInputCloudMesh(const ResolvedPayload& payload,
       return true;
     }
 #if defined(__APPLE__)
-    if (gpuCaps.inputComputeEnabled &&
-        gpuCaps.sessionBackend == ViewerComputeBackendKind::MetalCompute &&
-        glossViewMetalFieldPathEnabled() &&
-        buildGlossViewFieldMeshMetal(payload, cloud, samples, out)) {
+    std::string metalReason;
+    if (gpuCaps.sessionBackend == ViewerComputeBackendKind::MetalCompute &&
+        canUseMetalGlossFieldPath(gpuCaps, sessionState, &metalReason) &&
+        buildGlossViewFieldMeshMetal(payload, cloud, samples, out, &metalReason)) {
       return true;
+    }
+    if (gpuCaps.sessionBackend == ViewerComputeBackendKind::MetalCompute &&
+        canUseMetalGlossFieldPath(gpuCaps, sessionState, nullptr)) {
+      demoteMetalGlossFieldPath(sessionState, metalReason.empty() ? std::string("runtime-failure") : metalReason);
     }
 #endif
 #if defined(CHROMASPACE_VIEWER_HAS_CUDA) && !defined(__APPLE__)
@@ -7193,6 +7911,74 @@ bool buildInputPointDrawBuffers(const MeshData& mesh,
   return buildCpuSampledPointDrawBuffers(mesh, spec, out);
 }
 
+bool runGlossFieldParityCheck(const ResolvedPayload& payload,
+                              const InputCloudPayload& cloud,
+                              const std::vector<InputCloudSample>& samples,
+                              const MeshData& gpuMesh,
+                              bool enabled) {
+  if (!enabled) return true;
+  MeshData cpuMesh{};
+  if (!buildGlossViewFieldMeshCpu(payload, cloud, samples, &cpuMesh)) return true;
+  const size_t carrierWindow = 24u;
+  const size_t rgbWindow = carrierWindow * 3u;
+  const std::vector<float> cpuOccupancy(cpuMesh.glossFieldOccupancy.begin(),
+                                        cpuMesh.glossFieldOccupancy.begin() + static_cast<std::ptrdiff_t>(std::min(cpuMesh.glossFieldOccupancy.size(), carrierWindow)));
+  const std::vector<float> gpuOccupancy(gpuMesh.glossFieldOccupancy.begin(),
+                                        gpuMesh.glossFieldOccupancy.begin() + static_cast<std::ptrdiff_t>(std::min(gpuMesh.glossFieldOccupancy.size(), cpuOccupancy.size())));
+  const std::vector<float> cpuCarrierMax(cpuMesh.glossFieldCarrierMax.begin(),
+                                         cpuMesh.glossFieldCarrierMax.begin() + static_cast<std::ptrdiff_t>(std::min(cpuMesh.glossFieldCarrierMax.size(), carrierWindow)));
+  const std::vector<float> gpuCarrierMax(gpuMesh.glossFieldCarrierMax.begin(),
+                                         gpuMesh.glossFieldCarrierMax.begin() + static_cast<std::ptrdiff_t>(std::min(gpuMesh.glossFieldCarrierMax.size(), cpuCarrierMax.size())));
+  const std::vector<float> cpuCarrierY(cpuMesh.glossFieldCarrierY.begin(),
+                                       cpuMesh.glossFieldCarrierY.begin() + static_cast<std::ptrdiff_t>(std::min(cpuMesh.glossFieldCarrierY.size(), carrierWindow)));
+  const std::vector<float> gpuCarrierY(gpuMesh.glossFieldCarrierY.begin(),
+                                       gpuMesh.glossFieldCarrierY.begin() + static_cast<std::ptrdiff_t>(std::min(gpuMesh.glossFieldCarrierY.size(), cpuCarrierY.size())));
+  const std::vector<float> cpuCarrierMin(cpuMesh.glossFieldCarrierMin.begin(),
+                                         cpuMesh.glossFieldCarrierMin.begin() + static_cast<std::ptrdiff_t>(std::min(cpuMesh.glossFieldCarrierMin.size(), carrierWindow)));
+  const std::vector<float> gpuCarrierMin(gpuMesh.glossFieldCarrierMin.begin(),
+                                         gpuMesh.glossFieldCarrierMin.begin() + static_cast<std::ptrdiff_t>(std::min(gpuMesh.glossFieldCarrierMin.size(), cpuCarrierMin.size())));
+  const std::vector<float> cpuMeanRgb(cpuMesh.glossFieldMeanRgb.begin(),
+                                      cpuMesh.glossFieldMeanRgb.begin() + static_cast<std::ptrdiff_t>(std::min(cpuMesh.glossFieldMeanRgb.size(), rgbWindow)));
+  const std::vector<float> gpuMeanRgb(gpuMesh.glossFieldMeanRgb.begin(),
+                                      gpuMesh.glossFieldMeanRgb.begin() + static_cast<std::ptrdiff_t>(std::min(gpuMesh.glossFieldMeanRgb.size(), cpuMeanRgb.size())));
+  const float cpuOccSum = std::accumulate(cpuMesh.glossFieldOccupancy.begin(), cpuMesh.glossFieldOccupancy.end(), 0.0f);
+  const float gpuOccSum = std::accumulate(gpuMesh.glossFieldOccupancy.begin(), gpuMesh.glossFieldOccupancy.end(), 0.0f);
+  const bool fitOk = (!cpuMesh.hasFitBounds && !gpuMesh.hasFitBounds) ||
+                     (cpuMesh.hasFitBounds && gpuMesh.hasFitBounds &&
+                      std::abs(cpuMesh.fitMin.x - gpuMesh.fitMin.x) <= 1e-4f &&
+                      std::abs(cpuMesh.fitMin.y - gpuMesh.fitMin.y) <= 1e-4f &&
+                      std::abs(cpuMesh.fitMin.z - gpuMesh.fitMin.z) <= 1e-4f &&
+                      std::abs(cpuMesh.fitMax.x - gpuMesh.fitMax.x) <= 1e-4f &&
+                      std::abs(cpuMesh.fitMax.y - gpuMesh.fitMax.y) <= 1e-4f &&
+                      std::abs(cpuMesh.fitMax.z - gpuMesh.fitMax.z) <= 1e-4f);
+  const bool ok = cpuMesh.glossFieldWidth == gpuMesh.glossFieldWidth &&
+                  cpuMesh.glossFieldHeight == gpuMesh.glossFieldHeight &&
+                  cpuMesh.pointCount == gpuMesh.pointCount &&
+                  std::abs(cpuOccSum - gpuOccSum) <= std::max(1e-3f, std::abs(cpuOccSum) * 1e-4f) &&
+                  sampledFloatsNear(cpuOccupancy, gpuOccupancy, 1e-4f) &&
+                  sampledFloatsNear(cpuMeanRgb, gpuMeanRgb, 2e-4f) &&
+                  sampledFloatsNear(cpuCarrierMax, gpuCarrierMax, 2e-4f) &&
+                  sampledFloatsNear(cpuCarrierY, gpuCarrierY, 2e-4f) &&
+                  sampledFloatsNear(cpuCarrierMin, gpuCarrierMin, 2e-4f) &&
+                  fitOk;
+  std::ostringstream os;
+  os << "grid cpu=" << cpuMesh.glossFieldWidth << "x" << cpuMesh.glossFieldHeight
+     << " gpu=" << gpuMesh.glossFieldWidth << "x" << gpuMesh.glossFieldHeight
+     << " occSum=" << cpuOccSum << "/" << gpuOccSum
+     << " occSig=" << std::hex
+     << floatSampleSignature(cpuOccupancy.data(), cpuOccupancy.size()) << "/"
+     << floatSampleSignature(gpuOccupancy.data(), gpuOccupancy.size())
+     << " maxSig=" << floatSampleSignature(cpuCarrierMax.data(), cpuCarrierMax.size()) << "/"
+     << floatSampleSignature(gpuCarrierMax.data(), gpuCarrierMax.size())
+     << " ySig=" << floatSampleSignature(cpuCarrierY.data(), cpuCarrierY.size()) << "/"
+     << floatSampleSignature(gpuCarrierY.data(), gpuCarrierY.size())
+     << " minSig=" << floatSampleSignature(cpuCarrierMin.data(), cpuCarrierMin.size()) << "/"
+     << floatSampleSignature(gpuCarrierMin.data(), gpuCarrierMin.size())
+     << " fit=" << (fitOk ? "ok" : "mismatch");
+  logParityCheckResult(enabled, "gloss-field", ok, os.str());
+  return ok;
+}
+
 bool runOverlayParityCheckWithBuffers(const ResolvedPayload& payload,
                                       GLuint vertsBuffer,
                                       GLuint colorsBuffer,
@@ -7291,9 +8077,14 @@ struct AppState {
   CameraState cam;
   Quat modelOrientation;
   std::string plotMode = "rgb";
-  GlossViewPresentationMode glossViewPresentation = GlossViewPresentationMode::Field2D;
+  GlossViewPresentationMode glossViewPresentation = GlossViewPresentationMode::Projection3D;
+  GlossViewFieldAlgorithm glossViewFieldAlgorithm = GlossViewFieldAlgorithm::Candidate1;
   GlossViewColorMode glossViewColorMode = GlossViewColorMode::SemanticSignal;
   GlossViewDebugFieldMode glossViewDebugFieldMode = GlossViewDebugFieldMode::Signal;
+  GlossViewDiagnosticOverlay glossViewDiagnosticOverlay = GlossViewDiagnosticOverlay::Off;
+  bool orthographicSnapEnabled = true;
+  float axisLockAccumDx = 0.0f;
+  float axisLockAccumDy = 0.0f;
   int orientAxisLock = 0;
   double orientAxisFeedbackUntil = 0.0;
   double slowFeedbackUntil = 0.0;
@@ -7542,6 +8333,23 @@ void keyCallback(GLFWwindow* window, int key, int, int action, int) {
       app->glossViewDebugFieldMode = static_cast<GlossViewDebugFieldMode>(nextMode);
       return;
     }
+    if (key == GLFW_KEY_A) {
+      app->glossViewFieldAlgorithm =
+          app->glossViewFieldAlgorithm == GlossViewFieldAlgorithm::Candidate1
+              ? GlossViewFieldAlgorithm::Candidate2
+              : GlossViewFieldAlgorithm::Candidate1;
+      return;
+    }
+    if (key == GLFW_KEY_D) {
+      const int nextMode = (static_cast<int>(app->glossViewDiagnosticOverlay) + 1) % 3;
+      app->glossViewDiagnosticOverlay = static_cast<GlossViewDiagnosticOverlay>(nextMode);
+      return;
+    }
+  }
+  if (action == GLFW_PRESS && key == GLFW_KEY_S) {
+    app->orthographicSnapEnabled = !app->orthographicSnapEnabled;
+    if (!app->orthographicSnapEnabled) resetGlossViewOrthoInteractionState(app);
+    return;
   }
   if (action == GLFW_PRESS && key == GLFW_KEY_F) {
     app->fitVolumeRequested = true;
@@ -8297,15 +9105,17 @@ void drawChromaticityInfoOverlay(const PlotRemapSpec& spec,
 
 void glossViewResolvedDisplaySignals(const MeshData& mesh,
                                      size_t idx,
+                                     GlossViewFieldAlgorithm algorithm,
                                      GlossViewDebugFieldMode debugMode,
                                      float* outBase,
                                      float* outPositive,
                                      float* outNegative,
                                      float* outSignedValue) {
-  if (outBase) *outBase = idx < mesh.glossFieldBody.size() ? mesh.glossFieldBody[idx] : 0.0f;
-  if (outPositive) *outPositive = idx < mesh.glossFieldPositive.size() ? mesh.glossFieldPositive[idx] : 0.0f;
-  if (outNegative) *outNegative = idx < mesh.glossFieldNegative.size() ? mesh.glossFieldNegative[idx] : 0.0f;
-  if (outSignedValue) *outSignedValue = idx < mesh.glossFieldSignal.size() ? mesh.glossFieldSignal[idx] : 0.0f;
+  const GlossFieldSolution& solution = glossViewFieldSolution(mesh, algorithm);
+  if (outBase) *outBase = idx < solution.body.size() ? solution.body[idx] : 0.0f;
+  if (outPositive) *outPositive = idx < solution.positive.size() ? solution.positive[idx] : 0.0f;
+  if (outNegative) *outNegative = idx < solution.negative.size() ? solution.negative[idx] : 0.0f;
+  if (outSignedValue) *outSignedValue = idx < solution.signal.size() ? solution.signal[idx] : 0.0f;
   if (debugMode == GlossViewDebugFieldMode::Signal) return;
   float scalar = 0.0f;
   switch (debugMode) {
@@ -8348,6 +9158,7 @@ Vec3 glossViewSourceHueColor(const MeshData& mesh, size_t idx, const ResolvedPay
 void glossViewCellUnderlayStyle(const MeshData& mesh,
                                 size_t idx,
                                 const ResolvedPayload& payload,
+                                GlossViewFieldAlgorithm algorithm,
                                 GlossViewColorMode colorMode,
                                 float* outR,
                                 float* outG,
@@ -8369,10 +9180,11 @@ void glossViewCellUnderlayStyle(const MeshData& mesh,
   mapDisplayColor(mr, mg, mb, &sr, &sg, &sb);
   const float sourceLuma = clampf(0.2126f * sr + 0.7152f * sg + 0.0722f * sb, 0.0f, 1.0f);
   const float sourcePresence = clampf(std::max(mr, std::max(mg, mb)), 0.0f, 1.0f);
+  const GlossFieldSolution& solution = glossViewFieldSolution(mesh, algorithm);
   const float confidence =
-      idx < mesh.glossFieldConfidence.size() ? clampf(mesh.glossFieldConfidence[idx], 0.0f, 1.0f) : 0.0f;
+      idx < solution.confidence.size() ? clampf(solution.confidence[idx], 0.0f, 1.0f) : 0.0f;
   const float bodyValue =
-      idx < mesh.glossFieldBody.size() ? clampf(mesh.glossFieldBody[idx], 0.0f, 1.0f) : sourceLuma;
+      idx < solution.body.size() ? clampf(solution.body[idx], 0.0f, 1.0f) : sourceLuma;
   const float structure = std::max(std::sqrt(confidence), std::sqrt(sourcePresence));
   const float bodyGain = 0.34f + 0.66f * payload.glossBodyOpacity;
 
@@ -8397,8 +9209,10 @@ void glossViewCellUnderlayStyle(const MeshData& mesh,
 void glossViewCellDisplayStyle(const MeshData& mesh,
                                size_t idx,
                                const ResolvedPayload& payload,
+                               GlossViewFieldAlgorithm algorithm,
                                GlossViewColorMode colorMode,
                                GlossViewDebugFieldMode debugMode,
+                               GlossViewDiagnosticOverlay diagnosticMode,
                                float* outR,
                                float* outG,
                                float* outB,
@@ -8408,13 +9222,16 @@ void glossViewCellDisplayStyle(const MeshData& mesh,
   float positive = 0.0f;
   float negative = 0.0f;
   float signedValue = 0.0f;
-  glossViewResolvedDisplaySignals(mesh, idx, debugMode, &base, &positive, &negative, &signedValue);
+  glossViewResolvedDisplaySignals(mesh, idx, algorithm, debugMode, &base, &positive, &negative, &signedValue);
+  const GlossFieldSolution& solution = glossViewFieldSolution(mesh, algorithm);
   const float confidence =
-      idx < mesh.glossFieldConfidence.size() ? clampf(mesh.glossFieldConfidence[idx], 0.0f, 1.0f) : 0.0f;
+      idx < solution.confidence.size() ? clampf(solution.confidence[idx], 0.0f, 1.0f) : 0.0f;
   const float congruence =
-      idx < mesh.glossFieldCongruence.size() ? clampf(mesh.glossFieldCongruence[idx], 0.0f, 1.0f) : 0.0f;
+      idx < solution.congruence.size() ? clampf(solution.congruence[idx], 0.0f, 1.0f) : 0.0f;
   const float boundary =
-      idx < mesh.glossFieldBoundary.size() ? clampf(mesh.glossFieldBoundary[idx], 0.0f, 1.0f) : 0.0f;
+      idx < solution.boundary.size() ? clampf(solution.boundary[idx], 0.0f, 1.0f) : 0.0f;
+  const float ambiguity =
+      idx < solution.ambiguity.size() ? clampf(solution.ambiguity[idx], 0.0f, 1.0f) : clampf(1.0f - confidence, 0.0f, 1.0f);
   const float signalScale = std::max(1.0f, payload.glossLiftScale);
   positive = clampf(positive * signalScale, 0.0f, 1.0f);
   negative = clampf(negative * signalScale, 0.0f, 1.0f);
@@ -8480,11 +9297,22 @@ void glossViewCellDisplayStyle(const MeshData& mesh,
   if (boundary > 0.0f) {
     color = mix3(color, Vec3{0.98f, 0.98f, 0.94f}, clampf(0.10f + 0.26f * boundary, 0.0f, 0.34f));
   }
-  const float alpha =
+  float alpha =
       clampf(payload.glossBodyOpacity * (0.12f + 0.62f * confidence) * (0.82f - 0.18f * signalPresence) +
                  payload.glossHighlightOpacity * signalPresence * (0.16f + 0.84f * structureStrength),
-             0.018f,
-             1.0f);
+              0.018f,
+              1.0f);
+  if (diagnosticMode == GlossViewDiagnosticOverlay::Confidence) {
+    const float gray = 0.16f + 0.78f * confidence;
+    color = mix3(color, Vec3{gray, gray, gray}, 0.36f);
+    color = mix3(color, Vec3{1.0f, 1.0f, 0.96f}, 0.10f * boundary);
+    alpha = clampf(alpha * (0.55f + 0.45f * confidence) + 0.10f * confidence, 0.018f, 1.0f);
+  } else if (diagnosticMode == GlossViewDiagnosticOverlay::Ambiguity) {
+    const float gray = 0.12f + 0.74f * ambiguity;
+    color = mix3(color, Vec3{gray * 0.94f, gray * 0.97f, gray}, 0.34f);
+    color = mix3(color, Vec3{0.80f, 0.90f, 1.0f}, 0.10f * boundary * ambiguity);
+    alpha = clampf(alpha * (0.48f + 0.52f * ambiguity) + 0.08f * ambiguity, 0.018f, 1.0f);
+  }
   *outR = clampf(color.x, 0.0f, 1.0f);
   *outG = clampf(color.y, 0.0f, 1.0f);
   *outB = clampf(color.z, 0.0f, 1.0f);
@@ -8531,8 +9359,10 @@ void drawGlossViewFieldRect(float left,
                             float top,
                             const MeshData& mesh,
                             const ResolvedPayload& payload,
+                            GlossViewFieldAlgorithm algorithm,
                             GlossViewColorMode colorMode,
-                            GlossViewDebugFieldMode debugMode) {
+                            GlossViewDebugFieldMode debugMode,
+                            GlossViewDiagnosticOverlay diagnosticMode) {
   if (!mesh.hasGlossField || mesh.glossFieldWidth <= 0 || mesh.glossFieldHeight <= 0) return;
   const float cellW = (right - left) / static_cast<float>(mesh.glossFieldWidth);
   const float cellH = (top - bottom) / static_cast<float>(mesh.glossFieldHeight);
@@ -8545,7 +9375,7 @@ void drawGlossViewFieldRect(float left,
       float g = 0.0f;
       float b = 0.0f;
       float a = 0.0f;
-      glossViewCellUnderlayStyle(mesh, idx, payload, colorMode, &r, &g, &b, &a);
+      glossViewCellUnderlayStyle(mesh, idx, payload, algorithm, colorMode, &r, &g, &b, &a);
       if (a <= 0.01f) continue;
       const float x0 = left + static_cast<float>(x) * cellW;
       const float x1 = x0 + cellW + 0.4f;
@@ -8565,8 +9395,9 @@ void drawGlossViewFieldRect(float left,
     for (int x = 0; x < mesh.glossFieldWidth; ++x) {
       const size_t idx =
           static_cast<size_t>(y) * static_cast<size_t>(mesh.glossFieldWidth) + static_cast<size_t>(x);
+      const GlossFieldSolution& solution = glossViewFieldSolution(mesh, algorithm);
       const float confidence =
-          idx < mesh.glossFieldConfidence.size() ? clampf(mesh.glossFieldConfidence[idx], 0.0f, 1.0f) : 0.0f;
+          idx < solution.confidence.size() ? clampf(solution.confidence[idx], 0.0f, 1.0f) : 0.0f;
       const float sourcePresence =
           idx * 3u + 2u < mesh.glossFieldMeanRgb.size()
               ? clampf(std::max(mesh.glossFieldMeanRgb[idx * 3u + 0u],
@@ -8579,7 +9410,7 @@ void drawGlossViewFieldRect(float left,
       float g = 0.0f;
       float b = 0.0f;
       float a = 0.0f;
-      glossViewCellDisplayStyle(mesh, idx, payload, colorMode, debugMode, &r, &g, &b, &a);
+      glossViewCellDisplayStyle(mesh, idx, payload, algorithm, colorMode, debugMode, diagnosticMode, &r, &g, &b, &a);
       if (a <= 0.01f) continue;
       const float x0 = left + static_cast<float>(x) * cellW;
       const float x1 = x0 + cellW + 0.4f;
@@ -8618,17 +9449,28 @@ void drawGlossLiftSpatialInsetOverlay(int width,
                                       const ResolvedPayload& payload,
                                       const MeshData& mesh,
                                       const HudTextRenderer& renderer,
+                                      GlossViewFieldAlgorithm algorithm,
                                       GlossViewColorMode colorMode,
-                                      GlossViewDebugFieldMode debugMode) {
+                                      GlossViewDebugFieldMode debugMode,
+                                      GlossViewDiagnosticOverlay diagnosticMode) {
   if (width <= 0 || height <= 0 || !mesh.hasGlossField || !payload.glossSpatialInset) {
     return;
   }
 
-  const float insetSize = clampf(static_cast<float>(std::min(width, height)) * 0.22f, 120.0f, 180.0f);
-  const float left = static_cast<float>(width) - insetSize - 18.0f;
-  const float bottom = static_cast<float>(height) - insetSize - 22.0f;
-  const float right = left + insetSize;
-  const float top = bottom + insetSize;
+  const float fieldAspect = static_cast<float>(mesh.glossFieldWidth) /
+                            static_cast<float>(std::max(1, mesh.glossFieldHeight));
+  const float maxInsetW = clampf(static_cast<float>(width) * 0.24f, 140.0f, 240.0f);
+  const float maxInsetH = clampf(static_cast<float>(height) * 0.24f, 100.0f, 180.0f);
+  float insetW = maxInsetW;
+  float insetH = insetW / std::max(0.001f, fieldAspect);
+  if (insetH > maxInsetH) {
+    insetH = maxInsetH;
+    insetW = insetH * fieldAspect;
+  }
+  const float left = static_cast<float>(width) - insetW - 18.0f;
+  const float bottom = static_cast<float>(height) - insetH - 22.0f;
+  const float right = left + insetW;
+  const float top = bottom + insetH;
   drawHudBackdrop(left - 8.0f, bottom - 22.0f, right + 8.0f, top + 8.0f, 0.10f);
   glDisable(GL_TEXTURE_2D);
   glBegin(GL_QUADS);
@@ -8638,7 +9480,7 @@ void drawGlossLiftSpatialInsetOverlay(int width,
   glVertex2f(right, top);
   glVertex2f(left, top);
   glEnd();
-  drawGlossViewFieldRect(left, bottom, right, top, mesh, payload, colorMode, debugMode);
+  drawGlossViewFieldRect(left, bottom, right, top, mesh, payload, algorithm, colorMode, debugMode, diagnosticMode);
   drawGlossViewFieldOrientationMarkers(left, bottom, right, top, true);
 
   const std::string label = "Linked 2D Field";
@@ -8657,8 +9499,10 @@ void drawGlossViewFieldOverlay(int width,
                                int height,
                                const ResolvedPayload& payload,
                                const MeshData& mesh,
+                               GlossViewFieldAlgorithm algorithm,
                                GlossViewColorMode colorMode,
-                               GlossViewDebugFieldMode debugMode) {
+                               GlossViewDebugFieldMode debugMode,
+                               GlossViewDiagnosticOverlay diagnosticMode) {
   if (width <= 0 || height <= 0 || !mesh.hasGlossField || mesh.glossFieldWidth <= 0 || mesh.glossFieldHeight <= 0) {
     return;
   }
@@ -8696,7 +9540,7 @@ void drawGlossViewFieldOverlay(int width,
   glVertex2f(right, top);
   glVertex2f(left, top);
   glEnd();
-  drawGlossViewFieldRect(left, bottom, right, top, mesh, payload, colorMode, debugMode);
+  drawGlossViewFieldRect(left, bottom, right, top, mesh, payload, algorithm, colorMode, debugMode, diagnosticMode);
   drawGlossViewFieldOrientationMarkers(left, bottom, right, top, false);
   glDisable(GL_BLEND);
   glEnable(GL_DEPTH_TEST);
@@ -8712,32 +9556,36 @@ void drawGlossLiftInfoOverlay(int width,
                               const MeshData& mesh,
                               const HudTextRenderer& renderer,
                               GlossViewPresentationMode presentationMode,
+                              GlossViewFieldAlgorithm algorithm,
                               GlossViewColorMode colorMode,
-                              GlossViewDebugFieldMode debugMode) {
+                              GlossViewDebugFieldMode debugMode,
+                              GlossViewDiagnosticOverlay diagnosticMode) {
   if (width <= 0 || height <= 0) return;
 
-  const std::string line1 = "Gloss View";
-  const std::string line2 = std::string("View = ") + glossViewPresentationLabel(presentationMode);
-  const std::string line3 = std::string("Color = ") + glossViewColorModeLabel(colorMode);
-  const std::string line4 = std::string("Field = ") + glossViewDebugFieldLabel(debugMode);
+  std::vector<std::string> lines;
+  lines.emplace_back(std::string("Algorithm = ") + glossViewFieldAlgorithmLabel(algorithm));
+  lines.emplace_back(std::string("Color = ") + glossViewColorModeLabel(colorMode));
+  lines.emplace_back(std::string("Field = ") + glossViewDebugFieldLabel(debugMode));
+  lines.emplace_back(std::string("Diagnostics = ") + glossViewDiagnosticOverlayLabel(diagnosticMode));
   const bool signedSignalField = debugMode == GlossViewDebugFieldMode::Signal;
-  const std::string line5 =
+  lines.emplace_back(
       presentationMode == GlossViewPresentationMode::Field2D
           ? (signedSignalField
                  ? "Gray underlay = source footprint | Warm = + excursion  Cool = - excursion"
                  : "Gray underlay = source footprint | Brighter = higher selected field")
           : (signedSignalField
                  ? "Positive relief comes off the image plane  Negative relief goes behind it"
-                 : "Relief = selected field value coming off the image plane | Debug basis");
-  const std::string line6 = presentationMode == GlossViewPresentationMode::Field2D
-                                  ? "Top/Left markers match image | Tab or V = toggle 2D/3D | C = color | B = basis"
-                                  : (payload.glossSpatialInset
-                                         ? (signedSignalField
-                                               ? "Inset = linked 2D field | Front ortho matches the 2D footprint"
-                                               : "Inset = linked 2D field | Front ortho matches the 2D footprint")
-                                         : "Front ortho matches the 2D footprint");
+                 : "Relief = selected field value coming off the image plane | Debug basis"));
+  lines.emplace_back(
+      presentationMode == GlossViewPresentationMode::Field2D
+          ? "Tab/V = 2D/3D | A = algorithm | D = diagnostics | C = Color | B = Field"
+          : (payload.glossSpatialInset
+                 ? "Inset = linked 2D field | A = algorithm | D = diagnostics | C = Color | B = Field"
+                 : "A = algorithm | D = diagnostics | C = Color | B = Field"));
   const bool showLinearHint = !payload.plotDisplayLinear;
-  const std::string line7 = "Plot in Linear recommended";
+  if (showLinearHint) {
+    lines.emplace_back("Assuming Linear encoded input");
+  }
 
   glMatrixMode(GL_PROJECTION);
   glPushMatrix();
@@ -8754,15 +9602,10 @@ void drawGlossLiftInfoOverlay(int width,
   const float leftX = 16.0f;
   const float bottomY = 8.0f;
   const float lineAdvance = renderer.available ? static_cast<float>(renderer.atlas.lineHeight) + 1.0f : 11.5f;
-  const float line7Y = renderer.available
-                           ? bottomY + static_cast<float>(renderer.atlas.descent + 1)
-                           : bottomY + 5.0f;
-  const float line6Y = line7Y + lineAdvance;
-  const float line5Y = line6Y + lineAdvance;
-  const float line4Y = line5Y + lineAdvance;
-  const float line3Y = line4Y + lineAdvance;
-  const float line2Y = line3Y + lineAdvance;
-  const float line1Y = line2Y + lineAdvance;
+  const float firstLineY = (renderer.available
+                                ? bottomY + static_cast<float>(renderer.atlas.descent + 1)
+                                : bottomY + 5.0f) +
+                           lineAdvance * static_cast<float>(lines.empty() ? 0 : lines.size() - 1);
   float blockWidth = 0.0f;
   auto accumulateWidth = [&](const std::string& text) {
     const float widthValue = renderer.available
@@ -8770,57 +9613,44 @@ void drawGlossLiftInfoOverlay(int width,
                                  : bitmapTextWidth(text, scale);
     blockWidth = std::max(blockWidth, widthValue);
   };
-  accumulateWidth(line1);
-  accumulateWidth(line2);
-  accumulateWidth(line3);
-  accumulateWidth(line4);
-  accumulateWidth(line5);
-  accumulateWidth(line6);
-  if (showLinearHint) {
-    accumulateWidth(line7);
+  for (const auto& line : lines) {
+    accumulateWidth(line);
   }
   drawHudBackdrop(leftX - 8.0f,
-                  line7Y - 6.0f,
+                  bottomY - 1.0f,
                   leftX + blockWidth + 10.0f,
-                  line1Y + 8.0f,
+                  firstLineY + 8.0f,
                   0.11f);
 
+  auto lineColor = [&](std::size_t index) {
+    if (index == 0) return std::array<float, 4>{0.94f, 0.66f, 0.89f, 0.94f};
+    if (index <= 3) return std::array<float, 4>{0.92f, 0.62f, 0.87f, 0.90f};
+    if (showLinearHint && index + 1 == lines.size()) return std::array<float, 4>{0.78f, 0.56f, 0.96f, 0.88f};
+    return std::array<float, 4>{0.84f, 0.58f, 0.83f, 0.86f};
+  };
+
   if (renderer.available) {
-    drawHudTextLine(renderer, line1, leftX, line1Y, scale, 0.74f, 0.93f, 0.95f, 0.98f);
-    drawHudTextLine(renderer, line2, leftX, line2Y, scale, 0.66f, 0.89f, 0.94f, 0.94f);
-    drawHudTextLine(renderer, line3, leftX, line3Y, scale, 0.62f, 0.87f, 0.90f, 0.92f);
-    drawHudTextLine(renderer, line4, leftX, line4Y, scale, 0.62f, 0.87f, 0.90f, 0.92f);
-    drawHudTextLine(renderer, line5, leftX, line5Y, scale, 0.60f, 0.85f, 0.88f, 0.90f);
-    drawHudTextLine(renderer, line6, leftX, line6Y, scale, 0.58f, 0.83f, 0.86f, 0.84f);
-    if (showLinearHint) {
-      drawHudTextLine(renderer, line7, leftX, line7Y, scale, 0.56f, 0.96f, 0.88f, 0.78f);
+    for (std::size_t index = 0; index < lines.size(); ++index) {
+      const float lineY = firstLineY - lineAdvance * static_cast<float>(index);
+      const auto color = lineColor(index);
+      drawHudTextLine(renderer, lines[index], leftX, lineY, scale, color[0], color[1], color[2], color[3]);
     }
   } else {
     glColor4f(0.0f, 0.0f, 0.0f, 0.32f);
-    drawScreenText(line1, leftX + 1.5f, line1Y - 1.5f, scale);
-    drawScreenText(line2, leftX + 1.5f, line2Y - 1.5f, scale);
-    drawScreenText(line3, leftX + 1.5f, line3Y - 1.5f, scale);
-    drawScreenText(line4, leftX + 1.5f, line4Y - 1.5f, scale);
-    drawScreenText(line5, leftX + 1.5f, line5Y - 1.5f, scale);
-    drawScreenText(line6, leftX + 1.5f, line6Y - 1.5f, scale);
-    if (showLinearHint) drawScreenText(line7, leftX + 1.5f, line7Y - 1.5f, scale);
-    glColor4f(0.93f, 0.95f, 0.98f, 0.74f);
-    drawScreenText(line1, leftX, line1Y, scale);
-    glColor4f(0.85f, 0.88f, 0.93f, 0.60f);
-    drawScreenText(line2, leftX, line2Y, scale);
-    drawScreenText(line3, leftX, line3Y, scale);
-    drawScreenText(line4, leftX, line4Y, scale);
-    drawScreenText(line5, leftX, line5Y, scale);
-    glColor4f(0.82f, 0.86f, 0.89f, 0.58f);
-    drawScreenText(line6, leftX, line6Y, scale);
-    if (showLinearHint) {
-      glColor4f(0.96f, 0.88f, 0.78f, 0.56f);
-      drawScreenText(line7, leftX, line7Y, scale);
+    for (std::size_t index = 0; index < lines.size(); ++index) {
+      const float lineY = firstLineY - lineAdvance * static_cast<float>(index);
+      drawScreenText(lines[index], leftX + 1.5f, lineY - 1.5f, scale);
+    }
+    for (std::size_t index = 0; index < lines.size(); ++index) {
+      const float lineY = firstLineY - lineAdvance * static_cast<float>(index);
+      const auto color = lineColor(index);
+      glColor4f(color[1], color[2], color[3], color[0]);
+      drawScreenText(lines[index], leftX, lineY, scale);
     }
   }
 
   if (presentationMode == GlossViewPresentationMode::Projection3D && payload.glossSpatialInset) {
-    drawGlossLiftSpatialInsetOverlay(width, height, payload, mesh, renderer, colorMode, debugMode);
+    drawGlossLiftSpatialInsetOverlay(width, height, payload, mesh, renderer, algorithm, colorMode, debugMode, diagnosticMode);
   }
 
   glDisable(GL_BLEND);
@@ -9312,6 +10142,43 @@ void drawModifierSymbolIndicator(int width, int height, char symbol, float xOffs
   glMatrixMode(GL_MODELVIEW);
 }
 
+void drawTopLeftTextIndicator(int width,
+                              int height,
+                              const std::string& text,
+                              float alpha,
+                              const HudTextRenderer* renderer) {
+  if (width <= 0 || height <= 0 || text.empty() || alpha <= 0.0f) return;
+
+  glMatrixMode(GL_PROJECTION);
+  glPushMatrix();
+  glLoadIdentity();
+  glOrtho(0.0, static_cast<double>(width), 0.0, static_cast<double>(height), -1.0, 1.0);
+  glMatrixMode(GL_MODELVIEW);
+  glPushMatrix();
+  glLoadIdentity();
+  glDisable(GL_DEPTH_TEST);
+  glEnable(GL_BLEND);
+  glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+
+  const bool useAtlas = renderer && renderer->available;
+  const float scale = useAtlas ? 0.92f : 6.0f;
+  const float x = 16.0f;
+  const float y = static_cast<float>(height) - (useAtlas ? 16.0f : 22.0f);
+  if (useAtlas) {
+    drawHudTextLine(*renderer, text, x, y, scale, alpha, 0.92f, 0.96f, 0.98f);
+  } else {
+    glColor4f(0.92f, 0.96f, 0.98f, alpha);
+    drawScreenText(text, x, y, scale);
+  }
+
+  glDisable(GL_BLEND);
+  glEnable(GL_DEPTH_TEST);
+  glPopMatrix();
+  glMatrixMode(GL_PROJECTION);
+  glPopMatrix();
+  glMatrixMode(GL_MODELVIEW);
+}
+
 void drawSlowModifierIndicator(int width,
                                int height,
                                float xOffset,
@@ -9756,6 +10623,8 @@ void cursorPosCallback(GLFWwindow* window, double xpos, double ypos) {
     app->orbitVirtualY = ypos;
     app->panVelocityX = 0.0f;
     app->panVelocityY = 0.0f;
+    app->axisLockAccumDx = 0.0f;
+    app->axisLockAccumDy = 0.0f;
     app->orientAxisLock = 0;
     app->orientAxisFeedbackUntil = 0.0;
     resetGlossViewOrthoInteractionState(app);
@@ -9767,6 +10636,8 @@ void cursorPosCallback(GLFWwindow* window, double xpos, double ypos) {
     app->zoomMode = false;
     app->panVelocityX = 0.0f;
     app->panVelocityY = 0.0f;
+    app->axisLockAccumDx = 0.0f;
+    app->axisLockAccumDy = 0.0f;
     app->orientAxisLock = 0;
     app->orientAxisFeedbackUntil = 0.0;
     app->rollFeedbackUntil = 0.0;
@@ -9869,6 +10740,36 @@ void cursorPosCallback(GLFWwindow* window, double xpos, double ypos) {
   const float angleScale = fastOrbit ? 2.0f : (slowOrbit ? shiftPrecisionFactor() : 1.0f);
   const bool lockView = alt && !app->panMode && !app->zoomMode;
   const Quat cur = Quat{app->cam.qx, app->cam.qy, app->cam.qz, app->cam.qw};
+  auto resolveLockedAxis = [&](float absDx, float absDy) -> int {
+    app->axisLockAccumDx += absDx;
+    app->axisLockAccumDy += absDy;
+    int nextAxisLock = app->orientAxisLock;
+    if (nextAxisLock == 0) {
+      const float total = app->axisLockAccumDx + app->axisLockAccumDy;
+      constexpr float kInitialDecisionTravel = 1.35f;
+      constexpr float kInitialDecisionSlack = 0.55f;
+      if (total < kInitialDecisionTravel) return 0;
+      if (app->axisLockAccumDx > app->axisLockAccumDy + kInitialDecisionSlack) {
+        nextAxisLock = 1;
+      } else if (app->axisLockAccumDy > app->axisLockAccumDx + kInitialDecisionSlack) {
+        nextAxisLock = 2;
+      } else {
+        nextAxisLock = (app->axisLockAccumDx >= app->axisLockAccumDy) ? 1 : 2;
+      }
+    } else {
+      const float switchMinTravel = 2.2f;
+      const float switchRatio = 1.65f;
+      const float switchSlack = 1.35f;
+      if ((absDx + absDy) >= switchMinTravel) {
+        if (nextAxisLock == 1) {
+          if (absDy > absDx * switchRatio + switchSlack) nextAxisLock = 2;
+        } else {
+          if (absDx > absDy * switchRatio + switchSlack) nextAxisLock = 1;
+        }
+      }
+    }
+    return nextAxisLock;
+  };
   auto commitOrientation = [&](const Quat& q) {
     app->cam.qx = q.x;
     app->cam.qy = q.y;
@@ -9877,26 +10778,24 @@ void cursorPosCallback(GLFWwindow* window, double xpos, double ypos) {
   };
   if (lockView) {
     const bool orthographicSnapMode = app->cam.orthographic;
-    if (orthographicSnapMode) {
-      syncOrthographicStateForPlotMode(app->plotMode, &app->cam);
-      if (app->cam.orthographicView >= 0) {
-        if (!app->glossOrthoSnapAnchorValid) {
-          app->glossOrthoSnapAnchor = orthographicQuaternionForPlotMode(app->plotMode, app->cam.orthographicView);
-          app->glossOrthoSnapAnchorValid = true;
-          app->glossOrthoSnapAccumAngle = 0.0f;
-          app->glossOrthoSnapEngaged = true;
-          app->glossOrthoSnapQuarterTurns = 0;
-        }
+      if (orthographicSnapMode && app->orthographicSnapEnabled) {
+        syncOrthographicStateForPlotMode(app->plotMode, &app->cam);
+        if (app->cam.orthographicView >= 0) {
+          if (!app->glossOrthoSnapAnchorValid) {
+            app->glossOrthoSnapAnchor = normalizeQ(cur);
+            app->glossOrthoSnapAnchorValid = true;
+            app->glossOrthoSnapAccumAngle = 0.0f;
+            app->glossOrthoSnapEngaged = true;
+            app->glossOrthoSnapQuarterTurns = 0;
+          }
         float yawAngle =
             (dx * 3.14159265358979323846f / static_cast<float>(std::max(1, width))) * angleScale;
         float pitchAngle =
             (dy * 3.14159265358979323846f / static_cast<float>(std::max(1, height))) * angleScale;
         const float absDx = std::fabs(dx);
         const float absDy = std::fabs(dy);
-        int nextAxisLock = app->orientAxisLock;
-        if (nextAxisLock == 0) {
-          nextAxisLock = (absDx >= absDy) ? 1 : 2;
-        }
+        const int nextAxisLock = resolveLockedAxis(absDx, absDy);
+        if (nextAxisLock == 0) return;
         if (app->orientAxisLock != nextAxisLock) {
           app->orientAxisLock = nextAxisLock;
           app->orientAxisFeedbackUntil = glfwGetTime() + 0.18;
@@ -9938,21 +10837,8 @@ void cursorPosCallback(GLFWwindow* window, double xpos, double ypos) {
     float pitchAngle = (dy * 3.14159265358979323846f / static_cast<float>(std::max(1, height))) * angleScale;
     const float absDx = std::fabs(dx);
     const float absDy = std::fabs(dy);
-    int nextAxisLock = app->orientAxisLock;
-    if (nextAxisLock == 0) {
-      nextAxisLock = (absDx >= absDy) ? 1 : 2;
-    } else {
-      const float switchMinTravel = 2.2f;
-      const float switchRatio = 1.65f;
-      const float switchSlack = 1.35f;
-      if ((absDx + absDy) >= switchMinTravel) {
-        if (nextAxisLock == 1) {
-          if (absDy > absDx * switchRatio + switchSlack) nextAxisLock = 2;
-        } else {
-          if (absDx > absDy * switchRatio + switchSlack) nextAxisLock = 1;
-        }
-      }
-    }
+    const int nextAxisLock = resolveLockedAxis(absDx, absDy);
+    if (nextAxisLock == 0) return;
     if (app->orientAxisLock != nextAxisLock) {
       app->orientAxisLock = nextAxisLock;
       app->orientAxisFeedbackUntil = glfwGetTime() + 0.18;
@@ -9970,25 +10856,26 @@ void cursorPosCallback(GLFWwindow* window, double xpos, double ypos) {
       const Quat qViewPitch = axisAngleQ(Vec3{1.0f, 0.0f, 0.0f}, pitchAngle);
       next = normalizeQ(mulQ(qViewPitch, next));
     }
-    constexpr float kAssistSnapEngage = 8.0f;
-    constexpr float kAssistSnapRelease = 12.0f;
-    if (app->orthographicAssistTargetValid) {
-      const float activeAngle = quaternionAngularDifferenceDegrees(next, app->orthographicAssistTarget);
-      if (activeAngle <= kAssistSnapRelease) {
-        next = app->orthographicAssistTarget;
-      } else {
-        app->orthographicAssistTargetValid = false;
-        app->orthographicAssistTargetView = -1;
+    if (app->orthographicSnapEnabled) {
+      constexpr float kAssistSnapEngage = 8.0f;
+      constexpr float kAssistSnapRelease = 12.0f;
+      if (app->orthographicAssistTargetValid) {
+        const float activeAngle = quaternionAngularDifferenceDegrees(next, app->orthographicAssistTarget);
+        if (activeAngle <= kAssistSnapRelease) {
+          next = app->orthographicAssistTarget;
+        } else {
+          app->orthographicAssistTargetValid = false;
+          app->orthographicAssistTargetView = -1;
+        }
       }
-    }
-    if (!app->orthographicAssistTargetValid) {
-      float nearestAngle = std::numeric_limits<float>::max();
-      const int nearestView = nearestOrthographicAssistView(app->plotMode, next, &nearestAngle);
-      if (nearestView >= 0 && nearestAngle <= kAssistSnapEngage) {
-        app->orthographicAssistTarget = orthographicQuaternionForPlotMode(app->plotMode, nearestView);
-        app->orthographicAssistTargetValid = true;
-        app->orthographicAssistTargetView = nearestView;
-        next = app->orthographicAssistTarget;
+      if (!app->orthographicAssistTargetValid) {
+        const OrthographicAssistMatch nearest = nearestOrthographicAssistMatch(app->plotMode, next);
+        if (nearest.face >= 0 && nearest.angleDegrees <= kAssistSnapEngage) {
+          app->orthographicAssistTarget = nearest.orientation;
+          app->orthographicAssistTargetValid = true;
+          app->orthographicAssistTargetView = nearest.face;
+          next = app->orthographicAssistTarget;
+        }
       }
     }
     commitOrientation(next);
@@ -10320,8 +11207,10 @@ int main() {
        << " roadmap=" << gpuCaps.roadmapLabel;
 #if defined(__APPLE__)
     os << " metalViewer=" << (gpuCaps.metalViewerAvailable ? "1" : "0")
-       << " metalQueue=" << (gpuCaps.metalQueueReady ? "1" : "0");
+       << " metalQueue=" << (gpuCaps.metalQueueReady ? "1" : "0")
+       << " metalGlossStartupValidated=" << (gpuCaps.metalGlossFieldStartupValidated ? "1" : "0");
     if (!gpuCaps.metalDeviceName.empty()) os << " metalDevice=" << gpuCaps.metalDeviceName;
+    if (!gpuCaps.metalGlossFieldStartupReason.empty()) os << " metalGlossStartupReason=" << gpuCaps.metalGlossFieldStartupReason;
 #elif defined(CHROMASPACE_VIEWER_HAS_CUDA)
      os << " cudaViewer=" << (gpuCaps.cudaViewerAvailable ? "1" : "0")
        << " cudaInterop=" << (gpuCaps.cudaInteropReady ? "1" : "0")
@@ -10348,7 +11237,15 @@ int main() {
     if (app.parityChecks) {
       logViewerDiagnostic(true, "CPU/GPU parity checks enabled.");
     }
-#if defined(CHROMASPACE_VIEWER_HAS_CUDA) && !defined(__APPLE__)
+#if defined(__APPLE__)
+    std::ostringstream os;
+    os << " metalViewer=" << (gpuCaps.metalViewerAvailable ? "1" : "0")
+       << " metalQueue=" << (gpuCaps.metalQueueReady ? "1" : "0")
+       << " metalGlossStartupValidated=" << (gpuCaps.metalGlossFieldStartupValidated ? "1" : "0");
+    if (!gpuCaps.metalDeviceName.empty()) os << " metalDevice=" << gpuCaps.metalDeviceName;
+    if (!gpuCaps.metalGlossFieldStartupReason.empty()) os << " metalGlossStartupReason=" << gpuCaps.metalGlossFieldStartupReason;
+    logViewerDiagnostic(true, os.str());
+#elif defined(CHROMASPACE_VIEWER_HAS_CUDA) && !defined(__APPLE__)
     std::ostringstream os;
     os << " cudaViewer=" << (gpuCaps.cudaViewerAvailable ? "1" : "0")
        << " cudaInterop=" << (gpuCaps.cudaInteropReady ? "1" : "0");
@@ -10460,10 +11357,13 @@ int main() {
             app.shiftPanGesture = false;
             logViewerEvent("Applied default orthographic chart view for chromaticity mode.");
           } else if (prevPlotMode != resolved.plotMode && isGlossViewPlotModeString(resolved.plotMode)) {
-            resetGlossLiftCamera(&app.cam);
-            app.glossViewPresentation = GlossViewPresentationMode::Field2D;
+            setGlossViewOrthographicCamera(&app.cam, kGlossViewOrthoFront);
+            requestGlossViewOrthoInspectionFit(&app);
+            app.glossViewPresentation = GlossViewPresentationMode::Projection3D;
+            app.glossViewFieldAlgorithm = GlossViewFieldAlgorithm::Candidate1;
             app.glossViewColorMode = GlossViewColorMode::SemanticSignal;
             app.glossViewDebugFieldMode = GlossViewDebugFieldMode::Signal;
+            app.glossViewDiagnosticOverlay = GlossViewDiagnosticOverlay::Off;
             app.modelOrientation = Quat{};
             app.panVelocityX = 0.0f;
             app.panVelocityY = 0.0f;
@@ -10473,7 +11373,7 @@ int main() {
             app.zoomMode = false;
             app.panMode = false;
             app.shiftPanGesture = false;
-            logViewerEvent("Applied default spatial view for Gloss View mode.");
+            logViewerEvent("Applied default front-orthographic 3D view for Gloss View mode.");
           }
           if (app.diagTransitions && prevSourceMode != resolved.sourceMode) {
             std::ostringstream os;
@@ -10708,9 +11608,15 @@ int main() {
     const bool glossProjection3DForTitle =
         glossViewModeForTitle && app.glossViewPresentation == GlossViewPresentationMode::Projection3D;
     if (glossViewModeForTitle) {
+      const std::string glossBackendReason = inputCloudComputeReason(resolved, app.gpuCaps, &app.computeSession);
       title << " | " << glossViewPresentationLabel(app.glossViewPresentation);
+      title << " | " << glossViewFieldAlgorithmLabel(app.glossViewFieldAlgorithm);
+      title << " | field:" << glossBackendReason;
       if (app.glossViewDebugFieldMode != GlossViewDebugFieldMode::Signal) {
         title << " | " << glossViewDebugFieldLabel(app.glossViewDebugFieldMode);
+      }
+      if (app.glossViewDiagnosticOverlay != GlossViewDiagnosticOverlay::Off) {
+        title << " | diag " << glossViewDiagnosticOverlayLabel(app.glossViewDiagnosticOverlay);
       }
     }
     if (app.cam.orthographic && (!glossViewModeForTitle || glossProjection3DForTitle)) {
@@ -10827,8 +11733,10 @@ int main() {
     if (glossProjection3DMode) {
       buildGlossViewProjectionCpuDrawArrays(mesh,
                                             resolved,
+                                            app.glossViewFieldAlgorithm,
                                             app.glossViewColorMode,
                                             app.glossViewDebugFieldMode,
+                                            app.glossViewDiagnosticOverlay,
                                             &glossProjectionVerts,
                                             &glossProjectionColors);
       activePointVerts = glossProjectionVerts.empty() ? nullptr : glossProjectionVerts.data();
@@ -11310,8 +12218,10 @@ int main() {
                                 height,
                                 resolved,
                                 mesh,
+                                app.glossViewFieldAlgorithm,
                                 app.glossViewColorMode,
-                                app.glossViewDebugFieldMode);
+                                app.glossViewDebugFieldMode,
+                                app.glossViewDiagnosticOverlay);
     }
 
     if (resolved.plotMode == "chromaticity") {
@@ -11331,8 +12241,10 @@ int main() {
                                mesh,
                                overlayTextRenderer ? *overlayTextRenderer : hudText,
                                app.glossViewPresentation,
+                               app.glossViewFieldAlgorithm,
                                app.glossViewColorMode,
-                               app.glossViewDebugFieldMode);
+                               app.glossViewDebugFieldMode,
+                               app.glossViewDiagnosticOverlay);
     }
 
     int indicatorSlot = 0;
@@ -11367,6 +12279,13 @@ int main() {
     if (app.orientAxisLock != 0) {
       const float pulse = clampf(static_cast<float>((app.orientAxisFeedbackUntil - glfwGetTime()) / 0.18), 0.0f, 1.0f);
       drawOrientationLockIndicator(width, height, app.orientAxisLock, pulse, indicatorYOffset(indicatorSlot++));
+    }
+    if (app.orthographicSnapEnabled) {
+      drawTopLeftTextIndicator(width,
+                               height,
+                               "S",
+                               0.72f,
+                               overlayTextRenderer ? overlayTextRenderer : &hudText);
     }
     const float speedPulse = clampf(static_cast<float>((app.speedFeedbackUntil - glfwGetTime()) / 0.18), 0.0f, 1.0f);
     if (speedPulse > 0.0f) {

@@ -50,7 +50,18 @@ bool shapeTextRun(const FontAtlas& atlas,
   if (!buffer) return false;
   hb_buffer_add_utf8(buffer, text.data(), static_cast<int>(text.size()), 0, static_cast<int>(text.size()));
   hb_buffer_guess_segment_properties(buffer);
-  hb_shape(atlas.runtime->hbFont, buffer, nullptr, 0);
+  // The viewer atlas only packs the base ASCII glyph set plus a few explicit extras.
+  // If HarfBuzz substitutes typographic ligatures such as fi/ff/ffi, shaping can emit
+  // glyph indices that are not present in the atlas, which shows up as dropped letters
+  // in HUD text. Disable discretionary/standard ligature substitution for this atlas path
+  // so each ASCII character maps back to a glyph we actually packed.
+  const hb_feature_t features[] = {
+      {HB_TAG('l', 'i', 'g', 'a'), 0, 0, static_cast<unsigned int>(-1)},
+      {HB_TAG('c', 'l', 'i', 'g'), 0, 0, static_cast<unsigned int>(-1)},
+      {HB_TAG('d', 'l', 'i', 'g'), 0, 0, static_cast<unsigned int>(-1)},
+      {HB_TAG('h', 'l', 'i', 'g'), 0, 0, static_cast<unsigned int>(-1)},
+  };
+  hb_shape(atlas.runtime->hbFont, buffer, features, static_cast<unsigned int>(std::size(features)));
   unsigned int glyphCount = 0;
   const hb_glyph_info_t* infos = hb_buffer_get_glyph_infos(buffer, &glyphCount);
   const hb_glyph_position_t* positions = hb_buffer_get_glyph_positions(buffer, &glyphCount);

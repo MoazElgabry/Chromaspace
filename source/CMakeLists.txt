@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(Chromaspace VERSION 1.0.8 LANGUAGES CXX)
-set(CUBE_DISPLAY_VERSION "1.0.8 Beta")
+project(Chromaspace VERSION 1.0.9 LANGUAGES CXX)
+set(CUBE_DISPLAY_VERSION "1.0.9 Beta")
 set(PLUGIN_BASENAME "Chromaspace")
 set(PLUGIN_IDENTIFIER "com.moazelgabry.chromaspace")
 set(LOCAL_OFX_SDK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/ofx-sdk")
@@ -45,7 +45,7 @@ set(WORKSHOP_TEXT_SOURCES
 set(WORKSHOP_TEXT_ASSETS
   "${WORKSHOP_COMMON_DIR}/text/assets/OpenSans-Regular.ttf"
 )
-set(PLUGIN_ICON_PNG "${SHARED_ICON_DIR}/Icon_Candidate.png")
+set(PLUGIN_ICON_PNG "${SHARED_ICON_DIR}/Chromaspace 2 to 1.png")
 set(VIEWER_ICON_PNG "${SHARED_ICON_DIR}/Icon_Candidate.png")
 set(GENERATED_ASSET_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
 

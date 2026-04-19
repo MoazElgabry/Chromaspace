@@ -88,8 +88,8 @@ using namespace OFX;
 constexpr const char* kPluginIdentifier = "com.moazelgabry.chromaspace";
 constexpr const char* kPluginGrouping = "Moaz Elgabry";
 constexpr int kPluginVersionMajor = 1;
-constexpr int kPluginVersionMinor = 5;
-constexpr const char* kPluginVersionLabel = "v1.0.8 Beta";
+constexpr int kPluginVersionMinor = 6;
+constexpr const char* kPluginVersionLabel = "v1.0.9 Beta";
 constexpr const char* kPluginName = "Chromaspace";
 constexpr const char* kWebsiteUrl = "https://moazelgabry.com";
 constexpr const char* kReleasesUrl = "https://github.com/MoazElgabry/Chromaspace/releases/latest";
@@ -1396,9 +1396,9 @@ struct ChromaspacePresetValues {
   int glossNeighborhood = 1;
   double glossLiftScale = 1.0;
   bool glossSpatialInset = true;
-  double glossBodyOpacity = 0.28;
-  double glossHighlightOpacity = 0.95;
-  double glossPointCrispness = 0.72;
+  double glossBodyOpacity = 1.0;
+  double glossHighlightOpacity = 1.0;
+  double glossPointCrispness = 0.0;
   bool plotInLinear = false;
   int inputTransferFunction = static_cast<int>(WorkshopColor::TransferFunctionId::Gamma24);
   bool showOverflow = false;
@@ -1463,9 +1463,9 @@ ChromaspacePresetValues chromaspaceFactoryPresetValues() {
   values.glossNeighborhood = 1;
   values.glossLiftScale = 1.0;
   values.glossSpatialInset = true;
-  values.glossBodyOpacity = 0.28;
-  values.glossHighlightOpacity = 0.95;
-  values.glossPointCrispness = 0.72;
+  values.glossBodyOpacity = 1.0;
+  values.glossHighlightOpacity = 1.0;
+  values.glossPointCrispness = 0.0;
   values.plotInLinear = false;
   values.inputTransferFunction = static_cast<int>(WorkshopColor::TransferFunctionId::Gamma24);
   values.showOverflow = false;
@@ -3488,15 +3488,15 @@ class ChromaspaceEffect : public ImageEffect {
   }
 
   double currentGlossBodyOpacityValue(double time) const {
-    return std::clamp(getDoubleValue("cubeViewerGlossBodyOpacity", time, 0.10), 0.0, 1.0);
+    return std::clamp(getDoubleValue("cubeViewerGlossBodyOpacity", time, 1.0), 0.0, 1.0);
   }
 
   double currentGlossHighlightOpacityValue(double time) const {
-    return std::clamp(getDoubleValue("cubeViewerGlossHighlightOpacity", time, 0.42), 0.0, 1.0);
+    return std::clamp(getDoubleValue("cubeViewerGlossHighlightOpacity", time, 1.0), 0.0, 1.0);
   }
 
   double currentGlossPointCrispnessValue(double time) const {
-    return std::clamp(getDoubleValue("cubeViewerGlossPointCrispness", time, 0.72), 0.0, 1.0);
+    return std::clamp(getDoubleValue("cubeViewerGlossPointCrispness", time, 0.0), 0.0, 1.0);
   }
 
   bool currentCircularHsl(double time) {
@@ -4159,6 +4159,9 @@ class ChromaspaceEffect : public ImageEffect {
     if (drawOnImage || useInstance1Requested) {
       setGroupOpenState("grp_cube_viewer_identity_overlay", true);
     }
+    if (glossViewMode) {
+      setGroupOpenState("grp_cube_viewer_gloss_structure", true);
+    }
     if (auto* drawCube = fetchBooleanParam("cubeViewerIdentityOverlayEnabled")) {
       drawCube->setLabel("Fill Volume");
     }
@@ -4222,6 +4225,8 @@ class ChromaspaceEffect : public ImageEffect {
     setParamVisibility(fetchChoiceParam("cubeViewerChromaticityOverlayPrimaries"),
                        !drawOnImage && chromaticityMode);
     setParamVisibility(fetchGroupParam("grp_cube_viewer_gloss_structure"),
+                       !drawOnImage && glossViewMode);
+    setParamVisibility(fetchGroupParam("grp_cube_viewer_gloss_appearance"),
                        !drawOnImage && glossViewMode);
     setParamVisibility(fetchChoiceParam("cubeViewerGlossNeighborhood"),
                        !drawOnImage && glossViewMode);
@@ -7916,7 +7921,7 @@ class ChromaspaceFactory : public PluginFactoryHelper<ChromaspaceFactory> {
 
     auto* grpCubeViewerGlossStructure = d.defineGroupParam("grp_cube_viewer_gloss_structure");
     grpCubeViewerGlossStructure->setLabel("Gloss View");
-    grpCubeViewerGlossStructure->setOpen(false);
+    grpCubeViewerGlossStructure->setOpen(true);
     grpCubeViewerGlossStructure->setIsSecret(true);
     grpCubeViewerGlossStructure->setEnabled(false);
 
@@ -7950,13 +7955,20 @@ class ChromaspaceFactory : public PluginFactoryHelper<ChromaspaceFactory> {
     cubeViewerGlossSpatialInset->setEnabled(false);
     if (const char* hint = tooltipFor("cubeViewerGlossSpatialInset")) cubeViewerGlossSpatialInset->setHint(hint);
 
+    auto* grpCubeViewerGlossAppearance = d.defineGroupParam("grp_cube_viewer_gloss_appearance");
+    grpCubeViewerGlossAppearance->setLabel("Appearance");
+    grpCubeViewerGlossAppearance->setOpen(true);
+    grpCubeViewerGlossAppearance->setParent(*grpCubeViewerGlossStructure);
+    grpCubeViewerGlossAppearance->setIsSecret(true);
+    grpCubeViewerGlossAppearance->setEnabled(false);
+
     auto* cubeViewerGlossBodyOpacity = d.defineDoubleParam("cubeViewerGlossBodyOpacity");
     cubeViewerGlossBodyOpacity->setLabel("Base Field Opacity");
     cubeViewerGlossBodyOpacity->setRange(0.0, 1.0);
     cubeViewerGlossBodyOpacity->setDisplayRange(0.0, 1.0);
     cubeViewerGlossBodyOpacity->setIncrement(0.01);
     cubeViewerGlossBodyOpacity->setDefault(std::clamp(chromaspaceDefaultValues.glossBodyOpacity, 0.0, 1.0));
-    cubeViewerGlossBodyOpacity->setParent(*grpCubeViewerGlossStructure);
+    cubeViewerGlossBodyOpacity->setParent(*grpCubeViewerGlossAppearance);
     cubeViewerGlossBodyOpacity->setIsSecret(true);
     cubeViewerGlossBodyOpacity->setEnabled(false);
     if (const char* hint = tooltipFor("cubeViewerGlossBodyOpacity")) cubeViewerGlossBodyOpacity->setHint(hint);
@@ -7967,7 +7979,7 @@ class ChromaspaceFactory : public PluginFactoryHelper<ChromaspaceFactory> {
     cubeViewerGlossHighlightOpacity->setDisplayRange(0.0, 1.0);
     cubeViewerGlossHighlightOpacity->setIncrement(0.01);
     cubeViewerGlossHighlightOpacity->setDefault(std::clamp(chromaspaceDefaultValues.glossHighlightOpacity, 0.0, 1.0));
-    cubeViewerGlossHighlightOpacity->setParent(*grpCubeViewerGlossStructure);
+    cubeViewerGlossHighlightOpacity->setParent(*grpCubeViewerGlossAppearance);
     cubeViewerGlossHighlightOpacity->setIsSecret(true);
     cubeViewerGlossHighlightOpacity->setEnabled(false);
     if (const char* hint = tooltipFor("cubeViewerGlossHighlightOpacity")) cubeViewerGlossHighlightOpacity->setHint(hint);
@@ -7978,7 +7990,7 @@ class ChromaspaceFactory : public PluginFactoryHelper<ChromaspaceFactory> {
     cubeViewerGlossPointCrispness->setDisplayRange(0.0, 1.0);
     cubeViewerGlossPointCrispness->setIncrement(0.01);
     cubeViewerGlossPointCrispness->setDefault(std::clamp(chromaspaceDefaultValues.glossPointCrispness, 0.0, 1.0));
-    cubeViewerGlossPointCrispness->setParent(*grpCubeViewerGlossStructure);
+    cubeViewerGlossPointCrispness->setParent(*grpCubeViewerGlossAppearance);
     cubeViewerGlossPointCrispness->setIsSecret(true);
     cubeViewerGlossPointCrispness->setEnabled(false);
     if (const char* hint = tooltipFor("cubeViewerGlossPointCrispness")) cubeViewerGlossPointCrispness->setHint(hint);
@@ -8220,6 +8232,12 @@ class ChromaspaceFactory : public PluginFactoryHelper<ChromaspaceFactory> {
     cubeViewerModeToggle->setParent(*grpCubeViewerIdentityOverlay);
     if (const char* hint = tooltipFor("cubeViewerModeToggle")) cubeViewerModeToggle->setHint(hint);
 
+    auto* chromaspacePresetMenu = d.defineChoiceParam("chromaspacePresetMenu");
+    chromaspacePresetMenu->setLabel("Chromaspace Preset");
+    chromaspacePresetMenu->appendOption(kChromaspacePresetDefaultName);
+    for (const auto& name : visibleChromaspaceUserPresetNames()) chromaspacePresetMenu->appendOption(name);
+    chromaspacePresetMenu->setDefault(0);
+
     auto* grpCubeViewer = d.defineGroupParam("grp_cube_viewer");
     grpCubeViewer->setLabel("Settings");
     grpCubeViewer->setOpen(false);
@@ -8333,13 +8351,6 @@ class ChromaspaceFactory : public PluginFactoryHelper<ChromaspaceFactory> {
     grpChromaspaceDefaultsPresets->setLabel("Defaults & Presets");
     grpChromaspaceDefaultsPresets->setOpen(false);
     grpChromaspaceDefaultsPresets->setParent(*grpCubeViewer);
-
-    auto* chromaspacePresetMenu = d.defineChoiceParam("chromaspacePresetMenu");
-    chromaspacePresetMenu->setLabel("Chromaspace Preset");
-    chromaspacePresetMenu->appendOption(kChromaspacePresetDefaultName);
-    for (const auto& name : visibleChromaspaceUserPresetNames()) chromaspacePresetMenu->appendOption(name);
-    chromaspacePresetMenu->setDefault(0);
-    chromaspacePresetMenu->setParent(*grpChromaspaceDefaultsPresets);
 
     auto* chromaspacePresetName = d.defineStringParam("chromaspacePresetName");
     chromaspacePresetName->setLabel("Preset Name");
