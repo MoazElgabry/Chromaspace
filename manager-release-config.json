@@ -2,6 +2,7 @@
   "pluginId": "chromaspace",
   "displayName": "Chromaspace",
   "releaseRepo": "MoazElgabry/Chromaspace",
+  "iconSourcePath": "icons/plugin-manager.png",
   "minManagerVersion": "0.1.0",
   "hostProcesses": [
     "Resolve",
