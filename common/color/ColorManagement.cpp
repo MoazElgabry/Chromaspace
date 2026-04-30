@@ -31,15 +31,22 @@ constexpr std::array<PrimariesDefinition, 15> kPrimaries = {{
     {ColorPrimariesId::Xyz, "xyz", "XYZ", {1.0f, 0.0f}, {0.0f, 1.0f}, {0.0f, 0.0f}, {kOneThird, kOneThird}},
 }};
 
-constexpr std::array<TransferFunctionDefinition, 11> kTransferFunctions = {{
+constexpr std::array<TransferFunctionDefinition, 18> kTransferFunctions = {{
     {TransferFunctionId::AcesCct, "acescct", "ACEScct"},
+    {TransferFunctionId::BMDFilmGen5, "bmd_film_gen5", "BMD Film Gen 5"},
     {TransferFunctionId::CanonLog2, "canon_log2", "Canon Log 2"},
     {TransferFunctionId::CanonLog3, "canon_log3", "Canon Log 3"},
     {TransferFunctionId::DavinciIntermediate, "davinci_intermediate", "DaVinci Intermediate"},
+    {TransferFunctionId::DjiDLog, "dji_dlog", "DJI D-Log"},
+    {TransferFunctionId::FujifilmFLog, "fujifilm_flog", "Fujifilm F-Log"},
+    {TransferFunctionId::FujifilmFLog2, "fujifilm_flog2", "Fujifilm F-Log2"},
+    {TransferFunctionId::Gamma22, "gamma_22", "Gamma 2.2"},
     {TransferFunctionId::Gamma24, "gamma_24", "Gamma 2.4 / Rec.709 Display"},
+    {TransferFunctionId::Gamma26, "gamma_26", "Gamma 2.6"},
     {TransferFunctionId::Linear, "linear", "Linear"},
     {TransferFunctionId::ArriLogC3, "arri_logc3", "LogC3"},
     {TransferFunctionId::ArriLogC4, "arri_logc4", "LogC4"},
+    {TransferFunctionId::PanasonicVLog, "panasonic_vlog", "Panasonic V-Log"},
     {TransferFunctionId::RedLog3G10, "red_log3g10", "RED Log3G10"},
     {TransferFunctionId::SonySLog3, "sony_slog3", "S-Log3"},
     {TransferFunctionId::SRgb, "srgb", "sRGB"},
@@ -107,6 +114,10 @@ inline float exp10Compat(float x) {
   return std::exp2(x * 3.3219280948873626f);
 }
 
+inline float log10Compat(float x) {
+  return std::log2(x) / 3.3219280948873626f;
+}
+
 std::size_t transferFunctionIndex(TransferFunctionId id) {
   const auto it = std::find_if(
       kTransferFunctions.begin(), kTransferFunctions.end(),
@@ -165,6 +176,10 @@ float decodeChannel(float x, TransferFunctionId tf) {
     }
     case TransferFunctionId::Gamma24:
       return signPreservingPow(x, 2.4f);
+    case TransferFunctionId::Gamma22:
+      return signPreservingPow(x, 2.2f);
+    case TransferFunctionId::Gamma26:
+      return signPreservingPow(x, 2.6f);
     case TransferFunctionId::DavinciIntermediate:
       return x <= 0.02740668f ? x / 10.44426855f : std::exp2(x / 0.07329248f - 7.0f) - 0.0075f;
     case TransferFunctionId::AcesCct:
@@ -198,9 +213,132 @@ float decodeChannel(float x, TransferFunctionId tf) {
         return (x - 0.073059361f) / 2.3069815f;
       }
       return (exp10Compat((x - 0.073059361f) / 0.36726845f) - 1.0f) / 14.98325f;
+    case TransferFunctionId::BMDFilmGen5: {
+      constexpr float kA = 8.283605932402494f;
+      constexpr float kB = 0.09246575342465753f;
+      constexpr float kC = 0.5300133392291939f;
+      constexpr float kD = 0.08692876065491224f;
+      constexpr float kE = 0.005494072432257808f;
+      constexpr float kCut = kA * 0.005f + kB;
+      return x < kCut ? (x - kB) / kA : std::exp((x - kC) / kD) - kE;
+    }
+    case TransferFunctionId::DjiDLog:
+      return x <= 0.14f ? (x - 0.0929f) / 6.025f
+                        : (exp10Compat(3.89616f * x - 2.27752f) - 0.0108f) / 0.9892f;
+    case TransferFunctionId::FujifilmFLog: {
+      constexpr float kA = 0.555556f;
+      constexpr float kB = 0.009468f;
+      constexpr float kC = 0.344676f;
+      constexpr float kD = 0.790453f;
+      constexpr float kE = 8.735631f;
+      constexpr float kF = 0.092864f;
+      constexpr float kCut = 0.100537775223865f;
+      return x >= kCut ? exp10Compat((x - kD) / kC) / kA - kB / kA : (x - kF) / kE;
+    }
+    case TransferFunctionId::FujifilmFLog2: {
+      constexpr float kA = 5.555556f;
+      constexpr float kB = 0.064829f;
+      constexpr float kC = 0.245281f;
+      constexpr float kD = 0.384316f;
+      constexpr float kE = 8.799461f;
+      constexpr float kF = 0.092864f;
+      constexpr float kCut = 0.100686685370811f;
+      return x >= kCut ? exp10Compat((x - kD) / kC) / kA - kB / kA : (x - kF) / kE;
+    }
+    case TransferFunctionId::PanasonicVLog:
+      return x < 0.181f ? (x - 0.125f) / 5.6f : exp10Compat((x - 0.598206f) / 0.241514f) - 0.00873f;
     case TransferFunctionId::RedLog3G10:
       return x < 0.0f ? (x / 15.1927f) - 0.01f
                       : (exp10Compat(x / 0.224282f) - 1.0f) / 155.975327f - 0.01f;
+    default:
+      return x;
+  }
+}
+
+float encodeChannel(float x, TransferFunctionId tf) {
+  switch (tf) {
+    case TransferFunctionId::Linear:
+      return x;
+    case TransferFunctionId::SRgb: {
+      const float a = std::fabs(x);
+      const float encoded = (a <= 0.0031308f) ? (a * 12.92f)
+                                              : (1.055f * std::pow(a, 1.0f / 2.4f) - 0.055f);
+      return std::copysign(encoded, x);
+    }
+    case TransferFunctionId::Gamma22:
+      return signPreservingPow(x, 1.0f / 2.2f);
+    case TransferFunctionId::Gamma24:
+      return signPreservingPow(x, 1.0f / 2.4f);
+    case TransferFunctionId::Gamma26:
+      return signPreservingPow(x, 1.0f / 2.6f);
+    case TransferFunctionId::DavinciIntermediate:
+      return x <= 0.00262409f ? x * 10.44426855f : (std::log2(x + 0.0075f) + 7.0f) * 0.07329248f;
+    case TransferFunctionId::AcesCct:
+      return x <= 0.0078125f ? x * 10.5402377416545f + 0.0729055341958355f
+                             : (std::log2(std::max(x, 1e-12f)) + 9.72f) / 17.52f;
+    case TransferFunctionId::ArriLogC3:
+      return x < 0.010591f ? x * 5.367655f + 0.092809f
+                           : 0.247190f * log10Compat(5.555556f * x + 0.052272f) + 0.385537f;
+    case TransferFunctionId::ArriLogC4: {
+      constexpr float kA = 2231.8263090676883f;
+      constexpr float kB = 0.9071358748778103f;
+      constexpr float kC = 0.09286412512218964f;
+      constexpr float kS = 0.3033266726886969f;
+      constexpr float kT = -0.7774983977293537f;
+      return x < 0.0f ? (x - kT) / kS : ((std::log2(kA * x + 64.0f) - 6.0f) / 14.0f) * kB + kC;
+    }
+    case TransferFunctionId::CanonLog2:
+      return x < 0.0f ? -0.24136077f * log10Compat(1.0f - 87.099375f * (x / 0.9f)) + 0.092864125f
+                      : 0.24136077f * log10Compat(87.099375f * (x / 0.9f) + 1.0f) + 0.092864125f;
+    case TransferFunctionId::CanonLog3:
+      if (x < -0.014f) {
+        return -0.36726845f * log10Compat(1.0f - 14.98325f * x) + 0.12783901f;
+      }
+      if (x <= 0.014f) {
+        return 1.9754798f * x + 0.12512219f;
+      }
+      return 0.36726845f * log10Compat(14.98325f * x + 1.0f) + 0.12240537f;
+    case TransferFunctionId::BMDFilmGen5: {
+      constexpr float kA = 8.283605932402494f;
+      constexpr float kB = 0.09246575342465753f;
+      constexpr float kC = 0.5300133392291939f;
+      constexpr float kD = 0.08692876065491224f;
+      constexpr float kE = 0.005494072432257808f;
+      constexpr float kCut = 0.005f;
+      return x < kCut ? kA * x + kB : kD * std::log(x + kE) + kC;
+    }
+    case TransferFunctionId::SonySLog3:
+      if (x < 0.01125000f) {
+        return (x * (171.2102946929f - 95.0f) / 0.01125f + 95.0f) / 1023.0f;
+      }
+      return (420.0f + std::log10((x + 0.01f) / 0.19f) * 261.5f) / 1023.0f;
+    case TransferFunctionId::DjiDLog:
+      return x <= 0.0078f ? 6.025f * x + 0.0929f
+                          : log10Compat(x * 0.9892f + 0.0108f) * 0.256663f + 0.584555f;
+    case TransferFunctionId::FujifilmFLog: {
+      constexpr float kA = 0.555556f;
+      constexpr float kB = 0.009468f;
+      constexpr float kC = 0.344676f;
+      constexpr float kD = 0.790453f;
+      constexpr float kE = 8.735631f;
+      constexpr float kF = 0.092864f;
+      constexpr float kCut = 0.00089f;
+      return x >= kCut ? kC * log10Compat(kA * x + kB) + kD : kE * x + kF;
+    }
+    case TransferFunctionId::FujifilmFLog2: {
+      constexpr float kA = 5.555556f;
+      constexpr float kB = 0.064829f;
+      constexpr float kC = 0.245281f;
+      constexpr float kD = 0.384316f;
+      constexpr float kE = 8.799461f;
+      constexpr float kF = 0.092864f;
+      constexpr float kCut = 0.000889f;
+      return x >= kCut ? kC * log10Compat(kA * x + kB) + kD : kE * x + kF;
+    }
+    case TransferFunctionId::PanasonicVLog:
+      return x < 0.01f ? 5.6f * x + 0.125f : 0.241514f * log10Compat(x + 0.00873f) + 0.598206f;
+    case TransferFunctionId::RedLog3G10:
+      return x < -0.01f ? (x + 0.01f) * 15.1927f : 0.224282f * log10Compat(155.975327f * (x + 0.01f) + 1.0f);
     default:
       return x;
   }
@@ -307,6 +445,26 @@ Vec3f mul(const Mat3f& matrix, Vec3f v) {
 
 Vec3f decodeToLinear(Vec3f rgb, TransferFunctionId tf) {
   return {decodeChannel(rgb.x, tf), decodeChannel(rgb.y, tf), decodeChannel(rgb.z, tf)};
+}
+
+Vec3f encodeFromLinear(Vec3f rgb, TransferFunctionId tf) {
+  return {encodeChannel(rgb.x, tf), encodeChannel(rgb.y, tf), encodeChannel(rgb.z, tf)};
+}
+
+Vec3f transformLinearRgb(Vec3f rgb, ColorPrimariesId srcPrimaries, ColorPrimariesId dstPrimaries) {
+  if (srcPrimaries == dstPrimaries) return rgb;
+  const Vec3f xyz = mul(rgbToXyzMatrix(srcPrimaries), rgb);
+  return mul(xyzToRgbMatrix(dstPrimaries), xyz);
+}
+
+Vec3f transformRgb(Vec3f rgb,
+                   ColorPrimariesId srcPrimaries,
+                   TransferFunctionId srcTransfer,
+                   ColorPrimariesId dstPrimaries,
+                   TransferFunctionId dstTransfer) {
+  const Vec3f linear = decodeToLinear(rgb, srcTransfer);
+  const Vec3f transformed = transformLinearRgb(linear, srcPrimaries, dstPrimaries);
+  return encodeFromLinear(transformed, dstTransfer);
 }
 
 Vec3f clamp(Vec3f rgb, float lo, float hi) {

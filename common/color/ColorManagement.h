@@ -59,6 +59,13 @@ enum class TransferFunctionId : int {
   SonySLog3,
   CanonLog3,
   RedLog3G10,
+  BMDFilmGen5,
+  DjiDLog,
+  FujifilmFLog,
+  FujifilmFLog2,
+  PanasonicVLog,
+  Gamma22,
+  Gamma26,
 };
 
 enum class ChromaticityReferenceBasis : int {
@@ -112,6 +119,13 @@ Mat3f xyzToRgbMatrix(ColorPrimariesId id);
 Vec3f mul(const Mat3f& matrix, Vec3f v);
 
 Vec3f decodeToLinear(Vec3f rgb, TransferFunctionId tf);
+Vec3f encodeFromLinear(Vec3f rgb, TransferFunctionId tf);
+Vec3f transformLinearRgb(Vec3f rgb, ColorPrimariesId srcPrimaries, ColorPrimariesId dstPrimaries);
+Vec3f transformRgb(Vec3f rgb,
+                   ColorPrimariesId srcPrimaries,
+                   TransferFunctionId srcTransfer,
+                   ColorPrimariesId dstPrimaries,
+                   TransferFunctionId dstTransfer);
 Vec3f clamp(Vec3f rgb, float lo, float hi);
 bool isFinite(Vec2f v);
 bool isFinite(Vec3f v);

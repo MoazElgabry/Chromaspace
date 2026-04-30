@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(Chromaspace VERSION 1.0.9 LANGUAGES CXX)
-set(CUBE_DISPLAY_VERSION "1.0.9 Beta")
+project(Chromaspace VERSION 1.0.10 LANGUAGES CXX)
+set(CUBE_DISPLAY_VERSION "1.0.10 Beta")
 set(PLUGIN_BASENAME "Chromaspace")
 set(PLUGIN_IDENTIFIER "com.moazelgabry.chromaspace")
 set(LOCAL_OFX_SDK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/ofx-sdk")

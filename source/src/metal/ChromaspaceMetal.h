@@ -141,4 +141,15 @@ bool copyHostBuffersReadback(
     float* readbackSrc,
     size_t readbackSrcRowBytes);
 
+bool copySourceRowsToHost(
+    const void* srcMetalBuffer,
+    int width,
+    size_t srcRowBytes,
+    const int* rows,
+    int rowCount,
+    int originX,
+    void* metalCommandQueue,
+    float* readbackSrc,
+    size_t readbackSrcRowBytes);
+
 }  // namespace ChromaspaceMetal

@@ -10,6 +10,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <functional>
 #include <fstream>
 #include <map>
 #include <memory>
@@ -88,8 +89,8 @@ using namespace OFX;
 constexpr const char* kPluginIdentifier = "com.moazelgabry.chromaspace";
 constexpr const char* kPluginGrouping = "Moaz Elgabry";
 constexpr int kPluginVersionMajor = 1;
-constexpr int kPluginVersionMinor = 6;
-constexpr const char* kPluginVersionLabel = "v1.0.9 Beta";
+constexpr int kPluginVersionMinor = 7;
+constexpr const char* kPluginVersionLabel = "v1.0.10 Beta";
 constexpr const char* kPluginName = "Chromaspace";
 constexpr const char* kWebsiteUrl = "https://moazelgabry.com";
 constexpr const char* kReleasesUrl = "https://github.com/MoazElgabry/Chromaspace/releases/latest";
@@ -198,10 +199,11 @@ std::string pluginModulePath() {
 
 bool cubeViewerDebugEnabled() {
   const char* direct = std::getenv("CHROMASPACE_DEBUG_LOG");
+  if (direct && std::strcmp(direct, "0") == 0) return false;
   if (direct && direct[0] != '\0' && std::strcmp(direct, "0") != 0) return true;
   const char* multi = std::getenv("CHROMASPACE_MULTI_INSTANCE_DEBUG");
   if (multi && multi[0] != '\0' && std::strcmp(multi, "0") != 0) return true;
-  return false;
+  return true;
 }
 
 bool cubeViewerMultiInstanceDebugEnabled() {
@@ -218,9 +220,17 @@ void cubeViewerDebugLog(const std::string& msg) {
   if (!parent.empty()) {
     std::filesystem::create_directories(parent, ec);
   }
-  FILE* f = std::fopen(path.c_str(), "a");
+  constexpr uintmax_t kMaxLogBytes = 4u * 1024u * 1024u;
+  const bool rotate = std::filesystem::exists(path, ec) && std::filesystem::file_size(path, ec) > kMaxLogBytes;
+  FILE* f = std::fopen(path.c_str(), rotate ? "w" : "a");
   if (!f) return;
-  std::fprintf(f, "[Chromaspace] %s\n", msg.c_str());
+  const auto now = std::chrono::system_clock::now().time_since_epoch();
+  const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now).count();
+  if (rotate) std::fprintf(f, "[Chromaspace] log rotated at %lldms\n", static_cast<long long>(ms));
+  std::fprintf(f, "[Chromaspace %lld tid=%zu] %s\n",
+               static_cast<long long>(ms),
+               std::hash<std::thread::id>{}(std::this_thread::get_id()),
+               msg.c_str());
   std::fclose(f);
 }
 
@@ -281,6 +291,28 @@ struct ViewerCloudTransportBlob {
   }
 };
 
+enum class CloudCoverageKind {
+  Full = 0,
+  Partial = 1,
+};
+
+struct CloudFootprintInfo {
+  int fullX1 = 0;
+  int fullY1 = 0;
+  int fullWidth = 0;
+  int fullHeight = 0;
+  int sampledX1 = 0;
+  int sampledY1 = 0;
+  int sampledWidth = 0;
+  int sampledHeight = 0;
+  float sampledNormX1 = 0.0f;
+  float sampledNormY1 = 0.0f;
+  float sampledNormX2 = 1.0f;
+  float sampledNormY2 = 1.0f;
+  CloudCoverageKind coverageKind = CloudCoverageKind::Full;
+  bool authoritative = false;
+};
+
 struct CachedCloud {
   std::string payload;
   std::string pointsPayload;
@@ -295,6 +327,18 @@ struct CachedCloud {
   int resolution = 25;
   int sourceWidth = 0;
   int sourceHeight = 0;
+  int fullX1 = 0;
+  int fullY1 = 0;
+  int sampledX1 = 0;
+  int sampledY1 = 0;
+  int sampledWidth = 0;
+  int sampledHeight = 0;
+  float sampledNormX1 = 0.0f;
+  float sampledNormY1 = 0.0f;
+  float sampledNormX2 = 1.0f;
+  float sampledNormY2 = 1.0f;
+  CloudCoverageKind coverageKind = CloudCoverageKind::Full;
+  bool authoritative = false;
   bool valid = false;
 };
 
@@ -319,6 +363,18 @@ struct CloudBuildResult {
   int resolution = 25;
   int sourceWidth = 0;
   int sourceHeight = 0;
+  int fullX1 = 0;
+  int fullY1 = 0;
+  int sampledX1 = 0;
+  int sampledY1 = 0;
+  int sampledWidth = 0;
+  int sampledHeight = 0;
+  float sampledNormX1 = 0.0f;
+  float sampledNormY1 = 0.0f;
+  float sampledNormX2 = 1.0f;
+  float sampledNormY2 = 1.0f;
+  CloudCoverageKind coverageKind = CloudCoverageKind::Full;
+  bool authoritative = false;
   bool success = false;
 };
 
@@ -557,6 +613,29 @@ int qualityPointCountForIndex(int q, bool previewMode) {
   }
 }
 
+double coverageScaleForFootprint(const CloudFootprintInfo& footprint) {
+  const double fullPixels =
+      static_cast<double>(std::max(1, footprint.fullWidth)) *
+      static_cast<double>(std::max(1, footprint.fullHeight));
+  const double sampledPixels =
+      static_cast<double>(std::max(1, footprint.sampledWidth)) *
+      static_cast<double>(std::max(1, footprint.sampledHeight));
+  return std::clamp(sampledPixels / fullPixels, 0.0, 1.0);
+}
+
+int pointBudgetForFootprint(int qualityIndex,
+                            bool previewMode,
+                            double scaleFactor,
+                            const CloudFootprintInfo& footprint) {
+  const double baseBudget =
+      static_cast<double>(qualityPointCountForIndex(qualityIndex, previewMode)) *
+      scaleFactor * scaleFactor;
+  const bool partialCoverage = footprint.coverageKind == CloudCoverageKind::Partial;
+  const double coverageScale = partialCoverage ? coverageScaleForFootprint(footprint) : 1.0;
+  const int minBudget = partialCoverage ? 128 : 512;
+  return std::max(minBudget, static_cast<int>(std::lround(baseBudget * coverageScale)));
+}
+
 int clampOverlayCubeSize(int size) {
   return std::max(4, std::min(65, size));
 }
@@ -596,10 +675,12 @@ float identityStripCellWidth(int imageWidth, int cubeSize) {
 }
 
 // Stage: map the synthetic draw-on-image strip into image-space bands.
-// The cube always occupies the bottom band; the optional ramp sits directly above it.
+// When both are present, the cube occupies the bottom band and the ramp sits directly above it.
+// If only the gray ramp is drawn/read, it occupies the bottom band itself.
 bool computeIdentityStripLayout(const OfxRectI& bounds,
                                 int cubeSize,
-                                bool overlayRamp,
+                                bool drawCube,
+                                bool drawRamp,
                                 int* stripHeight,
                                 int* cubeY1,
                                 int* cubeY2,
@@ -608,24 +689,37 @@ bool computeIdentityStripLayout(const OfxRectI& bounds,
   const int imageWidth = bounds.x2 - bounds.x1;
   const int imageHeight = bounds.y2 - bounds.y1;
   if (imageWidth <= 0 || imageHeight <= 0 || cubeSize <= 0) return false;
+  const int bandCount = (drawCube ? 1 : 0) + (drawRamp ? 1 : 0);
+  if (bandCount <= 0) return false;
   const float cellWidth = identityStripCellWidth(imageWidth, cubeSize);
   const int strip = std::max(1, static_cast<int>(std::lround(cellWidth)));
-  const int totalStripHeight = std::min(imageHeight, strip * (overlayRamp ? 2 : 1));
+  const int totalStripHeight = std::min(imageHeight, strip * bandCount);
   const int baseY1 = bounds.y1;
   const int baseY2 = std::min(bounds.y2, baseY1 + totalStripHeight);
-  if (overlayRamp) {
-    if (cubeY1) *cubeY1 = baseY1;
-    if (cubeY2) *cubeY2 = std::min(baseY2, baseY1 + strip);
-    if (rampY1) *rampY1 = std::min(baseY2, baseY1 + strip);
-    if (rampY2) *rampY2 = std::min(baseY2, baseY1 + strip * 2);
-  } else {
-    if (rampY1) *rampY1 = baseY1;
-    if (rampY2) *rampY2 = baseY1;
-    if (cubeY1) *cubeY1 = baseY1;
-    if (cubeY2) *cubeY2 = baseY2;
+  int cursorY = baseY1;
+  int cubeBandY1 = baseY1;
+  int cubeBandY2 = baseY1;
+  int rampBandY1 = baseY1;
+  int rampBandY2 = baseY1;
+  if (drawCube) {
+    cubeBandY1 = cursorY;
+    cubeBandY2 = std::min(baseY2, cursorY + strip);
+    cursorY = cubeBandY2;
   }
+  if (drawRamp) {
+    rampBandY1 = cursorY;
+    rampBandY2 = std::min(baseY2, cursorY + strip);
+    cursorY = rampBandY2;
+  } else {
+    rampBandY1 = cursorY;
+    rampBandY2 = cursorY;
+  }
+  if (cubeY1) *cubeY1 = cubeBandY1;
+  if (cubeY2) *cubeY2 = cubeBandY2;
+  if (rampY1) *rampY1 = rampBandY1;
+  if (rampY2) *rampY2 = rampBandY2;
   if (stripHeight) *stripHeight = strip;
-  return (cubeY1 == nullptr || cubeY2 == nullptr || *cubeY2 > *cubeY1);
+  return (!drawCube || cubeBandY2 > cubeBandY1) && (!drawRamp || rampBandY2 > rampBandY1);
 }
 
 const char* qualityLabelForIndex(int q) {
@@ -2179,9 +2273,10 @@ class ChromaspaceEffect : public ImageEffect {
       markSharedViewerActiveSender();
       cubeViewerInputCloudRefreshPending_ = true;
       deferredLatestCloudRefresh_.store(false, std::memory_order_relaxed);
+      deferredAuthoritativeCloudRefresh_.store(false, std::memory_order_relaxed);
+      authoritativeOnlyCloudRefresh_.store(false, std::memory_order_relaxed);
       logSharedViewerEvent("syncPrivateData/activate");
       pushParamsUpdate(0.0, "syncPrivateData/activate");
-      (void)trySendCachedCloud(0.0, "syncPrivateData/activate");
     }
     ImageEffect::syncPrivateData();
   }
@@ -2344,9 +2439,10 @@ class ChromaspaceEffect : public ImageEffect {
       markSharedViewerActiveSender(sourceId);
       cubeViewerInputCloudRefreshPending_ = true;
       deferredLatestCloudRefresh_.store(false, std::memory_order_relaxed);
+      deferredAuthoritativeCloudRefresh_.store(false, std::memory_order_relaxed);
+      authoritativeOnlyCloudRefresh_.store(false, std::memory_order_relaxed);
       logSharedViewerEvent("render/sourceHandoff", sourceId);
       pushParamsUpdate(args.time, "render/source-handoff");
-      (void)trySendCachedCloud(args.time, "render/source-handoff");
     }
     const bool drivesViewer = drivesSharedViewer();
     logSharedViewerEvent("render/drivesViewer", sourceId,
@@ -2357,8 +2453,49 @@ class ChromaspaceEffect : public ImageEffect {
     const bool needCloudWork = !drawOnImageMode && drivesViewer && cubeViewerLive_;
     const bool previewMode = shouldUseInteractivePreview(renderNow);
     const bool firstHandoff = cubeViewerInputCloudRefreshPending_;
+    const bool useConservativeCloudPath = currentUseInstance1Requested(args.time);
+    const bool forceAuthoritativeCloud = authoritativeOnlyCloudRefresh_.load(std::memory_order_relaxed);
     const bool steadyState = shouldEmitSteadyStateCloud(args.time, sourceId, settingsKey, previewMode);
-    const bool needCloud = needCloudWork && (firstHandoff || steadyState);
+    const bool previewRequested =
+        needCloudWork && previewMode && !forceAuthoritativeCloud && !useConservativeCloudPath && (firstHandoff || steadyState);
+    const bool authoritativeRequested =
+        needCloudWork &&
+        (forceAuthoritativeCloud
+             ? true
+             : useConservativeCloudPath
+             ? (firstHandoff || steadyState)
+             : shouldEmitAuthoritativeCloud(args.time, sourceId, settingsKey, firstHandoff, steadyState, previewRequested));
+    const bool needCloud = needCloudWork && (previewRequested || authoritativeRequested);
+    if (sessionRequested || needCloudWork) {
+      std::ostringstream os;
+      os << "Cloud schedule"
+         << " time=" << args.time
+         << " drawOnImage=" << (drawOnImageMode ? 1 : 0)
+         << " drives=" << (drivesViewer ? 1 : 0)
+         << " live=" << (cubeViewerLive_ ? 1 : 0)
+         << " first=" << (firstHandoff ? 1 : 0)
+         << " steady=" << (steadyState ? 1 : 0)
+         << " previewMode=" << (previewMode ? 1 : 0)
+         << " useInstance1=" << (useConservativeCloudPath ? 1 : 0)
+         << " forceAuth=" << (forceAuthoritativeCloud ? 1 : 0)
+         << " previewReq=" << (previewRequested ? 1 : 0)
+         << " authReq=" << (authoritativeRequested ? 1 : 0)
+         << " queued=" << (cloudQueuedOrInFlight_.load(std::memory_order_relaxed) ? 1 : 0)
+         << " deferredLatest=" << (deferredLatestCloudRefresh_.load(std::memory_order_relaxed) ? 1 : 0)
+         << " deferredAuth=" << (deferredAuthoritativeCloudRefresh_.load(std::memory_order_relaxed) ? 1 : 0)
+         << " source=" << sourceId
+         << " settings=" << settingsKey;
+      const std::string scheduleTrace = os.str();
+      const auto scheduleTraceAgeMs =
+          lastCloudScheduleTraceAt_ == std::chrono::steady_clock::time_point{}
+              ? std::numeric_limits<long long>::max()
+              : std::chrono::duration_cast<std::chrono::milliseconds>(renderNow - lastCloudScheduleTraceAt_).count();
+      if (needCloud || scheduleTrace != lastCloudScheduleTrace_ || scheduleTraceAgeMs >= 1000) {
+        cubeViewerDebugLog(scheduleTrace);
+        lastCloudScheduleTrace_ = scheduleTrace;
+        lastCloudScheduleTraceAt_ = renderNow;
+      }
+    }
     lastRenderSeenAt_ = renderNow;
     if (needCloudWork && !firstHandoff && !steadyState && cloudQueuedOrInFlight_.load(std::memory_order_relaxed)) {
       deferredLatestCloudRefresh_.store(true, std::memory_order_relaxed);
@@ -2366,17 +2503,6 @@ class ChromaspaceEffect : public ImageEffect {
     if (!drawOnImageMode && drivesViewer && !cubeViewerConnected_) {
       pushParamsUpdate(args.time, "render/connect");
     }
-    std::unique_ptr<Image> cloudSrc;
-    if (needCloud && srcClip_ != nullptr) {
-      const OfxRectD rod = srcClip_->getRegionOfDefinition(args.time);
-      cloudSrc.reset(srcClip_->fetchImage(args.time, rod));
-      if (!cloudSrc) {
-        cubeViewerDebugLog("Failed to fetch full-source image for cloud build; falling back to render-window source.");
-      }
-    }
-    Image* cloudImage = cloudSrc ? cloudSrc.get() : src.get();
-    const std::string cloudSourceId = currentSourceIdentifier(cloudImage);
-    CloudBuildResult built{};
     OverlayStripData overlay{};
     const bool haveOverlay = drawOnImageMode && buildIdentityOverlayStripData(dst->getBounds(), args.renderWindow, args.time, &overlay);
 
@@ -2399,29 +2525,156 @@ class ChromaspaceEffect : public ImageEffect {
     if (!copiedViaGpu) {
       copySourceToDestination(src.get(), dst.get(), args.renderWindow);
     }
-    if (!needCloud || !cloudImage) return;
+    if (!needCloud) return;
 
-    built = buildViewerCloudPayload(cloudImage, dst.get(), args, previewMode);
-    if (!built.success) return;
-    bool cloudChanged = false;
-    const std::string effectiveSettingsKey = currentCloudSettingsKey(args.time);
-    if (!promoteBuiltCloud(built, cloudSourceId, effectiveSettingsKey, &cloudChanged)) {
-      if (firstHandoff) {
-        (void)trySendCachedCloud(args.time, "first-handoff/rejected-smaller-source");
+    const int qualityIndex = getChoiceValue("cubeViewerQuality", args.time, cubeViewerQuality_);
+    const auto cloudNow = std::chrono::steady_clock::now();
+
+    if (useConservativeCloudPath) {
+      std::unique_ptr<Image> cloudSrc;
+      if (srcClip_ != nullptr) {
+        const OfxRectD rod = srcClip_->getRegionOfDefinition(args.time);
+        cloudSrc.reset(srcClip_->fetchImage(args.time, rod));
+        if (!cloudSrc) {
+          cubeViewerDebugLog("Failed to fetch full-source image for conservative cloud build; falling back to render-window source.");
+        }
+      }
+      Image* cloudImage = cloudSrc ? cloudSrc.get() : src.get();
+      if (!cloudImage) return;
+      if (cloudSrc &&
+          !authoritativeImageMatchesLiveWindow(src.get(), cloudImage, args, "conservative-full-fetch")) {
+        cloudImage = src.get();
+        if (!cloudImage) return;
+      }
+      CloudBuildResult built = buildViewerCloudPayload(cloudImage, dst.get(), args, previewMode);
+      if (!built.success) return;
+      CloudFootprintInfo authoritativeFootprint{};
+      if (currentSourceFootprint(args.time, cloudImage->getBounds(), cloudImage == cloudSrc.get(), &authoritativeFootprint)) {
+        applyCloudFootprintMetadata(&built, authoritativeFootprint);
+      }
+      bool cloudChanged = false;
+      if (!promoteBuiltCloud(built, sourceId, settingsKey, &cloudChanged)) {
+        return;
+      }
+      deferredLatestCloudRefresh_.store(false, std::memory_order_relaxed);
+      deferredAuthoritativeCloudRefresh_.store(false, std::memory_order_relaxed);
+      authoritativeOnlyCloudRefresh_.store(false, std::memory_order_relaxed);
+      if (cloudChanged) {
+        enqueueCloudMessage(built.payload, firstHandoff ? "first-handoff/render" : "steady-state/render", built.fastBlob);
+      }
+      lastCloudTime_ = args.time;
+      lastCloudBuiltAt_ = cloudNow;
+      lastCloudSourceId_ = sourceId;
+      lastCloudSettingsKey_ = settingsKey;
+      lastAuthoritativeCloudBuiltAt_ = cloudNow;
+      lastAuthoritativeCloudSourceId_ = sourceId;
+      lastAuthoritativeCloudSettingsKey_ = settingsKey;
+      cubeViewerInputCloudRefreshPending_ = false;
+      if (cloudChanged) {
+        setStatusLabel("Updating");
       }
       return;
     }
 
-    deferredLatestCloudRefresh_.store(false, std::memory_order_relaxed);
-    if (cloudChanged) {
-      enqueueCloudMessage(built.payload, firstHandoff ? "first-handoff/render" : "steady-state/render");
+    CloudBuildResult previewBuilt{};
+    bool previewAccepted = false;
+    bool previewChanged = false;
+    if (previewRequested && src) {
+      CloudFootprintInfo previewFootprint{};
+      if (currentSourceFootprint(args.time, src->getBounds(), false, &previewFootprint)) {
+        previewBuilt = buildViewerPreviewCloudPayload(src.get(), dst.get(), args, previewMode, previewFootprint);
+        if (previewBuilt.success) {
+          previewAccepted = promotePreviewCloud(previewBuilt, sourceId, settingsKey, &previewChanged);
+        }
+      }
+      deferredAuthoritativeCloudRefresh_.store(true, std::memory_order_relaxed);
     }
-    lastCloudTime_ = args.time;
-    lastCloudBuiltAt_ = std::chrono::steady_clock::now();
-    lastCloudSourceId_ = cloudSourceId;
-    lastCloudSettingsKey_ = effectiveSettingsKey;
-    cubeViewerInputCloudRefreshPending_ = false;
-    if (cloudChanged) {
+
+    CloudBuildResult authoritativeBuilt{};
+    bool authoritativeAccepted = false;
+    bool authoritativeChanged = false;
+    if (authoritativeRequested && srcClip_ != nullptr) {
+      std::unique_ptr<Image> cloudSrc;
+      const OfxRectD rod = srcClip_->getRegionOfDefinition(args.time);
+      cloudSrc.reset(srcClip_->fetchImage(args.time, rod));
+      if (!cloudSrc) {
+        cubeViewerDebugLog("Failed to fetch authoritative full-source image for cloud build.");
+      } else if (!authoritativeImageMatchesLiveWindow(src.get(), cloudSrc.get(), args, "authoritative-full-fetch")) {
+        deferredAuthoritativeCloudRefresh_.store(true, std::memory_order_relaxed);
+      } else {
+        authoritativeBuilt = buildViewerCloudPayload(cloudSrc.get(), dst.get(), args, previewMode);
+        if (authoritativeBuilt.success) {
+          CloudFootprintInfo authoritativeFootprint{};
+          if (currentSourceFootprint(args.time, cloudSrc->getBounds(), true, &authoritativeFootprint)) {
+            applyCloudFootprintMetadata(&authoritativeBuilt, authoritativeFootprint);
+          }
+          authoritativeAccepted = promoteBuiltCloud(authoritativeBuilt, sourceId, settingsKey, &authoritativeChanged);
+        }
+      }
+      if (!authoritativeAccepted) {
+        deferredAuthoritativeCloudRefresh_.store(true, std::memory_order_relaxed);
+      }
+    }
+
+    if (authoritativeRequested && !authoritativeAccepted && !previewAccepted && previewMode && src) {
+      CloudFootprintInfo fallbackFootprint{};
+      if (currentSourceFootprint(args.time, src->getBounds(), false, &fallbackFootprint)) {
+        previewBuilt = buildViewerPreviewCloudPayload(src.get(), dst.get(), args, previewMode, fallbackFootprint);
+        if (previewBuilt.success) {
+          previewAccepted = promotePreviewCloud(previewBuilt, sourceId, settingsKey, &previewChanged);
+          if (previewAccepted) {
+            cubeViewerDebugLog("Using live render-window preview after authoritative cloud was unavailable or stale.");
+          }
+        }
+      }
+    }
+
+    bool queuedCloud = false;
+    if (authoritativeAccepted) {
+      lastAuthoritativeCloudBuiltAt_ = cloudNow;
+      lastAuthoritativeCloudSourceId_ = sourceId;
+      lastAuthoritativeCloudSettingsKey_ = settingsKey;
+      lastCloudTime_ = args.time;
+      lastCloudBuiltAt_ = cloudNow;
+      lastCloudSourceId_ = sourceId;
+      lastCloudSettingsKey_ = settingsKey;
+      cubeViewerInputCloudRefreshPending_ = false;
+      deferredAuthoritativeCloudRefresh_.store(false, std::memory_order_relaxed);
+      authoritativeOnlyCloudRefresh_.store(false, std::memory_order_relaxed);
+      if (authoritativeChanged) {
+        enqueueCloudMessage(authoritativeBuilt.payload,
+                            firstHandoff ? "first-handoff/authoritative" : "steady-state/authoritative",
+                            authoritativeBuilt.fastBlob);
+        deferredLatestCloudRefresh_.store(false, std::memory_order_relaxed);
+        queuedCloud = true;
+      }
+    }
+
+    if (!queuedCloud && previewAccepted) {
+      lastCloudTime_ = args.time;
+      lastCloudBuiltAt_ = cloudNow;
+      lastCloudSourceId_ = sourceId;
+      lastCloudSettingsKey_ = settingsKey;
+      cubeViewerInputCloudRefreshPending_ = false;
+      if (previewChanged) {
+        bool composedWithAuthoritative = false;
+        CloudBuildResult previewToSend =
+            buildCompositePreviewCloud(previewBuilt, sourceId, settingsKey, qualityIndex, &composedWithAuthoritative);
+        enqueueCloudMessage(previewToSend.payload,
+                            firstHandoff
+                                ? (composedWithAuthoritative ? "first-handoff/preview-composite" : "first-handoff/preview")
+                                : (composedWithAuthoritative ? "steady-state/preview-composite" : "steady-state/preview"),
+                            previewToSend.fastBlob);
+        deferredLatestCloudRefresh_.store(false, std::memory_order_relaxed);
+        queuedCloud = true;
+      }
+    }
+
+    if ((previewAccepted || authoritativeAccepted) && !queuedCloud) {
+      deferredLatestCloudRefresh_.store(false, std::memory_order_relaxed);
+    }
+
+    if (queuedCloud) {
       setStatusLabel("Updating");
     }
   }
@@ -2611,6 +2864,7 @@ class ChromaspaceEffect : public ImageEffect {
     if (paramName == "cubeViewerUpdateMode") {
       cubeViewerUpdateMode_ = getChoiceValue("cubeViewerUpdateMode", args.time, 0);
       deferredLatestCloudRefresh_.store(false, std::memory_order_relaxed);
+      deferredAuthoritativeCloudRefresh_.store(false, std::memory_order_relaxed);
       cubeViewerDebugLog(std::string("changedParam(cubeViewerUpdateMode) -> ") +
                          viewerUpdateModeLabelForIndex(cubeViewerUpdateMode_));
       syncChromaspacePresetMenuState(args.time);
@@ -2764,7 +3018,7 @@ class ChromaspaceEffect : public ImageEffect {
         paramName == "cubeViewerPlotDisplayLinearTransfer") {
       cubeViewerDebugLog(std::string("changedParam(") + paramName + ")");
       updateDrawOnImageModeUi(args.time);
-      invalidateCubeViewerCloudState();
+      requestAuthoritativeCubeViewerCloudRefresh();
       syncChromaspacePresetMenuState(args.time);
       if (viewerSessionRequested()) {
         pushParamsUpdate(args.time, paramName);
@@ -2916,7 +3170,8 @@ class ChromaspaceEffect : public ImageEffect {
       const bool useInstance1 = getBoolValue("cubeViewerSampleDrawnCubeOnly", args.time, false);
       cubeViewerDebugLog(std::string("changedParam(cubeViewerSampleDrawnCubeOnly) -> ") +
                          (useInstance1 ? "1" : "0"));
-      if (!useInstance1 && !getBoolValue("cubeViewerReadGrayRamp", args.time, false)) {
+      const bool readGrayRamp = getBoolValue("cubeViewerReadGrayRamp", args.time, false);
+      if (!useInstance1 && !readGrayRamp) {
         if (auto* p = fetchBooleanParam("cubeViewerShowIdentityOnly")) p->setValue(false);
       }
       syncIdentityReadbackUi(args.time);
@@ -2931,7 +3186,8 @@ class ChromaspaceEffect : public ImageEffect {
       const bool readGrayRamp = getBoolValue("cubeViewerReadGrayRamp", args.time, false);
       cubeViewerDebugLog(std::string("changedParam(cubeViewerReadGrayRamp) -> ") +
                          (readGrayRamp ? "1" : "0"));
-      if (!readGrayRamp && !getBoolValue("cubeViewerSampleDrawnCubeOnly", args.time, false)) {
+      const bool readIdentityPlot = getBoolValue("cubeViewerSampleDrawnCubeOnly", args.time, false);
+      if (!readGrayRamp && !readIdentityPlot) {
         if (auto* p = fetchBooleanParam("cubeViewerShowIdentityOnly")) p->setValue(false);
       }
       syncIdentityReadbackUi(args.time);
@@ -2975,7 +3231,7 @@ class ChromaspaceEffect : public ImageEffect {
       updateCircularHslToggleVisibility(args.time);
       updateCircularHsvToggleVisibility(args.time);
       updateNormConeToggleVisibility(args.time);
-      invalidateCubeViewerCloudState();
+      requestAuthoritativeCubeViewerCloudRefresh();
       syncChromaspacePresetMenuState(args.time);
       if (viewerSessionRequested()) {
         pushParamsUpdate(args.time, "cubeViewerPlotModel");
@@ -3060,6 +3316,8 @@ class ChromaspaceEffect : public ImageEffect {
   PendingMessage pendingCloud_;
   std::atomic<bool> cloudQueuedOrInFlight_{false};
   std::atomic<bool> deferredLatestCloudRefresh_{false};
+  std::atomic<bool> deferredAuthoritativeCloudRefresh_{false};
+  std::atomic<bool> authoritativeOnlyCloudRefresh_{false};
   std::atomic<int64_t> lastViewerTransportActivityMs_{0};
   std::mutex statusMutex_;
   std::string pendingStatusText_;
@@ -3080,16 +3338,22 @@ class ChromaspaceEffect : public ImageEffect {
   int chromaspacePresetCustomIndex_ = -1;
   int chromaspacePresetMenuUserCount_ = 0;
   CachedCloud cachedCloud_;
+  CachedCloud previewCloud_;
   CachedIdentityStripCloud cachedIdentityStripCloud_;
   double lastCloudTime_ = std::numeric_limits<double>::quiet_NaN();
   std::chrono::steady_clock::time_point lastCloudBuiltAt_{};
+  std::chrono::steady_clock::time_point lastAuthoritativeCloudBuiltAt_{};
   std::chrono::steady_clock::time_point lastRenderSeenAt_{};
   std::chrono::steady_clock::time_point previewModeUntil_{};
+  std::chrono::steady_clock::time_point lastCloudScheduleTraceAt_{};
   std::chrono::steady_clock::time_point lastHeartbeatAt_{};
   ViewerProbeResult lastLoggedHeartbeatProbe_{};
   bool hasLoggedHeartbeatProbe_ = false;
   std::string lastCloudSourceId_;
   std::string lastCloudSettingsKey_;
+  std::string lastAuthoritativeCloudSourceId_;
+  std::string lastAuthoritativeCloudSettingsKey_;
+  std::string lastCloudScheduleTrace_;
   std::string statusCache_;
   std::vector<float> stageSrc_;
   std::mutex stageMutex_;
@@ -3109,6 +3373,10 @@ class ChromaspaceEffect : public ImageEffect {
       std::string* reason) const {
     if (!built.success || built.sourceWidth <= 0 || built.sourceHeight <= 0) {
       if (reason) *reason = "invalid-build";
+      return false;
+    }
+    if (built.coverageKind != CloudCoverageKind::Full) {
+      if (reason) *reason = "partial-build";
       return false;
     }
     if (!cachedCloud_.valid) {
@@ -3134,6 +3402,51 @@ class ChromaspaceEffect : public ImageEffect {
       return false;
     }
     if (reason) *reason = "same-or-larger-source";
+    return true;
+  }
+
+  bool sameCloudCoverage(const CachedCloud& cached, const CloudBuildResult& built) const {
+    return cached.coverageKind == built.coverageKind &&
+           cached.fullX1 == built.fullX1 &&
+           cached.fullY1 == built.fullY1 &&
+           cached.sourceWidth == built.sourceWidth &&
+           cached.sourceHeight == built.sourceHeight &&
+           cached.sampledX1 == built.sampledX1 &&
+           cached.sampledY1 == built.sampledY1 &&
+           cached.sampledWidth == built.sampledWidth &&
+           cached.sampledHeight == built.sampledHeight;
+  }
+
+  bool shouldAcceptPreviewCloudLocked(
+      const CloudBuildResult& built,
+      const std::string& sourceId,
+      const std::string& settingsKey,
+      std::string* reason) const {
+    if (!built.success || built.sourceWidth <= 0 || built.sourceHeight <= 0) {
+      if (reason) *reason = "invalid-build";
+      return false;
+    }
+    if (!previewCloud_.valid) {
+      if (reason) *reason = "preview-cache-empty";
+      return true;
+    }
+    if (previewCloud_.quality != built.quality || previewCloud_.resolution != built.resolution) {
+      if (reason) *reason = "quality-changed";
+      return true;
+    }
+    if (previewCloud_.sourceId != sourceId || previewCloud_.settingsKey != settingsKey) {
+      if (reason) *reason = "source-changed";
+      return true;
+    }
+    if (!sameCloudCoverage(previewCloud_, built)) {
+      if (reason) *reason = "coverage-changed";
+      return true;
+    }
+    if (previewCloud_.contentHash != 0 && built.contentHash != 0 && previewCloud_.contentHash == built.contentHash) {
+      if (reason) *reason = "unchanged-content";
+      return false;
+    }
+    if (reason) *reason = "preview-changed";
     return true;
   }
 
@@ -3168,13 +3481,128 @@ class ChromaspaceEffect : public ImageEffect {
     cachedCloud_.resolution = built.resolution;
     cachedCloud_.sourceWidth = built.sourceWidth;
     cachedCloud_.sourceHeight = built.sourceHeight;
+    cachedCloud_.fullX1 = built.fullX1;
+    cachedCloud_.fullY1 = built.fullY1;
+    cachedCloud_.sampledX1 = built.sampledX1;
+    cachedCloud_.sampledY1 = built.sampledY1;
+    cachedCloud_.sampledWidth = built.sampledWidth;
+    cachedCloud_.sampledHeight = built.sampledHeight;
+    cachedCloud_.sampledNormX1 = built.sampledNormX1;
+    cachedCloud_.sampledNormY1 = built.sampledNormY1;
+    cachedCloud_.sampledNormX2 = built.sampledNormX2;
+    cachedCloud_.sampledNormY2 = built.sampledNormY2;
+    cachedCloud_.coverageKind = built.coverageKind;
+    cachedCloud_.authoritative = true;
     cachedCloud_.valid = true;
     if (changed) *changed = true;
     cubeViewerDebugLog(std::string("Accepted cloud payload: reason=") + decisionReason +
                        " source=" + std::to_string(built.sourceWidth) + "x" + std::to_string(built.sourceHeight) +
+                       " coverage=" + cloudCoverageLabel(built.coverageKind) +
                        " quality=" + built.quality +
                        " res=" + std::to_string(built.resolution));
     return true;
+  }
+
+  bool promotePreviewCloud(
+      const CloudBuildResult& built,
+      const std::string& sourceId,
+      const std::string& settingsKey,
+      bool* changed = nullptr) {
+    std::lock_guard<std::mutex> lock(stateMutex_);
+    std::string decisionReason;
+    if (!shouldAcceptPreviewCloudLocked(built, sourceId, settingsKey, &decisionReason)) {
+      if (changed) *changed = false;
+      cubeViewerDebugLog(std::string("Rejected preview cloud payload: reason=") + decisionReason +
+                         " built=" + std::to_string(built.sourceWidth) + "x" + std::to_string(built.sourceHeight) +
+                         " coverage=" + cloudCoverageLabel(built.coverageKind) +
+                         " quality=" + built.quality +
+                         " res=" + std::to_string(built.resolution));
+      return decisionReason == "unchanged-content";
+    }
+    previewCloud_.payload = built.payload;
+    previewCloud_.pointsPayload = built.pointsPayload;
+    previewCloud_.paramHash = built.paramHash;
+    previewCloud_.quality = built.quality;
+    previewCloud_.sourceId = sourceId;
+    previewCloud_.settingsKey = settingsKey;
+    previewCloud_.fastBlob = built.fastBlob;
+    previewCloud_.samples = built.samples;
+    previewCloud_.contentHash = built.contentHash;
+    previewCloud_.sampleCount = built.sampleCount;
+    previewCloud_.resolution = built.resolution;
+    previewCloud_.sourceWidth = built.sourceWidth;
+    previewCloud_.sourceHeight = built.sourceHeight;
+    previewCloud_.fullX1 = built.fullX1;
+    previewCloud_.fullY1 = built.fullY1;
+    previewCloud_.sampledX1 = built.sampledX1;
+    previewCloud_.sampledY1 = built.sampledY1;
+    previewCloud_.sampledWidth = built.sampledWidth;
+    previewCloud_.sampledHeight = built.sampledHeight;
+    previewCloud_.sampledNormX1 = built.sampledNormX1;
+    previewCloud_.sampledNormY1 = built.sampledNormY1;
+    previewCloud_.sampledNormX2 = built.sampledNormX2;
+    previewCloud_.sampledNormY2 = built.sampledNormY2;
+    previewCloud_.coverageKind = built.coverageKind;
+    previewCloud_.authoritative = false;
+    previewCloud_.valid = true;
+    if (changed) *changed = true;
+    cubeViewerDebugLog(std::string("Accepted preview cloud payload: reason=") + decisionReason +
+                       " source=" + std::to_string(built.sourceWidth) + "x" + std::to_string(built.sourceHeight) +
+                       " coverage=" + cloudCoverageLabel(built.coverageKind) +
+                       " quality=" + built.quality +
+                       " res=" + std::to_string(built.resolution));
+    return true;
+  }
+
+  bool cloudSampleInsideBounds(const ViewerCloudSample& sample,
+                               const CloudBuildResult& boundsSource) const {
+    const float epsX = 0.5f / static_cast<float>(std::max(1, boundsSource.sourceWidth));
+    const float epsY = 0.5f / static_cast<float>(std::max(1, boundsSource.sourceHeight));
+    return sample.xNorm >= (boundsSource.sampledNormX1 - epsX) &&
+           sample.xNorm <= (boundsSource.sampledNormX2 + epsX) &&
+           sample.yNorm >= (boundsSource.sampledNormY1 - epsY) &&
+           sample.yNorm <= (boundsSource.sampledNormY2 + epsY);
+  }
+
+  CloudBuildResult buildCompositePreviewCloud(const CloudBuildResult& preview,
+                                              const std::string& sourceId,
+                                              const std::string& settingsKey,
+                                              int qualityIndex,
+                                              bool* usedAuthoritative = nullptr) {
+    if (usedAuthoritative) *usedAuthoritative = false;
+    if (!preview.success || preview.coverageKind == CloudCoverageKind::Full) return preview;
+    std::lock_guard<std::mutex> lock(stateMutex_);
+    if (!cachedCloud_.valid || !cachedCloud_.authoritative || cachedCloud_.samples.empty()) return preview;
+    if (cachedCloud_.sourceId != sourceId || cachedCloud_.settingsKey != settingsKey) return preview;
+    if (cachedCloud_.quality != preview.quality || cachedCloud_.resolution != preview.resolution) return preview;
+    std::vector<ViewerCloudSample> merged;
+    merged.reserve(cachedCloud_.samples.size() + preview.samples.size());
+    for (const auto& sample : cachedCloud_.samples) {
+      if (!cloudSampleInsideBounds(sample, preview)) {
+        merged.push_back(sample);
+      }
+    }
+    merged.insert(merged.end(), preview.samples.begin(), preview.samples.end());
+    CloudBuildResult out = preview;
+    out.samples = std::move(merged);
+    out.pointsPayload = serializeViewerCloudSamples(out.samples);
+    out.contentHash = out.samples.empty()
+                          ? fnv1a64(std::string{})
+                          : fnv1a64Bytes(out.samples.data(), out.samples.size() * sizeof(ViewerCloudSample));
+    out.sampleCount = out.samples.size();
+    out.fastBlob.reset();
+    std::shared_ptr<ViewerCloudTransportBlob> fastBlob;
+    std::string transportMode = "json";
+    out.payload = buildInputCloudJson(out.samples,
+                                      out.paramHash,
+                                      settingsKey,
+                                      out.resolution,
+                                      qualityIndex,
+                                      &fastBlob,
+                                      &transportMode);
+    out.fastBlob = std::move(fastBlob);
+    if (usedAuthoritative) *usedAuthoritative = true;
+    return out;
   }
 
   void copySourceToDestination(Image* src, Image* dst, const OfxRectI& renderWindow) {
@@ -3200,11 +3628,12 @@ class ChromaspaceEffect : public ImageEffect {
   // This is the shared contract that downstream "sample drawn cube only" reads back.
   bool buildIdentityOverlayStripData(const OfxRectI& bounds, const OfxRectI& renderWindow, double time, OverlayStripData* out) {
     if (!out || !getBoolValue("cubeViewerDrawOnImageEnabled", time, false)) return false;
-    if (!currentIdentityOverlayEnabled(time)) return false;
     const int imageWidth = bounds.x2 - bounds.x1;
     const int imageHeight = bounds.y2 - bounds.y1;
     if (imageWidth <= 0 || imageHeight <= 0) return false;
+    const bool overlayCube = currentIdentityOverlayEnabled(time);
     const bool overlayRamp = currentIdentityOverlayRamp(time);
+    if (!overlayCube && !overlayRamp) return false;
     const int requestedSize = getIntValue("cubeViewerSampleDrawnCubeSize", time, 29);
     const int cubeSize = clampOverlayCubeSize(requestedSize);
     const int denom = std::max(1, cubeSize - 1);
@@ -3214,9 +3643,9 @@ class ChromaspaceEffect : public ImageEffect {
     int cubeY2 = 0;
     int rampY1 = 0;
     int rampY2 = 0;
-    if (!computeIdentityStripLayout(bounds, cubeSize, overlayRamp, &stripHeight, &cubeY1, &cubeY2, &rampY1, &rampY2)) return false;
+    if (!computeIdentityStripLayout(bounds, cubeSize, overlayCube, overlayRamp, &stripHeight, &cubeY1, &cubeY2, &rampY1, &rampY2)) return false;
     const int drawY1 = std::max(renderWindow.y1, bounds.y1);
-    const int drawY2 = std::min(renderWindow.y2, overlayRamp ? rampY2 : cubeY2);
+    const int drawY2 = std::min(renderWindow.y2, std::max(cubeY2, rampY2));
     if (drawY1 >= drawY2) return false;
     OverlayStripData overlay{};
     overlay.x1 = renderWindow.x1;
@@ -3228,7 +3657,7 @@ class ChromaspaceEffect : public ImageEffect {
     for (int y = drawY1; y < drawY2; ++y) {
       float* row = overlay.pixels.data() + static_cast<size_t>(y - drawY1) * static_cast<size_t>(overlay.width) * 4u;
       const bool inRampBand = overlayRamp && y >= rampY1 && y < rampY2;
-      const bool inCubeBand = y >= cubeY1 && y < cubeY2;
+      const bool inCubeBand = overlayCube && y >= cubeY1 && y < cubeY2;
       if (!inRampBand && !inCubeBand) continue;
       for (int x = renderWindow.x1; x < renderWindow.x2; ++x) {
         float r = 0.0f;
@@ -3458,8 +3887,12 @@ class ChromaspaceEffect : public ImageEffect {
     return !currentDrawOnImageMode(time) && getBoolValue("cubeViewerReadGrayRamp", time, false);
   }
 
+  bool currentReadStripData(double time) {
+    return currentReadIdentityPlot(time) || currentReadGrayRamp(time);
+  }
+
   bool currentShowIdentityOnly(double time) {
-    return currentUseInstance1(time) && getBoolValue("cubeViewerShowIdentityOnly", time, false);
+    return currentReadStripData(time) && getBoolValue("cubeViewerShowIdentityOnly", time, false);
   }
 
   bool currentOccupancyGuidedFill(double time) {
@@ -3681,7 +4114,9 @@ class ChromaspaceEffect : public ImageEffect {
     values.neutralRadius = std::clamp(getDoubleValue("cubeViewerNeutralRadius", time, values.neutralRadius), 0.0, 1.0);
     values.readGrayRamp = !drawOnImage && getBoolValue("cubeViewerReadGrayRamp", time, values.readGrayRamp);
     values.readIdentityPlot = !drawOnImage && getBoolValue("cubeViewerSampleDrawnCubeOnly", time, values.readIdentityPlot);
-    values.isolateIdentityData = !drawOnImage && getBoolValue("cubeViewerShowIdentityOnly", time, values.isolateIdentityData);
+    values.isolateIdentityData =
+        (values.readIdentityPlot || values.readGrayRamp) &&
+        getBoolValue("cubeViewerShowIdentityOnly", time, values.isolateIdentityData);
     values.liveUpdate = getBoolValue("cubeViewerLive", time, values.liveUpdate);
     values.keepOnTop = getBoolValue("cubeViewerOnTop", time, values.keepOnTop);
     values.updateMode = getChoiceValue("cubeViewerUpdateMode", time, values.updateMode);
@@ -4137,21 +4572,22 @@ class ChromaspaceEffect : public ImageEffect {
 
   void syncIdentityReadbackUi(double time) {
     const bool drawOnImage = currentDrawOnImageMode(time);
+    const bool drawIdentityPlot = currentIdentityOverlayEnabled(time);
+    const bool drawGrayRamp = currentIdentityOverlayRamp(time);
     const bool readIdentityPlot = currentReadIdentityPlot(time);
     const bool readGrayRamp = currentReadGrayRamp(time);
-    const bool useInstance1 = currentUseInstance1(time);
     setParamVisibility(fetchIntParam("cubeViewerSampleDrawnCubeSize"),
-                       drawOnImage ? currentIdentityOverlayEnabled(time) : (readIdentityPlot || readGrayRamp));
+                       drawOnImage ? (drawIdentityPlot || drawGrayRamp) : (readIdentityPlot || readGrayRamp));
     setParamVisibility(fetchBooleanParam("cubeViewerShowIdentityOnly"),
-                       !drawOnImage && useInstance1);
+                       !drawOnImage && (readIdentityPlot || readGrayRamp));
     syncIdentityOverlayGroupOpenState(time);
   }
 
   void updateDrawOnImageModeUi(double time) {
     const bool drawOnImage = currentDrawOnImageMode(time);
     const bool overlayEnabled = currentIdentityOverlayEnabled(time);
+    const bool overlayRamp = currentIdentityOverlayRamp(time);
     const bool useInstance1Requested = currentUseInstance1Requested(time);
-    const bool useInstance1 = currentUseInstance1(time);
     const bool readIdentityPlot = currentReadIdentityPlot(time);
     const bool readGrayRamp = currentReadGrayRamp(time);
     const bool chromaticityMode = currentChromaticityPlotMode(time);
@@ -4243,14 +4679,14 @@ class ChromaspaceEffect : public ImageEffect {
     setParamVisibility(fetchBooleanParam("cubeViewerGlossSurfaceLinks"), false);
     setParamVisibility(fetchBooleanParam("cubeViewerIdentityOverlayEnabled"), !drawOnImage && !glossViewMode);
     setParamVisibility(fetchBooleanParam("cubeViewerIdentityOverlayEnabledDraw"), drawOnImage);
-    setParamVisibility(fetchBooleanParam("cubeViewerIdentityOverlayRampDraw"), drawOnImage && overlayEnabled);
+    setParamVisibility(fetchBooleanParam("cubeViewerIdentityOverlayRampDraw"), drawOnImage);
     setParamVisibility(fetchIntParam("cubeViewerIdentityOverlaySize"), !drawOnImage && !glossViewMode && overlayEnabled);
     setParamVisibility(fetchBooleanParam("cubeViewerIdentityOverlayRamp"), !drawOnImage && !glossViewMode && overlayEnabled);
     setParamVisibility(fetchBooleanParam("cubeViewerSampleDrawnCubeOnly"), !drawOnImage);
     setParamVisibility(fetchBooleanParam("cubeViewerReadGrayRamp"), !drawOnImage);
     setParamVisibility(fetchIntParam("cubeViewerSampleDrawnCubeSize"),
-                       drawOnImage ? overlayEnabled : (readIdentityPlot || readGrayRamp));
-    setParamVisibility(fetchBooleanParam("cubeViewerShowIdentityOnly"), !drawOnImage && useInstance1);
+                       drawOnImage ? (overlayEnabled || overlayRamp) : (readIdentityPlot || readGrayRamp));
+    setParamVisibility(fetchBooleanParam("cubeViewerShowIdentityOnly"), !drawOnImage && (readIdentityPlot || readGrayRamp));
     setParamVisibility(fetchGroupParam("grp_cube_viewer"), !drawOnImage);
     setParamVisibility(fetchGroupParam("grp_cube_viewer_identity_overlay"), true);
     setParamVisibility(fetchGroupParam("grp_support_root"), true);
@@ -4284,23 +4720,37 @@ class ChromaspaceEffect : public ImageEffect {
   void invalidateCubeViewerCloudState() {
     cubeViewerInputCloudRefreshPending_ = true;
     deferredLatestCloudRefresh_.store(false, std::memory_order_relaxed);
+    deferredAuthoritativeCloudRefresh_.store(false, std::memory_order_relaxed);
+    authoritativeOnlyCloudRefresh_.store(false, std::memory_order_relaxed);
     playbackRenderBurstCount_ = 0;
     lastCloudTime_ = std::numeric_limits<double>::quiet_NaN();
     lastCloudBuiltAt_ = std::chrono::steady_clock::time_point{};
+    lastAuthoritativeCloudBuiltAt_ = std::chrono::steady_clock::time_point{};
     lastCloudSourceId_.clear();
     lastCloudSettingsKey_.clear();
+    lastAuthoritativeCloudSourceId_.clear();
+    lastAuthoritativeCloudSettingsKey_.clear();
     {
       std::lock_guard<std::mutex> lock(stateMutex_);
       cachedCloud_ = CachedCloud{};
+      previewCloud_ = CachedCloud{};
       cachedIdentityStripCloud_ = CachedIdentityStripCloud{};
     }
   }
 
   void requestCubeViewerCloudResample() {
     deferredLatestCloudRefresh_.store(false, std::memory_order_relaxed);
+    deferredAuthoritativeCloudRefresh_.store(false, std::memory_order_relaxed);
+    authoritativeOnlyCloudRefresh_.store(false, std::memory_order_relaxed);
     playbackRenderBurstCount_ = 0;
     lastCloudTime_ = std::numeric_limits<double>::quiet_NaN();
     lastCloudBuiltAt_ = std::chrono::steady_clock::time_point{};
+    lastAuthoritativeCloudBuiltAt_ = std::chrono::steady_clock::time_point{};
+  }
+
+  void requestAuthoritativeCubeViewerCloudRefresh() {
+    invalidateCubeViewerCloudState();
+    authoritativeOnlyCloudRefresh_.store(true, std::memory_order_relaxed);
   }
 
   std::string buildIdentityStripParamHash(int width, int height, int resolution, bool readCube, bool readRamp, double time) {
@@ -4363,11 +4813,123 @@ class ChromaspaceEffect : public ImageEffect {
     cachedIdentityStripCloud_.valid = true;
   }
 
+  bool allowIdentityStripCacheReuse(double time) const {
+    (void)time;
+    // Strip/ramp reuse is only safe when we key it against a content-aware signature.
+    // The signature is built from a tiny readback of the actual strip source rows rather
+    // than from weaker host image identifiers alone.
+    return true;
+  }
+
+  void appendEvenlySpacedRows(int y1, int y2, int maxRows, std::vector<int>* outRows) const {
+    if (!outRows || maxRows <= 0 || y2 <= y1) return;
+    const int available = y2 - y1;
+    const int sampleCount = std::min(maxRows, available);
+    const int denom = std::max(1, sampleCount - 1);
+    for (int i = 0; i < sampleCount; ++i) {
+      const int offset = std::clamp(static_cast<int>(std::lround(
+          (static_cast<double>(i) / static_cast<double>(denom)) * static_cast<double>(std::max(0, available - 1)))),
+          0,
+          std::max(0, available - 1));
+      outRows->push_back(y1 + offset);
+    }
+  }
+
+  std::vector<int> identityStripSignatureRows(const OfxRectI& bounds,
+                                              int resolution,
+                                              bool readCube,
+                                              bool readRamp) const {
+    std::vector<int> rows;
+    int stripHeight = 0;
+    int cubeY1 = 0;
+    int cubeY2 = 0;
+    int rampY1 = 0;
+    int rampY2 = 0;
+    if (!computeIdentityStripLayout(bounds, resolution, readCube, readRamp, &stripHeight, &cubeY1, &cubeY2, &rampY1, &rampY2)) {
+      return rows;
+    }
+    if (readCube) appendEvenlySpacedRows(cubeY1, cubeY2, 4, &rows);
+    if (readRamp) appendEvenlySpacedRows(rampY1, rampY2, 4, &rows);
+    std::sort(rows.begin(), rows.end());
+    rows.erase(std::unique(rows.begin(), rows.end()), rows.end());
+    return rows;
+  }
+
+#if defined(CHROMASPACE_HAS_CUDA)
+  bool buildIdentityStripSourceSignatureCuda(Image* src,
+                                             const RenderArguments& args,
+                                             int resolution,
+                                             bool readCube,
+                                             bool readRamp,
+                                             uint64_t* outSignature) {
+    if (!src || !outSignature || !args.isEnabledCudaRender || args.pCudaStream == nullptr || src->getPixelData() == nullptr) return false;
+    const OfxRectI bounds = src->getBounds();
+    const int width = bounds.x2 - bounds.x1;
+    if (width <= 0) return false;
+    const std::vector<int> rows = identityStripSignatureRows(bounds, resolution, readCube, readRamp);
+    if (rows.empty()) return false;
+    const size_t packedRowBytes = static_cast<size_t>(width) * 4u * sizeof(float);
+    if (!ensureStageBuffer(static_cast<size_t>(width) * rows.size())) return false;
+    float* readback = stageSrcPtr();
+    if (!readback) return false;
+    size_t srcRowBytes = static_cast<size_t>(std::abs(src->getRowBytes()));
+    if (srcRowBytes == 0) srcRowBytes = packedRowBytes;
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(args.pCudaStream);
+    for (size_t i = 0; i < rows.size(); ++i) {
+      const char* srcRow = reinterpret_cast<const char*>(src->getPixelData()) +
+                           static_cast<size_t>(rows[i]) * srcRowBytes +
+                           static_cast<size_t>(bounds.x1) * 4u * sizeof(float);
+      char* dstRow = reinterpret_cast<char*>(readback) + i * packedRowBytes;
+      if (cudaMemcpyAsync(dstRow, srcRow, packedRowBytes, cudaMemcpyDeviceToHost, stream) != cudaSuccess) {
+        return false;
+      }
+    }
+    if (cudaStreamSynchronize(stream) != cudaSuccess) return false;
+    *outSignature = fnv1a64Bytes(readback, packedRowBytes * rows.size());
+    return true;
+  }
+#endif
+
+#if defined(__APPLE__)
+  bool buildIdentityStripSourceSignatureMetal(Image* src,
+                                              const RenderArguments& args,
+                                              int resolution,
+                                              bool readCube,
+                                              bool readRamp,
+                                              uint64_t* outSignature) {
+    if (!src || !outSignature || !args.isEnabledMetalRender || args.pMetalCmdQ == nullptr || src->getPixelData() == nullptr) return false;
+    const OfxRectI bounds = src->getBounds();
+    const int width = bounds.x2 - bounds.x1;
+    if (width <= 0) return false;
+    const std::vector<int> rows = identityStripSignatureRows(bounds, resolution, readCube, readRamp);
+    if (rows.empty()) return false;
+    size_t srcRowBytes = static_cast<size_t>(std::abs(src->getRowBytes()));
+    const size_t packedRowBytes = static_cast<size_t>(width) * 4u * sizeof(float);
+    if (srcRowBytes == 0) srcRowBytes = packedRowBytes;
+    if (!ensureStageBuffer(static_cast<size_t>(width) * rows.size())) return false;
+    float* readback = stageSrcPtr();
+    if (!readback) return false;
+    if (!ChromaspaceMetal::copySourceRowsToHost(src->getPixelData(),
+                                                width,
+                                                srcRowBytes,
+                                                rows.data(),
+                                                static_cast<int>(rows.size()),
+                                                bounds.x1,
+                                                args.pMetalCmdQ,
+                                                readback,
+                                                packedRowBytes)) {
+      return false;
+    }
+    *outSignature = fnv1a64Bytes(readback, packedRowBytes * rows.size());
+    return true;
+  }
+#endif
+
   std::string currentQualityLabel(double time) {
     return qualityLabelForIndex(getChoiceValue("cubeViewerQuality", time, cubeViewerQuality_));
   }
 
-  // This key is the contract between the OFX instance and the external viewer. Any setting that changes
+  // This key is the contract between the OFX instance and the external viewer.
   // Only settings that change which RGB samples are serialized into the source cloud should live here.
   // Pure viewer-side interpretation controls are sent separately in the params payload so the viewer
   // can reinterpret the currently cached cloud without forcing a fresh resample.
@@ -4384,14 +4946,12 @@ class ChromaspaceEffect : public ImageEffect {
     const int sampleDrawnCubeResolvedSize = clampOverlayCubeSize(sampleDrawnCubeRequestedSize);
     const std::string plotMode = currentPlotMode(time);
     const bool showOverflow = currentShowOverflow(time);
-    const bool highlightOverflow = showOverflow && getBoolValue("cubeViewerHighlightOverflow", time, true);
     const bool circularHsl = currentCircularHsl(time);
     const bool circularHsv = currentCircularHsv(time);
     const bool normConeNormalized = getBoolValue("cubeViewerNormConeNormalized", time, true);
     const bool plotDisplayLinear = currentPlotDisplayLinearEnabled(time);
     const int plotDisplayLinearTransfer = currentPlotDisplayLinearTransferChoice(time);
-    const auto overflowColor = getRGBValue("cubeViewerOverflowHighlightColor", time, {1.0, 0.0, 0.0});
-    const auto backgroundColor = getRGBValue("cubeViewerBackgroundColor", time, {0.08, 0.08, 0.09});
+    const bool neutralRadiusEnabled = currentNeutralRadiusSlicingEnabled(time);
     std::ostringstream oss;
     oss << "quality=" << qualityLabelForIndex(qualityIndex)
         << "|resolution=" << qualityResolutionForIndex(qualityIndex)
@@ -4399,21 +4959,22 @@ class ChromaspaceEffect : public ImageEffect {
         << "|occupancyFill=" << (occupancyFill ? 1 : 0)
         << "|scale=" << scaleLabelForIndex(scaleIndex)
         << "|plotMode=" << plotMode
-         << "|circularHsl=" << (circularHsl ? 1 : 0)
-         << "|circularHsv=" << (circularHsv ? 1 : 0)
-         << "|normConeNormalized=" << (normConeNormalized ? 1 : 0)
-         << "|plotDisplayLinear=" << (plotDisplayLinear ? 1 : 0)
-         << "|plotDisplayLinearTransfer=" << plotDisplayLinearTransfer
-         << "|showOverflow=" << (showOverflow ? 1 : 0)
-         << "|highlightOverflow=" << (highlightOverflow ? 1 : 0)
-         << "|overflowColor=" << overflowColor[0] << "," << overflowColor[1] << "," << overflowColor[2]
-        << "|backgroundColor=" << backgroundColor[0] << "," << backgroundColor[1] << "," << backgroundColor[2]
+        << "|circularHsl=" << (circularHsl ? 1 : 0)
+        << "|circularHsv=" << (circularHsv ? 1 : 0)
+        << "|normConeNormalized=" << (normConeNormalized ? 1 : 0)
+        << "|plotDisplayLinear=" << (plotDisplayLinear ? 1 : 0)
+        << "|plotDisplayLinearTransfer=" << plotDisplayLinearTransfer
+        << "|showOverflow=" << (showOverflow ? 1 : 0)
         << "|drawMode=" << (currentDrawOnImageMode(time) ? 1 : 0)
         << "|useInstance1=" << (useInstance1 ? 1 : 0)
-         << "|showIdentityOnly=" << (showIdentityOnly ? 1 : 0)
-         << "|readIdentityPlot=" << (readIdentityPlot ? 1 : 0)
-         << "|readGrayRamp=" << (readGrayRamp ? 1 : 0)
-         << "|sampleDrawnCubeSize=" << sampleDrawnCubeResolvedSize;
+        << "|showIdentityOnly=" << (showIdentityOnly ? 1 : 0)
+        << "|readIdentityPlot=" << (readIdentityPlot ? 1 : 0)
+        << "|readGrayRamp=" << (readGrayRamp ? 1 : 0)
+        << "|sampleDrawnCubeSize=" << sampleDrawnCubeResolvedSize;
+    if (neutralRadiusEnabled) {
+      oss << "|neutralRadius=1"
+          << "|neutralRadiusValue=" << currentNeutralRadiusValue(time);
+    }
     return oss.str();
   }
 
@@ -4425,6 +4986,168 @@ class ChromaspaceEffect : public ImageEffect {
     // Resolve can leave image unique IDs empty in some clip/group/timeline render contexts.
     // Fall back to the OFX instance sender so shared-viewer ownership can still hand off.
     return std::string("sender:") + senderId_;
+  }
+
+  const char* cloudCoverageLabel(CloudCoverageKind kind) const {
+    return kind == CloudCoverageKind::Full ? "full" : "partial";
+  }
+
+  OfxRectI rectIFromRectD(const OfxRectD& rect) const {
+    return OfxRectI{static_cast<int>(std::floor(rect.x1)),
+                    static_cast<int>(std::floor(rect.y1)),
+                    static_cast<int>(std::ceil(rect.x2)),
+                    static_cast<int>(std::ceil(rect.y2))};
+  }
+
+  bool validRectI(const OfxRectI& rect) const {
+    return rect.x2 > rect.x1 && rect.y2 > rect.y1;
+  }
+
+  bool buildCloudFootprintInfo(const OfxRectI& fullBounds,
+                               const OfxRectI& sampledBounds,
+                               bool authoritative,
+                               CloudFootprintInfo* out) const {
+    if (!out || !validRectI(fullBounds) || !validRectI(sampledBounds)) return false;
+    CloudFootprintInfo info{};
+    info.fullX1 = fullBounds.x1;
+    info.fullY1 = fullBounds.y1;
+    info.fullWidth = fullBounds.x2 - fullBounds.x1;
+    info.fullHeight = fullBounds.y2 - fullBounds.y1;
+    info.sampledX1 = sampledBounds.x1;
+    info.sampledY1 = sampledBounds.y1;
+    info.sampledWidth = sampledBounds.x2 - sampledBounds.x1;
+    info.sampledHeight = sampledBounds.y2 - sampledBounds.y1;
+    const int fullX2 = info.fullX1 + info.fullWidth;
+    const int fullY2 = info.fullY1 + info.fullHeight;
+    const int sampledX2 = info.sampledX1 + info.sampledWidth;
+    const int sampledY2 = info.sampledY1 + info.sampledHeight;
+    info.coverageKind =
+        (info.sampledX1 <= info.fullX1 && info.sampledY1 <= info.fullY1 &&
+         sampledX2 >= fullX2 && sampledY2 >= fullY2)
+            ? CloudCoverageKind::Full
+            : CloudCoverageKind::Partial;
+    info.authoritative = authoritative;
+    const double denomW = static_cast<double>(std::max(1, info.fullWidth));
+    const double denomH = static_cast<double>(std::max(1, info.fullHeight));
+    info.sampledNormX1 = static_cast<float>((static_cast<double>(info.sampledX1 - info.fullX1)) / denomW);
+    info.sampledNormY1 = static_cast<float>((static_cast<double>(info.sampledY1 - info.fullY1)) / denomH);
+    info.sampledNormX2 = static_cast<float>((static_cast<double>(sampledX2 - info.fullX1)) / denomW);
+    info.sampledNormY2 = static_cast<float>((static_cast<double>(sampledY2 - info.fullY1)) / denomH);
+    *out = info;
+    return true;
+  }
+
+  bool currentSourceFootprint(double time,
+                              const OfxRectI& sampledBounds,
+                              bool authoritative,
+                              CloudFootprintInfo* out) const {
+    if (!out || !validRectI(sampledBounds)) return false;
+    if (srcClip_ != nullptr) {
+      const OfxRectD rod = srcClip_->getRegionOfDefinition(time);
+      const OfxRectI fullBounds = rectIFromRectD(rod);
+      if (validRectI(fullBounds)) {
+        return buildCloudFootprintInfo(fullBounds, sampledBounds, authoritative, out);
+      }
+    }
+    return buildCloudFootprintInfo(sampledBounds, sampledBounds, authoritative, out);
+  }
+
+  void applyCloudFootprintMetadata(CloudBuildResult* out, const CloudFootprintInfo& footprint) const {
+    if (!out) return;
+    out->sourceWidth = footprint.fullWidth;
+    out->sourceHeight = footprint.fullHeight;
+    out->fullX1 = footprint.fullX1;
+    out->fullY1 = footprint.fullY1;
+    out->sampledX1 = footprint.sampledX1;
+    out->sampledY1 = footprint.sampledY1;
+    out->sampledWidth = footprint.sampledWidth;
+    out->sampledHeight = footprint.sampledHeight;
+    out->sampledNormX1 = footprint.sampledNormX1;
+    out->sampledNormY1 = footprint.sampledNormY1;
+    out->sampledNormX2 = footprint.sampledNormX2;
+    out->sampledNormY2 = footprint.sampledNormY2;
+    out->coverageKind = footprint.coverageKind;
+    out->authoritative = footprint.authoritative;
+  }
+
+  bool intersectRects(const OfxRectI& a, const OfxRectI& b, OfxRectI* out) const {
+    if (!out) return false;
+    OfxRectI r{std::max(a.x1, b.x1),
+               std::max(a.y1, b.y1),
+               std::min(a.x2, b.x2),
+               std::min(a.y2, b.y2)};
+    if (!validRectI(r)) return false;
+    *out = r;
+    return true;
+  }
+
+  bool authoritativeImageMatchesLiveWindow(Image* liveSrc,
+                                           Image* authoritativeSrc,
+                                           const RenderArguments& args,
+                                           const std::string& reason) {
+    if (!liveSrc || !authoritativeSrc) return true;
+    if (args.isEnabledCudaRender || args.isEnabledOpenCLRender || args.isEnabledMetalRender) {
+      return true;
+    }
+    OfxRectI overlap{};
+    if (!intersectRects(liveSrc->getBounds(), authoritativeSrc->getBounds(), &overlap)) return true;
+    if (!intersectRects(overlap, args.renderWindow, &overlap)) return true;
+
+    const int width = overlap.x2 - overlap.x1;
+    const int height = overlap.y2 - overlap.y1;
+    if (width <= 0 || height <= 0) return true;
+
+    const int gridX = std::min(width, 9);
+    const int gridY = std::min(height, 7);
+    int compared = 0;
+    int mismatched = 0;
+    double mismatchSum = 0.0;
+    double maxMismatch = 0.0;
+
+    for (int gy = 0; gy < gridY; ++gy) {
+      const int y = overlap.y1 + std::min(height - 1, (gy * height + height / 2) / gridY);
+      for (int gx = 0; gx < gridX; ++gx) {
+        const int x = overlap.x1 + std::min(width - 1, (gx * width + width / 2) / gridX);
+        const float* livePix = reinterpret_cast<const float*>(liveSrc->getPixelAddress(x, y));
+        const float* authPix = reinterpret_cast<const float*>(authoritativeSrc->getPixelAddress(x, y));
+        if (!livePix || !authPix) continue;
+        const double dr = std::abs(static_cast<double>(livePix[0]) - static_cast<double>(authPix[0]));
+        const double dg = std::abs(static_cast<double>(livePix[1]) - static_cast<double>(authPix[1]));
+        const double db = std::abs(static_cast<double>(livePix[2]) - static_cast<double>(authPix[2]));
+        const double delta = std::max(dr, std::max(dg, db));
+        const double magnitude = std::max({std::abs(static_cast<double>(livePix[0])),
+                                           std::abs(static_cast<double>(livePix[1])),
+                                           std::abs(static_cast<double>(livePix[2])),
+                                           std::abs(static_cast<double>(authPix[0])),
+                                           std::abs(static_cast<double>(authPix[1])),
+                                           std::abs(static_cast<double>(authPix[2])),
+                                           1.0});
+        const double tolerance = 0.0025 + 0.0025 * magnitude;
+        ++compared;
+        if (std::isfinite(delta) && delta > tolerance) {
+          ++mismatched;
+          mismatchSum += delta;
+          maxMismatch = std::max(maxMismatch, delta);
+        }
+      }
+    }
+
+    if (compared < 12) return true;
+    const double mismatchRatio = static_cast<double>(mismatched) / static_cast<double>(compared);
+    const double mismatchAverage = mismatched > 0 ? mismatchSum / static_cast<double>(mismatched) : 0.0;
+    const bool stale =
+        mismatchRatio >= 0.22 &&
+        (mismatchAverage > 0.006 || maxMismatch > 0.025);
+    if (stale) {
+      std::ostringstream os;
+      os << "Rejected stale authoritative cloud source: reason=" << reason
+         << " compared=" << compared
+         << " mismatched=" << mismatched
+         << " avgDelta=" << mismatchAverage
+         << " maxDelta=" << maxMismatch;
+      cubeViewerDebugLog(os.str());
+    }
+    return !stale;
   }
 
   // Params payloads describe how the viewer should interpret any subsequent cloud payloads and overlays.
@@ -5013,10 +5736,20 @@ class ChromaspaceEffect : public ImageEffect {
     }
     const int requestedSize = getIntValue("cubeViewerSampleDrawnCubeSize", args.time, 29);
     const int resolution = clampOverlayCubeSize(requestedSize);
-    const std::string cacheKey =
+    bool allowStripCacheReuse = allowIdentityStripCacheReuse(args.time);
+    const std::string cacheKeyBase =
         currentIdentityStripCacheKey(args.time, width, height, bounds.x1, bounds.y1, resolution, readCube, readRamp, "cuda-strip");
+    std::string cacheKey = cacheKeyBase;
+    if (allowStripCacheReuse) {
+      uint64_t contentSignature = 0;
+      if (buildIdentityStripSourceSignatureCuda(src, args, resolution, readCube, readRamp, &contentSignature)) {
+        cacheKey += "|contentSignature=" + std::to_string(contentSignature);
+      } else {
+        allowStripCacheReuse = false;
+      }
+    }
     const std::string paramHash = buildIdentityStripParamHash(width, height, resolution, readCube, readRamp, args.time);
-    if (tryGetCachedIdentityStripCloud(cacheKey, outSamples, outParamHash, outResolution)) {
+    if (allowStripCacheReuse && tryGetCachedIdentityStripCloud(cacheKey, outSamples, outParamHash, outResolution)) {
       cubeViewerDebugLog(std::string("Viewer identity strip CUDA cache hit samples=") + std::to_string(outSamples->size()));
       return true;
     }
@@ -5025,7 +5758,7 @@ class ChromaspaceEffect : public ImageEffect {
     int cubeY2 = 0;
     int rampY1 = 0;
     int rampY2 = 0;
-    if (!computeIdentityStripLayout(bounds, resolution, readRamp, &stripHeight, &cubeY1, &cubeY2, &rampY1, &rampY2)) {
+    if (!computeIdentityStripLayout(bounds, resolution, readCube, readRamp, &stripHeight, &cubeY1, &cubeY2, &rampY1, &rampY2)) {
       if (reason) *reason = "layout-failed";
       return false;
     }
@@ -5063,7 +5796,9 @@ class ChromaspaceEffect : public ImageEffect {
     *outSamples = toViewerCloudSamples(stripResult.samples);
     *outParamHash = paramHash;
     *outResolution = resolution;
-    storeCachedIdentityStripCloud(cacheKey, *outSamples, *outParamHash, *outResolution);
+    if (allowStripCacheReuse) {
+      storeCachedIdentityStripCloud(cacheKey, *outSamples, *outParamHash, *outResolution);
+    }
     const auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
     cubeViewerDebugLog(std::string("Viewer identity strip CUDA path succeeded samples=") + std::to_string(outSamples->size()) +
                        " elapsedMs=" + std::to_string(elapsedMs));
@@ -5281,7 +6016,7 @@ class ChromaspaceEffect : public ImageEffect {
     int cubeY2 = 0;
     int rampY1 = 0;
     int rampY2 = 0;
-    if (!computeIdentityStripLayout(bounds, stripResolution, readRamp, &stripHeight, &cubeY1, &cubeY2, &rampY1, &rampY2)) {
+    if (!computeIdentityStripLayout(bounds, stripResolution, readCube, readRamp, &stripHeight, &cubeY1, &cubeY2, &rampY1, &rampY2)) {
       if (reason) *reason = "layout-failed";
       return false;
     }
@@ -5416,10 +6151,20 @@ class ChromaspaceEffect : public ImageEffect {
     }
     const int requestedSize = getIntValue("cubeViewerSampleDrawnCubeSize", args.time, 29);
     const int resolution = clampOverlayCubeSize(requestedSize);
-    const std::string cacheKey =
+    bool allowStripCacheReuse = allowIdentityStripCacheReuse(args.time);
+    const std::string cacheKeyBase =
         currentIdentityStripCacheKey(args.time, width, height, bounds.x1, bounds.y1, resolution, readCube, readRamp, "metal-strip");
+    std::string cacheKey = cacheKeyBase;
+    if (allowStripCacheReuse) {
+      uint64_t contentSignature = 0;
+      if (buildIdentityStripSourceSignatureMetal(src, args, resolution, readCube, readRamp, &contentSignature)) {
+        cacheKey += "|contentSignature=" + std::to_string(contentSignature);
+      } else {
+        allowStripCacheReuse = false;
+      }
+    }
     const std::string paramHash = buildIdentityStripParamHash(width, height, resolution, readCube, readRamp, args.time);
-    if (tryGetCachedIdentityStripCloud(cacheKey, outSamples, outParamHash, outResolution)) {
+    if (allowStripCacheReuse && tryGetCachedIdentityStripCloud(cacheKey, outSamples, outParamHash, outResolution)) {
       cubeViewerDebugLog(std::string("Viewer identity strip Metal cache hit samples=") + std::to_string(outSamples->size()));
       return true;
     }
@@ -5428,7 +6173,7 @@ class ChromaspaceEffect : public ImageEffect {
     int cubeY2 = 0;
     int rampY1 = 0;
     int rampY2 = 0;
-    if (!computeIdentityStripLayout(bounds, resolution, readRamp, &stripHeight, &cubeY1, &cubeY2, &rampY1, &rampY2)) {
+    if (!computeIdentityStripLayout(bounds, resolution, readCube, readRamp, &stripHeight, &cubeY1, &cubeY2, &rampY1, &rampY2)) {
       if (reason) *reason = "layout-failed";
       return false;
     }
@@ -5467,7 +6212,9 @@ class ChromaspaceEffect : public ImageEffect {
     *outSamples = toViewerCloudSamples(stripResult.samples);
     *outParamHash = paramHash;
     *outResolution = resolution;
-    storeCachedIdentityStripCloud(cacheKey, *outSamples, *outParamHash, *outResolution);
+    if (allowStripCacheReuse) {
+      storeCachedIdentityStripCloud(cacheKey, *outSamples, *outParamHash, *outResolution);
+    }
     const auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
     cubeViewerDebugLog(std::string("Viewer identity strip Metal path succeeded samples=") + std::to_string(outSamples->size()) +
                        " elapsedMs=" + std::to_string(elapsedMs));
@@ -5496,13 +6243,14 @@ class ChromaspaceEffect : public ImageEffect {
 
   template <typename FetchPixelFn>
   CloudBuildResult buildInputCloudPayloadFromWholeImageSamples(
-      int width,
-      int height,
+      int sampledWidth,
+      int sampledHeight,
+      const CloudFootprintInfo& footprint,
       double time,
       bool previewMode,
       FetchPixelFn&& fetchPixel) {
     CloudBuildResult out;
-    if (width <= 0 || height <= 0) return out;
+    if (sampledWidth <= 0 || sampledHeight <= 0 || footprint.fullWidth <= 0 || footprint.fullHeight <= 0) return out;
 
     struct OccupancyCandidate {
       float xNorm = 0.0f;
@@ -5530,10 +6278,10 @@ class ChromaspaceEffect : public ImageEffect {
                                       hueSliceSpec.cubeSliceYellow || hueSliceSpec.cubeSliceMagenta;
     const bool noHueRegionSelected = hueSliceSpec.enabled && !anyHueRegionSelected;
     const bool selectionImpossible = noHueRegionSelected;
-    const int scaledWidth = std::max(1, static_cast<int>(std::lround(static_cast<double>(width) * scaleFactor)));
-    const int scaledHeight = std::max(1, static_cast<int>(std::lround(static_cast<double>(height) * scaleFactor)));
-    const int pointCount = std::max(512, static_cast<int>(std::lround(
-        static_cast<double>(qualityPointCountForIndex(qualityIndex, previewMode)) * scaleFactor * scaleFactor)));
+    const int scaledWidth = std::max(1, static_cast<int>(std::lround(static_cast<double>(sampledWidth) * scaleFactor)));
+    const int scaledHeight = std::max(1, static_cast<int>(std::lround(static_cast<double>(sampledHeight) * scaleFactor)));
+    const int pointCount = pointBudgetForFootprint(qualityIndex, previewMode, scaleFactor, footprint);
+    const bool partialCoverage = footprint.coverageKind == CloudCoverageKind::Partial;
     int selectionRetryMultiplier = hueSliceSpec.enabled ? 12 : 1;
     if (hueSliceSpec.neutralRadiusEnabled) {
       const int neutralRetryMultiplier =
@@ -5546,13 +6294,14 @@ class ChromaspaceEffect : public ImageEffect {
                                               ? pointCount
                                               : std::min(std::max(pointCount * selectionRetryMultiplier, pointCount + 4096),
                                                          previewMode ? 750000 : 3000000));
-    std::string pts;
-    pts.reserve(static_cast<size_t>(pointCount) * 52u);
-    bool first = true;
+    std::vector<ViewerCloudSample> samples;
+    samples.reserve(static_cast<size_t>(pointCount));
     const int occupancyBinsPerAxis = preserveOverflow ? 18 : 16;
     std::vector<int> occupancy(static_cast<size_t>(occupancyBinsPerAxis * occupancyBinsPerAxis * occupancyBinsPerAxis), 0);
     int primaryAttempts = 0;
     int primaryAccepted = 0;
+    const double normDenomW = static_cast<double>(std::max(1, footprint.fullWidth));
+    const double normDenomH = static_cast<double>(std::max(1, footprint.fullHeight));
 
     auto sampleUvForAttempt = [&](int attemptIndex, double* outU, double* outV) {
       double u = 0.0;
@@ -5597,8 +6346,12 @@ class ChromaspaceEffect : public ImageEffect {
       ++primaryAttempts;
       const int sx = std::clamp(static_cast<int>(u * static_cast<double>(scaledWidth - 1)), 0, scaledWidth - 1);
       const int sy = std::clamp(static_cast<int>(v * static_cast<double>(scaledHeight - 1)), 0, scaledHeight - 1);
-      const int x = std::clamp(static_cast<int>(((static_cast<double>(sx) + 0.5) / static_cast<double>(scaledWidth)) * static_cast<double>(width)), 0, width - 1);
-      const int y = std::clamp(static_cast<int>(((static_cast<double>(sy) + 0.5) / static_cast<double>(scaledHeight)) * static_cast<double>(height)), 0, height - 1);
+      const int x = std::clamp(static_cast<int>(((static_cast<double>(sx) + 0.5) / static_cast<double>(scaledWidth)) * static_cast<double>(sampledWidth)),
+                               0,
+                               sampledWidth - 1);
+      const int y = std::clamp(static_cast<int>(((static_cast<double>(sy) + 0.5) / static_cast<double>(scaledHeight)) * static_cast<double>(sampledHeight)),
+                               0,
+                               sampledHeight - 1);
       const float* pix = fetchPixel(x, y);
       if (!pix) continue;
       const WorkshopColor::Vec3f linearSample = transformCloudSampleForPlot(
@@ -5612,16 +6365,25 @@ class ChromaspaceEffect : public ImageEffect {
       const uint32_t samplingSeed = static_cast<uint32_t>(attemptIndex * 2654435761u) ^
                                     static_cast<uint32_t>(x * 911u + y * 3571u);
       if (!sampleAcceptedBySelection(x, y, r, g, b, samplingSeed)) continue;
-      const float xNorm = static_cast<float>((static_cast<double>(x) + 0.5) / static_cast<double>(width));
-      const float yNorm = static_cast<float>((static_cast<double>(y) + 0.5) / static_cast<double>(height));
-      appendCloudPointSample(&pts, &first, xNorm, yNorm, r, g, b);
+      const int actualX = footprint.sampledX1 + x;
+      const int actualY = footprint.sampledY1 + y;
+      ViewerCloudSample sample{};
+      sample.xNorm = static_cast<float>((static_cast<double>(actualX - footprint.fullX1) + 0.5) / normDenomW);
+      sample.yNorm = static_cast<float>((static_cast<double>(actualY - footprint.fullY1) + 0.5) / normDenomH);
+      sample.zReserved = 0.0f;
+      sample.r = r;
+      sample.g = g;
+      sample.b = b;
+      samples.push_back(sample);
       ++occupancy[occupancyBinIndex(r, g, b, preserveOverflow)];
       ++primaryAccepted;
     }
 
     if (occupancyFill) {
-      const int extraPointCount = std::max(2048, pointCount / (previewMode ? 4 : 2));
-      const int candidateTarget = std::min(std::max(extraPointCount * 3, 8192), previewMode ? 32768 : 131072);
+      const int minExtraPointCount = partialCoverage ? 128 : 2048;
+      const int minCandidateTarget = partialCoverage ? 512 : 8192;
+      const int extraPointCount = std::max(minExtraPointCount, pointCount / (previewMode ? 4 : 2));
+      const int candidateTarget = std::min(std::max(extraPointCount * 3, minCandidateTarget), previewMode ? 32768 : 131072);
       const int maxCandidateAttempts = selectionImpossible
                                            ? 0
                                            : (selectionRetryMultiplier <= 1
@@ -5637,8 +6399,12 @@ class ChromaspaceEffect : public ImageEffect {
         double v = halton(static_cast<uint32_t>(attemptIndex + 1), 3);
         const int sx = std::clamp(static_cast<int>(u * static_cast<double>(scaledWidth - 1)), 0, scaledWidth - 1);
         const int sy = std::clamp(static_cast<int>(v * static_cast<double>(scaledHeight - 1)), 0, scaledHeight - 1);
-        const int x = std::clamp(static_cast<int>(((static_cast<double>(sx) + 0.5) / static_cast<double>(scaledWidth)) * static_cast<double>(width)), 0, width - 1);
-        const int y = std::clamp(static_cast<int>(((static_cast<double>(sy) + 0.5) / static_cast<double>(scaledHeight)) * static_cast<double>(height)), 0, height - 1);
+        const int x = std::clamp(static_cast<int>(((static_cast<double>(sx) + 0.5) / static_cast<double>(scaledWidth)) * static_cast<double>(sampledWidth)),
+                                 0,
+                                 sampledWidth - 1);
+        const int y = std::clamp(static_cast<int>(((static_cast<double>(sy) + 0.5) / static_cast<double>(scaledHeight)) * static_cast<double>(sampledHeight)),
+                                 0,
+                                 sampledHeight - 1);
         const float* pix = fetchPixel(x, y);
         if (!pix) continue;
         const WorkshopColor::Vec3f linearSample = transformCloudSampleForPlot(
@@ -5653,9 +6419,11 @@ class ChromaspaceEffect : public ImageEffect {
                                       static_cast<uint32_t>(x * 977u + y * 4051u);
         if (!sampleAcceptedBySelection(x, y, r, g, b, samplingSeed)) continue;
         const int bin = occupancyBinIndex(r, g, b, preserveOverflow);
+        const int actualX = footprint.sampledX1 + x;
+        const int actualY = footprint.sampledY1 + y;
         OccupancyCandidate candidate{};
-        candidate.xNorm = static_cast<float>((static_cast<double>(x) + 0.5) / static_cast<double>(width));
-        candidate.yNorm = static_cast<float>((static_cast<double>(y) + 0.5) / static_cast<double>(height));
+        candidate.xNorm = static_cast<float>((static_cast<double>(actualX - footprint.fullX1) + 0.5) / normDenomW);
+        candidate.yNorm = static_cast<float>((static_cast<double>(actualY - footprint.fullY1) + 0.5) / normDenomH);
         candidate.r = r;
         candidate.g = g;
         candidate.b = b;
@@ -5675,28 +6443,47 @@ class ChromaspaceEffect : public ImageEffect {
         return a.tie < b.tie;
       });
       const int appendCount = std::min<int>(extraPointCount, static_cast<int>(candidates.size()));
-      pts.reserve(pts.size() + static_cast<size_t>(appendCount) * 52u);
+      samples.reserve(samples.size() + static_cast<size_t>(appendCount));
       for (int i = 0; i < appendCount; ++i) {
         const auto& candidate = candidates[static_cast<size_t>(i)];
-        appendCloudPointSample(&pts, &first, candidate.xNorm, candidate.yNorm, candidate.r, candidate.g, candidate.b);
+        ViewerCloudSample sample{};
+        sample.xNorm = candidate.xNorm;
+        sample.yNorm = candidate.yNorm;
+        sample.zReserved = 0.0f;
+        sample.r = candidate.r;
+        sample.g = candidate.g;
+        sample.b = candidate.b;
+        samples.push_back(sample);
       }
     }
 
     std::ostringstream hash;
-    hash << width << 'x' << height << ':' << resolution << ':' << qualityLabelForIndex(qualityIndex)
+    hash << footprint.fullWidth << 'x' << footprint.fullHeight << ':' << resolution << ':' << qualityLabelForIndex(qualityIndex)
          << ":sampling=" << samplingModeLabelForIndex(samplingMode)
          << ":occupancyFill=" << (occupancyFill ? 1 : 0)
-         << ":scale=" << scaleLabelForIndex(scaleIndex);
+         << ":scale=" << scaleLabelForIndex(scaleIndex)
+         << ":coverage=" << cloudCoverageLabel(footprint.coverageKind)
+         << ":sampled=" << footprint.sampledWidth << 'x' << footprint.sampledHeight
+         << '@' << footprint.sampledX1 << ',' << footprint.sampledY1
+         << ":fullOrigin=" << footprint.fullX1 << ',' << footprint.fullY1
+         << ":pointBudget=" << pointCount;
     out.paramHash = hash.str();
-    out.pointsPayload = pts;
-    out.contentHash = fnv1a64(pts);
-    out.payload = buildInputCloudJson(pts, out.paramHash, currentCloudSettingsKey(time), resolution, qualityIndex);
+    out.samples = samples;
+    out.pointsPayload = serializeViewerCloudSamples(samples);
+    out.contentHash = samples.empty()
+                          ? fnv1a64(std::string{})
+                          : fnv1a64Bytes(samples.data(), samples.size() * sizeof(ViewerCloudSample));
+    std::shared_ptr<ViewerCloudTransportBlob> fastBlob;
+    std::string transportMode = "json";
+    out.payload = buildInputCloudJson(samples, out.paramHash, currentCloudSettingsKey(time), resolution, qualityIndex, &fastBlob, &transportMode);
+    out.fastBlob = std::move(fastBlob);
     out.quality = qualityLabelForIndex(qualityIndex);
     out.resolution = resolution;
-    out.sourceWidth = width;
-    out.sourceHeight = height;
+    out.sampleCount = samples.size();
+    applyCloudFootprintMetadata(&out, footprint);
     out.success = true;
     cubeViewerDebugLog(std::string("Built whole-image cloud payload: quality=") + out.quality +
+                       " coverage=" + cloudCoverageLabel(footprint.coverageKind) +
                        " sampling=" + samplingModeLabelForIndex(samplingMode) +
                        " occupancyFill=" + (occupancyFill ? "1" : "0") +
                        " hueSlice=" + (hueSliceSpec.enabled ? "1" : "0") +
@@ -5704,8 +6491,9 @@ class ChromaspaceEffect : public ImageEffect {
                        " attempts=" + std::to_string(primaryAttempts) +
                        " accepted=" + std::to_string(primaryAccepted) +
                        " scale=" + scaleLabelForIndex(scaleIndex) +
+                       " coverageScale=" + std::to_string(coverageScaleForFootprint(footprint)) +
                        " res=" + std::to_string(out.resolution) +
-                       " pointBytes=" + std::to_string(pts.size()) +
+                       " pointBytes=" + std::to_string(out.pointsPayload.size()) +
                        " hash=" + out.paramHash);
     return out;
   }
@@ -5728,7 +6516,7 @@ class ChromaspaceEffect : public ImageEffect {
     int rampY2 = 0;
     // Identity-strip sampling should remain limited to the cube band. The ramp has its own
     // dedicated readback path when the user explicitly enables it.
-    if (!computeIdentityStripLayout(bounds, resolution, false, &stripHeight, &cubeY1, &cubeY2, &rampY1, &rampY2)) return out;
+    if (!computeIdentityStripLayout(bounds, resolution, true, false, &stripHeight, &cubeY1, &cubeY2, &rampY1, &rampY2)) return out;
 
     std::string pts;
     pts.reserve(static_cast<size_t>(width) * static_cast<size_t>(std::max(1, cubeY2 - cubeY1)) * 52u);
@@ -5793,7 +6581,7 @@ class ChromaspaceEffect : public ImageEffect {
     // The cube-strip readback is deliberately isolated from the ramp contract.
     // Even if a ramp exists elsewhere in the strip, this concentrated sampler should only
     // reconstruct the cube lattice from the cube band itself.
-    if (!computeIdentityStripLayout(bounds, resolution, false, &stripHeight, &cubeY1, &cubeY2, &rampY1, &rampY2)) return out;
+    if (!computeIdentityStripLayout(bounds, resolution, true, false, &stripHeight, &cubeY1, &cubeY2, &rampY1, &rampY2)) return out;
     const int denom = std::max(1, resolution - 1);
     const float cellWidth = identityStripCellWidth(width, resolution);
     std::vector<float> samples;
@@ -5872,7 +6660,103 @@ class ChromaspaceEffect : public ImageEffect {
     int cubeY2 = 0;
     int rampY1 = 0;
     int rampY2 = 0;
-    if (!computeIdentityStripLayout(bounds, resolution, true, &stripHeight, &cubeY1, &cubeY2, &rampY1, &rampY2)) return out;
+    const auto rampBandScore = [&](int y1, int y2) -> double {
+      if (y2 <= y1) return std::numeric_limits<double>::infinity();
+      const int rowCount = std::min(3, std::max(1, y2 - y1));
+      const int colCount = std::min(17, std::max(1, width));
+      const int rowDenom = std::max(1, rowCount - 1);
+      const int colDenom = std::max(1, colCount - 1);
+      double error = 0.0;
+      int count = 0;
+      for (int rowIndex = 0; rowIndex < rowCount; ++rowIndex) {
+        const int y = y1 + std::clamp(static_cast<int>(std::lround(
+            (static_cast<double>(rowIndex) / static_cast<double>(rowDenom)) *
+            static_cast<double>(std::max(0, y2 - y1 - 1)))),
+            0, std::max(0, y2 - y1 - 1));
+        for (int colIndex = 0; colIndex < colCount; ++colIndex) {
+          const int x = std::clamp(static_cast<int>(std::lround(
+              (static_cast<double>(colIndex) / static_cast<double>(colDenom)) *
+              static_cast<double>(std::max(0, width - 1)))),
+              0, std::max(0, width - 1));
+          const float* pix = fetchPixel(x, y);
+          if (!pix) continue;
+          const float expected = width <= 1 ? 0.0f : static_cast<float>(x) / static_cast<float>(std::max(1, width - 1));
+          const float r = pix[0];
+          const float g = pix[1];
+          const float b = pix[2];
+          const float gray = (r + g + b) / 3.0f;
+          error += static_cast<double>(std::fabs(r - g) + std::fabs(g - b) + std::fabs(gray - expected));
+          ++count;
+        }
+      }
+      return count > 0 ? error / static_cast<double>(count) : std::numeric_limits<double>::infinity();
+    };
+    const bool sourceHasKnownCubeBand = currentReadIdentityPlot(time);
+    bool layoutFound = computeIdentityStripLayout(bounds,
+                                                  resolution,
+                                                  sourceHasKnownCubeBand,
+                                                  true,
+                                                  &stripHeight,
+                                                  &cubeY1,
+                                                  &cubeY2,
+                                                  &rampY1,
+                                                  &rampY2);
+    if (!sourceHasKnownCubeBand) {
+      int rampOnlyStripHeight = 0;
+      int rampOnlyCubeY1 = 0;
+      int rampOnlyCubeY2 = 0;
+      int rampOnlyY1 = 0;
+      int rampOnlyY2 = 0;
+      const bool haveRampOnlyLayout = computeIdentityStripLayout(bounds,
+                                                                 resolution,
+                                                                 false,
+                                                                 true,
+                                                                 &rampOnlyStripHeight,
+                                                                 &rampOnlyCubeY1,
+                                                                 &rampOnlyCubeY2,
+                                                                 &rampOnlyY1,
+                                                                 &rampOnlyY2);
+      int cubeAndRampStripHeight = 0;
+      int cubeAndRampY1 = 0;
+      int cubeAndRampY2 = 0;
+      int cubeAndRampRampY1 = 0;
+      int cubeAndRampRampY2 = 0;
+      const bool haveCubeAndRampLayout = computeIdentityStripLayout(bounds,
+                                                                    resolution,
+                                                                    true,
+                                                                    true,
+                                                                    &cubeAndRampStripHeight,
+                                                                    &cubeAndRampY1,
+                                                                    &cubeAndRampY2,
+                                                                    &cubeAndRampRampY1,
+                                                                    &cubeAndRampRampY2);
+      const double rampOnlyScore = haveRampOnlyLayout
+                                       ? rampBandScore(rampOnlyY1, rampOnlyY2)
+                                       : std::numeric_limits<double>::infinity();
+      const double cubeAndRampScore = haveCubeAndRampLayout
+                                          ? rampBandScore(cubeAndRampRampY1, cubeAndRampRampY2)
+                                          : std::numeric_limits<double>::infinity();
+      if (haveCubeAndRampLayout && cubeAndRampScore < rampOnlyScore) {
+        stripHeight = cubeAndRampStripHeight;
+        cubeY1 = cubeAndRampY1;
+        cubeY2 = cubeAndRampY2;
+        rampY1 = cubeAndRampRampY1;
+        rampY2 = cubeAndRampRampY2;
+        layoutFound = true;
+      } else if (haveRampOnlyLayout) {
+        stripHeight = rampOnlyStripHeight;
+        cubeY1 = rampOnlyCubeY1;
+        cubeY2 = rampOnlyCubeY2;
+        rampY1 = rampOnlyY1;
+        rampY2 = rampOnlyY2;
+        layoutFound = true;
+      }
+      cubeViewerDebugLog(std::string("Gray ramp readback layout: ") +
+                         ((haveCubeAndRampLayout && cubeAndRampScore < rampOnlyScore) ? "above-cube" : "bottom") +
+                         " bottomScore=" + std::to_string(rampOnlyScore) +
+                         " aboveCubeScore=" + std::to_string(cubeAndRampScore));
+    }
+    if (!layoutFound) return out;
     if (rampY2 <= rampY1) return out;
     std::string pts;
     const int rampHeight = std::max(0, rampY2 - rampY1);
@@ -6067,13 +6951,22 @@ class ChromaspaceEffect : public ImageEffect {
     return out;
   }
 
-  CloudBuildResult buildInputCloudPayloadFromWholeImage(Image* src, double time, bool previewMode) {
+  CloudBuildResult buildInputCloudPayloadFromWholeImage(Image* src,
+                                                        double time,
+                                                        bool previewMode,
+                                                        const CloudFootprintInfo* overrideFootprint = nullptr) {
     CloudBuildResult out;
     if (!src) return out;
     const OfxRectI bounds = src->getBounds();
     const int width = bounds.x2 - bounds.x1;
     const int height = bounds.y2 - bounds.y1;
-    return buildInputCloudPayloadFromWholeImageSamples(width, height, time, previewMode, [&](int x, int y) -> const float* {
+    CloudFootprintInfo footprint{};
+    if (overrideFootprint != nullptr) {
+      footprint = *overrideFootprint;
+    } else if (!buildCloudFootprintInfo(bounds, bounds, false, &footprint)) {
+      return out;
+    }
+    return buildInputCloudPayloadFromWholeImageSamples(width, height, footprint, time, previewMode, [&](int x, int y) -> const float* {
       return reinterpret_cast<const float*>(src->getPixelAddress(bounds.x1 + x, bounds.y1 + y));
     });
   }
@@ -6084,8 +6977,18 @@ class ChromaspaceEffect : public ImageEffect {
       int width,
       int height,
       double time,
-      bool previewMode) {
-    return buildInputCloudPayloadFromWholeImageSamples(width, height, time, previewMode, [&](int x, int y) -> const float* {
+      bool previewMode,
+      const CloudFootprintInfo* overrideFootprint = nullptr) {
+    CloudFootprintInfo footprint{};
+    if (overrideFootprint != nullptr) {
+      footprint = *overrideFootprint;
+    } else {
+      const OfxRectI bounds{0, 0, width, height};
+      if (!buildCloudFootprintInfo(bounds, bounds, false, &footprint)) {
+        return {};
+      }
+    }
+    return buildInputCloudPayloadFromWholeImageSamples(width, height, footprint, time, previewMode, [&](int x, int y) -> const float* {
       if (!srcBase) return nullptr;
       const char* rowBase = reinterpret_cast<const char*>(srcBase) + static_cast<size_t>(y) * srcRowBytes;
       return reinterpret_cast<const float*>(rowBase) + static_cast<size_t>(x) * 4u;
@@ -6121,6 +7024,194 @@ class ChromaspaceEffect : public ImageEffect {
       return combineInstance1AndImageClouds(stripCloud, image, time);
     }
     return buildInputCloudPayloadFromWholeImageBuffer(srcBase, srcRowBytes, width, height, time, previewMode);
+  }
+
+  CloudBuildResult buildPreviewInputCloudPayloadFromBuffer(
+      const float* srcBase,
+      size_t srcRowBytes,
+      int width,
+      int height,
+      double time,
+      bool previewMode,
+      const CloudFootprintInfo& footprint) {
+    return buildInputCloudPayloadFromWholeImageBuffer(srcBase, srcRowBytes, width, height, time, previewMode, &footprint);
+  }
+
+  CloudBuildResult buildPreviewCloudPayloadFromCudaReadback(
+      Image* src,
+      const RenderArguments& args,
+      bool previewMode,
+      const CloudFootprintInfo& footprint) {
+#if defined(CHROMASPACE_HAS_CUDA)
+    CloudBuildResult out{};
+    if (!args.isEnabledCudaRender || args.pCudaStream == nullptr || !src) return out;
+    const void* srcRaw = src->getPixelData();
+    if (!srcRaw) return out;
+    const OfxRectI bounds = src->getBounds();
+    const int sampledWidth = bounds.x2 - bounds.x1;
+    const int sampledHeight = bounds.y2 - bounds.y1;
+    if (sampledWidth <= 0 || sampledHeight <= 0) return out;
+    size_t srcRowBytes = static_cast<size_t>(std::abs(src->getRowBytes()));
+    const size_t sampledPackedRowBytes = static_cast<size_t>(sampledWidth) * 4u * sizeof(float);
+    if (srcRowBytes == 0) srcRowBytes = sampledPackedRowBytes;
+    if (!ensureStageBuffer(static_cast<size_t>(sampledWidth) * static_cast<size_t>(sampledHeight))) return out;
+    float* readback = stageSrcPtr();
+    if (!readback) return out;
+    const size_t sampledOffset =
+        static_cast<size_t>(bounds.y1) * srcRowBytes + static_cast<size_t>(bounds.x1) * 4u * sizeof(float);
+    const char* sampledSrcBytes = reinterpret_cast<const char*>(srcRaw) + sampledOffset;
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(args.pCudaStream);
+    if (cudaMemcpy2DAsync(readback,
+                          sampledPackedRowBytes,
+                          sampledSrcBytes,
+                          srcRowBytes,
+                          sampledPackedRowBytes,
+                          static_cast<size_t>(sampledHeight),
+                          cudaMemcpyDeviceToHost,
+                          stream) != cudaSuccess) {
+      return out;
+    }
+    if (cudaStreamSynchronize(stream) != cudaSuccess) return out;
+    out = buildPreviewInputCloudPayloadFromBuffer(readback, sampledPackedRowBytes, sampledWidth, sampledHeight, args.time, previewMode, footprint);
+    if (out.success) out.backendName = "CPU-preview/CUDA";
+    return out;
+#else
+    (void)src;
+    (void)args;
+    (void)previewMode;
+    (void)footprint;
+    return {};
+#endif
+  }
+
+  CloudBuildResult buildPreviewCloudPayloadFromOpenCLReadback(
+      Image* src,
+      const RenderArguments& args,
+      bool previewMode,
+      const CloudFootprintInfo& footprint) {
+#if defined(CHROMASPACE_HAS_OPENCL)
+    CloudBuildResult out{};
+    if (!args.isEnabledOpenCLRender || args.pOpenCLCmdQ == nullptr || !src) return out;
+    cl_command_queue queue = reinterpret_cast<cl_command_queue>(args.pOpenCLCmdQ);
+    if (!queue) return out;
+    const OfxRectI bounds = src->getBounds();
+    const int sampledWidth = bounds.x2 - bounds.x1;
+    const int sampledHeight = bounds.y2 - bounds.y1;
+    if (sampledWidth <= 0 || sampledHeight <= 0) return out;
+    const size_t sampledPackedRowBytes = static_cast<size_t>(sampledWidth) * 4u * sizeof(float);
+    if (!ensureStageBuffer(static_cast<size_t>(sampledWidth) * static_cast<size_t>(sampledHeight))) return out;
+    float* readback = stageSrcPtr();
+    if (!readback) return out;
+    if (src->getPixelData() != nullptr) {
+      const size_t srcRowBytes = static_cast<size_t>(std::abs(src->getRowBytes()));
+      cl_mem srcBuffer = reinterpret_cast<cl_mem>(src->getPixelData());
+      const size_t sampledBufferOffset =
+          static_cast<size_t>(bounds.y1) * srcRowBytes + static_cast<size_t>(bounds.x1) * 4u * sizeof(float);
+      const size_t sampledSrcOrigin[3] = {sampledBufferOffset, 0, 0};
+      const size_t hostOrigin[3] = {0, 0, 0};
+      const size_t sampledRegion[3] = {sampledPackedRowBytes, static_cast<size_t>(sampledHeight), 1};
+      if (clEnqueueReadBufferRect(queue, srcBuffer, CL_TRUE, sampledSrcOrigin, hostOrigin, sampledRegion,
+                                  srcRowBytes, 0, sampledPackedRowBytes, 0, readback,
+                                  0, nullptr, nullptr) != CL_SUCCESS) {
+        return out;
+      }
+    } else if (src->getOpenCLImage() != nullptr) {
+      cl_mem srcImage = reinterpret_cast<cl_mem>(src->getOpenCLImage());
+      const size_t sampledOrigin[3] = {static_cast<size_t>(bounds.x1), static_cast<size_t>(bounds.y1), 0};
+      const size_t sampledRegion[3] = {static_cast<size_t>(sampledWidth), static_cast<size_t>(sampledHeight), 1};
+      if (clEnqueueReadImage(queue, srcImage, CL_TRUE, sampledOrigin, sampledRegion, sampledPackedRowBytes, 0,
+                             readback, 0, nullptr, nullptr) != CL_SUCCESS) {
+        return out;
+      }
+    } else {
+      return out;
+    }
+    out = buildPreviewInputCloudPayloadFromBuffer(readback, sampledPackedRowBytes, sampledWidth, sampledHeight, args.time, previewMode, footprint);
+    if (out.success) out.backendName = "CPU-preview/OpenCL";
+    return out;
+#else
+    (void)src;
+    (void)args;
+    (void)previewMode;
+    (void)footprint;
+    return {};
+#endif
+  }
+
+  CloudBuildResult buildPreviewCloudPayloadFromMetalReadback(
+      Image* src,
+      Image* dst,
+      const RenderArguments& args,
+      bool previewMode,
+      const CloudFootprintInfo& footprint) {
+#if defined(__APPLE__)
+    CloudBuildResult out{};
+    if (!src || !dst || !args.isEnabledMetalRender || args.pMetalCmdQ == nullptr ||
+        src->getPixelData() == nullptr || dst->getPixelData() == nullptr) {
+      return out;
+    }
+    const OfxRectI bounds = src->getBounds();
+    const int sampledWidth = bounds.x2 - bounds.x1;
+    const int sampledHeight = bounds.y2 - bounds.y1;
+    if (sampledWidth <= 0 || sampledHeight <= 0) return out;
+    size_t srcRowBytes = static_cast<size_t>(std::abs(src->getRowBytes()));
+    size_t dstRowBytes = static_cast<size_t>(std::abs(dst->getRowBytes()));
+    const size_t sampledPackedRowBytes = static_cast<size_t>(sampledWidth) * 4u * sizeof(float);
+    if (srcRowBytes == 0) srcRowBytes = sampledPackedRowBytes;
+    if (dstRowBytes == 0) dstRowBytes = sampledPackedRowBytes;
+    if (!ensureStageBuffer(static_cast<size_t>(sampledWidth) * static_cast<size_t>(sampledHeight))) return out;
+    float* readback = stageSrcPtr();
+    if (!readback) return out;
+    if (!ChromaspaceMetal::copyHostBuffersReadback(src->getPixelData(),
+                                                   dst->getPixelData(),
+                                                   sampledWidth,
+                                                   sampledHeight,
+                                                   srcRowBytes,
+                                                   dstRowBytes,
+                                                   bounds.x1,
+                                                   bounds.y1,
+                                                   args.pMetalCmdQ,
+                                                   readback,
+                                                   sampledPackedRowBytes)) {
+      return out;
+    }
+    out = buildPreviewInputCloudPayloadFromBuffer(readback, sampledPackedRowBytes, sampledWidth, sampledHeight, args.time, previewMode, footprint);
+    if (out.success) out.backendName = "CPU-preview/Metal";
+    return out;
+#else
+    (void)src;
+    (void)dst;
+    (void)args;
+    (void)previewMode;
+    (void)footprint;
+    return {};
+#endif
+  }
+
+  CloudBuildResult buildViewerPreviewCloudPayload(
+      Image* src,
+      Image* dst,
+      const RenderArguments& args,
+      bool previewMode,
+      const CloudFootprintInfo& footprint) {
+    if (!src) return {};
+    const bool stableSamplingMode = currentGlossViewPlotMode(args.time);
+    const bool effectivePreviewMode = stableSamplingMode ? false : previewMode;
+    if (args.isEnabledCudaRender && args.pCudaStream != nullptr) {
+      CloudBuildResult cudaPreview = buildPreviewCloudPayloadFromCudaReadback(src, args, effectivePreviewMode, footprint);
+      if (cudaPreview.success) return cudaPreview;
+    }
+    if (args.isEnabledOpenCLRender && args.pOpenCLCmdQ != nullptr) {
+      CloudBuildResult openclPreview = buildPreviewCloudPayloadFromOpenCLReadback(src, args, effectivePreviewMode, footprint);
+      if (openclPreview.success) return openclPreview;
+    }
+    if (args.isEnabledMetalRender && args.pMetalCmdQ != nullptr) {
+      CloudBuildResult metalPreview = buildPreviewCloudPayloadFromMetalReadback(src, dst, args, effectivePreviewMode, footprint);
+      if (metalPreview.success) return metalPreview;
+    }
+    CloudBuildResult cpuPreview = buildInputCloudPayloadFromWholeImage(src, args.time, effectivePreviewMode, &footprint);
+    if (cpuPreview.success) cpuPreview.backendName = "CPU-preview";
+    return cpuPreview;
   }
 
   CloudBuildResult buildInputCloudPayloadFromCudaReadback(
@@ -6338,6 +7429,7 @@ class ChromaspaceEffect : public ImageEffect {
     const bool showIdentityOnly = currentShowIdentityOnly(args.time);
 #if defined(CHROMASPACE_PLUGIN_HAS_CUDA_KERNELS)
     if (useInstance1Requested &&
+        !(currentReadGrayRamp(args.time) && !currentReadIdentityPlot(args.time)) &&
         args.isEnabledCudaRender && args.pCudaStream != nullptr && src->getPixelData() != nullptr) {
       std::vector<ViewerCloudSample> stripSamples;
       std::string stripParamHash;
@@ -6448,6 +7540,7 @@ class ChromaspaceEffect : public ImageEffect {
 #endif
 #if defined(__APPLE__)
     if (useInstance1Requested &&
+        !(currentReadGrayRamp(args.time) && !currentReadIdentityPlot(args.time)) &&
         args.isEnabledMetalRender && args.pMetalCmdQ != nullptr && src->getPixelData() != nullptr) {
       const bool readCube = currentReadIdentityPlot(args.time);
       const bool readRamp = currentReadGrayRamp(args.time);
@@ -6476,11 +7569,22 @@ class ChromaspaceEffect : public ImageEffect {
         std::string reason;
         const int requestedSize = getIntValue("cubeViewerSampleDrawnCubeSize", args.time, 29);
         const int cachedStripResolution = clampOverlayCubeSize(requestedSize);
-        const std::string stripCacheKey =
+        bool allowStripCacheReuse = allowIdentityStripCacheReuse(args.time);
+        const std::string stripCacheKeyBase =
             currentIdentityStripCacheKey(args.time, width, height, bounds.x1, bounds.y1, cachedStripResolution, readCube, readRamp, "metal-strip");
+        std::string stripCacheKey = stripCacheKeyBase;
+        if (allowStripCacheReuse) {
+          uint64_t contentSignature = 0;
+          if (buildIdentityStripSourceSignatureMetal(src, args, cachedStripResolution, readCube, readRamp, &contentSignature)) {
+            stripCacheKey += "|contentSignature=" + std::to_string(contentSignature);
+          } else {
+            allowStripCacheReuse = false;
+          }
+        }
         std::vector<ViewerCloudSample> cachedStripSamples;
         int cachedResolution = cachedStripResolution;
-        if (tryGetCachedIdentityStripCloud(stripCacheKey, &cachedStripSamples, nullptr, &cachedResolution) &&
+        if (allowStripCacheReuse &&
+            tryGetCachedIdentityStripCloud(stripCacheKey, &cachedStripSamples, nullptr, &cachedResolution) &&
             buildWholeImageCloudMetal(request, currentHueSectorSliceSpec(args.time), src, args, &metalBuilt, &reason)) {
           std::vector<ViewerCloudSample> mergedSamples;
           mergedSamples.reserve(cachedStripSamples.size() + metalBuilt.samples.size());
@@ -6500,7 +7604,9 @@ class ChromaspaceEffect : public ImageEffect {
         }
         if (buildWholeImageAndInstance1CloudMetal(
                 request, currentHueSectorSliceSpec(args.time), src, args, &metalBuilt, &stripResolution, &reason)) {
-          if (!metalBuilt.identityStripSamples.empty() && !metalBuilt.identityStripParamHash.empty()) {
+          if (allowStripCacheReuse &&
+              !metalBuilt.identityStripSamples.empty() &&
+              !metalBuilt.identityStripParamHash.empty()) {
             storeCachedIdentityStripCloud(stripCacheKey,
                                           metalBuilt.identityStripSamples,
                                           metalBuilt.identityStripParamHash,
@@ -6871,6 +7977,83 @@ class ChromaspaceEffect : public ImageEffect {
     return false;
   }
 
+  bool viewerTransportBackpressured(std::chrono::steady_clock::time_point now) const {
+    constexpr auto kTransportPressureWindow = std::chrono::milliseconds(180);
+    const int64_t lastTransportActivityMs = lastViewerTransportActivityMs_.load(std::memory_order_relaxed);
+    const bool recentTransportActivity =
+        lastTransportActivityMs > 0 &&
+        (monotonicNowMs() - lastTransportActivityMs) <= kTransportPressureWindow.count();
+    return cloudQueuedOrInFlight_.load(std::memory_order_relaxed) ||
+           recentTransportActivity;
+  }
+
+  bool authoritativeCacheMatchesCurrentLocked(const std::string& sourceId,
+                                              const std::string& settingsKey,
+                                              int qualityIndex) const {
+    return cachedCloud_.valid &&
+           cachedCloud_.coverageKind == CloudCoverageKind::Full &&
+           cachedCloud_.quality == qualityLabelForIndex(qualityIndex) &&
+           cachedCloud_.resolution == qualityResolutionForIndex(qualityIndex) &&
+           cachedCloud_.sourceId == sourceId &&
+           cachedCloud_.settingsKey == settingsKey;
+  }
+
+  bool shouldEmitAuthoritativeCloud(double time,
+                                    const std::string& sourceId,
+                                    const std::string& settingsKey,
+                                    bool firstHandoff,
+                                    bool steadyState,
+                                    bool previewRequested) {
+    if (!drivesSharedViewer() || !cubeViewerLive_) return false;
+    const int qualityIndex = getChoiceValue("cubeViewerQuality", time, cubeViewerQuality_);
+    const auto now = std::chrono::steady_clock::now();
+    const bool cloudInFlight = cloudQueuedOrInFlight_.load(std::memory_order_relaxed);
+    const bool backpressured = viewerTransportBackpressured(now);
+    const bool authNeverBuilt = lastAuthoritativeCloudBuiltAt_ == std::chrono::steady_clock::time_point{};
+    bool matchingAuthoritativeCache = false;
+    {
+      std::lock_guard<std::mutex> lock(stateMutex_);
+      matchingAuthoritativeCache = authoritativeCacheMatchesCurrentLocked(sourceId, settingsKey, qualityIndex);
+    }
+    const bool matchingAuthoritative = !firstHandoff && !authNeverBuilt && matchingAuthoritativeCache;
+    const bool urgent = firstHandoff || !matchingAuthoritative;
+    const auto authAgeMs = authNeverBuilt
+                               ? std::numeric_limits<long long>::max()
+                               : std::chrono::duration_cast<std::chrono::milliseconds>(now - lastAuthoritativeCloudBuiltAt_).count();
+    const bool latestDeferred = deferredLatestCloudRefresh_.load(std::memory_order_relaxed);
+    if (urgent) {
+      if (!cloudInFlight && (authNeverBuilt || authAgeMs >= 250)) {
+        return true;
+      }
+      deferredAuthoritativeCloudRefresh_.store(true, std::memory_order_relaxed);
+      return false;
+    }
+    if (previewRequested) {
+      deferredAuthoritativeCloudRefresh_.store(true, std::memory_order_relaxed);
+      return false;
+    }
+    if (latestDeferred) {
+      if (!cloudInFlight && authAgeMs >= steadyStateCloudIntervalMs(false)) {
+        return true;
+      }
+      deferredAuthoritativeCloudRefresh_.store(true, std::memory_order_relaxed);
+      return false;
+    }
+    if (steadyState) {
+      if (!cloudInFlight) return true;
+      deferredAuthoritativeCloudRefresh_.store(true, std::memory_order_relaxed);
+      return false;
+    }
+    if (!deferredAuthoritativeCloudRefresh_.load(std::memory_order_relaxed)) return false;
+    if (backpressured || authAgeMs < 250) return false;
+    if (lastCloudBuiltAt_ != std::chrono::steady_clock::time_point{}) {
+      const auto previewAgeMs =
+          std::chrono::duration_cast<std::chrono::milliseconds>(now - lastCloudBuiltAt_).count();
+      if (previewAgeMs < 250) return false;
+    }
+    return true;
+  }
+
   bool shouldUseInteractivePreview(std::chrono::steady_clock::time_point now) {
     const ViewerUpdateMode updateMode = static_cast<ViewerUpdateMode>(std::clamp(cubeViewerUpdateMode_, 0, 2));
     if (updateMode == ViewerUpdateMode::Fluid) {
@@ -6886,15 +8069,8 @@ class ChromaspaceEffect : public ImageEffect {
     constexpr auto kPlaybackRenderGap = std::chrono::milliseconds(60);
     constexpr auto kPlaybackGapReset = std::chrono::milliseconds(125);
     constexpr auto kPreviewHold = std::chrono::milliseconds(95);
-    constexpr auto kTransportPressureWindow = std::chrono::milliseconds(180);
     constexpr int kBurstThreshold = 4;
-    const int64_t lastTransportActivityMs = lastViewerTransportActivityMs_.load(std::memory_order_relaxed);
-    const bool recentTransportActivity =
-        lastTransportActivityMs > 0 &&
-        (monotonicNowMs() - lastTransportActivityMs) <= kTransportPressureWindow.count();
-    const bool cloudBackpressure = deferredLatestCloudRefresh_.load(std::memory_order_relaxed) ||
-                                   cloudQueuedOrInFlight_.load(std::memory_order_relaxed) ||
-                                   recentTransportActivity;
+    const bool cloudBackpressure = viewerTransportBackpressured(now);
     if (lastRenderSeenAt_ != std::chrono::steady_clock::time_point{}) {
       const auto renderGap = now - lastRenderSeenAt_;
       if (cloudBackpressure && renderGap <= kPlaybackRenderGap) {
@@ -6997,6 +8173,7 @@ class ChromaspaceEffect : public ImageEffect {
       cloudQueuedOrInFlight_.store(false, std::memory_order_relaxed);
     }
     deferredLatestCloudRefresh_.store(false, std::memory_order_relaxed);
+    deferredAuthoritativeCloudRefresh_.store(false, std::memory_order_relaxed);
     playbackRenderBurstCount_ = 0;
     lastViewerTransportActivityMs_.store(0, std::memory_order_relaxed);
     {
@@ -7019,9 +8196,12 @@ class ChromaspaceEffect : public ImageEffect {
     cubeViewerWindowUsable_ = false;
     cubeViewerInputCloudRefreshPending_ = false;
     lastCloudBuiltAt_ = std::chrono::steady_clock::time_point{};
+    lastAuthoritativeCloudBuiltAt_ = std::chrono::steady_clock::time_point{};
     lastHeartbeatAt_ = std::chrono::steady_clock::time_point{};
     lastCloudSourceId_.clear();
     lastCloudSettingsKey_.clear();
+    lastAuthoritativeCloudSourceId_.clear();
+    lastAuthoritativeCloudSettingsKey_.clear();
     releaseViewerRuntimeResources();
     setStatusLabel("Disconnected");
     cubeViewerDebugLog(reason);
@@ -7121,12 +8301,22 @@ class ChromaspaceEffect : public ImageEffect {
 
   // Cached clouds are only reusable when the viewer-facing interpretation is unchanged.
   // This keeps reconnect/refresh fast without letting old strip/cloud states leak into new modes.
-  bool trySendCachedCloud(double time, const std::string& reason) {
+  bool trySendCachedCloud(double time,
+                          const std::string& reason,
+                          const std::string& expectedSourceId = std::string()) {
     if (!viewerSessionRequested() || !cubeViewerLive_) return false;
     ensureViewerSessionTransportReady();
     std::lock_guard<std::mutex> lock(stateMutex_);
     if (!cachedCloud_.valid) {
       cubeViewerDebugLog(std::string("Cached cloud miss: reason=") + reason);
+      return false;
+    }
+    if (cachedCloud_.coverageKind != CloudCoverageKind::Full) {
+      cubeViewerDebugLog(std::string("Cached cloud suppressed because it is not authoritative/full: reason=") + reason);
+      return false;
+    }
+    if (!expectedSourceId.empty() && cachedCloud_.sourceId != expectedSourceId) {
+      cubeViewerDebugLog(std::string("Cached cloud suppressed for source mismatch: reason=") + reason);
       return false;
     }
     const int qualityIndex = getChoiceValue("cubeViewerQuality", time, cubeViewerQuality_);
@@ -7161,7 +8351,8 @@ class ChromaspaceEffect : public ImageEffect {
     enqueueCloudMessage(freshPayload, reason + "/cached", freshBlob);
     cubeViewerInputCloudRefreshPending_ = false;
     deferredLatestCloudRefresh_.store(false, std::memory_order_relaxed);
-    logSharedViewerEvent("cachedCloudQueued", lastCloudSourceId_,
+    deferredAuthoritativeCloudRefresh_.store(true, std::memory_order_relaxed);
+    logSharedViewerEvent("cachedCloudQueued", cachedCloud_.sourceId,
                          std::string("reason=") + reason +
                              " settings=" + cachedCloud_.settingsKey);
     cubeViewerDebugLog(std::string("Cached cloud queued: reason=") + reason +
@@ -7404,8 +8595,11 @@ class ChromaspaceEffect : public ImageEffect {
     cubeViewerWindowUsable_ = existing.ok ? (existing.visible && !existing.iconified) : true;
     cubeViewerInputCloudRefreshPending_ = true;
     deferredLatestCloudRefresh_.store(false, std::memory_order_relaxed);
+    deferredAuthoritativeCloudRefresh_.store(false, std::memory_order_relaxed);
+    authoritativeOnlyCloudRefresh_.store(false, std::memory_order_relaxed);
     playbackRenderBurstCount_ = 0;
     lastCloudBuiltAt_ = std::chrono::steady_clock::time_point{};
+    lastAuthoritativeCloudBuiltAt_ = std::chrono::steady_clock::time_point{};
     lastHeartbeatAt_ = existing.ok ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     {
       std::lock_guard<std::mutex> lock(ioMutex_);
@@ -7413,7 +8607,6 @@ class ChromaspaceEffect : public ImageEffect {
       cloudQueuedOrInFlight_.store(false, std::memory_order_relaxed);
     }
     pushParamsUpdate(time, "openCubeViewer");
-    (void)trySendCachedCloud(time, "openCubeViewer");
     setStatusLabel(existing.ok ? (cubeViewerLive_ ? "Updating" : "Connected") : "Connecting...");
     cubeViewerDebugLog("Cube viewer session opened.");
   }
@@ -7425,11 +8618,16 @@ class ChromaspaceEffect : public ImageEffect {
     cubeViewerWindowUsable_ = false;
     cubeViewerInputCloudRefreshPending_ = false;
     deferredLatestCloudRefresh_.store(false, std::memory_order_relaxed);
+    deferredAuthoritativeCloudRefresh_.store(false, std::memory_order_relaxed);
+    authoritativeOnlyCloudRefresh_.store(false, std::memory_order_relaxed);
     playbackRenderBurstCount_ = 0;
     lastCloudBuiltAt_ = std::chrono::steady_clock::time_point{};
+    lastAuthoritativeCloudBuiltAt_ = std::chrono::steady_clock::time_point{};
     lastHeartbeatAt_ = std::chrono::steady_clock::time_point{};
     lastCloudSourceId_.clear();
     lastCloudSettingsKey_.clear();
+    lastAuthoritativeCloudSourceId_.clear();
+    lastAuthoritativeCloudSettingsKey_.clear();
     releaseViewerRuntimeResources();
     setStatusLabel("Disconnected");
     cubeViewerDebugLog("Cube viewer session closed.");
@@ -7834,7 +9032,7 @@ class ChromaspaceFactory : public PluginFactoryHelper<ChromaspaceFactory> {
           {"cubeViewerIdentityOverlayNote", "For this to work you need to use another instance in generate mode Upstream"},
           {"cubeViewerSampleDrawnCubeOnly", "Enable this on a downstream instance when an earlier instance is generating the identity plot strip into the image. The downstream plot will read that strip and combine its dense identity-solid sampling with the normal whole-image sampling."},
           {"cubeViewerReadGrayRamp", "Enable this on a downstream instance to add a dedicated concentrated readback of the gray ramp band from the identity plot strip."},
-          {"cubeViewerShowIdentityOnly", "Only available when using the identity plot from instance 1. When enabled, the downstream plot reads only the drawn identity strip and skips the normal whole-image cloud, so you see just the transformed identity data."},
+          {"cubeViewerShowIdentityOnly", "Only available when reading strip data from instance 1. When enabled, the downstream plot reads only the selected identity plot and/or gray ramp strip data and skips the normal whole-image cloud."},
 {"cubeViewerSampleDrawnCubeSize", "Sets the identity-strip resolution from 4 to 65. In the identity generator this controls the generated strip density, and in a downstream instance it should match instance 1 so the strip can be decoded correctly."},
 {"cubeViewerModeToggle", "Switch between the 3D viewer and the identity generator. The identity generator burns the identity strip into the image and hides plot-only controls."},
           {"cubeViewerPlotModel", "Choose which 3D color geometry or analysis view is used to inspect the current signal: RGB cube, HSL bicone or circular HSL, HSV hexcone or circular HSV, Chen, Norm-Cone, JP-Conical, Reuleaux, Chromaticity xyY, or Gloss View."},

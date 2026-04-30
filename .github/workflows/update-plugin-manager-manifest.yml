@@ -7,6 +7,10 @@ on:
       - published
       - edited
 
+concurrency:
+  group: update-plugin-manager-manifest-${{ github.event.release.id || github.ref || github.run_id }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
@@ -59,13 +63,41 @@ jobs:
             Trigger: `${{ github.event_name }}`
             Release: `${{ github.event.release.tag_name || 'manual-run' }}`
 
-      - name: Enable manager manifest PR auto-merge
+      - name: Wait for and merge manager manifest PR
         if: ${{ steps.create_pr.outputs.pull-request-number != '' }}
         env:
           GH_TOKEN: ${{ secrets.MEPM_MANAGER_REPO_TOKEN }}
         run: |
-          gh pr merge "${{ steps.create_pr.outputs.pull-request-number }}" \
-            --repo MoazElgabry/Moaz-Elgabry-plugins \
-            --auto \
+          set -euo pipefail
+          pr_number="${{ steps.create_pr.outputs.pull-request-number }}"
+          repo="MoazElgabry/Moaz-Elgabry-plugins"
+
+          for attempt in {1..30}; do
+            merge_state="$(gh pr view "${pr_number}" --repo "${repo}" --json mergeStateStatus --jq .mergeStateStatus)"
+            echo "PR #${pr_number} merge state: ${merge_state} (attempt ${attempt}/30)"
+
+            if [ "${merge_state}" = "CLEAN" ] || [ "${merge_state}" = "HAS_HOOKS" ]; then
+              break
+            fi
+
+            if [ "${merge_state}" = "DIRTY" ] || [ "${merge_state}" = "BLOCKED" ]; then
+              gh pr view "${pr_number}" \
+                --repo "${repo}" \
+                --json mergeStateStatus,reviewDecision,statusCheckRollup
+              exit 1
+            fi
+
+            sleep 5
+          done
+
+          if [ "${merge_state}" != "CLEAN" ] && [ "${merge_state}" != "HAS_HOOKS" ]; then
+            gh pr view "${pr_number}" \
+              --repo "${repo}" \
+              --json mergeStateStatus,reviewDecision,statusCheckRollup
+            exit 1
+          fi
+
+          gh pr merge "${pr_number}" \
+            --repo "${repo}" \
             --squash \
             --delete-branch

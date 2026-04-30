@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <functional>
 #include <mutex>
 #include <numeric>
 #include <sstream>
@@ -217,11 +218,13 @@ bool nativeSuperModifierPressed() {
 
 bool viewerDebugLogEnabled() {
   const char* direct = std::getenv("CHROMASPACE_DEBUG_LOG");
+  if (direct && std::strcmp(direct, "0") == 0) return false;
   if (direct && direct[0] != '\0' && std::strcmp(direct, "0") != 0) return true;
   const char* multi = std::getenv("CHROMASPACE_MULTI_INSTANCE_DEBUG");
   if (multi && multi[0] != '\0' && std::strcmp(multi, "0") != 0) return true;
   const char* diagnostics = std::getenv("CHROMASPACE_DIAGNOSTICS");
-  return diagnostics != nullptr && diagnostics[0] != '\0' && std::strcmp(diagnostics, "0") != 0;
+  if (diagnostics != nullptr && diagnostics[0] != '\0' && std::strcmp(diagnostics, "0") != 0) return true;
+  return true;
 }
 
 bool viewerMultiInstanceDebugEnabled() {
@@ -237,9 +240,17 @@ void logViewerEvent(const std::string& msg) {
   if (!parent.empty()) {
     std::filesystem::create_directories(parent, ec);
   }
-  FILE* f = std::fopen(path.c_str(), "a");
+  constexpr uintmax_t kMaxLogBytes = 4u * 1024u * 1024u;
+  const bool rotate = std::filesystem::exists(path, ec) && std::filesystem::file_size(path, ec) > kMaxLogBytes;
+  FILE* f = std::fopen(path.c_str(), rotate ? "w" : "a");
   if (!f) return;
-  std::fprintf(f, "[Chromaspace] %s\n", msg.c_str());
+  const auto now = std::chrono::system_clock::now().time_since_epoch();
+  const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now).count();
+  if (rotate) std::fprintf(f, "[Chromaspace] viewer log rotated at %lldms\n", static_cast<long long>(ms));
+  std::fprintf(f, "[ChromaspaceViewer %lld tid=%zu] %s\n",
+               static_cast<long long>(ms),
+               std::hash<std::thread::id>{}(std::this_thread::get_id()),
+               msg.c_str());
   std::fclose(f);
 }
 
@@ -329,7 +340,7 @@ void notifyExistingViewerBringToFront() {
 }
 #endif
 
-const char* kViewerVersionString = "v1.0.9 Beta";
+const char* kViewerVersionString = "v1.0.10 Beta";
 
 #if !defined(_WIN32)
 bool sendAllSocket(int fd, const char* data, size_t size) {
@@ -11504,7 +11515,12 @@ int main() {
              << " seq=" << cp.seq
              << " quality=" << cp.quality
              << " res=" << cp.resolution
-             << " bytes=" << cp.points.size();
+             << " pointCount=" << cp.pointCount
+             << " stride=" << cp.pointStride
+             << " transport=" << cp.transport
+             << " bytes=" << cp.points.size()
+             << " settings=" << cp.settingsKey
+             << " paramHash=" << cp.paramHash;
           logViewerEvent(os.str());
         }
         if (!senderMatchesCurrent(resolved.senderId, cp.senderId)) {

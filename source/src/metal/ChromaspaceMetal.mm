@@ -1055,6 +1055,50 @@ bool copyHostBuffersReadback(
   return true;
 }
 
+bool copySourceRowsToHost(
+    const void* srcMetalBuffer,
+    int width,
+    size_t srcRowBytes,
+    const int* rows,
+    int rowCount,
+    int originX,
+    void* metalCommandQueue,
+    float* readbackSrc,
+    size_t readbackSrcRowBytes) {
+  if (!srcMetalBuffer || !metalCommandQueue || !readbackSrc || !rows || rowCount <= 0 || width <= 0) return false;
+  if (!validateFloatRowBytes(srcRowBytes)) return false;
+  if (readbackSrcRowBytes < packedRowBytesForWidth(width)) return false;
+
+  id<MTLCommandQueue> queue = (__bridge id<MTLCommandQueue>)metalCommandQueue;
+  id<MTLBuffer> src = (__bridge id<MTLBuffer>)srcMetalBuffer;
+  if (queue == nil || src == nil || queue.device == nil) return false;
+
+  const size_t packedRowBytes = packedRowBytesForWidth(width);
+  const size_t readbackBytes = readbackSrcRowBytes * static_cast<size_t>(rowCount);
+  id<MTLBuffer> readbackBuffer =
+      [queue.device newBufferWithLength:readbackBytes options:MTLResourceStorageModeShared];
+  if (readbackBuffer == nil) return false;
+
+  id<MTLCommandBuffer> cmd = [queue commandBuffer];
+  if (cmd == nil) return false;
+  id<MTLBlitCommandEncoder> blit = [cmd blitCommandEncoder];
+  if (blit == nil) return false;
+
+  const size_t originXOffset = static_cast<size_t>(originX) * 4u * sizeof(float);
+  for (int i = 0; i < rowCount; ++i) {
+    const size_t srcOffset = static_cast<size_t>(rows[i]) * srcRowBytes + originXOffset;
+    const size_t dstOffset = static_cast<size_t>(i) * readbackSrcRowBytes;
+    [blit copyFromBuffer:src sourceOffset:srcOffset toBuffer:readbackBuffer destinationOffset:dstOffset size:packedRowBytes];
+  }
+  [blit endEncoding];
+  [cmd commit];
+  [cmd waitUntilCompleted];
+  if (cmd.status != MTLCommandBufferStatusCompleted) return false;
+
+  std::memcpy(readbackSrc, readbackBuffer.contents, readbackBytes);
+  return true;
+}
+
 }  // namespace ChromaspaceMetal
 
 #endif
