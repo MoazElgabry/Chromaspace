@@ -340,7 +340,7 @@ void notifyExistingViewerBringToFront() {
 }
 #endif
 
-const char* kViewerVersionString = "v1.0.10 Beta";
+const char* kViewerVersionString = "v1.0.10";
 
 #if !defined(_WIN32)
 bool sendAllSocket(int fd, const char* data, size_t size) {
@@ -4442,8 +4442,10 @@ bool cloudMatchesResolved(const ResolvedPayload& resolved, const InputCloudPaylo
 std::mutex gMsgMutex;
 PendingMessage gPendingParamsMsg;
 PendingMessage gPendingCloudMsg;
+PendingMessage gPendingClearMsg;
 bool gHasPendingParamsMsg = false;
 bool gHasPendingCloudMsg = false;
+bool gHasPendingClearMsg = false;
 
 std::string heartbeatAckJson() {
   std::ostringstream os;
@@ -11054,6 +11056,15 @@ std::string handleIncomingLine(const std::string& line) {
     }
     return std::string();
   }
+  if (line.find("\"type\":\"clear_viewer_output\"") != std::string::npos) {
+    uint64_t seq = 0;
+    extractUInt64(line, "seq", &seq);
+    std::lock_guard<std::mutex> lock(gMsgMutex);
+    gPendingClearMsg.line = line;
+    gPendingClearMsg.seq = seq;
+    gHasPendingClearMsg = true;
+    return std::string();
+  }
   if (line.find("\"type\":\"input_cloud\"") != std::string::npos) {
     InputCloudPayload payload{};
     if (parseInputCloudMessage(line, &payload)) {
@@ -11313,6 +11324,7 @@ int main() {
   bool hasCurrentCloud = false;
   uint64_t lastCloudSeq = 0;
   uint64_t lastParamsSeq = 0;
+  uint64_t lastClearSeq = 0;
 
   while (gRun.load() && !glfwWindowShouldClose(window)) {
     glfwPollEvents();
@@ -11323,8 +11335,10 @@ int main() {
 
     PendingMessage pendingParams;
     PendingMessage pendingCloud;
+    PendingMessage pendingClear;
     bool haveParams = false;
     bool haveCloud = false;
+    bool haveClear = false;
     {
       std::lock_guard<std::mutex> lock(gMsgMutex);
       if (gHasPendingParamsMsg) {
@@ -11332,10 +11346,56 @@ int main() {
         gHasPendingParamsMsg = false;
         haveParams = true;
       }
+      if (gHasPendingClearMsg) {
+        pendingClear = gPendingClearMsg;
+        gHasPendingClearMsg = false;
+        haveClear = true;
+      }
       if (gHasPendingCloudMsg) {
         pendingCloud = gPendingCloudMsg;
         gHasPendingCloudMsg = false;
         haveCloud = true;
+      }
+    }
+
+    if (haveClear) {
+      std::string clearSender;
+      std::string clearReason;
+      extractQuoted(pendingClear.line, "senderId", &clearSender);
+      extractQuoted(pendingClear.line, "reason", &clearReason);
+      if (pendingClear.seq <= lastClearSeq) {
+        logViewerEvent("Ignored stale clear-viewer-output sequence.");
+      } else if (!senderMatchesCurrent(resolved.senderId, clearSender)) {
+        if (viewerMultiInstanceDebugEnabled()) {
+          std::ostringstream os;
+          os << "ignoredClearForNonActiveSender"
+             << " activeSender=" << resolved.senderId
+             << " clearSender=" << clearSender
+             << " seq=" << pendingClear.seq;
+          logViewerMultiInstance(os.str());
+        }
+      } else {
+        lastClearSeq = pendingClear.seq;
+        hasCurrentCloud = false;
+        hasDeferredCloud = false;
+        currentCloud = InputCloudPayload{};
+        deferredCloud = InputCloudPayload{};
+        mesh = MeshData{};
+        mesh.quality = "Waiting";
+        mesh.resolution = resolved.resolution;
+        mesh.paramHash.clear();
+        identityMesh = MeshData{};
+        overlayMesh = MeshData{};
+        overlayComputeCache = OverlayComputeCache{};
+        inputCloudComputeCache = InputCloudComputeCache{};
+        inputCloudSampleComputeCache = InputCloudSampleComputeCache{};
+#if defined(CHROMASPACE_VIEWER_HAS_CUDA) && !defined(__APPLE__)
+        overlayCudaCache = OverlayCudaCache{};
+        inputCloudCudaCache = InputCloudCudaCache{};
+        inputCloudSampleCudaCache = InputCloudSampleCudaCache{};
+#endif
+        inputCloudSampleMetalCache = InputCloudSampleMetalCache{};
+        logViewerEvent(std::string("Cleared viewer output for draw-mode sender: ") + clearReason);
       }
     }
 

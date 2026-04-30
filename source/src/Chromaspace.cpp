@@ -90,7 +90,7 @@ constexpr const char* kPluginIdentifier = "com.moazelgabry.chromaspace";
 constexpr const char* kPluginGrouping = "Moaz Elgabry";
 constexpr int kPluginVersionMajor = 1;
 constexpr int kPluginVersionMinor = 7;
-constexpr const char* kPluginVersionLabel = "v1.0.10 Beta";
+constexpr const char* kPluginVersionLabel = "v1.0.10";
 constexpr const char* kPluginName = "Chromaspace";
 constexpr const char* kWebsiteUrl = "https://moazelgabry.com";
 constexpr const char* kReleasesUrl = "https://github.com/MoazElgabry/Chromaspace/releases/latest";
@@ -2269,7 +2269,9 @@ class ChromaspaceEffect : public ImageEffect {
     updateNormConeToggleVisibility(0.0);
     syncChromaspacePresetMenuState(0.0);
     logSharedViewerEvent("syncPrivateData");
-    if (cubeViewerRequested_ && viewerSessionRequested() && !sharedViewerActiveForThisSender()) {
+    suppressDrawModeViewerOutput(0.0, "syncPrivateData/draw-mode");
+    if (canPublishViewerOutput(0.0) &&
+        cubeViewerRequested_ && viewerSessionRequested() && !sharedViewerActiveForThisSender()) {
       markSharedViewerActiveSender();
       cubeViewerInputCloudRefreshPending_ = true;
       deferredLatestCloudRefresh_.store(false, std::memory_order_relaxed);
@@ -2319,6 +2321,10 @@ class ChromaspaceEffect : public ImageEffect {
 
   bool drivesSharedViewer() const {
     return viewerSessionRequested() && sharedViewerActiveForThisSender();
+  }
+
+  bool canPublishViewerOutput(double time) {
+    return !currentDrawOnImageMode(time);
   }
 
   bool sharedViewerActiveForThisSender() const {
@@ -2392,6 +2398,48 @@ class ChromaspaceEffect : public ImageEffect {
     logSharedViewerEvent("renderActivity", sourceId);
   }
 
+  void clearSharedViewerActiveSenderForThisInstance(const std::string& reason) {
+    bool cleared = false;
+    {
+      std::lock_guard<std::mutex> lock(gSharedCubeViewerSenderMutex);
+      if (gSharedCubeViewerActiveSenderId == senderId_) {
+        gSharedCubeViewerActiveSenderId.clear();
+        gSharedCubeViewerActiveSourceId.clear();
+        cleared = true;
+      }
+    }
+    if (cleared) {
+      gSharedCubeViewerActiveRenderMs.store(0, std::memory_order_relaxed);
+      logSharedViewerEvent("clearActiveSender", std::string(), std::string("reason=") + reason);
+    }
+  }
+
+  void suppressDrawModeViewerOutput(double time, const std::string& reason) {
+    if (canPublishViewerOutput(time)) return;
+    const bool wasActive = sharedViewerActiveForThisSender();
+    {
+      std::lock_guard<std::mutex> lock(ioMutex_);
+      pendingParams_ = PendingMessage{};
+      pendingCloud_ = PendingMessage{};
+      cloudQueuedOrInFlight_.store(false, std::memory_order_relaxed);
+    }
+    cubeViewerInputCloudRefreshPending_ = false;
+    deferredLatestCloudRefresh_.store(false, std::memory_order_relaxed);
+    deferredAuthoritativeCloudRefresh_.store(false, std::memory_order_relaxed);
+    authoritativeOnlyCloudRefresh_.store(false, std::memory_order_relaxed);
+    playbackRenderBurstCount_ = 0;
+    lastCloudBuiltAt_ = std::chrono::steady_clock::time_point{};
+    lastAuthoritativeCloudBuiltAt_ = std::chrono::steady_clock::time_point{};
+    lastCloudSourceId_.clear();
+    lastCloudSettingsKey_.clear();
+    lastAuthoritativeCloudSourceId_.clear();
+    lastAuthoritativeCloudSettingsKey_.clear();
+    if (wasActive && viewerSessionRequested()) {
+      enqueueCloudMessage(buildClearViewerOutputPayload(reason), reason + "/draw-mode-clear");
+    }
+    clearSharedViewerActiveSenderForThisInstance(reason);
+  }
+
   void retainSharedViewerSession() {
     if (cubeViewerRequested_) return;
     gSharedCubeViewerRequestCount.fetch_add(1, std::memory_order_relaxed);
@@ -2424,6 +2472,9 @@ class ChromaspaceEffect : public ImageEffect {
     const bool drawOnImageMode = currentDrawOnImageMode(args.time);
     const bool sessionRequested = viewerSessionRequested();
     const std::string sourceId = currentSourceIdentifier(src.get());
+    if (drawOnImageMode) {
+      suppressDrawModeViewerOutput(args.time, "render/draw-mode");
+    }
     if (cubeViewerMultiInstanceDebugEnabled()) {
       std::ostringstream os;
       os << "time=" << args.time
@@ -2848,7 +2899,11 @@ class ChromaspaceEffect : public ImageEffect {
       updateNormConeToggleVisibility(args.time);
       invalidateCubeViewerCloudState();
       if (viewerSessionRequested()) {
-        pushParamsUpdate(args.time, "cubeViewerModeToggle");
+        if (nextDrawOnImage) {
+          suppressDrawModeViewerOutput(args.time, "cubeViewerModeToggle/draw-mode");
+        } else {
+          pushParamsUpdate(args.time, "cubeViewerModeToggle");
+        }
       }
       return;
     }
@@ -5373,6 +5428,15 @@ class ChromaspaceEffect : public ImageEffect {
     blob->fd = fd;
 #endif
     return blob;
+  }
+
+  std::string buildClearViewerOutputPayload(const std::string& reason) {
+    const uint64_t seq = gSharedCubeViewerSeqCounter.fetch_add(1, std::memory_order_relaxed);
+    std::ostringstream oss;
+    oss << "{\"type\":\"clear_viewer_output\",\"seq\":" << seq
+        << ",\"senderId\":\"" << jsonEscape(senderId_) << "\""
+        << ",\"reason\":\"" << jsonEscape(reason) << "\"}\n";
+    return oss.str();
   }
 
   std::string serializeViewerCloudSamples(const std::vector<ViewerCloudSample>& samples) const {
@@ -8305,6 +8369,11 @@ class ChromaspaceEffect : public ImageEffect {
                           const std::string& reason,
                           const std::string& expectedSourceId = std::string()) {
     if (!viewerSessionRequested() || !cubeViewerLive_) return false;
+    if (!canPublishViewerOutput(time)) {
+      suppressDrawModeViewerOutput(time, reason + "/draw-mode");
+      cubeViewerDebugLog(std::string("Cached cloud suppressed for draw-mode instance: reason=") + reason);
+      return false;
+    }
     ensureViewerSessionTransportReady();
     std::lock_guard<std::mutex> lock(stateMutex_);
     if (!cachedCloud_.valid) {
@@ -8392,7 +8461,9 @@ class ChromaspaceEffect : public ImageEffect {
           markViewerTransportActivity();
           cubeViewerConnected_ = true;
           cubeViewerWindowUsable_ = true;
-          markSharedViewerActiveSender();
+          if (canPublishViewerOutput(0.0)) {
+            markSharedViewerActiveSender();
+          }
           setStatusLabel(cubeViewerLive_ ? "Updating" : "Connected");
           cubeViewerDebugLog("Params payload send succeeded.");
           logSharedViewerEvent("io/sendParams/success");
@@ -8606,7 +8677,11 @@ class ChromaspaceEffect : public ImageEffect {
       pendingCloud_.valid = false;
       cloudQueuedOrInFlight_.store(false, std::memory_order_relaxed);
     }
-    pushParamsUpdate(time, "openCubeViewer");
+    if (canPublishViewerOutput(time)) {
+      pushParamsUpdate(time, "openCubeViewer");
+    } else {
+      suppressDrawModeViewerOutput(time, "openCubeViewer/draw-mode");
+    }
     setStatusLabel(existing.ok ? (cubeViewerLive_ ? "Updating" : "Connected") : "Connecting...");
     cubeViewerDebugLog("Cube viewer session opened.");
   }
@@ -8635,6 +8710,11 @@ class ChromaspaceEffect : public ImageEffect {
 
   void pushParamsUpdate(double time, const std::string& reason) {
     if (!viewerSessionRequested()) return;
+    if (!canPublishViewerOutput(time)) {
+      suppressDrawModeViewerOutput(time, reason + "/draw-mode");
+      cubeViewerDebugLog(std::string("Params payload suppressed for draw-mode instance: reason=") + reason);
+      return;
+    }
     ensureViewerSessionTransportReady();
     logSharedViewerEvent("queueParams", std::string(),
                          std::string("reason=") + reason +
@@ -9035,7 +9115,7 @@ class ChromaspaceFactory : public PluginFactoryHelper<ChromaspaceFactory> {
           {"cubeViewerShowIdentityOnly", "Only available when reading strip data from instance 1. When enabled, the downstream plot reads only the selected identity plot and/or gray ramp strip data and skips the normal whole-image cloud."},
 {"cubeViewerSampleDrawnCubeSize", "Sets the identity-strip resolution from 4 to 65. In the identity generator this controls the generated strip density, and in a downstream instance it should match instance 1 so the strip can be decoded correctly."},
 {"cubeViewerModeToggle", "Switch between the 3D viewer and the identity generator. The identity generator burns the identity strip into the image and hides plot-only controls."},
-          {"cubeViewerPlotModel", "Choose which 3D color geometry or analysis view is used to inspect the current signal: RGB cube, HSL bicone or circular HSL, HSV hexcone or circular HSV, Chen, Norm-Cone, JP-Conical, Reuleaux, Chromaticity xyY, or Gloss View."},
+          {"cubeViewerPlotModel", "Choose which 3D color geometry or analysis view is used to inspect the current signal: RGB cube, HSL bicone or circular HSL, HSV hexcone or circular HSV, Chen, Norm-Cone, JP-Conical, Reuleaux, Chromaticity xyY, or Gloss View (beta)."},
           {"cubeViewerPlotDisplayLinear", "Decode sampled input values from the selected input transfer function to linear light before building the 3D plot. Intended for non-chromaticity plot modes."},
           {"cubeViewerPlotDisplayLinearTransfer", "Choose the assumed input transfer function used when Plot in Display Linear is enabled."},
           {"cubeViewerNormConeNormalized", "For Norm-Cone only: when enabled, use the normalized cone chroma from JP's DCTL; when disabled, use the raw spherical chroma variant instead."},
@@ -9072,7 +9152,7 @@ class ChromaspaceFactory : public PluginFactoryHelper<ChromaspaceFactory> {
     cubeViewerPlotModel->appendOption("JP-Conical");
     cubeViewerPlotModel->appendOption("Reuleaux");
     cubeViewerPlotModel->appendOption("Chromaticity");
-    cubeViewerPlotModel->appendOption("Gloss View");
+    cubeViewerPlotModel->appendOption("Gloss View (beta)");
     cubeViewerPlotModel->setDefault(std::clamp(chromaspaceDefaultValues.plotModel, 0, 8));
     if (const char* hint = tooltipFor("cubeViewerPlotModel")) cubeViewerPlotModel->setHint(hint);
 
