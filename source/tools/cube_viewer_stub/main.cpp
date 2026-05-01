@@ -8163,6 +8163,23 @@ void requestGlossViewOrthoInspectionFit(AppState* app) {
   app->glossOrthoAutoFitRequested = true;
 }
 
+void clearPointerInteractionState(AppState* app) {
+  if (!app) return;
+  app->leftDown = false;
+  app->panMode = false;
+  app->shiftPanGesture = false;
+  app->rollMode = false;
+  app->zoomMode = false;
+  app->panVelocityX = 0.0f;
+  app->panVelocityY = 0.0f;
+  app->axisLockAccumDx = 0.0f;
+  app->axisLockAccumDy = 0.0f;
+  app->orientAxisLock = 0;
+  app->orientAxisFeedbackUntil = 0.0;
+  app->rollFeedbackUntil = 0.0;
+  resetGlossViewOrthoInteractionState(app);
+}
+
 bool platformRollModifierPressed(const AppState& app) {
   if (app.rollKeyHeld) return true;
 #if defined(__APPLE__)
@@ -10528,6 +10545,14 @@ void mouseButtonCallback(GLFWwindow* window, int button, int action, int mods) {
   if (!app) return;
   refreshModifierState(window, app);
   applyMouseModifierBits(app, mods);
+  if (action == GLFW_RELEASE) {
+    const bool anyDown =
+        glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS ||
+        glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_MIDDLE) == GLFW_PRESS ||
+        glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_RIGHT) == GLFW_PRESS;
+    if (!anyDown) clearPointerInteractionState(app);
+    return;
+  }
   if (button != GLFW_MOUSE_BUTTON_LEFT || action != GLFW_PRESS) return;
   const double now = glfwGetTime();
   if ((now - app->lastClick) < 0.3) {
@@ -10585,17 +10610,7 @@ void mouseButtonCallback(GLFWwindow* window, int button, int action, int mods) {
       }
     }
     }
-    app->leftDown = false;
-    app->panMode = false;
-    app->shiftPanGesture = false;
-    app->rollMode = false;
-    app->zoomMode = false;
-    app->panVelocityX = 0.0f;
-    app->panVelocityY = 0.0f;
-    app->orientAxisLock = 0;
-    app->orientAxisFeedbackUntil = 0.0;
-    app->rollFeedbackUntil = 0.0;
-    resetGlossViewOrthoInteractionState(app);
+    clearPointerInteractionState(app);
   }
   app->lastClick = now;
 }
@@ -10642,19 +10657,7 @@ void cursorPosCallback(GLFWwindow* window, double xpos, double ypos) {
     app->orientAxisFeedbackUntil = 0.0;
     resetGlossViewOrthoInteractionState(app);
   } else if (!anyDown && app->leftDown) {
-    app->leftDown = false;
-    app->panMode = false;
-    app->shiftPanGesture = false;
-    app->rollMode = false;
-    app->zoomMode = false;
-    app->panVelocityX = 0.0f;
-    app->panVelocityY = 0.0f;
-    app->axisLockAccumDx = 0.0f;
-    app->axisLockAccumDy = 0.0f;
-    app->orientAxisLock = 0;
-    app->orientAxisFeedbackUntil = 0.0;
-    app->rollFeedbackUntil = 0.0;
-    resetGlossViewOrthoInteractionState(app);
+    clearPointerInteractionState(app);
   }
 
   if (!app->leftDown) return;
@@ -10971,8 +10974,12 @@ void windowCloseCallback(GLFWwindow*) {
   gRun.store(false);
 }
 
-void iconifyCallback(GLFWwindow*, int iconified) {
+void iconifyCallback(GLFWwindow* window, int iconified) {
   gWindowIconified.store(iconified ? 1 : 0);
+  if (iconified) {
+    AppState* app = reinterpret_cast<AppState*>(glfwGetWindowUserPointer(window));
+    clearPointerInteractionState(app);
+  }
 }
 
 void focusCallback(GLFWwindow* window, int focused) {
@@ -10989,6 +10996,7 @@ void focusCallback(GLFWwindow* window, int focused) {
   app->altHeld = false;
   app->superHeld = false;
   app->rollKeyHeld = false;
+  clearPointerInteractionState(app);
 }
 
 void refreshCallback(GLFWwindow*, int width, int height) {
