@@ -9085,7 +9085,7 @@ class ChromaspaceFactory : public PluginFactoryHelper<ChromaspaceFactory> {
           {"cubeViewerQuality", "Viewer sampling density for the 3D cube (Low=25^3, about 45k points; Medium=41^3, about 90k points; High=57^3, about 180k points)."},
           {"cubeViewerScale", "Scales the sampled image domain used for cube generation to lighten processing. 100% keeps full size, while lower values reduce cloud-build work."},
           {"cubeViewerPointSize", "Makes points larger or smaller and automatically adjusts point density in the opposite direction to keep the cloud readable. Sizes above 1.0 use a looser density reduction so the cloud can clump more densely instead of opening up too much."},
-          {"cubeViewerColorSaturation", "Adjust how vivid the plotted colors appear in the viewer. Higher values reduce the washed-out white look and make it easier to read what hues are being plotted."},
+          {"cubeViewerColorSaturation", "Adjust how saturated the plotted points appear in the viewer. Higher values reduce the washed-out white look and make it easier to read what hues are being plotted."},
           {"cubeViewerSamplingMode", "Balanced uses a deterministic lattice for stable coverage, Stratified adds jitter for cleaner coverage, and Random gives a noisier organic scatter."},
           {"cubeViewerOccupancyGuidedFill", "Adds a second occupancy-guided pass after the normal image sampler so sparsely occupied RGB regions receive more support and the plot reads denser without switching to the instance-1 workflow."},
           {"cubeViewerPointShape", "Choose whether points are rendered as circular or square splats in the viewer."},
@@ -9594,10 +9594,10 @@ class ChromaspaceFactory : public PluginFactoryHelper<ChromaspaceFactory> {
     if (const char* hint = tooltipFor("cubeViewerPointSize")) cubeViewerPointSize->setHint(hint);
 
     auto* cubeViewerColorSaturation = d.defineDoubleParam("cubeViewerColorSaturation");
-    cubeViewerColorSaturation->setLabel("Color Saturation");
-    cubeViewerColorSaturation->setDefault(std::clamp(chromaspaceDefaultValues.colorSaturation, 1.0, 6.0));
-    cubeViewerColorSaturation->setRange(1.0, 6.0);
-    cubeViewerColorSaturation->setDisplayRange(1.0, 6.0);
+    cubeViewerColorSaturation->setLabel("Point Saturation");
+    cubeViewerColorSaturation->setDefault(std::clamp(chromaspaceDefaultValues.colorSaturation, 0.8, 6.0));
+    cubeViewerColorSaturation->setRange(0.8, 6.0);
+    cubeViewerColorSaturation->setDisplayRange(0.8, 6.0);
     cubeViewerColorSaturation->setIncrement(0.01);
     cubeViewerColorSaturation->setParent(*grpCubeViewerAppearance);
     if (const char* hint = tooltipFor("cubeViewerColorSaturation")) cubeViewerColorSaturation->setHint(hint);

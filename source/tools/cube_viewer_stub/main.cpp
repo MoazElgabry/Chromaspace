@@ -1265,7 +1265,7 @@ vec3 hslToRgb(vec3 hsl) {
 }
 void main() {
   vec3 c = clamp(vColor.rgb, 0.0, 1.0);
-  float sat = clamp(uColorSaturation, 1.0, 6.0);
+  float sat = clamp(uColorSaturation, 0.8, 6.0);
   float luma = clamp(dot(c, vec3(0.2126, 0.7152, 0.0722)), 0.0, 1.0);
   if (sat <= 1.0) {
     c = max(vec3(0.0), vec3(luma) + (c - vec3(luma)) * sat);
@@ -2866,7 +2866,7 @@ void hslToRgb(float h, float s, float l, out float r, out float g, out float b) 
 }
 
 void applyDisplaySaturation(inout float r, inout float g, inout float b) {
-  float sat = clamp(uColorSaturation, 1.0, 6.0);
+  float sat = clamp(uColorSaturation, 0.8, 6.0);
   float baseR = clamp01(r);
   float baseG = clamp01(g);
   float baseB = clamp01(b);
@@ -3721,7 +3721,7 @@ void hslToRgb(float h, float s, float l, out float r, out float g, out float b) 
 }
 
 void applyDisplaySaturation(inout float r, inout float g, inout float b) {
-  float sat = clamp(uColorSaturation, 1.0, 6.0);
+  float sat = clamp(uColorSaturation, 0.8, 6.0);
   float baseR = clamp01(r);
   float baseG = clamp01(g);
   float baseB = clamp01(b);
@@ -4614,7 +4614,7 @@ bool parseParamsMessage(const std::string& line, ResolvedPayload* out) {
   p.chromaticityPlanckianLocus = (chromaticityPlanckianLocus != 0);
   p.pointSize = clampf(p.pointSize, 0.35f, 3.0f);
   p.pointDensity = clampf(p.pointDensity, 0.1f, 4.0f);
-  p.colorSaturation = clampf(p.colorSaturation, 1.0f, 6.0f);
+  p.colorSaturation = clampf(p.colorSaturation, 0.8f, 6.0f);
   p.glossNeighborhood = std::clamp(p.glossNeighborhood, 0, 2);
   p.glossLiftScale = clampf(p.glossLiftScale, 0.25f, 3.0f);
   p.glossBodyOpacity = clampf(p.glossBodyOpacity, 0.0f, 1.0f);
@@ -5431,7 +5431,7 @@ float colorPreservationBiasForPlot(float pointSize, float pointDensity, int reso
 }
 
 float effectiveColorSaturationForPlot(float colorSaturation, float pointSize, float pointDensity, int resolution) {
-  const float base = clampf(colorSaturation, 1.0f, 6.0f);
+  const float base = clampf(colorSaturation, 0.8f, 6.0f);
   const float preserveBias = colorPreservationBiasForPlot(pointSize, pointDensity, resolution);
   if (preserveBias <= 0.0f) return base;
   const float saturationIntent = clampf((base - 1.0f) / 5.0f, 0.0f, 1.0f);
@@ -8095,7 +8095,7 @@ struct AppState {
   GlossViewColorMode glossViewColorMode = GlossViewColorMode::SemanticSignal;
   GlossViewDebugFieldMode glossViewDebugFieldMode = GlossViewDebugFieldMode::Signal;
   GlossViewDiagnosticOverlay glossViewDiagnosticOverlay = GlossViewDiagnosticOverlay::Off;
-  bool orthographicSnapEnabled = true;
+  bool orthographicSnapEnabled = false;
   float axisLockAccumDx = 0.0f;
   float axisLockAccumDy = 0.0f;
   int orientAxisLock = 0;
