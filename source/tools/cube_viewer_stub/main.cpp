@@ -2373,10 +2373,11 @@ struct ResolvedPayload {
   std::string pointShape = "Circle";
   int glossNeighborhood = 1;
   float glossLiftScale = 1.0f;
-  bool glossSpatialInset = true;
+  bool glossSpatialInset = false;
   float glossBodyOpacity = 0.10f;
   float glossHighlightOpacity = 0.42f;
   float glossPointCrispness = 0.72f;
+  bool glossHideText = false;
   bool showOverflow = false;
   bool highlightOverflow = true;
   bool cubeSlicingEnabled = false;
@@ -4588,12 +4589,15 @@ bool parseParamsMessage(const std::string& line, ResolvedPayload* out) {
   extractFloat(line, "colorSaturation", &p.colorSaturation);
   extractInt(line, "glossNeighborhood", &p.glossNeighborhood);
   extractFloat(line, "glossLiftScale", &p.glossLiftScale);
-  int glossSpatialInset = 1;
+  int glossSpatialInset = 0;
   extractInt(line, "glossSpatialInset", &glossSpatialInset);
   p.glossSpatialInset = (glossSpatialInset != 0);
   extractFloat(line, "glossBodyOpacity", &p.glossBodyOpacity);
   extractFloat(line, "glossHighlightOpacity", &p.glossHighlightOpacity);
   extractFloat(line, "glossPointCrispness", &p.glossPointCrispness);
+  int glossHideText = 0;
+  extractInt(line, "glossHideText", &glossHideText);
+  p.glossHideText = (glossHideText != 0);
   int identityOverlayEnabled = 0;
   extractInt(line, "identityOverlayEnabled", &identityOverlayEnabled);
   p.identityOverlayEnabled = (identityOverlayEnabled != 0);
@@ -9606,12 +9610,7 @@ void drawGlossLiftInfoOverlay(int width,
           : (signedSignalField
                  ? "Positive relief comes off the image plane  Negative relief goes behind it"
                  : "Relief = selected field value coming off the image plane | Debug basis"));
-  lines.emplace_back(
-      presentationMode == GlossViewPresentationMode::Field2D
-          ? "Tab/V = 2D/3D | A = algorithm | D = diagnostics | C = Color | B = Field"
-          : (payload.glossSpatialInset
-                 ? "Inset = linked 2D field | A = algorithm | D = diagnostics | C = Color | B = Field"
-                 : "A = algorithm | D = diagnostics | C = Color | B = Field"));
+  lines.emplace_back("Tab/V = 2D/3D | A = algorithm | D = diagnostics | C = Color | B = Field");
   const bool showLinearHint = !payload.plotDisplayLinear;
   if (showLinearHint) {
     lines.emplace_back("Assuming Linear encoded input");
@@ -10602,7 +10601,8 @@ void mouseButtonCallback(GLFWwindow* window, int button, int action, int mods) {
       } else if (app->plotMode == "chromaticity") {
         resetChromaticityCamera(&app->cam);
       } else if (isGlossViewPlotModeString(app->plotMode)) {
-        resetGlossLiftCamera(&app->cam);
+        setGlossViewOrthographicCamera(&app->cam, kGlossViewOrthoFront);
+        requestGlossViewOrthoInspectionFit(app);
       } else if (app->plotMode == "chen") {
         resetChenCamera(&app->cam);
       } else {
@@ -12318,7 +12318,7 @@ int main() {
                                   app.hoverY * hoverScaleY,
                                   overlayTextRenderer ? *overlayTextRenderer : hudText);
     }
-    if (isGlossViewPlotModeString(resolved.plotMode)) {
+    if (isGlossViewPlotModeString(resolved.plotMode) && !resolved.glossHideText) {
       drawGlossLiftInfoOverlay(width,
                                height,
                                resolved,
