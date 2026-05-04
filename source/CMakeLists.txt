@@ -86,7 +86,7 @@ find_package(CUDAToolkit QUIET)
 include(CheckLanguage)
 
 set(CHROMASPACE_CUDA_RUNTIME_TARGET CUDA::cudart)
-if(UNIX AND NOT APPLE AND CUDAToolkit_FOUND)
+if((WIN32 OR (UNIX AND NOT APPLE)) AND CUDAToolkit_FOUND AND TARGET CUDA::cudart_static)
   set(CHROMASPACE_CUDA_RUNTIME_TARGET CUDA::cudart_static)
 endif()
 
@@ -312,7 +312,7 @@ if(CHROMASPACE_VIEWER_HAS_CUDA)
   target_include_directories(Chromaspace_CubeViewer PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
   target_link_libraries(Chromaspace_CubeViewer PRIVATE ${CHROMASPACE_CUDA_RUNTIME_TARGET})
   set(_CHROMASPACE_VIEWER_CUDA_RUNTIME Shared)
-  if(UNIX AND NOT APPLE)
+  if((WIN32 OR (UNIX AND NOT APPLE)) AND CHROMASPACE_CUDA_RUNTIME_TARGET STREQUAL "CUDA::cudart_static")
     set(_CHROMASPACE_VIEWER_CUDA_RUNTIME Static)
   endif()
   set_target_properties(Chromaspace_CubeViewer PROPERTIES
