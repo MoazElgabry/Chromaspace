@@ -2284,7 +2284,6 @@ class ChromaspaceEffect : public ImageEffect {
     registerSharedViewerInstance();
     setStatusLabel("Disconnected");
     flushStatusLabelToHost();
-    updateActivePlotModelLabel(0.0);
     updateDrawOnImageModeUi(0.0);
     syncIdentityOverlayGroupOpenState(0.0);
     updateCircularHslToggleVisibility(0.0);
@@ -2308,7 +2307,6 @@ class ChromaspaceEffect : public ImageEffect {
 
   void syncPrivateData(void) override {
     flushStatusLabelToHost();
-    updateActivePlotModelLabel(0.0);
     updateDrawOnImageModeUi(0.0);
     syncIdentityOverlayGroupOpenState(0.0);
     updateCircularHslToggleVisibility(0.0);
@@ -2796,9 +2794,6 @@ class ChromaspaceEffect : public ImageEffect {
     if (suppressChromaspacePresetChangedHandling_) return;
     if (paramName == "cubeViewerRefreshNonce") {
       cubeViewerDebugLog("changedParam(cubeViewerRefreshNonce)");
-      return;
-    }
-    if (paramName == "cubeViewerActivePlotModel") {
       return;
     }
     if (paramName == "chromaspacePresetMenu") {
@@ -3365,7 +3360,6 @@ class ChromaspaceEffect : public ImageEffect {
     if (paramName == "cubeViewerCircularHsl") {
       cubeViewerDebugLog(std::string("changedParam(cubeViewerCircularHsl) -> ") +
                          (getBoolValue("cubeViewerCircularHsl", args.time, false) ? "1" : "0"));
-      updateActivePlotModelLabel(args.time);
       if (viewerSessionRequested()) {
         pushParamsUpdate(args.time, "cubeViewerCircularHsl");
         trySendCachedCloudOrRequestRefresh(args.time, "cubeViewerCircularHsl");
@@ -3375,7 +3369,6 @@ class ChromaspaceEffect : public ImageEffect {
     if (paramName == "cubeViewerCircularHsv") {
       cubeViewerDebugLog(std::string("changedParam(cubeViewerCircularHsv) -> ") +
                          (getBoolValue("cubeViewerCircularHsv", args.time, false) ? "1" : "0"));
-      updateActivePlotModelLabel(args.time);
       if (viewerSessionRequested()) {
         pushParamsUpdate(args.time, "cubeViewerCircularHsv");
         trySendCachedCloudOrRequestRefresh(args.time, "cubeViewerCircularHsv");
@@ -3385,7 +3378,6 @@ class ChromaspaceEffect : public ImageEffect {
     if (paramName == "cubeViewerNormConeNormalized") {
       cubeViewerDebugLog(std::string("changedParam(cubeViewerNormConeNormalized) -> ") +
                          (getBoolValue("cubeViewerNormConeNormalized", args.time, true) ? "1" : "0"));
-      updateActivePlotModelLabel(args.time);
       if (viewerSessionRequested()) {
         pushParamsUpdate(args.time, "cubeViewerNormConeNormalized");
         trySendCachedCloudOrRequestRefresh(args.time, "cubeViewerNormConeNormalized");
@@ -4143,7 +4135,6 @@ class ChromaspaceEffect : public ImageEffect {
     const std::string plotMode = currentPlotMode(time);
     cubeViewerDebugLog(std::string("changedParam(cubeViewerPlotModel) -> ") + plotMode +
                        " reason=" + reason);
-    updateActivePlotModelLabel(time);
     updateDrawOnImageModeUi(time);
     syncShowOverflowSupport(time);
     syncCubeSlicingUi(time);
@@ -4410,21 +4401,6 @@ class ChromaspaceEffect : public ImageEffect {
         return "Gloss View";
       default:
         return "Cube";
-    }
-  }
-
-  void updateActivePlotModelLabel(double time) {
-    auto* p = fetchStringParam("cubeViewerActivePlotModel");
-    if (!p) return;
-    const std::string next = currentDrawOnImageMode(time) ? "Identity Generator" : currentPlotModelDisplayLabel(time);
-    std::string current;
-    try {
-      p->getValueAtTime(time, current);
-    } catch (...) {
-      current.clear();
-    }
-    if (current != next) {
-      p->setValue(next);
     }
   }
 
@@ -5239,17 +5215,12 @@ class ChromaspaceEffect : public ImageEffect {
     if (auto* toggle = fetchPushButtonParam("cubeViewerModeToggle")) {
       toggle->setLabel(drawOnImage ? "Switch to 3D Viewer" : "Switch to Identity Generator");
     }
-    updateActivePlotModelLabel(time);
     setParamVisibility(fetchPushButtonParam("openCubeViewer"), !drawOnImage);
     setParamVisibility(fetchBooleanParam("cubeViewerPlotDisplayLinear"),
                        !drawOnImage && !chromaticityMode);
     setParamVisibility(fetchChoiceParam("cubeViewerPlotDisplayLinearTransfer"),
                        !drawOnImage && !chromaticityMode && currentPlotDisplayLinearEnabled(time));
     setParamVisibility(fetchChoiceParam("cubeViewerPlotModel"), !drawOnImage);
-    if (auto* activePlot = fetchStringParam("cubeViewerActivePlotModel")) {
-      activePlot->setIsSecret(drawOnImage);
-      activePlot->setEnabled(false);
-    }
     syncShowOverflowSupport(time);
     syncCubeSlicingUi(time);
     setParamVisibility(fetchPushButtonParam("closeCubeViewer"), !drawOnImage);
@@ -10249,7 +10220,6 @@ class ChromaspaceFactory : public PluginFactoryHelper<ChromaspaceFactory> {
 {"cubeViewerSampleDrawnCubeSize", "Sets the identity-strip resolution from 4 to 65. In the identity generator this controls the generated strip density, and in a downstream instance it should match instance 1 so the strip can be decoded correctly."},
           {"cubeViewerModeToggle", "Switch between the 3D viewer and the identity generator. The identity generator burns the identity strip into the image and hides plot-only controls."},
           {"cubeViewerPlotModel", "Choose which 3D color geometry or analysis view is used to inspect the current signal: RGB cube, HSL bicone or circular HSL, HSV hexcone or circular HSV, Chen, Norm-Cone, JP-Conical, Reuleaux, Chromaticity xyY, or Gloss View (beta)."},
-          {"cubeViewerActivePlotModel", "Read-only plot model currently active inside the plugin/viewer state. This mirrors viewer-menu changes even when a host delays repainting its native choice widget."},
           {"cubeViewerPlotDisplayLinear", "Decode sampled input values from the selected input transfer function to linear light before building the 3D plot. Intended for non-chromaticity plot modes."},
           {"cubeViewerPlotDisplayLinearTransfer", "Choose the assumed input transfer function used when Plot in Display Linear is enabled."},
           {"cubeViewerNormConeNormalized", "For Norm-Cone only: when enabled, use the normalized cone chroma from JP's DCTL; when disabled, use the raw spherical chroma variant instead."},
@@ -10291,17 +10261,6 @@ class ChromaspaceFactory : public PluginFactoryHelper<ChromaspaceFactory> {
     cubeViewerPlotModel->setDefault(std::clamp(chromaspaceDefaultValues.plotModel, 0, 8));
     cubeViewerPlotModel->setAnimates(false);
     if (const char* hint = tooltipFor("cubeViewerPlotModel")) cubeViewerPlotModel->setHint(hint);
-
-    auto* cubeViewerActivePlotModel = d.defineStringParam("cubeViewerActivePlotModel");
-    cubeViewerActivePlotModel->setLabel("Active Plot");
-    cubeViewerActivePlotModel->setStringType(eStringTypeLabel);
-    cubeViewerActivePlotModel->setDefault("Cube");
-    cubeViewerActivePlotModel->setAnimates(false);
-    cubeViewerActivePlotModel->setIsPersistant(false);
-    cubeViewerActivePlotModel->setCanUndo(false);
-    cubeViewerActivePlotModel->setEvaluateOnChange(false);
-    cubeViewerActivePlotModel->setEnabled(false);
-    if (const char* hint = tooltipFor("cubeViewerActivePlotModel")) cubeViewerActivePlotModel->setHint(hint);
 
     auto* openCubeViewer = d.definePushButtonParam("openCubeViewer");
     openCubeViewer->setLabel("Open 3D Viewer");
@@ -10849,7 +10808,6 @@ class ChromaspaceFactory : public PluginFactoryHelper<ChromaspaceFactory> {
     // params from plugin callbacks. Tell hosts up front so plugin-originated
     // updates are treated as legitimate parameter edits instead of stale UI state.
     markPluginMayWrite(cubeViewerPlotModel);
-    markPluginMayWrite(cubeViewerActivePlotModel);
     markPluginMayWrite(cubeViewerRefreshNonce);
     markPluginMayWrite(cubeViewerPlotDisplayLinear);
     markPluginMayWrite(cubeViewerPlotDisplayLinearTransfer);
