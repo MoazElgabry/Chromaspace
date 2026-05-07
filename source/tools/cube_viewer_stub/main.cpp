@@ -356,7 +356,7 @@ void notifyExistingViewerBringToFront() {
 }
 #endif
 
-const char* kViewerVersionString = "v1.0.10";
+const char* kViewerVersionString = "v1.0.11";
 
 #if !defined(_WIN32)
 bool sendAllSocket(int fd, const char* data, size_t size) {
@@ -2383,6 +2383,7 @@ struct ResolvedPayload {
   int plotDisplayLinearTransfer = 0;
   float sourceAspect = 16.0f / 9.0f;
   bool alwaysOnTop = true;
+  bool resetViewOnPlotSwitch = true;
   std::string quality = "Low";
   int resolution = 25;
   float pointSize = 1.4f;
@@ -4555,6 +4556,16 @@ bool cloudMatchesResolved(const ResolvedPayload& resolved, const InputCloudPaylo
          cloudSettingsCompatibleWithResolved(resolved.cloudSettingsKey, cloud.settingsKey);
 }
 
+bool mayKeepDrawingCurrentMeshDuringParamHandoff(const ResolvedPayload& previous,
+                                                 const ResolvedPayload& next,
+                                                 const InputCloudPayload& currentCloud) {
+  if (previous.sourceMode != "input" || next.sourceMode != "input") return false;
+  if (previous.plotMode != next.plotMode) return false;
+  if (isGlossViewPlotModeString(previous.plotMode) || isGlossViewPlotModeString(next.plotMode)) return false;
+  if (!senderMatchesCurrent(next.senderId, currentCloud.senderId)) return false;
+  return true;
+}
+
 std::mutex gMsgMutex;
 PendingMessage gPendingParamsMsg;
 PendingMessage gPendingCloudMsg;
@@ -4715,6 +4726,9 @@ bool parseParamsMessage(const std::string& line, ResolvedPayload* out) {
   int alwaysOnTop = 1;
   extractInt(line, "alwaysOnTop", &alwaysOnTop);
   p.alwaysOnTop = (alwaysOnTop != 0);
+  int resetViewOnPlotSwitch = 1;
+  extractInt(line, "resetViewOnPlotSwitch", &resetViewOnPlotSwitch);
+  p.resetViewOnPlotSwitch = (resetViewOnPlotSwitch != 0);
   int circularHsl = 0;
   extractInt(line, "circularHsl", &circularHsl);
   p.circularHsl = (circularHsl != 0);
@@ -8663,24 +8677,44 @@ void requestGlossViewOrthoInspectionFit(AppState* app) {
   app->glossOrthoAutoFitRequested = true;
 }
 
+void resetCameraForCurrentPlotMode(AppState* app, bool vectorscopeVariant) {
+  if (!app) return;
+  app->modelOrientation = Quat{};
+  if (vectorscopeVariant) {
+    if (app->plotMode == "hsl") {
+      resetHslTopCamera(&app->cam);
+    } else if (app->plotMode == "rgb") {
+      resetVectorscopeCamera(&app->cam);
+    } else if (app->plotMode == "chromaticity") {
+      resetChromaticityVectorscopeCamera(&app->cam);
+    } else if (isGlossViewPlotModeString(app->plotMode)) {
+      resetGlossLiftCamera(&app->cam);
+    } else if (app->plotMode == "chen") {
+      resetChenVectorscopeCamera(&app->cam);
+    } else if (app->plotMode == "jp_conical" || app->plotMode == "reuleaux") {
+      resetTightPolarVectorscopeCamera(&app->cam);
+    } else {
+      resetPolarVectorscopeCamera(&app->cam);
+    }
+  } else {
+    if (app->plotMode == "hsl") {
+      resetHslCamera(&app->cam);
+    } else if (app->plotMode == "chromaticity") {
+      resetChromaticityCamera(&app->cam);
+    } else if (isGlossViewPlotModeString(app->plotMode)) {
+      setGlossViewOrthographicCamera(&app->cam, kGlossViewOrthoFront);
+      requestGlossViewOrthoInspectionFit(app);
+    } else if (app->plotMode == "chen") {
+      resetChenCamera(&app->cam);
+    } else {
+      resetCamera(&app->cam);
+    }
+  }
+}
+
 void applyDefaultCameraForViewerPlotSelection(AppState* app, const std::string& prevPlotMode) {
   if (!app || prevPlotMode == app->plotMode) return;
-  if (app->plotMode == "chromaticity") {
-    setOrthographicInspectionCamera(&app->cam, 0);
-    app->cam.distance = 6.2f;
-    app->cam.panX = 0.0f;
-    app->cam.panY = -0.16f;
-    app->modelOrientation = Quat{};
-  } else if (isGlossViewPlotModeString(app->plotMode)) {
-    setGlossViewOrthographicCamera(&app->cam, kGlossViewOrthoFront);
-    requestGlossViewOrthoInspectionFit(app);
-    app->glossViewPresentation = GlossViewPresentationMode::Projection3D;
-    app->glossViewFieldAlgorithm = GlossViewFieldAlgorithm::Candidate1;
-    app->glossViewColorMode = GlossViewColorMode::SemanticSignal;
-    app->glossViewDebugFieldMode = GlossViewDebugFieldMode::Signal;
-    app->glossViewDiagnosticOverlay = GlossViewDiagnosticOverlay::Off;
-    app->modelOrientation = Quat{};
-  }
+  resetCameraForCurrentPlotMode(app, false);
   app->panVelocityX = 0.0f;
   app->panVelocityY = 0.0f;
   app->orientAxisLock = 0;
@@ -8689,6 +8723,7 @@ void applyDefaultCameraForViewerPlotSelection(AppState* app, const std::string& 
   app->zoomMode = false;
   app->panMode = false;
   app->shiftPanGesture = false;
+  resetGlossViewOrthoInteractionState(app);
 }
 
 void clearPointerInteractionState(AppState* app) {
@@ -11344,37 +11379,7 @@ void mouseButtonCallback(GLFWwindow* window, int button, int action, int mods) {
         setOrthographicInspectionCamera(&app->cam, nextOrthoView);
       }
     } else {
-      app->modelOrientation = Quat{};
-      if (ctrl) {
-      if (app->plotMode == "hsl") {
-        resetHslTopCamera(&app->cam);
-      } else if (app->plotMode == "rgb") {
-        resetVectorscopeCamera(&app->cam);
-      } else if (app->plotMode == "chromaticity") {
-        resetChromaticityVectorscopeCamera(&app->cam);
-      } else if (isGlossViewPlotModeString(app->plotMode)) {
-        resetGlossLiftCamera(&app->cam);
-      } else if (app->plotMode == "chen") {
-        resetChenVectorscopeCamera(&app->cam);
-      } else if (app->plotMode == "jp_conical" || app->plotMode == "reuleaux") {
-        resetTightPolarVectorscopeCamera(&app->cam);
-      } else {
-        resetPolarVectorscopeCamera(&app->cam);
-      }
-    } else {
-      if (app->plotMode == "hsl") {
-        resetHslCamera(&app->cam);
-      } else if (app->plotMode == "chromaticity") {
-        resetChromaticityCamera(&app->cam);
-      } else if (isGlossViewPlotModeString(app->plotMode)) {
-        setGlossViewOrthographicCamera(&app->cam, kGlossViewOrthoFront);
-        requestGlossViewOrthoInspectionFit(app);
-      } else if (app->plotMode == "chen") {
-        resetChenCamera(&app->cam);
-      } else {
-        resetCamera(&app->cam);
-      }
-    }
+      resetCameraForCurrentPlotMode(app, ctrl);
     }
     clearPointerInteractionState(app);
   }
@@ -12205,6 +12210,7 @@ int main() {
           logViewerEvent("Ignored stale params sequence.");
         } else {
           lastParamsSeq = next.seq;
+          const ResolvedPayload previousResolved = resolved;
           const std::string prevSourceMode = resolved.sourceMode;
           const std::string prevPlotMode = resolved.plotMode;
           resolved = next;
@@ -12217,39 +12223,9 @@ int main() {
           app.readIdentityPlot = resolved.readIdentityPlot;
           app.isolateIdentityData = resolved.isolateIdentityData;
           app.identityReadResolution = resolved.identityReadResolution;
-          if (prevPlotMode != resolved.plotMode && resolved.plotMode == "chromaticity") {
-            setOrthographicInspectionCamera(&app.cam, 0);
-            app.cam.distance = 6.2f;
-            app.cam.panX = 0.0f;
-            app.cam.panY = -0.16f;
-            app.modelOrientation = Quat{};
-            app.panVelocityX = 0.0f;
-            app.panVelocityY = 0.0f;
-            app.orientAxisLock = 0;
-            app.orientAxisFeedbackUntil = 0.0;
-            app.rollMode = false;
-            app.zoomMode = false;
-            app.panMode = false;
-            app.shiftPanGesture = false;
-            logViewerEvent("Applied default orthographic chart view for chromaticity mode.");
-          } else if (prevPlotMode != resolved.plotMode && isGlossViewPlotModeString(resolved.plotMode)) {
-            setGlossViewOrthographicCamera(&app.cam, kGlossViewOrthoFront);
-            requestGlossViewOrthoInspectionFit(&app);
-            app.glossViewPresentation = GlossViewPresentationMode::Projection3D;
-            app.glossViewFieldAlgorithm = GlossViewFieldAlgorithm::Candidate1;
-            app.glossViewColorMode = GlossViewColorMode::SemanticSignal;
-            app.glossViewDebugFieldMode = GlossViewDebugFieldMode::Signal;
-            app.glossViewDiagnosticOverlay = GlossViewDiagnosticOverlay::Off;
-            app.modelOrientation = Quat{};
-            app.panVelocityX = 0.0f;
-            app.panVelocityY = 0.0f;
-            app.orientAxisLock = 0;
-            app.orientAxisFeedbackUntil = 0.0;
-            app.rollMode = false;
-            app.zoomMode = false;
-            app.panMode = false;
-            app.shiftPanGesture = false;
-            logViewerEvent("Applied default front-orthographic 3D view for Gloss View mode.");
+          if (prevPlotMode != resolved.plotMode && resolved.resetViewOnPlotSwitch) {
+            applyDefaultCameraForViewerPlotSelection(&app, prevPlotMode);
+            logViewerEvent("Reset camera after plot model switch.");
           }
           if (app.diagTransitions && prevSourceMode != resolved.sourceMode) {
             std::ostringstream os;
@@ -12358,18 +12334,25 @@ int main() {
               logViewerEvent("Rebuilt active input cloud after params update.");
             }
           } else {
+            const bool keepDrawingCurrentMesh =
+                hasCurrentCloud &&
+                mayKeepDrawingCurrentMeshDuringParamHandoff(previousResolved, resolved, currentCloud);
             if (hasCurrentCloud) {
               deferredCloud = currentCloud;
               hasDeferredCloud = true;
               logViewerEvent("Deferred active input cloud after params changed settings.");
             }
-            hasCurrentCloud = false;
-            currentCloud = InputCloudPayload{};
-            mesh = MeshData{};
-            mesh.quality = "Waiting";
-            mesh.resolution = resolved.resolution;
-            mesh.paramHash.clear();
-            logViewerEvent("Cleared stale input cloud after params changed settings.");
+            if (keepDrawingCurrentMesh) {
+              logViewerEvent("Keeping previous input cloud visible while waiting for matching params/cloud handoff.");
+            } else {
+              hasCurrentCloud = false;
+              currentCloud = InputCloudPayload{};
+              mesh = MeshData{};
+              mesh.quality = "Waiting";
+              mesh.resolution = resolved.resolution;
+              mesh.paramHash.clear();
+              logViewerEvent("Cleared stale input cloud after params changed settings.");
+            }
           }
         }
       }

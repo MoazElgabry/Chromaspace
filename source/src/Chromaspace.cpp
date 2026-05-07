@@ -90,8 +90,8 @@ using namespace OFX;
 constexpr const char* kPluginIdentifier = "com.moazelgabry.chromaspace";
 constexpr const char* kPluginGrouping = "Moaz Elgabry";
 constexpr int kPluginVersionMajor = 1;
-constexpr int kPluginVersionMinor = 7;
-constexpr const char* kPluginVersionLabel = "v1.0.10";
+constexpr int kPluginVersionMinor = 8;
+constexpr const char* kPluginVersionLabel = "v1.0.11";
 constexpr const char* kPluginName = "Chromaspace";
 constexpr const char* kWebsiteUrl = "https://moazelgabry.com";
 constexpr const char* kReleasesUrl = "https://github.com/MoazElgabry/Chromaspace/releases/latest";
@@ -1547,6 +1547,7 @@ struct ChromaspacePresetValues {
   bool isolateIdentityData = false;
   bool liveUpdate = true;
   bool keepOnTop = true;
+  bool resetViewOnPlotSwitch = true;
   int updateMode = 0;
   int quality = 0;
   int scale = 3;
@@ -1615,6 +1616,7 @@ ChromaspacePresetValues chromaspaceFactoryPresetValues() {
   values.isolateIdentityData = false;
   values.liveUpdate = true;
   values.keepOnTop = true;
+  values.resetViewOnPlotSwitch = true;
   values.updateMode = 0;
   values.quality = 0;
   values.scale = 3;
@@ -1728,6 +1730,7 @@ bool chromaspacePresetValuesEqual(const ChromaspacePresetValues& a, const Chroma
          a.isolateIdentityData == b.isolateIdentityData &&
          a.liveUpdate == b.liveUpdate &&
          a.keepOnTop == b.keepOnTop &&
+         a.resetViewOnPlotSwitch == b.resetViewOnPlotSwitch &&
          a.updateMode == b.updateMode &&
          a.quality == b.quality &&
          a.scale == b.scale &&
@@ -1947,6 +1950,7 @@ std::string chromaspacePresetValuesAsJson(const ChromaspacePresetValues& values)
   os << "\"isolateIdentityData\":" << (values.isolateIdentityData ? "true" : "false") << ",";
   os << "\"liveUpdate\":" << (values.liveUpdate ? "true" : "false") << ",";
   os << "\"keepOnTop\":" << (values.keepOnTop ? "true" : "false") << ",";
+  os << "\"resetViewOnPlotSwitch\":" << (values.resetViewOnPlotSwitch ? "true" : "false") << ",";
   os << "\"updateMode\":" << values.updateMode << ",";
   os << "\"quality\":" << values.quality << ",";
   os << "\"scale\":" << values.scale << ",";
@@ -1991,6 +1995,7 @@ bool parseChromaspacePresetValuesFromJson(const std::string& json, ChromaspacePr
   (void)extractJsonBoolField(json, "isolateIdentityData", &values.isolateIdentityData);
   (void)extractJsonBoolField(json, "liveUpdate", &values.liveUpdate);
   (void)extractJsonBoolField(json, "keepOnTop", &values.keepOnTop);
+  (void)extractJsonBoolField(json, "resetViewOnPlotSwitch", &values.resetViewOnPlotSwitch);
   (void)extractJsonIntField(json, "updateMode", &values.updateMode);
   (void)extractJsonIntField(json, "quality", &values.quality);
   (void)extractJsonIntField(json, "scale", &values.scale);
@@ -2559,7 +2564,17 @@ class ChromaspaceEffect : public ImageEffect {
     if (drivesViewer) noteSharedViewerRenderActivity(sourceId);
     const auto renderNow = std::chrono::steady_clock::now();
     const std::string settingsKey = currentCloudSettingsKey(args.time);
-    const bool needCloudWork = !drawOnImageMode && drivesViewer && cubeViewerLive_;
+    const bool windowUsableForCloud = cubeViewerWindowUsable_;
+    if (!drawOnImageMode && drivesViewer && windowUsableForCloud &&
+        viewerWindowRestoreRefreshPending_.exchange(false, std::memory_order_acq_rel)) {
+      cubeViewerInputCloudRefreshPending_ = true;
+      deferredLatestCloudRefresh_.store(false, std::memory_order_relaxed);
+      deferredAuthoritativeCloudRefresh_.store(false, std::memory_order_relaxed);
+      authoritativeOnlyCloudRefresh_.store(false, std::memory_order_relaxed);
+      pushParamsUpdate(args.time, "viewer-restored");
+      cubeViewerDebugLog("Viewer restored; scheduling cloud refresh.");
+    }
+    const bool needCloudWork = !drawOnImageMode && drivesViewer && cubeViewerLive_ && windowUsableForCloud;
     const bool previewMode = shouldUseInteractivePreview(renderNow);
     const bool firstHandoff = cubeViewerInputCloudRefreshPending_;
     const bool useConservativeCloudPath = currentUseInstance1Requested(args.time);
@@ -2609,7 +2624,7 @@ class ChromaspaceEffect : public ImageEffect {
     if (needCloudWork && !firstHandoff && !steadyState && cloudQueuedOrInFlight_.load(std::memory_order_relaxed)) {
       deferredLatestCloudRefresh_.store(true, std::memory_order_relaxed);
     }
-    if (!drawOnImageMode && drivesViewer && !cubeViewerConnected_) {
+    if (!drawOnImageMode && drivesViewer && windowUsableForCloud && !cubeViewerConnected_) {
       pushParamsUpdate(args.time, "render/connect");
     }
     OverlayStripData overlay{};
@@ -3160,7 +3175,6 @@ class ChromaspaceEffect : public ImageEffect {
     if (paramName == "cubeViewerNeutralRadius") {
       cubeViewerDebugLog(std::string("changedParam(cubeViewerNeutralRadius) -> ") +
                          std::to_string(currentNeutralRadiusValue(args.time)));
-      requestCubeViewerCloudResample();
       syncChromaspacePresetMenuState(args.time);
       if (viewerSessionRequested()) {
         pushParamsUpdate(args.time, "cubeViewerNeutralRadius");
@@ -3240,6 +3254,15 @@ class ChromaspaceEffect : public ImageEffect {
       syncChromaspacePresetMenuState(args.time);
       if (viewerSessionRequested()) {
         pushParamsUpdate(args.time, "cubeViewerOnTop");
+      }
+      return;
+    }
+    if (paramName == "cubeViewerResetViewOnPlotSwitch") {
+      cubeViewerDebugLog(std::string("changedParam(cubeViewerResetViewOnPlotSwitch) -> ") +
+                         (getBoolValue("cubeViewerResetViewOnPlotSwitch", args.time, true) ? "1" : "0"));
+      syncChromaspacePresetMenuState(args.time);
+      if (viewerSessionRequested()) {
+        pushParamsUpdate(args.time, "cubeViewerResetViewOnPlotSwitch");
       }
       return;
     }
@@ -3454,6 +3477,7 @@ class ChromaspaceEffect : public ImageEffect {
   bool cubeViewerLive_ = true;
   int cubeViewerUpdateMode_ = 0;
   int cubeViewerQuality_ = 0;
+  std::atomic<bool> viewerWindowRestoreRefreshPending_{false};
   bool cubeViewerInputCloudRefreshPending_ = false;
   std::chrono::steady_clock::time_point viewerLaunchPendingSince_{};
   bool rememberedShowOverflowValue_ = false;
@@ -4582,7 +4606,7 @@ class ChromaspaceEffect : public ImageEffect {
            getBoolValue("cubeViewerSliceMagenta", time, false);
   }
 
-  SliceSelectionSpec currentHueSectorSliceSpec(double time) {
+  SliceSelectionSpec currentHueSectorSliceSpec(double time, bool includeNeutralRadius = true) {
     SliceSelectionSpec spec{};
     const std::string plotMode = currentPlotMode(time);
     if (plotMode == "hsl") {
@@ -4607,8 +4631,8 @@ class ChromaspaceEffect : public ImageEffect {
     spec.circularHsv = currentCircularHsv(time);
     spec.normConeNormalized = getBoolValue("cubeViewerNormConeNormalized", time, true);
     spec.enabled = currentHueSectorSlicingEnabled(time);
-    spec.neutralRadiusEnabled = currentNeutralRadiusSlicingEnabled(time);
-    spec.neutralRadius = static_cast<float>(currentNeutralRadiusValue(time));
+    spec.neutralRadiusEnabled = includeNeutralRadius && currentNeutralRadiusSlicingEnabled(time);
+    spec.neutralRadius = includeNeutralRadius ? static_cast<float>(currentNeutralRadiusValue(time)) : 1.0f;
     spec.cubeSliceRed = getBoolValue("cubeViewerSliceRed", time, true);
     spec.cubeSliceGreen = getBoolValue("cubeViewerSliceGreen", time, false);
     spec.cubeSliceBlue = getBoolValue("cubeViewerSliceBlue", time, false);
@@ -4702,6 +4726,8 @@ class ChromaspaceEffect : public ImageEffect {
         getBoolValue("cubeViewerShowIdentityOnly", time, values.isolateIdentityData);
     values.liveUpdate = getBoolValue("cubeViewerLive", time, values.liveUpdate);
     values.keepOnTop = getBoolValue("cubeViewerOnTop", time, values.keepOnTop);
+    values.resetViewOnPlotSwitch =
+        getBoolValue("cubeViewerResetViewOnPlotSwitch", time, values.resetViewOnPlotSwitch);
     values.updateMode = getChoiceValue("cubeViewerUpdateMode", time, values.updateMode);
     values.quality = getChoiceValue("cubeViewerQuality", time, values.quality);
     values.scale = getChoiceValue("cubeViewerScale", time, values.scale);
@@ -4749,6 +4775,7 @@ class ChromaspaceEffect : public ImageEffect {
     if (auto* p = fetchBooleanParam("cubeViewerShowIdentityOnly")) p->setValue(values.isolateIdentityData);
     if (auto* p = fetchBooleanParam("cubeViewerLive")) p->setValue(values.liveUpdate);
     if (auto* p = fetchBooleanParam("cubeViewerOnTop")) p->setValue(values.keepOnTop);
+    if (auto* p = fetchBooleanParam("cubeViewerResetViewOnPlotSwitch")) p->setValue(values.resetViewOnPlotSwitch);
     if (auto* p = fetchChoiceParam("cubeViewerUpdateMode")) p->setValue(values.updateMode);
     if (auto* p = fetchChoiceParam("cubeViewerQuality")) p->setValue(values.quality);
     if (auto* p = fetchChoiceParam("cubeViewerScale")) p->setValue(values.scale);
@@ -4958,6 +4985,7 @@ class ChromaspaceEffect : public ImageEffect {
            paramName == "cubeViewerSampleDrawnCubeSize" ||
            paramName == "cubeViewerLive" ||
            paramName == "cubeViewerOnTop" ||
+           paramName == "cubeViewerResetViewOnPlotSwitch" ||
            paramName == "cubeViewerUpdateMode" ||
            paramName == "cubeViewerQuality" ||
            paramName == "cubeViewerScale" ||
@@ -5226,6 +5254,7 @@ class ChromaspaceEffect : public ImageEffect {
     setParamVisibility(fetchPushButtonParam("closeCubeViewer"), !drawOnImage);
     setParamVisibility(fetchBooleanParam("cubeViewerLive"), !drawOnImage);
     setParamVisibility(fetchBooleanParam("cubeViewerOnTop"), !drawOnImage);
+    setParamVisibility(fetchBooleanParam("cubeViewerResetViewOnPlotSwitch"), !drawOnImage);
     setParamVisibility(fetchChoiceParam("cubeViewerQuality"), !drawOnImage);
     setParamVisibility(fetchChoiceParam("cubeViewerScale"), !drawOnImage);
     setParamVisibility(fetchDoubleParam("cubeViewerPointSize"), !drawOnImage);
@@ -5576,7 +5605,6 @@ class ChromaspaceEffect : public ImageEffect {
     const bool glossView = currentGlossViewPlotMode(time);
     const bool plotDisplayLinear = currentPlotDisplayLinearEnabled(time);
     const int plotDisplayLinearTransfer = currentPlotDisplayLinearTransferChoice(time);
-    const bool neutralRadiusEnabled = currentNeutralRadiusSlicingEnabled(time);
     std::ostringstream oss;
     oss << "quality=" << qualityLabelForIndex(qualityIndex)
         << "|resolution=" << qualityResolutionForIndex(qualityIndex)
@@ -5593,10 +5621,6 @@ class ChromaspaceEffect : public ImageEffect {
         << "|readIdentityPlot=" << (readIdentityPlot ? 1 : 0)
         << "|readGrayRamp=" << (readGrayRamp ? 1 : 0)
         << "|sampleDrawnCubeSize=" << sampleDrawnCubeResolvedSize;
-    if (neutralRadiusEnabled) {
-      oss << "|neutralRadius=1"
-          << "|neutralRadiusValue=" << currentNeutralRadiusValue(time);
-    }
     return oss.str();
   }
 
@@ -5791,6 +5815,7 @@ class ChromaspaceEffect : public ImageEffect {
     const bool glossHideText = currentGlossHideTextEnabled(time);
     const int resolution = qualityResolutionForIndex(qualityIndex);
     const bool onTop = getBoolValue("cubeViewerOnTop", time, true);
+    const bool resetViewOnPlotSwitch = getBoolValue("cubeViewerResetViewOnPlotSwitch", time, true);
     const double pointSize = getDoubleValue("cubeViewerPointSize", time, 1.4);
     const double colorSaturation = getDoubleValue("cubeViewerColorSaturation", time, 2.0);
     const double pointDensity = derivedDensityScaleForPointSize(pointSize);
@@ -5849,6 +5874,7 @@ class ChromaspaceEffect : public ImageEffect {
         << ",\"chromaticityOverlayPrimaries\":" << chromaticityOverlayPrimaries
         << ",\"chromaticityPlanckianLocus\":" << (chromaticityPlanckianLocus ? 1 : 0)
         << ",\"alwaysOnTop\":" << (onTop ? 1 : 0)
+        << ",\"resetViewOnPlotSwitch\":" << (resetViewOnPlotSwitch ? 1 : 0)
         << ",\"quality\":\"" << qualityLabelForIndex(qualityIndex) << "\""
         << ",\"sampling\":\"" << samplingModeLabelForIndex(samplingMode) << "\""
         << ",\"occupancyFill\":" << (occupancyFill ? 1 : 0)
@@ -6912,7 +6938,7 @@ class ChromaspaceEffect : public ImageEffect {
     const int resolution = qualityResolutionForIndex(qualityIndex);
     const bool preserveOverflow = currentShowOverflow(time);
     const bool occupancyFill = currentOccupancyGuidedFill(time);
-    const SliceSelectionSpec hueSliceSpec = currentHueSectorSliceSpec(time);
+    const SliceSelectionSpec hueSliceSpec = currentHueSectorSliceSpec(time, false);
     const float effectiveNeutralRadius = effectiveNeutralRadiusThreshold(hueSliceSpec.neutralRadius);
     const bool anyHueRegionSelected = hueSliceSpec.cubeSliceRed || hueSliceSpec.cubeSliceGreen ||
                                       hueSliceSpec.cubeSliceBlue || hueSliceSpec.cubeSliceCyan ||
@@ -8136,7 +8162,7 @@ class ChromaspaceEffect : public ImageEffect {
         ViewerCloudSamplesBuildResult cudaBuilt{};
         std::string reason;
         if (buildWholeImageCloudCuda(cudaRequest,
-                                     currentHueSectorSliceSpec(args.time),
+                                     currentHueSectorSliceSpec(args.time, false),
                                      reinterpret_cast<cudaStream_t>(args.pCudaStream),
                                      &cudaBuilt,
                                      &reason)) {
@@ -8194,7 +8220,7 @@ class ChromaspaceEffect : public ImageEffect {
       ViewerCloudSamplesBuildResult cudaBuilt{};
       std::string reason;
       if (buildWholeImageCloudCuda(cudaRequest,
-                                   currentHueSectorSliceSpec(args.time),
+                                   currentHueSectorSliceSpec(args.time, false),
                                    reinterpret_cast<cudaStream_t>(args.pCudaStream),
                                    &cudaBuilt,
                                    &reason)) {
@@ -8259,7 +8285,7 @@ class ChromaspaceEffect : public ImageEffect {
         int cachedResolution = cachedStripResolution;
         if (allowStripCacheReuse &&
             tryGetCachedIdentityStripCloud(stripCacheKey, &cachedStripSamples, nullptr, &cachedResolution) &&
-            buildWholeImageCloudMetal(request, currentHueSectorSliceSpec(args.time), src, args, &metalBuilt, &reason)) {
+            buildWholeImageCloudMetal(request, currentHueSectorSliceSpec(args.time, false), src, args, &metalBuilt, &reason)) {
           CloudBuildResult imageOnly = finalizeCloudBuildFromSamples(metalBuilt.samples,
                                                                      metalBuilt.paramHash,
                                                                      request.settingsKey,
@@ -8288,7 +8314,7 @@ class ChromaspaceEffect : public ImageEffect {
                                                metalBuilt.primaryAccepted + static_cast<int>(cachedStripSamples.size()));
         }
         if (buildWholeImageAndInstance1CloudMetal(
-                request, currentHueSectorSliceSpec(args.time), src, args, &metalBuilt, &stripResolution, &reason)) {
+                request, currentHueSectorSliceSpec(args.time, false), src, args, &metalBuilt, &stripResolution, &reason)) {
           if (allowStripCacheReuse &&
               !metalBuilt.identityStripSamples.empty() &&
               !metalBuilt.identityStripParamHash.empty()) {
@@ -8310,7 +8336,7 @@ class ChromaspaceEffect : public ImageEffect {
                                                metalBuilt.primaryAccepted);
         }
         cubeViewerDebugLog(std::string("Viewer combined Metal kernel path fell back in instance1 mode: ") + reason);
-        if (buildWholeImageCloudMetal(request, currentHueSectorSliceSpec(args.time), src, args, &metalBuilt, &reason)) {
+        if (buildWholeImageCloudMetal(request, currentHueSectorSliceSpec(args.time, false), src, args, &metalBuilt, &reason)) {
           cubeViewerDebugLog("Viewer cloud backend selected: Metal-kernel");
           CloudBuildResult imageOnly = finalizeCloudBuildFromSamples(metalBuilt.samples,
                                                                      metalBuilt.paramHash,
@@ -8335,7 +8361,7 @@ class ChromaspaceEffect : public ImageEffect {
         args.isEnabledMetalRender && args.pMetalCmdQ != nullptr && src->getPixelData() != nullptr) {
       ViewerCloudSamplesBuildResult metalBuilt{};
       std::string reason;
-      if (buildWholeImageCloudMetal(request, currentHueSectorSliceSpec(args.time), src, args, &metalBuilt, &reason)) {
+      if (buildWholeImageCloudMetal(request, currentHueSectorSliceSpec(args.time, false), src, args, &metalBuilt, &reason)) {
         cubeViewerDebugLog("Viewer cloud backend selected: Metal-kernel");
         return finalizeCloudBuildFromSamples(metalBuilt.samples,
                                              metalBuilt.paramHash,
@@ -8899,6 +8925,7 @@ class ChromaspaceEffect : public ImageEffect {
     cubeViewerRequested_ = false;
     cubeViewerConnected_ = false;
     cubeViewerWindowUsable_ = false;
+    viewerWindowRestoreRefreshPending_.store(false, std::memory_order_release);
     cubeViewerInputCloudRefreshPending_ = false;
     viewerLaunchPendingSince_ = std::chrono::steady_clock::time_point{};
     lastCloudBuiltAt_ = std::chrono::steady_clock::time_point{};
@@ -8918,6 +8945,7 @@ class ChromaspaceEffect : public ImageEffect {
     cubeViewerRequested_ = false;
     cubeViewerConnected_ = false;
     cubeViewerWindowUsable_ = false;
+    viewerWindowRestoreRefreshPending_.store(false, std::memory_order_release);
     cubeViewerInputCloudRefreshPending_ = false;
     viewerLaunchPendingSince_ = std::chrono::steady_clock::time_point{};
     lastHeartbeatAt_ = std::chrono::steady_clock::time_point{};
@@ -8984,12 +9012,22 @@ class ChromaspaceEffect : public ImageEffect {
 
       failedProbeCount = 0;
       cubeViewerConnected_ = true;
+      const bool wasWindowUsable = cubeViewerWindowUsable_;
       cubeViewerWindowUsable_ = probe.visible && !probe.iconified;
       lastHeartbeatAt_ = std::chrono::steady_clock::now();
       if (!probe.visible || probe.iconified) {
-        markViewerInactive(probe.iconified ? "Viewer minimized; auto-disconnecting."
-                                           : "Viewer hidden; auto-disconnecting.");
+        setStatusLabel("Connected");
+        cubeViewerDebugLog(probe.iconified ? "Viewer minimized; pausing cloud processing."
+                                           : "Viewer hidden; pausing cloud processing.");
         continue;
+      }
+      if (!wasWindowUsable) {
+        viewerWindowRestoreRefreshPending_.store(true, std::memory_order_release);
+        cubeViewerInputCloudRefreshPending_ = true;
+        deferredLatestCloudRefresh_.store(false, std::memory_order_relaxed);
+        deferredAuthoritativeCloudRefresh_.store(false, std::memory_order_relaxed);
+        authoritativeOnlyCloudRefresh_.store(false, std::memory_order_relaxed);
+        cubeViewerDebugLog("Viewer became usable after being minimized/hidden; refresh pending.");
       }
 
       // Viewer menu commands arrive through heartbeat replies, but the status thread
@@ -9502,7 +9540,9 @@ class ChromaspaceEffect : public ImageEffect {
         if (sendViewerMessageWithRetry(params.payload, false)) {
           markViewerTransportActivity();
           cubeViewerConnected_ = true;
-          cubeViewerWindowUsable_ = true;
+          if (lastHeartbeatAt_ == std::chrono::steady_clock::time_point{} || cubeViewerWindowUsable_) {
+            cubeViewerWindowUsable_ = true;
+          }
           if (canPublishViewerOutput(0.0)) {
             markSharedViewerActiveSender();
           }
@@ -9526,7 +9566,9 @@ class ChromaspaceEffect : public ImageEffect {
           retainSentCloudTransportBlob(cloud.keepAliveBlob);
           markViewerTransportActivity();
           cubeViewerConnected_ = true;
-          cubeViewerWindowUsable_ = true;
+          if (lastHeartbeatAt_ == std::chrono::steady_clock::time_point{} || cubeViewerWindowUsable_) {
+            cubeViewerWindowUsable_ = true;
+          }
           setStatusLabel("Updating");
           cubeViewerDebugLog("Cloud payload send succeeded.");
           logSharedViewerEvent("io/sendCloud/success");
@@ -9749,6 +9791,7 @@ class ChromaspaceEffect : public ImageEffect {
       cubeViewerRequested_ = false;
       cubeViewerConnected_ = false;
       cubeViewerWindowUsable_ = false;
+      viewerWindowRestoreRefreshPending_.store(false, std::memory_order_release);
       cubeViewerInputCloudRefreshPending_ = false;
       viewerLaunchPendingSince_ = std::chrono::steady_clock::time_point{};
       setStatusLabel("Viewer launch failed");
@@ -9760,6 +9803,7 @@ class ChromaspaceEffect : public ImageEffect {
     markViewerTransportActivity();
     cubeViewerConnected_ = existing.ok;
     cubeViewerWindowUsable_ = existing.ok ? (existing.visible && !existing.iconified) : true;
+    viewerWindowRestoreRefreshPending_.store(false, std::memory_order_release);
     viewerLaunchPendingSince_ =
         (!existing.ok && launchedOrConnected) ? std::chrono::steady_clock::now()
                                               : std::chrono::steady_clock::time_point{};
@@ -9793,6 +9837,7 @@ class ChromaspaceEffect : public ImageEffect {
     cubeViewerRequested_ = false;
     cubeViewerConnected_ = false;
     cubeViewerWindowUsable_ = false;
+    viewerWindowRestoreRefreshPending_.store(false, std::memory_order_release);
     cubeViewerInputCloudRefreshPending_ = false;
     deferredLatestCloudRefresh_.store(false, std::memory_order_relaxed);
     deferredAuthoritativeCloudRefresh_.store(false, std::memory_order_relaxed);
@@ -10186,6 +10231,7 @@ class ChromaspaceFactory : public PluginFactoryHelper<ChromaspaceFactory> {
           {"cubeViewerLive", "When enabled, changes update the viewer continuously."},
           {"cubeViewerUpdateMode", "Choose how live viewer refreshes are scheduled. Auto adapts between fluid and scheduled behavior, Fluid prioritizes the smoothest point-cloud updates, and Scheduled prioritizes steadier host playback when live updates become heavy."},
           {"cubeViewerOnTop", "Keep the external viewer above the host application."},
+          {"cubeViewerResetViewOnPlotSwitch", "Reset the external viewer camera to the plot model's default view whenever the Plot Model changes."},
           {"cubeViewerQuality", "Viewer sampling density for the 3D cube (Low=25^3, about 45k points; Medium=41^3, about 90k points; High=57^3, about 180k points)."},
           {"cubeViewerScale", "Scales the sampled image domain used for cube generation to lighten processing. 100% keeps full size, while lower values reduce cloud-build work."},
           {"cubeViewerPointSize", "Makes points larger or smaller and automatically adjusts point density in the opposite direction to keep the cloud readable. Sizes above 1.0 use a looser density reduction so the cloud can clump more densely instead of opening up too much."},
@@ -10663,6 +10709,14 @@ class ChromaspaceFactory : public PluginFactoryHelper<ChromaspaceFactory> {
     cubeViewerOnTop->setParent(*grpCubeViewer);
     if (const char* hint = tooltipFor("cubeViewerOnTop")) cubeViewerOnTop->setHint(hint);
 
+    auto* cubeViewerResetViewOnPlotSwitch = d.defineBooleanParam("cubeViewerResetViewOnPlotSwitch");
+    cubeViewerResetViewOnPlotSwitch->setLabel("Reset Camera on Model Switch");
+    cubeViewerResetViewOnPlotSwitch->setDefault(chromaspaceDefaultValues.resetViewOnPlotSwitch);
+    cubeViewerResetViewOnPlotSwitch->setParent(*grpCubeViewer);
+    if (const char* hint = tooltipFor("cubeViewerResetViewOnPlotSwitch")) {
+      cubeViewerResetViewOnPlotSwitch->setHint(hint);
+    }
+
     auto* grpCubeViewerPerformance = d.defineGroupParam("grp_cube_viewer_performance");
     grpCubeViewerPerformance->setLabel("Performance");
     grpCubeViewerPerformance->setOpen(true);
@@ -10844,6 +10898,7 @@ class ChromaspaceFactory : public PluginFactoryHelper<ChromaspaceFactory> {
     markPluginMayWrite(cubeViewerSampleDrawnCubeSize);
     markPluginMayWrite(cubeViewerLive);
     markPluginMayWrite(cubeViewerOnTop);
+    markPluginMayWrite(cubeViewerResetViewOnPlotSwitch);
     markPluginMayWrite(cubeViewerUpdateMode);
     markPluginMayWrite(cubeViewerQuality);
     markPluginMayWrite(cubeViewerScale);
