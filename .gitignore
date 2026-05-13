@@ -1,0 +1,43 @@
+# Build directories
+build/
+out/
+dist/
+install/
+_deps/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+compile_commands.json
+
+# Generated bundles and packaged release artifacts
+*.ofx.bundle/
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.7z
+*.dmg
+
+# Native build products
+*.exe
+*.dll
+*.so
+*.dylib
+*.lib
+*.a
+*.obj
+*.o
+*.pdb
+*.ilk
+*.exp
+
+# Logs and local diagnostics
+*.log
+local-*.png
+*_ACTIVE_DOCUMENT.md
+
+# Local editor/OS state
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
