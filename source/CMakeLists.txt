@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(Chromaspace VERSION 1.0.11 LANGUAGES CXX)
-set(CUBE_DISPLAY_VERSION "1.0.11")
+project(Chromaspace VERSION 1.0.12 LANGUAGES CXX)
+set(CUBE_DISPLAY_VERSION "1.0.12")
 set(PLUGIN_BASENAME "Chromaspace")
 set(PLUGIN_IDENTIFIER "com.moazelgabry.chromaspace")
 set(LOCAL_OFX_SDK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/ofx-sdk")
@@ -190,6 +190,8 @@ endif()
 
 if(APPLE)
   target_compile_features(${PLUGIN_BASENAME} PRIVATE cxx_std_17)
+  target_compile_options(${PLUGIN_BASENAME} PRIVATE
+    $<$<COMPILE_LANGUAGE:OBJCXX>:-fobjc-arc>)
   target_link_libraries(${PLUGIN_BASENAME} PRIVATE "-framework Foundation" "-framework Metal" "-framework OpenGL")
 endif()
 
@@ -322,6 +324,10 @@ if(CHROMASPACE_VIEWER_HAS_CUDA)
     CUDA_SEPARABLE_COMPILATION OFF)
 endif()
 target_link_libraries(Chromaspace_CubeViewer PRIVATE ${CHROMASPACE_TEXT_DEPS_TARGET})
+if(APPLE)
+  target_compile_options(Chromaspace_CubeViewer PRIVATE
+    $<$<COMPILE_LANGUAGE:OBJCXX>:-fobjc-arc>)
+endif()
 if(CHROMASPACE_TEXT_DEPS_EXTERNAL_TARGET)
   add_dependencies(Chromaspace_CubeViewer ${CHROMASPACE_TEXT_DEPS_EXTERNAL_TARGET})
 endif()

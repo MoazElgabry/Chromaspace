@@ -90,8 +90,8 @@ using namespace OFX;
 constexpr const char* kPluginIdentifier = "com.moazelgabry.chromaspace";
 constexpr const char* kPluginGrouping = "Moaz Elgabry";
 constexpr int kPluginVersionMajor = 1;
-constexpr int kPluginVersionMinor = 8;
-constexpr const char* kPluginVersionLabel = "v1.0.11";
+constexpr int kPluginVersionMinor = 9;
+constexpr const char* kPluginVersionLabel = "v1.0.12";
 constexpr const char* kPluginName = "Chromaspace";
 constexpr const char* kWebsiteUrl = "https://moazelgabry.com";
 constexpr const char* kReleasesUrl = "https://github.com/MoazElgabry/Chromaspace/releases/latest";
@@ -1527,6 +1527,7 @@ struct ChromaspacePresetValues {
   double glossHighlightOpacity = 1.0;
   double glossPointCrispness = 0.0;
   bool glossHideText = false;
+  bool chromaticitySpectralLocus3D = true;
   bool plotInLinear = false;
   int inputTransferFunction = static_cast<int>(WorkshopColor::TransferFunctionId::Gamma24);
   bool showOverflow = false;
@@ -1596,6 +1597,7 @@ ChromaspacePresetValues chromaspaceFactoryPresetValues() {
   values.glossHighlightOpacity = 1.0;
   values.glossPointCrispness = 0.0;
   values.glossHideText = false;
+  values.chromaticitySpectralLocus3D = true;
   values.plotInLinear = false;
   values.inputTransferFunction = static_cast<int>(WorkshopColor::TransferFunctionId::Gamma24);
   values.showOverflow = false;
@@ -1710,6 +1712,7 @@ bool chromaspacePresetValuesEqual(const ChromaspacePresetValues& a, const Chroma
          std::abs(a.glossHighlightOpacity - b.glossHighlightOpacity) <= 1e-6 &&
          std::abs(a.glossPointCrispness - b.glossPointCrispness) <= 1e-6 &&
          a.glossHideText == b.glossHideText &&
+         a.chromaticitySpectralLocus3D == b.chromaticitySpectralLocus3D &&
          a.plotInLinear == b.plotInLinear &&
          a.inputTransferFunction == b.inputTransferFunction &&
          a.showOverflow == b.showOverflow &&
@@ -1930,6 +1933,7 @@ std::string chromaspacePresetValuesAsJson(const ChromaspacePresetValues& values)
   os << "\"glossHighlightOpacity\":" << std::setprecision(15) << values.glossHighlightOpacity << ",";
   os << "\"glossPointCrispness\":" << std::setprecision(15) << values.glossPointCrispness << ",";
   os << "\"glossHideText\":" << (values.glossHideText ? "true" : "false") << ",";
+  os << "\"chromaticitySpectralLocus3D\":" << (values.chromaticitySpectralLocus3D ? "true" : "false") << ",";
   os << "\"plotInLinear\":" << (values.plotInLinear ? "true" : "false") << ",";
   os << "\"inputTransferFunction\":" << values.inputTransferFunction << ",";
   os << "\"showOverflow\":" << (values.showOverflow ? "true" : "false") << ",";
@@ -1975,6 +1979,7 @@ bool parseChromaspacePresetValuesFromJson(const std::string& json, ChromaspacePr
   (void)extractJsonDoubleField(json, "glossHighlightOpacity", &values.glossHighlightOpacity);
   (void)extractJsonDoubleField(json, "glossPointCrispness", &values.glossPointCrispness);
   (void)extractJsonBoolField(json, "glossHideText", &values.glossHideText);
+  (void)extractJsonBoolField(json, "chromaticitySpectralLocus3D", &values.chromaticitySpectralLocus3D);
   (void)extractJsonBoolField(json, "plotInLinear", &values.plotInLinear);
   (void)extractJsonIntField(json, "inputTransferFunction", &values.inputTransferFunction);
   (void)extractJsonBoolField(json, "showOverflow", &values.showOverflow);
@@ -3418,7 +3423,8 @@ class ChromaspaceEffect : public ImageEffect {
       }
       return;
     }
-    if (paramName == "cubeViewerChromaticityPlanckianLocus") {
+    if (paramName == "cubeViewerChromaticityPlanckianLocus" ||
+        paramName == "cubeViewerChromaticitySpectralLocus3D") {
       cubeViewerDebugLog(std::string("changedParam(") + paramName + ")");
       if (viewerSessionRequested()) {
         pushParamsUpdate(args.time, paramName);
@@ -4671,6 +4677,10 @@ class ChromaspaceEffect : public ImageEffect {
     return getBoolValue("cubeViewerChromaticityPlanckianLocus", time, true);
   }
 
+  bool currentChromaticitySpectralLocus3DEnabled(double time) const {
+    return getBoolValue("cubeViewerChromaticitySpectralLocus3D", time, true);
+  }
+
   std::string getStringValue(const std::string& name, double time, const std::string& fallback) const {
     if (auto* p = fetchStringParam(name)) {
       std::string value;
@@ -4702,6 +4712,7 @@ class ChromaspaceEffect : public ImageEffect {
     values.glossHighlightOpacity = currentGlossHighlightOpacityValue(time);
     values.glossPointCrispness = currentGlossPointCrispnessValue(time);
     values.glossHideText = currentGlossHideTextEnabled(time);
+    values.chromaticitySpectralLocus3D = currentChromaticitySpectralLocus3DEnabled(time);
     values.plotInLinear = getBoolValue("cubeViewerPlotDisplayLinear", time, values.plotInLinear);
     values.inputTransferFunction = static_cast<int>(currentPlotDisplayLinearTransferId(time));
     values.showOverflow = getBoolValue("cubeViewerShowOverflow", time, values.showOverflow);
@@ -4749,6 +4760,9 @@ class ChromaspaceEffect : public ImageEffect {
     if (auto* p = fetchDoubleParam("cubeViewerGlossHighlightOpacity")) p->setValue(values.glossHighlightOpacity);
     if (auto* p = fetchDoubleParam("cubeViewerGlossPointCrispness")) p->setValue(values.glossPointCrispness);
     if (auto* p = fetchBooleanParam("cubeViewerGlossHideText")) p->setValue(values.glossHideText);
+    if (auto* p = fetchBooleanParam("cubeViewerChromaticitySpectralLocus3D")) {
+      p->setValue(values.chromaticitySpectralLocus3D);
+    }
     if (auto* p = fetchBooleanParam("cubeViewerPlotDisplayLinear")) p->setValue(values.plotInLinear);
     if (auto* p = fetchChoiceParam("cubeViewerPlotDisplayLinearTransfer")) {
       const auto transferId = static_cast<WorkshopColor::TransferFunctionId>(values.inputTransferFunction);
@@ -5275,6 +5289,8 @@ class ChromaspaceEffect : public ImageEffect {
     setParamVisibility(fetchGroupParam("grp_cube_viewer_chromaticity_cm"),
                        !drawOnImage && chromaticityMode);
     setParamVisibility(fetchBooleanParam("cubeViewerChromaticityPlanckianLocus"),
+                       !drawOnImage && chromaticityMode);
+    setParamVisibility(fetchBooleanParam("cubeViewerChromaticitySpectralLocus3D"),
                        !drawOnImage && chromaticityMode);
     setParamVisibility(fetchChoiceParam("cubeViewerChromaticityInputPrimaries"),
                        !drawOnImage && chromaticityMode);
@@ -5831,6 +5847,7 @@ class ChromaspaceEffect : public ImageEffect {
     const int chromaticityReferenceBasis = currentChromaticityReferenceBasisChoice(time);
     const int chromaticityOverlayPrimaries = currentChromaticityOverlayPrimariesChoice(time);
     const bool chromaticityPlanckianLocus = currentChromaticityPlanckianLocusEnabled(time);
+    const bool chromaticitySpectralLocus3D = currentChromaticitySpectralLocus3DEnabled(time);
     const bool overlayEnabled = currentIdentityOverlayEnabled(time);
     const bool overlayRamp = currentIdentityOverlayRamp(time);
     const bool readGrayRamp = currentReadGrayRamp(time);
@@ -5873,6 +5890,7 @@ class ChromaspaceEffect : public ImageEffect {
         << ",\"chromaticityReferenceBasis\":" << chromaticityReferenceBasis
         << ",\"chromaticityOverlayPrimaries\":" << chromaticityOverlayPrimaries
         << ",\"chromaticityPlanckianLocus\":" << (chromaticityPlanckianLocus ? 1 : 0)
+        << ",\"chromaticitySpectralLocus3D\":" << (chromaticitySpectralLocus3D ? 1 : 0)
         << ",\"alwaysOnTop\":" << (onTop ? 1 : 0)
         << ",\"resetViewOnPlotSwitch\":" << (resetViewOnPlotSwitch ? 1 : 0)
         << ",\"quality\":\"" << qualityLabelForIndex(qualityIndex) << "\""
@@ -10281,6 +10299,7 @@ class ChromaspaceFactory : public PluginFactoryHelper<ChromaspaceFactory> {
           {"cubeViewerChromaticityReferenceBasis", "Plot chromaticity coordinates relative to the CIE standard observer basis or the selected input observer basis."},
           {"cubeViewerChromaticityOverlayPrimaries", "Choose which gamut triangle to overlay on the chromaticity plot, or set None to hide the overlay triangle."},
           {"cubeViewerChromaticityPlanckianLocus", "Show the Planckian locus overlay and Kelvin labels in chromaticity mode."},
+          {"cubeViewerChromaticitySpectralLocus3D", "Show the spectral locus as a 3D xyY curve in chromaticity mode. Turn off to flatten it to the classic 2D chromaticity outline."},
           {"cubeViewerStatus", "Connection state for the external cube viewer."},
       };
       auto it = kHints.find(name);
@@ -10481,6 +10500,11 @@ class ChromaspaceFactory : public PluginFactoryHelper<ChromaspaceFactory> {
     cubeViewerChromaticityPlanckianLocus->setLabel("Planckian Locus");
     cubeViewerChromaticityPlanckianLocus->setDefault(true);
     if (const char* hint = tooltipFor("cubeViewerChromaticityPlanckianLocus")) cubeViewerChromaticityPlanckianLocus->setHint(hint);
+
+    auto* cubeViewerChromaticitySpectralLocus3D = d.defineBooleanParam("cubeViewerChromaticitySpectralLocus3D");
+    cubeViewerChromaticitySpectralLocus3D->setLabel("3D Spectral Locus");
+    cubeViewerChromaticitySpectralLocus3D->setDefault(true);
+    if (const char* hint = tooltipFor("cubeViewerChromaticitySpectralLocus3D")) cubeViewerChromaticitySpectralLocus3D->setHint(hint);
 
     auto* grpCubeViewerChromaticityCm = d.defineGroupParam("grp_cube_viewer_chromaticity_cm");
     grpCubeViewerChromaticityCm->setLabel("Chromaticity Color Management");
@@ -10875,6 +10899,7 @@ class ChromaspaceFactory : public PluginFactoryHelper<ChromaspaceFactory> {
     markPluginMayWrite(cubeViewerGlossHighlightOpacity);
     markPluginMayWrite(cubeViewerGlossPointCrispness);
     markPluginMayWrite(cubeViewerGlossHideText);
+    markPluginMayWrite(cubeViewerChromaticitySpectralLocus3D);
     markPluginMayWrite(cubeViewerShowOverflow);
     markPluginMayWrite(cubeViewerHighlightOverflow);
     markPluginMayWrite(cubeViewerIdentityOverlayEnabled);

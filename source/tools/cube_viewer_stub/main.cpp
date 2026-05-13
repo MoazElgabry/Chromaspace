@@ -356,7 +356,7 @@ void notifyExistingViewerBringToFront() {
 }
 #endif
 
-const char* kViewerVersionString = "v1.0.11";
+const char* kViewerVersionString = "v1.0.12";
 
 #if !defined(_WIN32)
 bool sendAllSocket(int fd, const char* data, size_t size) {
@@ -2430,6 +2430,7 @@ struct ResolvedPayload {
   int chromaticityOverlayPrimaries =
       WorkshopColor::overlayPrimariesChoiceIndex(true, WorkshopColor::ColorPrimariesId::Rec709);
   bool chromaticityPlanckianLocus = true;
+  bool chromaticitySpectralLocus3D = true;
   std::string version;
 };
 
@@ -4822,6 +4823,9 @@ bool parseParamsMessage(const std::string& line, ResolvedPayload* out) {
   int chromaticityPlanckianLocus = 1;
   extractInt(line, "chromaticityPlanckianLocus", &chromaticityPlanckianLocus);
   p.chromaticityPlanckianLocus = (chromaticityPlanckianLocus != 0);
+  int chromaticitySpectralLocus3D = 1;
+  extractInt(line, "chromaticitySpectralLocus3D", &chromaticitySpectralLocus3D);
+  p.chromaticitySpectralLocus3D = (chromaticitySpectralLocus3D != 0);
   p.pointSize = clampf(p.pointSize, 0.35f, 3.0f);
   p.pointDensity = clampf(p.pointDensity, 0.1f, 4.0f);
   p.colorSaturation = clampf(p.colorSaturation, 0.8f, 6.0f);
@@ -10493,7 +10497,7 @@ void drawChromaticityGuide(const ResolvedPayload& payload,
   for (size_t i = 0; i <= locusLast; ++i) {
     const WorkshopColor::Vec2f xy =
         WorkshopColor::xyzToXy(locus[i], spec.chromaticityWhite);
-    const Vec3 pos = mapChromaticityCoordsToViewer(spec, xy, 0.0f);
+    const Vec3 pos = mapChromaticityCoordsToViewer(spec, xy, payload.chromaticitySpectralLocus3D ? locus[i].y : 0.0f);
     const Vec3 color = wavelengthGuideColor(380.0f + static_cast<float>(i) * 5.0f);
     glColor4f(color.x, color.y, color.z, 0.88f);
     glVertex3f(pos.x, pos.y, pos.z);
@@ -10502,9 +10506,13 @@ void drawChromaticityGuide(const ResolvedPayload& payload,
   glDisable(GL_LINE_SMOOTH);
 
   const Vec3 purpleStart =
-      mapChromaticityCoordsToViewer(spec, WorkshopColor::xyzToXy(locus.front(), spec.chromaticityWhite), 0.0f);
+      mapChromaticityCoordsToViewer(spec,
+                                    WorkshopColor::xyzToXy(locus.front(), spec.chromaticityWhite),
+                                    payload.chromaticitySpectralLocus3D ? locus.front().y : 0.0f);
   const Vec3 purpleEnd =
-      mapChromaticityCoordsToViewer(spec, WorkshopColor::xyzToXy(locus[locusLast], spec.chromaticityWhite), 0.0f);
+      mapChromaticityCoordsToViewer(spec,
+                                    WorkshopColor::xyzToXy(locus[locusLast], spec.chromaticityWhite),
+                                    payload.chromaticitySpectralLocus3D ? locus[locusLast].y : 0.0f);
   glColor4f(0.90f, 0.68f, 0.96f, 0.52f);
   glBegin(GL_LINES);
   glVertex3f(purpleStart.x, purpleStart.y, purpleStart.z);
