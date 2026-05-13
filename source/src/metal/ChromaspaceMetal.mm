@@ -403,14 +403,28 @@ bool ensurePipelines(id<MTLDevice> device, PipelineBundle* out, std::string* err
   options.fastMathEnabled = NO;
   id<MTLLibrary> library = [device newLibraryWithSource:source options:options error:&compileError];
   if (library == nil) { if (error) *error = nsErrorString(compileError); return false; }
-  auto makePipeline = [&](NSString* name, id<MTLComputePipelineState>* outState) -> bool { NSError* localError = nil; id<MTLFunction> function = [library newFunctionWithName:name]; if (function == nil) { if (error) *error = std::string("missing Metal function: ") + (name.UTF8String ? name.UTF8String : "unknown"); return false; } id<MTLComputePipelineState> pipeline = [device newComputePipelineStateWithFunction:function error:&localError]; if (pipeline == nil) { if (error) *error = nsErrorString(localError); return false; } *outState = pipeline; return true; };
+  auto makePipeline = [&](NSString* name) -> id<MTLComputePipelineState> {
+    NSError* localError = nil;
+    id<MTLFunction> function = [library newFunctionWithName:name];
+    if (function == nil) {
+      if (error) *error = std::string("missing Metal function: ") + (name.UTF8String ? name.UTF8String : "unknown");
+      return nil;
+    }
+    id<MTLComputePipelineState> pipeline = [device newComputePipelineStateWithFunction:function error:&localError];
+    if (pipeline == nil && error) *error = nsErrorString(localError);
+    return pipeline;
+  };
   PipelineBundle built{}; built.device = device;
-  if (!makePipeline(@"primaryPassKernel", &built.primary) ||
-      !makePipeline(@"occupancyPassKernel", &built.occupancy) ||
-      !makePipeline(@"stripCubeKernel", &built.stripCube) ||
-      !makePipeline(@"stripRampKernel", &built.stripRamp) ||
-      !makePipeline(@"packCombinedKernel", &built.packCombined) ||
-      !makePipeline(@"appendSelectKernel", &built.appendSelect)) return false;
+  built.primary = makePipeline(@"primaryPassKernel");
+  built.occupancy = makePipeline(@"occupancyPassKernel");
+  built.stripCube = makePipeline(@"stripCubeKernel");
+  built.stripRamp = makePipeline(@"stripRampKernel");
+  built.packCombined = makePipeline(@"packCombinedKernel");
+  built.appendSelect = makePipeline(@"appendSelectKernel");
+  if (built.primary == nil || built.occupancy == nil || built.stripCube == nil ||
+      built.stripRamp == nil || built.packCombined == nil || built.appendSelect == nil) {
+    return false;
+  }
   gPipelines = built; *out = gPipelines; return true;
 }
 

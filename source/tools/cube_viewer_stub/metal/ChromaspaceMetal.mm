@@ -999,72 +999,72 @@ bool ensureContext(std::string* error) {
         c.initError = pipelineError != nil ? [[pipelineError localizedDescription] UTF8String] : "Failed to create input sample Metal pipeline.";
         return;
       }
-      auto buildPipeline = [&](NSString* name, id<MTLComputePipelineState>* dst, const char* missingMsg, const char* failMsg) -> bool {
+      auto buildPipeline = [&](NSString* name, const char* missingMsg, const char* failMsg) -> id<MTLComputePipelineState> {
         pipelineError = nil;
         id<MTLFunction> fn = [c.library newFunctionWithName:name];
         if (fn == nil) {
           c.initError = missingMsg;
-          return false;
+          return nil;
         }
-        *dst = [c.device newComputePipelineStateWithFunction:fn error:&pipelineError];
-        if (*dst == nil) {
+        id<MTLComputePipelineState> pipeline = [c.device newComputePipelineStateWithFunction:fn error:&pipelineError];
+        if (pipeline == nil) {
           c.initError = pipelineError != nil ? [[pipelineError localizedDescription] UTF8String] : failMsg;
-          return false;
+          return nil;
         }
-        return true;
+        return pipeline;
       };
-      if (!buildPipeline(@"glossFieldAccumulateKernel",
-                         &c.glossFieldAccumulatePipeline,
-                         "Missing gloss field accumulate Metal kernel.",
-                         "Failed to create gloss field accumulate Metal pipeline.")) {
+      c.glossFieldAccumulatePipeline = buildPipeline(@"glossFieldAccumulateKernel",
+                                                     "Missing gloss field accumulate Metal kernel.",
+                                                     "Failed to create gloss field accumulate Metal pipeline.");
+      if (c.glossFieldAccumulatePipeline == nil) {
         return;
       }
-      if (!buildPipeline(@"glossFieldFinalizeKernel",
-                         &c.glossFieldFinalizePipeline,
-                         "Missing gloss field finalize Metal kernel.",
-                         "Failed to create gloss field finalize Metal pipeline.")) {
+      c.glossFieldFinalizePipeline = buildPipeline(@"glossFieldFinalizeKernel",
+                                                   "Missing gloss field finalize Metal kernel.",
+                                                   "Failed to create gloss field finalize Metal pipeline.");
+      if (c.glossFieldFinalizePipeline == nil) {
         return;
       }
-      if (!buildPipeline(@"glossFieldMaxKernel",
-                         &c.glossFieldMaxPipeline,
-                         "Missing gloss field max Metal kernel.",
-                         "Failed to create gloss field max Metal pipeline.")) {
+      c.glossFieldMaxPipeline = buildPipeline(@"glossFieldMaxKernel",
+                                              "Missing gloss field max Metal kernel.",
+                                              "Failed to create gloss field max Metal pipeline.");
+      if (c.glossFieldMaxPipeline == nil) {
         return;
       }
-      if (!buildPipeline(@"glossFieldNormalizeKernel",
-                         &c.glossFieldNormalizePipeline,
-                         "Missing gloss field normalize Metal kernel.",
-                         "Failed to create gloss field normalize Metal pipeline.")) {
+      c.glossFieldNormalizePipeline = buildPipeline(@"glossFieldNormalizeKernel",
+                                                    "Missing gloss field normalize Metal kernel.",
+                                                    "Failed to create gloss field normalize Metal pipeline.");
+      if (c.glossFieldNormalizePipeline == nil) {
         return;
       }
-      if (!buildPipeline(@"glossFieldBlurKernel",
-                         &c.glossFieldBlurPipeline,
-                         "Missing gloss field blur Metal kernel.",
-                         "Failed to create gloss field blur Metal pipeline.")) {
+      c.glossFieldBlurPipeline = buildPipeline(@"glossFieldBlurKernel",
+                                               "Missing gloss field blur Metal kernel.",
+                                               "Failed to create gloss field blur Metal pipeline.");
+      if (c.glossFieldBlurPipeline == nil) {
         return;
       }
-      if (!buildPipeline(@"glossFieldBodyKernel",
-                         &c.glossFieldBodyPipeline,
-                         "Missing gloss field body Metal kernel.",
-                         "Failed to create gloss field body Metal pipeline.")) {
+      c.glossFieldBodyPipeline = buildPipeline(@"glossFieldBodyKernel",
+                                               "Missing gloss field body Metal kernel.",
+                                               "Failed to create gloss field body Metal pipeline.");
+      if (c.glossFieldBodyPipeline == nil) {
         return;
       }
-      if (!buildPipeline(@"glossFieldRawSignalKernel",
-                         &c.glossFieldRawSignalPipeline,
-                         "Missing gloss field raw signal Metal kernel.",
-                         "Failed to create gloss field raw signal Metal pipeline.")) {
+      c.glossFieldRawSignalPipeline = buildPipeline(@"glossFieldRawSignalKernel",
+                                                    "Missing gloss field raw signal Metal kernel.",
+                                                    "Failed to create gloss field raw signal Metal pipeline.");
+      if (c.glossFieldRawSignalPipeline == nil) {
         return;
       }
-      if (!buildPipeline(@"glossFieldWeightedSignalKernel",
-                         &c.glossFieldWeightedSignalPipeline,
-                         "Missing gloss field weighted signal Metal kernel.",
-                         "Failed to create gloss field weighted signal Metal pipeline.")) {
+      c.glossFieldWeightedSignalPipeline = buildPipeline(@"glossFieldWeightedSignalKernel",
+                                                         "Missing gloss field weighted signal Metal kernel.",
+                                                         "Failed to create gloss field weighted signal Metal pipeline.");
+      if (c.glossFieldWeightedSignalPipeline == nil) {
         return;
       }
-      if (!buildPipeline(@"glossFieldFinalNormalizeKernel",
-                         &c.glossFieldFinalNormalizePipeline,
-                         "Missing gloss field final normalize Metal kernel.",
-                         "Failed to create gloss field final normalize Metal pipeline.")) {
+      c.glossFieldFinalNormalizePipeline = buildPipeline(@"glossFieldFinalNormalizeKernel",
+                                                         "Missing gloss field final normalize Metal kernel.",
+                                                         "Failed to create gloss field final normalize Metal pipeline.");
+      if (c.glossFieldFinalNormalizePipeline == nil) {
         return;
       }
       c.ready = true;
