@@ -514,7 +514,8 @@ __device__ inline int occupancyBinIndex(const Request& request, float r, float g
   return (toBin(r) * binsPerAxis + toBin(g)) * binsPerAxis + toBin(b);
 }
 
-__global__ void primaryPassKernel(Request request, Sample* primaryOut, int* primaryCount, int* occupancyBins) {
+__global__ void primaryPassKernel(const Request* requestPtr, Sample* primaryOut, int* primaryCount, int* occupancyBins) {
+  const Request& request = *requestPtr;
   const int attemptIndex = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
   if (attemptIndex >= request.maxPrimaryAttempts) return;
   float u = 0.0f;
@@ -571,7 +572,8 @@ __global__ void primaryPassKernel(Request request, Sample* primaryOut, int* prim
   atomicAdd(&occupancyBins[occupancyBinIndex(request, r, g, b)], 1);
 }
 
-__global__ void occupancyPassKernel(Request request, OccupancyCandidate* candidateOut, int* candidateCount) {
+__global__ void occupancyPassKernel(const Request* requestPtr, OccupancyCandidate* candidateOut, int* candidateCount) {
+  const Request& request = *requestPtr;
   const int attemptIndex = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
   if (attemptIndex >= request.maxCandidateAttempts) return;
   float u = haltonFast(static_cast<uint32_t>(attemptIndex + 1), 2u);
@@ -844,20 +846,23 @@ bool buildWholeImageCloud(const Request& request, Result* out) {
   DeviceBuffer<Sample> primary;
   DeviceBuffer<int> primaryCount;
   DeviceBuffer<int> occupancy;
+  DeviceBuffer<Request> deviceRequest;
   if (!allocBuffer(&primary, static_cast<std::size_t>(request.pointCount), &out->error) ||
       !allocBuffer(&primaryCount, 1u, &out->error) ||
-      !allocBuffer(&occupancy, occupancyCount, &out->error)) {
+      !allocBuffer(&occupancy, occupancyCount, &out->error) ||
+      !allocBuffer(&deviceRequest, 1u, &out->error)) {
     return false;
   }
 
-  if (cudaMemsetAsync(primaryCount.ptr, 0, sizeof(int), request.stream) != cudaSuccess ||
+  if (cudaMemcpyAsync(deviceRequest.ptr, &request, sizeof(Request), cudaMemcpyHostToDevice, request.stream) != cudaSuccess ||
+      cudaMemsetAsync(primaryCount.ptr, 0, sizeof(int), request.stream) != cudaSuccess ||
       cudaMemsetAsync(occupancy.ptr, 0, occupancyCount * sizeof(int), request.stream) != cudaSuccess) {
-    out->error = "cudaMemsetAsync failed";
+    out->error = "cuda setup failed";
     return false;
   }
 
   const int primaryBlocks = std::max(1, (request.maxPrimaryAttempts + 255) / 256);
-  primaryPassKernel<<<primaryBlocks, 256, 0, request.stream>>>(request, primary.ptr, primaryCount.ptr, occupancy.ptr);
+  primaryPassKernel<<<primaryBlocks, 256, 0, request.stream>>>(deviceRequest.ptr, primary.ptr, primaryCount.ptr, occupancy.ptr);
   if (cudaGetLastError() != cudaSuccess || cudaStreamSynchronize(request.stream) != cudaSuccess) {
     out->error = "primary-pass failed";
     return false;
@@ -897,7 +902,7 @@ bool buildWholeImageCloud(const Request& request, Result* out) {
       return false;
     }
     const int candidateBlocks = std::max(1, (request.maxCandidateAttempts + 255) / 256);
-    occupancyPassKernel<<<candidateBlocks, 256, 0, request.stream>>>(request, candidates.ptr, candidateCount.ptr);
+    occupancyPassKernel<<<candidateBlocks, 256, 0, request.stream>>>(deviceRequest.ptr, candidates.ptr, candidateCount.ptr);
     if (cudaGetLastError() != cudaSuccess || cudaStreamSynchronize(request.stream) != cudaSuccess) {
       out->error = "occupancy-pass failed";
       return false;
