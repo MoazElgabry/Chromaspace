@@ -1,7 +1,8 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(Chromaspace VERSION 1.0.12 LANGUAGES CXX)
-set(CUBE_DISPLAY_VERSION "1.0.12")
+project(Chromaspace VERSION 2.0.0 LANGUAGES CXX)
+set(CHROMASPACE_PACKAGE_VERSION "2.0.0-beta")
+set(CUBE_DISPLAY_VERSION "2.0 beta")
 set(PLUGIN_BASENAME "Chromaspace")
 set(PLUGIN_IDENTIFIER "com.moazelgabry.chromaspace")
 set(LOCAL_OFX_SDK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/ofx-sdk")
@@ -227,8 +228,6 @@ if(APPLE)
   file(MAKE_DIRECTORY "${OFX_BUNDLE_CONTENTS_DIR}")
   file(MAKE_DIRECTORY "${OFX_RESOURCES_DIR}")
   configure_file("${CMAKE_CURRENT_SOURCE_DIR}/cmake/Info.plist.in" "${CMAKE_CURRENT_BINARY_DIR}/Info.plist" @ONLY)
-  add_custom_command(TARGET ${PLUGIN_BASENAME} POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different "${CMAKE_CURRENT_BINARY_DIR}/Info.plist" "${OFX_BUNDLE_CONTENTS_DIR}/Info.plist")
 endif()
 
 set(BUILD_ARTIFACT_DIR "${CMAKE_CURRENT_BINARY_DIR}/artifacts")
@@ -333,7 +332,7 @@ if(CHROMASPACE_TEXT_DEPS_EXTERNAL_TARGET)
 endif()
 chromaspace_attach_text_assets(Chromaspace_CubeViewer
   ASSETS "${WORKSHOP_TEXT_ASSETS}"
-  DESTINATIONS "${BUILD_VIEWER_DIR}" "${OFX_OUTPUT_DIR}")
+  DESTINATIONS "${BUILD_VIEWER_DIR}")
 
 if(WIN32)
   if(NOT EXISTS "${PLUGIN_ICON_PNG}")
@@ -401,31 +400,32 @@ set_target_properties(Chromaspace_CubeViewer PROPERTIES
   COMPILE_PDB_OUTPUT_DIRECTORY_DEBUG "${VIEWER_OUTPUT_DIR}"
   COMPILE_PDB_OUTPUT_DIRECTORY_RELEASE "${VIEWER_OUTPUT_DIR}")
 
-add_custom_command(TARGET ${PLUGIN_BASENAME} POST_BUILD
+add_custom_target(Chromaspace_Bundle ALL
+  COMMAND ${CMAKE_COMMAND} -E rm -rf "${OFX_STAGE_ROOT}"
   COMMAND ${CMAKE_COMMAND} -E make_directory "${OFX_OUTPUT_DIR}"
-  COMMAND ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_FILE:${PLUGIN_BASENAME}>" "${OFX_OUTPUT_DIR}/$<TARGET_FILE_NAME:${PLUGIN_BASENAME}>"
-  COMMAND ${CMAKE_COMMAND} -E rm -f "${OFX_RESOURCES_DIR}/Cube.png"
-  COMMAND ${CMAKE_COMMAND} -E copy_if_different "${PLUGIN_ICON_PNG}" "${OFX_RESOURCES_DIR}/${PLUGIN_IDENTIFIER}.png"
-  COMMAND ${CMAKE_COMMAND} -E rm -f
-    "${OFX_OUTPUT_DIR}/${PLUGIN_BASENAME}.ilk"
-    "${OFX_OUTPUT_DIR}/${PLUGIN_BASENAME}.pdb"
-    "${OFX_OUTPUT_DIR}/Chromaspace_CubeViewer.ilk"
-    "${OFX_OUTPUT_DIR}/Chromaspace_CubeViewer.pdb")
+  COMMAND ${CMAKE_COMMAND} -E make_directory "${OFX_RESOURCES_DIR}"
+  COMMAND ${CMAKE_COMMAND} -E copy "$<TARGET_FILE:${PLUGIN_BASENAME}>" "${OFX_OUTPUT_DIR}/$<TARGET_FILE_NAME:${PLUGIN_BASENAME}>"
+  COMMAND ${CMAKE_COMMAND} -E copy "$<TARGET_FILE:Chromaspace_CubeViewer>" "${OFX_OUTPUT_DIR}/$<TARGET_FILE_NAME:Chromaspace_CubeViewer>"
+  COMMAND ${CMAKE_COMMAND} -E copy "${WORKSHOP_TEXT_ASSETS}" "${OFX_OUTPUT_DIR}/OpenSans-Regular.ttf"
+  COMMAND ${CMAKE_COMMAND} -E copy "${CMAKE_CURRENT_SOURCE_DIR}/tools/resolve_bridge/chromaspace_resolve_bridge.py" "${OFX_RESOURCES_DIR}/chromaspace_resolve_bridge.py"
+  COMMAND ${CMAKE_COMMAND} -E copy "${PLUGIN_ICON_PNG}" "${OFX_RESOURCES_DIR}/${PLUGIN_IDENTIFIER}.png"
+  DEPENDS ${PLUGIN_BASENAME} Chromaspace_CubeViewer
+  COMMENT "Creating clean install-ready Chromaspace OFX bundle"
+  VERBATIM)
 
-add_custom_command(TARGET Chromaspace_CubeViewer POST_BUILD
-  COMMAND ${CMAKE_COMMAND} -E make_directory "${OFX_OUTPUT_DIR}"
-  COMMAND ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_FILE:Chromaspace_CubeViewer>" "${OFX_OUTPUT_DIR}/$<TARGET_FILE_NAME:Chromaspace_CubeViewer>"
-  COMMAND ${CMAKE_COMMAND} -E rm -f
-    "${OFX_OUTPUT_DIR}/${PLUGIN_BASENAME}.ilk"
-    "${OFX_OUTPUT_DIR}/${PLUGIN_BASENAME}.pdb"
-    "${OFX_OUTPUT_DIR}/Chromaspace_CubeViewer.ilk"
-    "${OFX_OUTPUT_DIR}/Chromaspace_CubeViewer.pdb")
+if(APPLE)
+  add_custom_command(TARGET Chromaspace_Bundle POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy "${CMAKE_CURRENT_BINARY_DIR}/Info.plist" "${OFX_BUNDLE_CONTENTS_DIR}/Info.plist"
+    VERBATIM)
+endif()
 
 if(UNIX AND NOT APPLE)
-  # Linux hosts launch the bundled viewer directly, so keep the execute bit on both
-  # the built helper and the copy staged into the OFX bundle.
+  # Linux hosts launch the bundled viewer directly, so keep the execute bit on
+  # both the built helper and the clean packaged copy.
   add_custom_command(TARGET Chromaspace_CubeViewer POST_BUILD
     COMMAND /bin/chmod +x "$<TARGET_FILE:Chromaspace_CubeViewer>"
+    VERBATIM)
+  add_custom_command(TARGET Chromaspace_Bundle POST_BUILD
     COMMAND /bin/chmod +x "${OFX_OUTPUT_DIR}/$<TARGET_FILE_NAME:Chromaspace_CubeViewer>"
     VERBATIM)
 endif()

@@ -11,4 +11,32 @@ if errorlevel 1 (
 )
 
 call "%~dp0configure_vc.bat" || exit /b 1
-"%CMAKE_EXE%" --build "%BUILD_DIR%" || exit /b 1
+"%CMAKE_EXE%" --build "%BUILD_DIR%" --target Chromaspace_Bundle || exit /b 1
+
+set "BUNDLE_ROOT=%ROOT%\bundle\Chromaspace.ofx.bundle"
+set "BUNDLE_WIN64=%BUNDLE_ROOT%\Contents\Win64"
+set "BUNDLE_RESOURCES=%BUNDLE_ROOT%\Contents\Resources"
+
+if not exist "%BUNDLE_WIN64%\Chromaspace.ofx" (
+  echo Bundle validation failed: missing Chromaspace.ofx
+  exit /b 1
+)
+if not exist "%BUNDLE_WIN64%\Chromaspace_CubeViewer.exe" (
+  echo Bundle validation failed: missing Chromaspace_CubeViewer.exe
+  exit /b 1
+)
+if not exist "%BUNDLE_WIN64%\OpenSans-Regular.ttf" (
+  echo Bundle validation failed: missing OpenSans-Regular.ttf
+  exit /b 1
+)
+if not exist "%BUNDLE_RESOURCES%\chromaspace_resolve_bridge.py" (
+  echo Bundle validation failed: missing chromaspace_resolve_bridge.py
+  exit /b 1
+)
+if not exist "%BUNDLE_RESOURCES%\com.moazelgabry.chromaspace.png" (
+  echo Bundle validation failed: missing plugin icon
+  exit /b 1
+)
+
+echo Install-ready bundle created at:
+echo   %BUNDLE_ROOT%

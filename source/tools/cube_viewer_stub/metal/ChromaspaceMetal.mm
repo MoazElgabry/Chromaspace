@@ -46,6 +46,12 @@ struct OverlayUniforms {
   int circularHsl;
   int circularHsv;
   int normConeNormalized;
+  int chromaticityInputTransfer;
+  int chromaticityReferenceBasis;
+  float chromaticityWhiteX;
+  float chromaticityWhiteY;
+  float chromaticityRgbToXyz[9];
+  float chromaticityXyzToRgb[9];
 };
 
 struct InputUniforms {
@@ -60,6 +66,12 @@ struct InputUniforms {
   int circularHsl;
   int circularHsv;
   int normConeNormalized;
+  int chromaticityInputTransfer;
+  int chromaticityReferenceBasis;
+  float chromaticityWhiteX;
+  float chromaticityWhiteY;
+  float chromaticityRgbToXyz[9];
+  float chromaticityXyzToRgb[9];
   float pointAlphaScale;
   float denseAlphaBias;
   float colorSaturation;
@@ -112,6 +124,12 @@ struct OverlayUniforms {
   int circularHsl;
   int circularHsv;
   int normConeNormalized;
+  int chromaticityInputTransfer;
+  int chromaticityReferenceBasis;
+  float chromaticityWhiteX;
+  float chromaticityWhiteY;
+  float chromaticityRgbToXyz[9];
+  float chromaticityXyzToRgb[9];
 };
 
 struct InputUniforms {
@@ -126,6 +144,12 @@ struct InputUniforms {
   int circularHsl;
   int circularHsv;
   int normConeNormalized;
+  int chromaticityInputTransfer;
+  int chromaticityReferenceBasis;
+  float chromaticityWhiteX;
+  float chromaticityWhiteY;
+  float chromaticityRgbToXyz[9];
+  float chromaticityXyzToRgb[9];
   float pointAlphaScale;
   float denseAlphaBias;
   float colorSaturation;
@@ -220,6 +244,127 @@ float rawRgbHue01(float r, float g, float b, float cMax, float delta) {
     h = ((r - g) / delta) + 4.0;
   }
   return wrapHue01(h / 6.0);
+}
+
+float safeDiv(float num, float den) {
+  return fabs(den) < 1e-6 ? 0.0 : num / den;
+}
+
+float safeExp2Clamped(float value) {
+  return exp2(clamp(value, -126.0, 126.0));
+}
+
+float safePowPos(float value, float exponent) {
+  return value <= 0.0 ? 0.0 : pow(value, exponent);
+}
+
+float signPreservingPow(float value, float exponent) {
+  return value == 0.0 ? 0.0 : copysign(safePowPos(fabs(value), exponent), value);
+}
+
+float exp10Compat(float value) {
+  return safeExp2Clamped(value * 3.3219280948873626);
+}
+
+float decodeTransferChannel(float x, int tf) {
+  switch (tf) {
+    case 0: return x;
+    case 1: {
+      float a = fabs(x);
+      float decoded = (a <= 0.04045) ? safeDiv(a, 12.92) : safePowPos(safeDiv(a + 0.055, 1.055), 2.4);
+      return copysign(decoded, x);
+    }
+    case 2: return signPreservingPow(x, 2.4);
+    case 3: return x <= 0.02740668 ? safeDiv(x, 10.44426855) : safeExp2Clamped(safeDiv(x, 0.07329248) - 7.0) - 0.0075;
+    case 4: return x <= 0.155251141552511 ? safeDiv(x - 0.0729055341958355, 10.5402377416545) : safeExp2Clamped(x * 17.52 - 9.72);
+    case 5: return x < 5.367655 * 0.010591 + 0.092809 ? safeDiv(x - 0.092809, 5.367655) : safeDiv(exp10Compat(safeDiv(x - 0.385537, 0.247190)) - 0.052272, 5.555556);
+    case 6: return x < -0.7774983977293537 ? x * 0.3033266726886969 - 0.7774983977293537 : safeDiv(safeExp2Clamped(14.0 * safeDiv(x - 0.09286412512218964, 0.9071358748778103) + 6.0) - 64.0, 2231.8263090676883);
+    case 7: {
+      constexpr float kCut = 0.092864125;
+      constexpr float kScale = 0.24136077;
+      constexpr float kGain = 87.099375;
+      float decoded = x < kCut ? -safeDiv(exp10Compat(safeDiv(kCut - x, kScale)) - 1.0, kGain) : safeDiv(exp10Compat(safeDiv(x - kCut, kScale)) - 1.0, kGain);
+      return decoded * 0.9;
+    }
+    case 8: return x < 171.2102946929 / 1023.0 ? safeDiv((x * 1023.0 - 95.0) * 0.01125, 171.2102946929 - 95.0) : (exp10Compat(safeDiv(x * 1023.0 - 420.0, 261.5)) * 0.19 - 0.01);
+    case 9:
+      if (x < 0.04076162) return -safeDiv(exp10Compat(safeDiv(0.069886632 - x, 0.42889912)) - 1.0, 14.98325);
+      if (x <= 0.105357102) return safeDiv(x - 0.073059361, 2.3069815);
+      return safeDiv(exp10Compat(safeDiv(x - 0.073059361, 0.36726845)) - 1.0, 14.98325);
+    case 10: return x < 0.0 ? safeDiv(x, 15.1927) - 0.01 : safeDiv(exp10Compat(safeDiv(x, 0.224282)) - 1.0, 155.975327) - 0.01;
+    case 11: {
+      constexpr float kA = 8.283605932402494;
+      constexpr float kB = 0.09246575342465753;
+      constexpr float kC = 0.5300133392291939;
+      constexpr float kD = 0.08692876065491224;
+      constexpr float kE = 0.005494072432257808;
+      constexpr float kCut = kA * 0.005 + kB;
+      return x < kCut ? safeDiv(x - kB, kA) : exp(safeDiv(x - kC, kD)) - kE;
+    }
+    case 12: return x <= 0.14 ? safeDiv(x - 0.0929, 6.025) : safeDiv(exp10Compat(3.89616 * x - 2.27752) - 0.0108, 0.9892);
+    case 13: {
+      constexpr float kA = 0.555556;
+      constexpr float kB = 0.009468;
+      constexpr float kC = 0.344676;
+      constexpr float kD = 0.790453;
+      constexpr float kE = 8.735631;
+      constexpr float kF = 0.092864;
+      constexpr float kCut = 0.100537775223865;
+      return x >= kCut ? safeDiv(exp10Compat(safeDiv(x - kD, kC)), kA) - safeDiv(kB, kA) : safeDiv(x - kF, kE);
+    }
+    case 14: {
+      constexpr float kA = 5.555556;
+      constexpr float kB = 0.064829;
+      constexpr float kC = 0.245281;
+      constexpr float kD = 0.384316;
+      constexpr float kE = 8.799461;
+      constexpr float kF = 0.092864;
+      constexpr float kCut = 0.100686685370811;
+      return x >= kCut ? safeDiv(exp10Compat(safeDiv(x - kD, kC)), kA) - safeDiv(kB, kA) : safeDiv(x - kF, kE);
+    }
+    case 15: return x < 0.181 ? safeDiv(x - 0.125, 5.6) : exp10Compat(safeDiv(x - 0.598206, 0.241514)) - 0.00873;
+    case 16: return signPreservingPow(x, 2.2);
+    case 17: return signPreservingPow(x, 2.6);
+    default: return x;
+  }
+}
+
+float3 mulRows(constant float* m, float3 v) {
+  return float3(dot(float3(m[0], m[1], m[2]), v),
+                dot(float3(m[3], m[4], m[5]), v),
+                dot(float3(m[6], m[7], m[8]), v));
+}
+
+float3 xyToXyz(float2 xy, float Y) {
+  if (fabs(xy.y) <= 1e-8) return float3(xy.x, Y, 1.0 - xy.x);
+  return float3(xy.x * Y / xy.y, Y, (1.0 - xy.x - xy.y) * Y / xy.y);
+}
+
+float3 xyzToXyY(float3 xyz, float2 fallbackWhite) {
+  if (fabs(xyz.y) <= 1e-8) return float3(fallbackWhite.x, fallbackWhite.y, 0.0);
+  float sum = xyz.x + xyz.y + xyz.z;
+  if (fabs(sum) <= 1e-8) return float3(fallbackWhite.x, fallbackWhite.y, xyz.y);
+  return float3(xyz.x / sum, xyz.y / sum, xyz.y);
+}
+
+float3 mapChromaticityPosition(float r, float g, float b, constant InputUniforms& u) {
+  float3 linear = float3(decodeTransferChannel(r, u.chromaticityInputTransfer),
+                         decodeTransferChannel(g, u.chromaticityInputTransfer),
+                         decodeTransferChannel(b, u.chromaticityInputTransfer));
+  if (u.showOverflow == 0) linear = clamp(linear, 0.0, 1.0);
+  float3 xyz = mulRows(u.chromaticityRgbToXyz, linear);
+  float2 white = float2(u.chromaticityWhiteX, u.chromaticityWhiteY);
+  float3 xyY = xyzToXyY(xyz, white);
+  float2 xy = xyY.xy;
+  if (u.chromaticityReferenceBasis != 0) {
+    float3 basisXyz = xyToXyz(xy, 1.0);
+    float3 rgb = mulRows(u.chromaticityXyzToRgb, basisXyz);
+    xy = xyzToXyY(rgb, float2(1.0 / 3.0, 1.0 / 3.0)).xy;
+  }
+  float viewerHeight = ((u.showOverflow != 0) ? xyY.z : clamp(xyY.z, 0.0, 1.0)) * 2.0 - 1.0;
+  return float3((xy.x - (1.0 / 3.0)) * 3.0,
+                (xy.y - (1.0 / 3.0)) * 3.0,
+                viewerHeight);
 }
 
 float2 rgbToHsvHexconePlane(float r, float g, float b) {
@@ -541,6 +686,9 @@ kernel void inputKernel(const device float* inputVals [[buffer(0)]],
   float plotG = (u.showOverflow != 0) ? g : clamp01(g);
   float plotB = (u.showOverflow != 0) ? b : clamp01(b);
   float3 pos = mapPlotPosition(plotR, plotG, plotB, u.plotMode, u.circularHsl, u.circularHsv, u.normConeNormalized, u.showOverflow);
+  if (u.plotMode == 8) {
+    pos = mapChromaticityPosition(r, g, b, u);
+  }
   if (u.glossView != 0) {
     float aspect = clamp(u.sourceAspect, 0.25, 4.0);
     float halfWidth = aspect >= 1.0 ? 1.22 : (1.22 * aspect);
@@ -1373,6 +1521,14 @@ bool buildInputMesh(const InputRequest& request,
   uniforms.circularHsl = request.remap.circularHsl;
   uniforms.circularHsv = request.remap.circularHsv;
   uniforms.normConeNormalized = request.remap.normConeNormalized;
+  uniforms.chromaticityInputTransfer = request.remap.chromaticityInputTransfer;
+  uniforms.chromaticityReferenceBasis = request.remap.chromaticityReferenceBasis;
+  uniforms.chromaticityWhiteX = request.remap.chromaticityWhiteX;
+  uniforms.chromaticityWhiteY = request.remap.chromaticityWhiteY;
+  for (int i = 0; i < 9; ++i) {
+    uniforms.chromaticityRgbToXyz[i] = request.remap.chromaticityRgbToXyz[i];
+    uniforms.chromaticityXyzToRgb[i] = request.remap.chromaticityXyzToRgb[i];
+  }
   uniforms.pointAlphaScale = request.pointAlphaScale;
   uniforms.denseAlphaBias = request.denseAlphaBias;
   uniforms.colorSaturation = request.colorSaturation;

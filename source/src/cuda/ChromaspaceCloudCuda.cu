@@ -431,6 +431,14 @@ __host__ __device__ inline float neutralRadiusAcceptanceProbability(const Reques
 __device__ inline void sampleUvForAttempt(const Request& request, int attemptIndex, float* outU, float* outV) {
   float u = 0.0f;
   float v = 0.0f;
+  if (request.samplingGridWidth > 0 && request.samplingGridHeight > 0) {
+    const int gx = attemptIndex % request.samplingGridWidth;
+    const int gy = attemptIndex / request.samplingGridWidth;
+    u = safeDiv(static_cast<float>(gx) + 0.5f,
+                static_cast<float>(request.samplingGridWidth));
+    v = safeDiv(static_cast<float>(gy) + 0.5f,
+                static_cast<float>(request.samplingGridHeight));
+  } else {
   switch (request.samplingMode) {
     case 1: {
       const int grid = max(1, static_cast<int>(ceilf(safeSqrt(static_cast<float>(request.pointCount)))));
@@ -453,8 +461,44 @@ __device__ inline void sampleUvForAttempt(const Request& request, int attemptInd
       break;
     }
   }
+  }
+  u = clampValue(u, 0.0f, 1.0f);
+  v = clampValue(v, 0.0f, 1.0f);
+  if (request.imageLassoEnabled != 0 && request.lassoBoundsValid != 0) {
+    u = request.lassoMinX + u * fmaxf(request.lassoMaxX - request.lassoMinX, 1e-6f);
+    v = request.lassoMinY + v * fmaxf(request.lassoMaxY - request.lassoMinY, 1e-6f);
+  }
   *outU = clampValue(u, 0.0f, 1.0f);
   *outV = clampValue(v, 0.0f, 1.0f);
+}
+
+__device__ inline bool pointInLassoStroke(const Request& request, int strokeIndex, float xNorm, float yNorm) {
+  if (strokeIndex < 0 || strokeIndex >= request.lassoStrokeCount) return false;
+  const int start = request.lassoStrokeStart[strokeIndex];
+  const int count = request.lassoStrokePointCount[strokeIndex];
+  if (count < 3 || start < 0 || start + count > request.lassoPointCount) return false;
+  bool inside = false;
+  for (int i = 0, j = count - 1; i < count; j = i++) {
+    const float xi = request.lassoPointX[start + i];
+    const float yi = request.lassoPointY[start + i];
+    const float xj = request.lassoPointX[start + j];
+    const float yj = request.lassoPointY[start + j];
+    const bool intersects = ((yi > yNorm) != (yj > yNorm)) &&
+                            (xNorm < (xj - xi) * (yNorm - yi) / ((yj - yi) + 1e-12f) + xi);
+    if (intersects) inside = !inside;
+  }
+  return inside;
+}
+
+__device__ inline bool lassoAcceptsPoint(const Request& request, float xNorm, float yNorm) {
+  if (request.imageLassoEnabled == 0) return true;
+  if (request.lassoStrokeCount <= 0 || request.lassoPointCount <= 0) return false;
+  bool inside = false;
+  for (int stroke = 0; stroke < request.lassoStrokeCount; ++stroke) {
+    if (!pointInLassoStroke(request, stroke, xNorm, yNorm)) continue;
+    inside = request.lassoStrokeSubtract[stroke] == 0;
+  }
+  return inside;
 }
 
 __device__ inline int occupancyBinIndex(const Request& request, float r, float g, float b) {
@@ -482,6 +526,11 @@ __global__ void primaryPassKernel(Request request, Sample* primaryOut, int* prim
                            0, request.width - 1);
   const int y = clampValue(static_cast<int>(((static_cast<float>(sy) + 0.5f) / static_cast<float>(request.scaledHeight)) * static_cast<float>(request.height)),
                            0, request.height - 1);
+  if (!lassoAcceptsPoint(request,
+                         (static_cast<float>(x) + 0.5f) / static_cast<float>(request.width),
+                         (static_cast<float>(y) + 0.5f) / static_cast<float>(request.height))) {
+    return;
+  }
 
   const char* rowBase = reinterpret_cast<const char*>(request.srcBase) + static_cast<std::size_t>(y) * request.srcRowBytes;
   const float* pix = reinterpret_cast<const float*>(rowBase) + static_cast<std::size_t>(x) * 4u;
@@ -525,14 +574,25 @@ __global__ void primaryPassKernel(Request request, Sample* primaryOut, int* prim
 __global__ void occupancyPassKernel(Request request, OccupancyCandidate* candidateOut, int* candidateCount) {
   const int attemptIndex = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
   if (attemptIndex >= request.maxCandidateAttempts) return;
-  const float u = haltonFast(static_cast<uint32_t>(attemptIndex + 1), 2u);
-  const float v = haltonFast(static_cast<uint32_t>(attemptIndex + 1), 3u);
+  float u = haltonFast(static_cast<uint32_t>(attemptIndex + 1), 2u);
+  float v = haltonFast(static_cast<uint32_t>(attemptIndex + 1), 3u);
+  if (request.imageLassoEnabled != 0 && request.lassoBoundsValid != 0) {
+    u = request.lassoMinX + u * fmaxf(request.lassoMaxX - request.lassoMinX, 1e-6f);
+    v = request.lassoMinY + v * fmaxf(request.lassoMaxY - request.lassoMinY, 1e-6f);
+  }
+  u = clampValue(u, 0.0f, 1.0f);
+  v = clampValue(v, 0.0f, 1.0f);
   const int sx = clampValue(static_cast<int>(u * static_cast<float>(request.scaledWidth - 1)), 0, request.scaledWidth - 1);
   const int sy = clampValue(static_cast<int>(v * static_cast<float>(request.scaledHeight - 1)), 0, request.scaledHeight - 1);
   const int x = clampValue(static_cast<int>(((static_cast<float>(sx) + 0.5f) / static_cast<float>(request.scaledWidth)) * static_cast<float>(request.width)),
                            0, request.width - 1);
   const int y = clampValue(static_cast<int>(((static_cast<float>(sy) + 0.5f) / static_cast<float>(request.scaledHeight)) * static_cast<float>(request.height)),
                            0, request.height - 1);
+  if (!lassoAcceptsPoint(request,
+                         (static_cast<float>(x) + 0.5f) / static_cast<float>(request.width),
+                         (static_cast<float>(y) + 0.5f) / static_cast<float>(request.height))) {
+    return;
+  }
 
   const char* rowBase = reinterpret_cast<const char*>(request.srcBase) + static_cast<std::size_t>(y) * request.srcRowBytes;
   const float* pix = reinterpret_cast<const float*>(rowBase) + static_cast<std::size_t>(x) * 4u;
@@ -651,6 +711,42 @@ __global__ void stripCubeKernel(StripRequest request, Sample* outSamples) {
   outSamples[index] = sample;
 }
 
+__global__ void rampLayoutScoreKernel(RampLayoutRequest request, float* outScores) {
+  const int candidate = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+  if (candidate >= 2) return;
+  const int y1 = request.candidateY1[candidate];
+  const int bandHeight = request.candidateHeight[candidate];
+  if (bandHeight <= 0 || y1 < 0 || y1 + bandHeight > request.height) {
+    outScores[candidate] = 3.402823466e+38f;
+    return;
+  }
+  constexpr int kRowCount = 3;
+  constexpr int kColCount = 17;
+  float error = 0.0f;
+  int count = 0;
+  for (int rowIndex = 0; rowIndex < kRowCount; ++rowIndex) {
+    const int y = y1 + clampValue(static_cast<int>(lrintf(
+                     (static_cast<float>(rowIndex) / static_cast<float>(kRowCount - 1)) *
+                     static_cast<float>(max(0, bandHeight - 1)))),
+                     0, max(0, bandHeight - 1));
+    const char* rowBase = reinterpret_cast<const char*>(request.srcBase) +
+                          static_cast<std::size_t>(y) * request.srcRowBytes;
+    for (int colIndex = 0; colIndex < kColCount; ++colIndex) {
+      const int x = clampValue(static_cast<int>(lrintf(
+                       (static_cast<float>(colIndex) / static_cast<float>(kColCount - 1)) *
+                       static_cast<float>(max(0, request.width - 1)))),
+                       0, max(0, request.width - 1));
+      const float* pix = reinterpret_cast<const float*>(rowBase) + static_cast<std::size_t>(x) * 4u;
+      const float expected = request.width <= 1 ? 0.0f
+                                                : static_cast<float>(x) / static_cast<float>(request.width - 1);
+      const float gray = (pix[0] + pix[1] + pix[2]) / 3.0f;
+      error += fabsf(pix[0] - pix[1]) + fabsf(pix[1] - pix[2]) + fabsf(gray - expected);
+      ++count;
+    }
+  }
+  outScores[candidate] = count > 0 ? error / static_cast<float>(count) : 3.402823466e+38f;
+}
+
 __global__ void stripRampKernel(StripRequest request, Sample* outSamples) {
   const int index = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
   const int sampleCols = request.width;
@@ -680,9 +776,15 @@ __global__ void stripRampKernel(StripRequest request, Sample* outSamples) {
     b = decodeTransferChannelFast(b, request.plotDisplayLinearTransfer);
   }
   Sample sample{};
-  sample.xNorm = r;
-  sample.yNorm = g;
-  sample.zReserved = b;
+  sample.xNorm = request.width <= 1
+                     ? 0.0f
+                     : static_cast<float>(colIndex) /
+                           static_cast<float>(request.width - 1);
+  sample.yNorm = sampleRows <= 1
+                     ? 0.0f
+                     : static_cast<float>(rowIndex) /
+                           static_cast<float>(sampleRows - 1);
+  sample.zReserved = 0.0f;
   sample.r = r;
   sample.g = g;
   sample.b = b;
@@ -857,6 +959,33 @@ bool buildWholeImageCloud(const Request& request, Result* out) {
     }
   }
 
+  out->success = true;
+  return true;
+}
+
+bool detectGrayRampLayout(const RampLayoutRequest& request, RampLayoutResult* out) {
+  if (!out) return false;
+  *out = RampLayoutResult{};
+  if (!request.srcBase || request.srcRowBytes == 0 || request.width <= 0 || request.height <= 0 || !request.stream) {
+    out->error = "invalid-ramp-layout-request";
+    return false;
+  }
+  DeviceBuffer<float> scores;
+  if (!allocBuffer(&scores, 2u, &out->error)) return false;
+  rampLayoutScoreKernel<<<1, 2, 0, request.stream>>>(request, scores.ptr);
+  if (cudaGetLastError() != cudaSuccess) {
+    out->error = "ramp-layout-score-kernel failed";
+    return false;
+  }
+  if (cudaStreamSynchronize(request.stream) != cudaSuccess) {
+    out->error = "ramp-layout-score sync failed";
+    return false;
+  }
+  if (cudaMemcpy(out->scores, scores.ptr, sizeof(out->scores), cudaMemcpyDeviceToHost) != cudaSuccess) {
+    out->error = "ramp-layout-score readback failed";
+    return false;
+  }
+  out->selectedCandidate = out->scores[1] < out->scores[0] ? 1 : 0;
   out->success = true;
   return true;
 }

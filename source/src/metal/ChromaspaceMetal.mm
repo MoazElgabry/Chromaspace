@@ -88,6 +88,8 @@ struct WholeImageRequestGpu {
   int maxPrimaryAttempts = 0;
   int maxCandidateAttempts = 0;
   int samplingMode = 0;
+  int samplingGridWidth = 0;
+  int samplingGridHeight = 0;
   int preserveOverflow = 0;
   int plotMode = 0;
   int circularHsl = 0;
@@ -98,6 +100,19 @@ struct WholeImageRequestGpu {
   int plotDisplayLinearTransfer = 0;
   int neutralRadiusEnabled = 0;
   float neutralRadius = 1.0f;
+  int imageLassoEnabled = 0;
+  int lassoBoundsValid = 0;
+  float lassoMinX = 0.0f;
+  float lassoMinY = 0.0f;
+  float lassoMaxX = 1.0f;
+  float lassoMaxY = 1.0f;
+  int lassoStrokeCount = 0;
+  int lassoPointCount = 0;
+  int lassoStrokeStart[64] = {};
+  int lassoStrokePointCount[64] = {};
+  int lassoStrokeSubtract[64] = {};
+  float lassoPointX[1024] = {};
+  float lassoPointY[1024] = {};
 };
 
 struct StripRequestGpu {
@@ -116,6 +131,16 @@ struct StripRequestGpu {
   int rampHeight = 0;
   int rampSampleRows = 0;
   float cellWidth = 1.0f;
+};
+
+struct RampLayoutRequestGpu {
+  int width = 0;
+  int height = 0;
+  int originX = 0;
+  int originY = 0;
+  uint32_t srcRowFloats = 0;
+  int candidateY1[2] = {};
+  int candidateHeight[2] = {};
 };
 
 struct CombinedPackRequestGpu {
@@ -137,6 +162,7 @@ struct PipelineBundle {
   id<MTLComputePipelineState> occupancy = nil;
   id<MTLComputePipelineState> stripCube = nil;
   id<MTLComputePipelineState> stripRamp = nil;
+  id<MTLComputePipelineState> rampLayoutScore = nil;
   id<MTLComputePipelineState> packCombined = nil;
   id<MTLComputePipelineState> appendSelect = nil;
 };
@@ -177,6 +203,8 @@ struct WholeImageRequestGpu {
   int maxPrimaryAttempts;
   int maxCandidateAttempts;
   int samplingMode;
+  int samplingGridWidth;
+  int samplingGridHeight;
   int preserveOverflow;
   int plotMode;
   int circularHsl;
@@ -187,6 +215,19 @@ struct WholeImageRequestGpu {
   int plotDisplayLinearTransfer;
   int neutralRadiusEnabled;
   float neutralRadius;
+  int imageLassoEnabled;
+  int lassoBoundsValid;
+  float lassoMinX;
+  float lassoMinY;
+  float lassoMaxX;
+  float lassoMaxY;
+  int lassoStrokeCount;
+  int lassoPointCount;
+  int lassoStrokeStart[64];
+  int lassoStrokePointCount[64];
+  int lassoStrokeSubtract[64];
+  float lassoPointX[1024];
+  float lassoPointY[1024];
 };
 
 struct StripRequestGpu {
@@ -205,6 +246,16 @@ struct StripRequestGpu {
   int rampHeight;
   int rampSampleRows;
   float cellWidth;
+};
+
+struct RampLayoutRequestGpu {
+  int width;
+  int height;
+  int originX;
+  int originY;
+  uint srcRowFloats;
+  int candidateY1[2];
+  int candidateHeight[2];
 };
 
 constant float kRgbAxisMaxRadius = 0.8164965809277260f;
@@ -285,7 +336,10 @@ inline float normalizedNeutralRadiusForPoint(constant WholeImageRequestGpu& requ
 }
 
 inline float neutralRadiusAcceptanceProbability(constant WholeImageRequestGpu& request, float normalizedRadius) { if (request.neutralRadiusEnabled == 0) return 1.0f; const float threshold = effectiveNeutralRadiusThresholdSafe(request.neutralRadius); if (threshold <= 1e-6f) return normalizedRadius <= threshold + 1e-6f ? 1.0f : 0.0f; if (normalizedRadius > threshold + 1e-6f) return 0.0f; const float clippedFraction = clamp(1.0f - threshold, 0.0f, 1.0f); const float normalizedInside = clamp(safeDiv(normalizedRadius, threshold), 0.0f, 1.0f); const float edgePenalty = 0.78f * clippedFraction; return clamp(1.0f - edgePenalty * safePowPos(normalizedInside, 1.35f, 0.0f), 0.0f, 1.0f); }
-inline void sampleUvForAttempt(constant WholeImageRequestGpu& request, int attemptIndex, thread float& outU, thread float& outV) { float u = 0.0f; float v = 0.0f; switch (request.samplingMode) { case 1: { const int grid = max(1, (int)ceil(safeSqrt((float)request.pointCount))); const int gx = attemptIndex % grid; const int gy = attemptIndex / grid; u = safeDiv((float)gx + unitHash01Fast((uint)(attemptIndex * 2 + 1)), (float)grid); v = safeDiv((float)gy + unitHash01Fast((uint)(attemptIndex * 2 + 2)), (float)grid); break; } case 2: u = unitHash01Fast((uint)(attemptIndex * 2 + 11)); v = unitHash01Fast((uint)(attemptIndex * 2 + 37)); break; default: { const int grid = max(1, (int)ceil(safeSqrt((float)request.pointCount))); const int gx = attemptIndex % grid; const int gy = attemptIndex / grid; u = safeDiv((float)gx + 0.5f, (float)grid); v = safeDiv((float)gy + 0.5f, (float)grid); break; } } outU = clamp(u, 0.0f, 1.0f); outV = clamp(v, 0.0f, 1.0f); }
+inline void remapUvForLassoBounds(constant WholeImageRequestGpu& request, thread float& u, thread float& v) { u = clamp(u, 0.0f, 1.0f); v = clamp(v, 0.0f, 1.0f); if (request.imageLassoEnabled != 0 && request.lassoBoundsValid != 0) { u = request.lassoMinX + u * max(request.lassoMaxX - request.lassoMinX, 1e-6f); v = request.lassoMinY + v * max(request.lassoMaxY - request.lassoMinY, 1e-6f); } u = clamp(u, 0.0f, 1.0f); v = clamp(v, 0.0f, 1.0f); }
+inline void sampleUvForAttempt(constant WholeImageRequestGpu& request, int attemptIndex, thread float& outU, thread float& outV) { float u = 0.0f; float v = 0.0f; if (request.samplingGridWidth > 0 && request.samplingGridHeight > 0) { const int gx = attemptIndex % request.samplingGridWidth; const int gy = attemptIndex / request.samplingGridWidth; u = safeDiv((float)gx + 0.5f, (float)request.samplingGridWidth); v = safeDiv((float)gy + 0.5f, (float)request.samplingGridHeight); } else { switch (request.samplingMode) { case 1: { const int grid = max(1, (int)ceil(safeSqrt((float)request.pointCount))); const int gx = attemptIndex % grid; const int gy = attemptIndex / grid; u = safeDiv((float)gx + unitHash01Fast((uint)(attemptIndex * 2 + 1)), (float)grid); v = safeDiv((float)gy + unitHash01Fast((uint)(attemptIndex * 2 + 2)), (float)grid); break; } case 2: u = unitHash01Fast((uint)(attemptIndex * 2 + 11)); v = unitHash01Fast((uint)(attemptIndex * 2 + 37)); break; default: { const int grid = max(1, (int)ceil(safeSqrt((float)request.pointCount))); const int gx = attemptIndex % grid; const int gy = attemptIndex / grid; u = safeDiv((float)gx + 0.5f, (float)grid); v = safeDiv((float)gy + 0.5f, (float)grid); break; } } } remapUvForLassoBounds(request, u, v); outU = u; outV = v; }
+inline bool pointInLassoStroke(constant WholeImageRequestGpu& request, int strokeIndex, float xNorm, float yNorm) { if (strokeIndex < 0 || strokeIndex >= request.lassoStrokeCount) return false; const int start = request.lassoStrokeStart[strokeIndex]; const int count = request.lassoStrokePointCount[strokeIndex]; if (count < 3 || start < 0 || start + count > request.lassoPointCount) return false; bool inside = false; for (int i = 0, j = count - 1; i < count; j = i++) { const float xi = request.lassoPointX[start + i]; const float yi = request.lassoPointY[start + i]; const float xj = request.lassoPointX[start + j]; const float yj = request.lassoPointY[start + j]; const bool intersects = ((yi > yNorm) != (yj > yNorm)) && (xNorm < (xj - xi) * (yNorm - yi) / ((yj - yi) + 1e-12f) + xi); if (intersects) inside = !inside; } return inside; }
+inline bool lassoAcceptsPoint(constant WholeImageRequestGpu& request, float xNorm, float yNorm) { if (request.imageLassoEnabled == 0) return true; if (request.lassoStrokeCount <= 0 || request.lassoPointCount <= 0) return false; bool inside = false; for (int stroke = 0; stroke < request.lassoStrokeCount; ++stroke) { if (!pointInLassoStroke(request, stroke, xNorm, yNorm)) continue; inside = request.lassoStrokeSubtract[stroke] == 0; } return inside; }
 inline int occupancyBinComponent(constant WholeImageRequestGpu& request, float value) { if (request.preserveOverflow == 0) return clamp((int)floor(clamp01Safe(value) * 16.0f), 0, 15); if (value < 0.0f) return 0; if (value > 1.0f) return 17; return 1 + clamp((int)floor(value * 16.0f), 0, 15); }
 inline int occupancyBinIndex(constant WholeImageRequestGpu& request, float r, float g, float b) { const int binsPerAxis = request.preserveOverflow != 0 ? 18 : 16; return (occupancyBinComponent(request, r) * binsPerAxis + occupancyBinComponent(request, g)) * binsPerAxis + occupancyBinComponent(request, b); }
 inline bool loadPixel(constant WholeImageRequestGpu& request, device const float* srcFloats, int x, int y, thread float& r, thread float& g, thread float& b) { const int px = request.originX + x; const int py = request.originY + y; if (px < 0 || py < 0) return false; const uint base = (uint)py * request.srcRowFloats + (uint)px * 4u; r = srcFloats[base + 0u]; g = srcFloats[base + 1u]; b = srcFloats[base + 2u]; return true; }
@@ -299,6 +353,7 @@ kernel void primaryPassKernel(device const float* srcFloats [[buffer(0)]], devic
   const int sy = clamp((int)(v * (float)(request.scaledHeight - 1)), 0, request.scaledHeight - 1);
   const int x = clamp((int)(((float(sx) + 0.5f) / float(request.scaledWidth)) * float(request.width)), 0, request.width - 1);
   const int y = clamp((int)(((float(sy) + 0.5f) / float(request.scaledHeight)) * float(request.height)), 0, request.height - 1);
+  if (!lassoAcceptsPoint(request, (float(x) + 0.5f) / float(request.width), (float(y) + 0.5f) / float(request.height))) return;
   float r = 0.0f; float g = 0.0f; float b = 0.0f; if (!loadPixel(request, srcFloats, x, y, r, g, b)) return;
   if (request.preserveOverflow == 0) { r = clamp01Safe(r); g = clamp01Safe(g); b = clamp01Safe(b); }
   if (request.plotDisplayLinearEnabled != 0) { r = decodeTransferChannelFast(r, request.plotDisplayLinearTransfer); g = decodeTransferChannelFast(g, request.plotDisplayLinearTransfer); b = decodeTransferChannelFast(b, request.plotDisplayLinearTransfer); }
@@ -310,11 +365,12 @@ kernel void primaryPassKernel(device const float* srcFloats [[buffer(0)]], devic
 
 kernel void occupancyPassKernel(device const float* srcFloats [[buffer(0)]], device OccupancyCandidate* candidateOut [[buffer(1)]], device atomic_uint* candidateCount [[buffer(2)]], constant WholeImageRequestGpu& request [[buffer(3)]], uint tid [[thread_position_in_grid]]) {
   const int attemptIndex = (int)tid; if (attemptIndex >= request.maxCandidateAttempts) return;
-  const float u = haltonFast((uint)(attemptIndex + 1), 2u); const float v = haltonFast((uint)(attemptIndex + 1), 3u);
+  float u = haltonFast((uint)(attemptIndex + 1), 2u); float v = haltonFast((uint)(attemptIndex + 1), 3u); remapUvForLassoBounds(request, u, v);
   const int sx = clamp((int)(u * (float)(request.scaledWidth - 1)), 0, request.scaledWidth - 1);
   const int sy = clamp((int)(v * (float)(request.scaledHeight - 1)), 0, request.scaledHeight - 1);
   const int x = clamp((int)(((float(sx) + 0.5f) / float(request.scaledWidth)) * float(request.width)), 0, request.width - 1);
   const int y = clamp((int)(((float(sy) + 0.5f) / float(request.scaledHeight)) * float(request.height)), 0, request.height - 1);
+  if (!lassoAcceptsPoint(request, (float(x) + 0.5f) / float(request.width), (float(y) + 0.5f) / float(request.height))) return;
   float r = 0.0f; float g = 0.0f; float b = 0.0f; if (!loadPixel(request, srcFloats, x, y, r, g, b)) return;
   if (request.preserveOverflow == 0) { r = clamp01Safe(r); g = clamp01Safe(g); b = clamp01Safe(b); }
   if (request.plotDisplayLinearEnabled != 0) { r = decodeTransferChannelFast(r, request.plotDisplayLinearTransfer); g = decodeTransferChannelFast(g, request.plotDisplayLinearTransfer); b = decodeTransferChannelFast(b, request.plotDisplayLinearTransfer); }
@@ -336,6 +392,27 @@ kernel void stripCubeKernel(device const float* srcFloats [[buffer(0)]], device 
   Sample sample; sample.xNorm = r; sample.yNorm = g; sample.zReserved = b; sample.r = r; sample.g = g; sample.b = b; outSamples[index] = sample;
 }
 
+kernel void rampLayoutScoreKernel(device const float* srcFloats [[buffer(0)]], device float* outScores [[buffer(1)]], constant RampLayoutRequestGpu& request [[buffer(2)]], uint tid [[thread_position_in_grid]]) {
+  const int candidate = (int)tid; if (candidate >= 2) return;
+  const int y1 = request.candidateY1[candidate]; const int bandHeight = request.candidateHeight[candidate];
+  if (bandHeight <= 0 || y1 < 0 || y1 + bandHeight > request.height) { outScores[candidate] = 3.402823466e+38f; return; }
+  const int rowCount = 3; const int colCount = 17; float error = 0.0f; int count = 0;
+  for (int rowIndex = 0; rowIndex < rowCount; ++rowIndex) {
+    const int y = y1 + clamp((int)rint((float(rowIndex) / float(rowCount - 1)) * float(max(0, bandHeight - 1))), 0, max(0, bandHeight - 1));
+    for (int colIndex = 0; colIndex < colCount; ++colIndex) {
+      const int x = clamp((int)rint((float(colIndex) / float(colCount - 1)) * float(max(0, request.width - 1))), 0, max(0, request.width - 1));
+      const int px = request.originX + x; const int py = request.originY + y;
+      if (px < 0 || py < 0) continue;
+      const uint base = (uint)py * request.srcRowFloats + (uint)px * 4u;
+      const float r = srcFloats[base + 0u]; const float g = srcFloats[base + 1u]; const float b = srcFloats[base + 2u];
+      const float expected = request.width <= 1 ? 0.0f : float(x) / float(request.width - 1);
+      const float gray = (r + g + b) / 3.0f;
+      error += fabs(r - g) + fabs(g - b) + fabs(gray - expected); ++count;
+    }
+  }
+  outScores[candidate] = count > 0 ? error / float(count) : 3.402823466e+38f;
+}
+
 kernel void stripRampKernel(device const float* srcFloats [[buffer(0)]], device Sample* outSamples [[buffer(1)]], constant StripRequestGpu& request [[buffer(2)]], uint tid [[thread_position_in_grid]]) {
   const int index = (int)tid; const int sampleCols = request.width; const int sampleRows = request.rampSampleRows; const int total = sampleCols * sampleRows; if (index >= total) return;
   const int rowIndex = index / sampleCols; const int colIndex = index % sampleCols; const int rowDenom = max(1, sampleRows - 1);
@@ -344,7 +421,11 @@ kernel void stripRampKernel(device const float* srcFloats [[buffer(0)]], device 
   float r = srcFloats[base + 0u]; float g = srcFloats[base + 1u]; float b = srcFloats[base + 2u];
   if (request.preserveOverflow == 0) { r = clamp01Safe(r); g = clamp01Safe(g); b = clamp01Safe(b); }
   if (request.plotDisplayLinearEnabled != 0) { r = decodeTransferChannelFast(r, request.plotDisplayLinearTransfer); g = decodeTransferChannelFast(g, request.plotDisplayLinearTransfer); b = decodeTransferChannelFast(b, request.plotDisplayLinearTransfer); }
-  Sample sample; sample.xNorm = r; sample.yNorm = g; sample.zReserved = b; sample.r = r; sample.g = g; sample.b = b; outSamples[index] = sample;
+  Sample sample;
+  sample.xNorm = request.width <= 1 ? 0.0f : float(colIndex) / float(request.width - 1);
+  sample.yNorm = sampleRows <= 1 ? 0.0f : float(rowIndex) / float(sampleRows - 1);
+  sample.zReserved = 0.0f;
+  sample.r = r; sample.g = g; sample.b = b; outSamples[index] = sample;
 }
 
 kernel void packCombinedKernel(device const Sample* stripSamples [[buffer(0)]],
@@ -394,7 +475,7 @@ bool ensurePipelines(id<MTLDevice> device, PipelineBundle* out, std::string* err
   if (!device || !out) return false;
   std::lock_guard<std::mutex> lock(gPipelineMutex);
   if (gPipelines.device == device && gPipelines.primary != nil && gPipelines.occupancy != nil &&
-      gPipelines.stripCube != nil && gPipelines.stripRamp != nil && gPipelines.packCombined != nil &&
+      gPipelines.stripCube != nil && gPipelines.stripRamp != nil && gPipelines.rampLayoutScore != nil && gPipelines.packCombined != nil &&
       gPipelines.appendSelect != nil) { *out = gPipelines; return true; }
   NSError* compileError = nil;
   const std::string sourceString = std::string(kCloudMetalSourcePart1) + kCloudMetalSourcePart2 + kCloudMetalSourcePart3;
@@ -419,10 +500,11 @@ bool ensurePipelines(id<MTLDevice> device, PipelineBundle* out, std::string* err
   built.occupancy = makePipeline(@"occupancyPassKernel");
   built.stripCube = makePipeline(@"stripCubeKernel");
   built.stripRamp = makePipeline(@"stripRampKernel");
+  built.rampLayoutScore = makePipeline(@"rampLayoutScoreKernel");
   built.packCombined = makePipeline(@"packCombinedKernel");
   built.appendSelect = makePipeline(@"appendSelectKernel");
   if (built.primary == nil || built.occupancy == nil || built.stripCube == nil ||
-      built.stripRamp == nil || built.packCombined == nil || built.appendSelect == nil) {
+      built.stripRamp == nil || built.rampLayoutScore == nil || built.packCombined == nil || built.appendSelect == nil) {
     return false;
   }
   gPipelines = built; *out = gPipelines; return true;
@@ -567,10 +649,22 @@ bool buildWholeImageCloud(const Request& request, Result* out) {
     gpuRequest.pointCount = request.pointCount; gpuRequest.candidateTarget = request.candidateTarget;
     gpuRequest.maxPrimaryAttempts = request.maxPrimaryAttempts; gpuRequest.maxCandidateAttempts = request.maxCandidateAttempts;
     gpuRequest.samplingMode = request.samplingMode; gpuRequest.preserveOverflow = request.preserveOverflow;
+    gpuRequest.samplingGridWidth = request.samplingGridWidth; gpuRequest.samplingGridHeight = request.samplingGridHeight;
     gpuRequest.plotMode = request.plotMode; gpuRequest.circularHsl = request.circularHsl; gpuRequest.circularHsv = request.circularHsv;
     gpuRequest.normConeNormalized = request.normConeNormalized; gpuRequest.showOverflow = request.showOverflow;
     gpuRequest.plotDisplayLinearEnabled = request.plotDisplayLinearEnabled; gpuRequest.plotDisplayLinearTransfer = request.plotDisplayLinearTransfer;
     gpuRequest.neutralRadiusEnabled = request.neutralRadiusEnabled; gpuRequest.neutralRadius = request.neutralRadius;
+    gpuRequest.imageLassoEnabled = request.imageLassoEnabled;
+    gpuRequest.lassoBoundsValid = request.lassoBoundsValid;
+    gpuRequest.lassoMinX = request.lassoMinX; gpuRequest.lassoMinY = request.lassoMinY;
+    gpuRequest.lassoMaxX = request.lassoMaxX; gpuRequest.lassoMaxY = request.lassoMaxY;
+    gpuRequest.lassoStrokeCount = request.lassoStrokeCount;
+    gpuRequest.lassoPointCount = request.lassoPointCount;
+    std::memcpy(gpuRequest.lassoStrokeStart, request.lassoStrokeStart, sizeof(gpuRequest.lassoStrokeStart));
+    std::memcpy(gpuRequest.lassoStrokePointCount, request.lassoStrokePointCount, sizeof(gpuRequest.lassoStrokePointCount));
+    std::memcpy(gpuRequest.lassoStrokeSubtract, request.lassoStrokeSubtract, sizeof(gpuRequest.lassoStrokeSubtract));
+    std::memcpy(gpuRequest.lassoPointX, request.lassoPointX, sizeof(gpuRequest.lassoPointX));
+    std::memcpy(gpuRequest.lassoPointY, request.lassoPointY, sizeof(gpuRequest.lassoPointY));
 
     id<MTLCommandBuffer> cmd = [queue commandBuffer];
     if (cmd == nil) { out->error = "metal-command-buffer-failed"; return false; }
@@ -624,6 +718,73 @@ bool buildWholeImageCloud(const Request& request, Result* out) {
         if (out->appendedSamples.empty() && !out->error.empty()) return false;
       }
     }
+    out->success = true;
+    return true;
+  }
+}
+
+bool detectGrayRampLayout(const RampLayoutRequest& request, RampLayoutResult* out) {
+  if (!out) return false;
+  *out = RampLayoutResult{};
+  @autoreleasepool {
+    if (!request.srcMetalBuffer || !request.metalCommandQueue || request.srcRowBytes == 0 ||
+        request.width <= 0 || request.height <= 0) {
+      out->error = "invalid-ramp-layout-request";
+      return false;
+    }
+    if (!validateFloatRowBytes(request.srcRowBytes)) {
+      out->error = "invalid-ramp-layout-row-bytes";
+      return false;
+    }
+    id<MTLCommandQueue> queue = (__bridge id<MTLCommandQueue>)request.metalCommandQueue;
+    id<MTLBuffer> src = (__bridge id<MTLBuffer>)request.srcMetalBuffer;
+    if (queue == nil || src == nil || queue.device == nil) {
+      out->error = "metal-unavailable";
+      return false;
+    }
+    PipelineBundle pipelines{};
+    if (!ensurePipelines(queue.device, &pipelines, &out->error)) return false;
+    id<MTLBuffer> scoresBuffer = [queue.device newBufferWithLength:2u * sizeof(float)
+                                                           options:MTLResourceStorageModeShared];
+    if (scoresBuffer == nil) {
+      out->error = "metal-ramp-layout-buffer-allocation-failed";
+      return false;
+    }
+    RampLayoutRequestGpu gpuRequest{};
+    gpuRequest.width = request.width;
+    gpuRequest.height = request.height;
+    gpuRequest.originX = request.originX;
+    gpuRequest.originY = request.originY;
+    gpuRequest.srcRowFloats = static_cast<uint32_t>(request.srcRowBytes / sizeof(float));
+    for (int i = 0; i < 2; ++i) {
+      gpuRequest.candidateY1[i] = request.candidateY1[i];
+      gpuRequest.candidateHeight[i] = request.candidateHeight[i];
+    }
+    id<MTLCommandBuffer> cmd = [queue commandBuffer];
+    if (cmd == nil) {
+      out->error = "metal-ramp-layout-command-buffer-failed";
+      return false;
+    }
+    id<MTLComputeCommandEncoder> encoder = [cmd computeCommandEncoder];
+    if (encoder == nil) {
+      out->error = "metal-ramp-layout-encoder-failed";
+      return false;
+    }
+    [encoder setBuffer:src offset:0 atIndex:0];
+    [encoder setBuffer:scoresBuffer offset:0 atIndex:1];
+    [encoder setBytes:&gpuRequest length:sizeof(gpuRequest) atIndex:2];
+    dispatch1D(encoder, pipelines.rampLayoutScore, 2u);
+    [encoder endEncoding];
+    [cmd commit];
+    [cmd waitUntilCompleted];
+    if (cmd.status != MTLCommandBufferStatusCompleted) {
+      out->error = "metal-ramp-layout-command-failed";
+      return false;
+    }
+    const float* scores = static_cast<const float*>(scoresBuffer.contents);
+    out->scores[0] = scores[0];
+    out->scores[1] = scores[1];
+    out->selectedCandidate = out->scores[1] < out->scores[0] ? 1 : 0;
     out->success = true;
     return true;
   }
@@ -811,6 +972,8 @@ bool buildWholeImageAndIdentityStripCloud(const Request& wholeImageRequest, cons
     wholeGpuRequest.maxPrimaryAttempts = wholeImageRequest.maxPrimaryAttempts;
     wholeGpuRequest.maxCandidateAttempts = wholeImageRequest.maxCandidateAttempts;
     wholeGpuRequest.samplingMode = wholeImageRequest.samplingMode;
+    wholeGpuRequest.samplingGridWidth = wholeImageRequest.samplingGridWidth;
+    wholeGpuRequest.samplingGridHeight = wholeImageRequest.samplingGridHeight;
     wholeGpuRequest.preserveOverflow = wholeImageRequest.preserveOverflow;
     wholeGpuRequest.plotMode = wholeImageRequest.plotMode;
     wholeGpuRequest.circularHsl = wholeImageRequest.circularHsl;
@@ -821,6 +984,19 @@ bool buildWholeImageAndIdentityStripCloud(const Request& wholeImageRequest, cons
     wholeGpuRequest.plotDisplayLinearTransfer = wholeImageRequest.plotDisplayLinearTransfer;
     wholeGpuRequest.neutralRadiusEnabled = wholeImageRequest.neutralRadiusEnabled;
     wholeGpuRequest.neutralRadius = wholeImageRequest.neutralRadius;
+    wholeGpuRequest.imageLassoEnabled = wholeImageRequest.imageLassoEnabled;
+    wholeGpuRequest.lassoBoundsValid = wholeImageRequest.lassoBoundsValid;
+    wholeGpuRequest.lassoMinX = wholeImageRequest.lassoMinX;
+    wholeGpuRequest.lassoMinY = wholeImageRequest.lassoMinY;
+    wholeGpuRequest.lassoMaxX = wholeImageRequest.lassoMaxX;
+    wholeGpuRequest.lassoMaxY = wholeImageRequest.lassoMaxY;
+    wholeGpuRequest.lassoStrokeCount = wholeImageRequest.lassoStrokeCount;
+    wholeGpuRequest.lassoPointCount = wholeImageRequest.lassoPointCount;
+    std::memcpy(wholeGpuRequest.lassoStrokeStart, wholeImageRequest.lassoStrokeStart, sizeof(wholeGpuRequest.lassoStrokeStart));
+    std::memcpy(wholeGpuRequest.lassoStrokePointCount, wholeImageRequest.lassoStrokePointCount, sizeof(wholeGpuRequest.lassoStrokePointCount));
+    std::memcpy(wholeGpuRequest.lassoStrokeSubtract, wholeImageRequest.lassoStrokeSubtract, sizeof(wholeGpuRequest.lassoStrokeSubtract));
+    std::memcpy(wholeGpuRequest.lassoPointX, wholeImageRequest.lassoPointX, sizeof(wholeGpuRequest.lassoPointX));
+    std::memcpy(wholeGpuRequest.lassoPointY, wholeImageRequest.lassoPointY, sizeof(wholeGpuRequest.lassoPointY));
 
     StripRequestGpu stripGpuRequest{};
     stripGpuRequest.width = stripRequest.width;

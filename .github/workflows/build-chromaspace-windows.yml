@@ -26,7 +26,9 @@ jobs:
         id: version
         run: |
           $cmake = Get-Content "CMakeLists.txt" -Raw
-          if ($cmake -match 'set\(CUBE_DISPLAY_VERSION\s+"([^"]+)"\)') {
+          if ($cmake -match 'set\(CHROMASPACE_PACKAGE_VERSION\s+"([^"]+)"\)') {
+            $version = $Matches[1]
+          } elseif ($cmake -match 'set\(CUBE_DISPLAY_VERSION\s+"([^"]+)"\)') {
             $version = $Matches[1]
           } elseif ($cmake -match 'project\([^\)]*VERSION\s+([0-9A-Za-z\.\-]+)') {
             $version = $Matches[1]
@@ -124,6 +126,12 @@ jobs:
           }
           if (!(Test-Path "bundle/Chromaspace.ofx.bundle/Contents/Win64/OpenSans-Regular.ttf")) {
             throw "Missing bundled font asset"
+          }
+          if (!(Test-Path "bundle/Chromaspace.ofx.bundle/Contents/Resources/chromaspace_resolve_bridge.py")) {
+            throw "Missing bundled Resolve bridge script"
+          }
+          if (!(Test-Path "bundle/Chromaspace.ofx.bundle/Contents/Resources/com.moazelgabry.chromaspace.png")) {
+            throw "Missing bundled plugin icon"
           }
           $viewerDeps = cmd /c "call ""$env:VSDEVCMD"" -arch=x64 -host_arch=x64 && dumpbin /dependents ""bundle\Chromaspace.ofx.bundle\Contents\Win64\Chromaspace_CubeViewer.exe"""
           if ($viewerDeps -match "cudart64_") {

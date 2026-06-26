@@ -7,6 +7,9 @@
 
 namespace ChromaspaceMetal {
 
+constexpr int kMaxLassoStrokes = 64;
+constexpr int kMaxLassoPoints = 1024;
+
 struct Sample {
   float xNorm = 0.0f;
   float yNorm = 0.0f;
@@ -38,6 +41,8 @@ struct Request {
   int maxPrimaryAttempts = 0;
   int maxCandidateAttempts = 0;
   int samplingMode = 0;
+  int samplingGridWidth = 0;
+  int samplingGridHeight = 0;
   int preserveOverflow = 0;
   int occupancyFill = 0;
   int plotMode = 0;
@@ -49,6 +54,19 @@ struct Request {
   int plotDisplayLinearTransfer = 0;
   int neutralRadiusEnabled = 0;
   float neutralRadius = 1.0f;
+  int imageLassoEnabled = 0;
+  int lassoBoundsValid = 0;
+  float lassoMinX = 0.0f;
+  float lassoMinY = 0.0f;
+  float lassoMaxX = 1.0f;
+  float lassoMaxY = 1.0f;
+  int lassoStrokeCount = 0;
+  int lassoPointCount = 0;
+  int lassoStrokeStart[kMaxLassoStrokes] = {};
+  int lassoStrokePointCount[kMaxLassoStrokes] = {};
+  int lassoStrokeSubtract[kMaxLassoStrokes] = {};
+  float lassoPointX[kMaxLassoPoints] = {};
+  float lassoPointY[kMaxLassoPoints] = {};
   void* metalCommandQueue = nullptr;
 };
 
@@ -65,6 +83,27 @@ struct Result {
 };
 
 bool buildWholeImageCloud(const Request& request, Result* out);
+
+struct RampLayoutRequest {
+  const void* srcMetalBuffer = nullptr;
+  std::size_t srcRowBytes = 0;
+  int width = 0;
+  int height = 0;
+  int originX = 0;
+  int originY = 0;
+  int candidateY1[2] = {};
+  int candidateHeight[2] = {};
+  void* metalCommandQueue = nullptr;
+};
+
+struct RampLayoutResult {
+  float scores[2] = {};
+  int selectedCandidate = 0;
+  std::string error;
+  bool success = false;
+};
+
+bool detectGrayRampLayout(const RampLayoutRequest& request, RampLayoutResult* out);
 
 struct StripRequest {
   const void* srcMetalBuffer = nullptr;

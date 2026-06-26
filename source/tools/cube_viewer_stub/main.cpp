@@ -4,12 +4,16 @@
 #include <chrono>
 #include <cmath>
 #include <csignal>
+#include <cctype>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <filesystem>
+#include <fstream>
 #include <functional>
+#include <iomanip>
 #include <mutex>
 #include <numeric>
 #include <sstream>
@@ -19,6 +23,7 @@
 #include <vector>
 
 #include "color/ColorManagement.h"
+#include "ChromaspaceViewerState.h"
 #include "text/FontRenderer.h"
 
 #if defined(_WIN32)
@@ -356,7 +361,7 @@ void notifyExistingViewerBringToFront() {
 }
 #endif
 
-const char* kViewerVersionString = "v1.0.12";
+const char* kViewerVersionString = "v2.0 beta";
 
 #if !defined(_WIN32)
 bool sendAllSocket(int fd, const char* data, size_t size) {
@@ -558,6 +563,22 @@ void resetCamera(CameraState* cam) {
   cam->qy = q.y;
   cam->qz = q.z;
   cam->qw = q.w;
+}
+
+void resetAnalyticalScopeCamera(CameraState* cam, bool histogram = false) {
+  if (!cam) return;
+  cam->orthographic = true;
+  cam->orthographicView = -1;
+  cam->distance = 6.35f;
+  // Histogram labels live below and to the right of the signal frame, while
+  // Waveform labels live on its left edge. Give each instrument a balanced
+  // initial framing instead of forcing both through the same centered camera.
+  cam->panX = histogram ? -0.07f : 0.035f;
+  cam->panY = 0.0f;
+  cam->qx = 0.0f;
+  cam->qy = 0.0f;
+  cam->qz = 0.0f;
+  cam->qw = 1.0f;
 }
 
 void resetChenCamera(CameraState* cam) {
@@ -1064,6 +1085,8 @@ using ViewerGLUseProgramProc = void(APIENTRY *)(GLuint);
 using ViewerGLGetUniformLocationProc = GLint(APIENTRY *)(GLuint, const char*);
 using ViewerGLUniform1iProc = void(APIENTRY *)(GLint, GLint);
 using ViewerGLUniform1fProc = void(APIENTRY *)(GLint, GLfloat);
+using ViewerGLUniform2fProc = void(APIENTRY *)(GLint, GLfloat, GLfloat);
+using ViewerGLUniform3fProc = void(APIENTRY *)(GLint, GLfloat, GLfloat, GLfloat);
 using ViewerGLBindBufferBaseProc = void(APIENTRY *)(GLenum, GLuint, GLuint);
 using ViewerGLDispatchComputeProc = void(APIENTRY *)(GLuint, GLuint, GLuint);
 using ViewerGLMemoryBarrierProc = void(APIENTRY *)(GLbitfield);
@@ -1153,6 +1176,8 @@ struct ViewerGlComputeApi {
   ViewerGLGetUniformLocationProc getUniformLocation = nullptr;
   ViewerGLUniform1iProc uniform1i = nullptr;
   ViewerGLUniform1fProc uniform1f = nullptr;
+  ViewerGLUniform2fProc uniform2f = nullptr;
+  ViewerGLUniform3fProc uniform3f = nullptr;
   ViewerGLBindBufferBaseProc bindBufferBase = nullptr;
   ViewerGLDispatchComputeProc dispatchCompute = nullptr;
   ViewerGLMemoryBarrierProc memoryBarrier = nullptr;
@@ -1168,6 +1193,22 @@ struct PointRenderProgramCache {
   GLint pointCrispnessLoc = -1;
   GLint glossModeLoc = -1;
   GLint occlusiveModeLoc = -1;
+  bool initAttempted = false;
+  bool available = false;
+};
+
+struct AnalyticalScopeComputeCache {
+  GLuint program = 0;
+  GLuint input = 0;
+  GLuint density = 0;
+  GLint pointCountLoc = -1;
+  GLint waveformLoc = -1;
+  GLint scopeModeLoc = -1;
+  GLint widthLoc = -1;
+  GLint heightLoc = -1;
+  GLint rangeMinLoc = -1;
+  GLint invRangeLoc = -1;
+  GLint excludeOverflowLoc = -1;
   bool initAttempted = false;
   bool available = false;
 };
@@ -1191,6 +1232,8 @@ const ViewerGlComputeApi& viewerGlComputeApi() {
     a.getUniformLocation = reinterpret_cast<ViewerGLGetUniformLocationProc>(glfwGetProcAddress("glGetUniformLocation"));
     a.uniform1i = reinterpret_cast<ViewerGLUniform1iProc>(glfwGetProcAddress("glUniform1i"));
     a.uniform1f = reinterpret_cast<ViewerGLUniform1fProc>(glfwGetProcAddress("glUniform1f"));
+    a.uniform2f = reinterpret_cast<ViewerGLUniform2fProc>(glfwGetProcAddress("glUniform2f"));
+    a.uniform3f = reinterpret_cast<ViewerGLUniform3fProc>(glfwGetProcAddress("glUniform3f"));
     a.bindBufferBase = reinterpret_cast<ViewerGLBindBufferBaseProc>(glfwGetProcAddress("glBindBufferBase"));
     a.dispatchCompute = reinterpret_cast<ViewerGLDispatchComputeProc>(glfwGetProcAddress("glDispatchCompute"));
     a.memoryBarrier = reinterpret_cast<ViewerGLMemoryBarrierProc>(glfwGetProcAddress("glMemoryBarrier"));
@@ -1199,7 +1242,7 @@ const ViewerGlComputeApi& viewerGlComputeApi() {
                   a.attachShader != nullptr && a.linkProgram != nullptr && a.getProgramiv != nullptr &&
                   a.getProgramInfoLog != nullptr && a.deleteShader != nullptr && a.deleteProgram != nullptr &&
                   a.useProgram != nullptr && a.getUniformLocation != nullptr && a.uniform1i != nullptr &&
-                  a.uniform1f != nullptr &&
+                  a.uniform1f != nullptr && a.uniform2f != nullptr && a.uniform3f != nullptr &&
                   a.bindBufferBase != nullptr && a.dispatchCompute != nullptr && a.memoryBarrier != nullptr;
     return a;
   }();
@@ -1418,7 +1461,7 @@ bool runViewerCudaStartupSelfTest(std::string* reason);
 bool runViewerMetalGlossFieldStartupSelfTest(std::string* reason);
 #endif
 
-ViewerGpuCapabilities detectViewerGpuCapabilities() {
+ViewerGpuCapabilities detectViewerGpuCapabilities(bool allowCudaProbe = true) {
   ViewerGpuCapabilities caps{};
   caps.glVersion = currentGlVersionString();
   caps.glBufferObjects = viewerGlBufferApi().available;
@@ -1446,7 +1489,9 @@ ViewerGpuCapabilities detectViewerGpuCapabilities() {
   caps.roadmapLabel = caps.metalQueueReady ? "metal-compute-mesh-phase2" : "metal-phase2";
 #else
 #if defined(CHROMASPACE_VIEWER_HAS_CUDA)
-  if (viewerCudaDisabled()) {
+  if (!allowCudaProbe) {
+    caps.cudaReason = "deferred-startup";
+  } else if (viewerCudaDisabled()) {
     caps.cudaReason = "disabled-by-env";
   } else {
     const ChromaspaceCuda::ProbeResult cudaProbe = ChromaspaceCuda::probe();
@@ -1485,6 +1530,20 @@ ViewerGpuCapabilities detectViewerGpuCapabilities() {
 #endif
   return caps;
 }
+
+#if defined(CHROMASPACE_VIEWER_HAS_CUDA) && !defined(__APPLE__)
+bool promoteViewerCudaCapabilities(ViewerGpuCapabilities* caps) {
+  if (!caps || viewerCudaDisabled()) return false;
+  ViewerGpuCapabilities promoted = detectViewerGpuCapabilities(true);
+  if (!promoted.cudaComputeEnabled) {
+    caps->cudaReason = promoted.cudaReason;
+    caps->cudaStartupReason = promoted.cudaStartupReason;
+    return false;
+  }
+  *caps = std::move(promoted);
+  return true;
+}
+#endif
 
 struct GlossFieldSolution {
   std::vector<float> body;
@@ -1547,6 +1606,9 @@ struct MeshData {
   std::vector<float> lineVerts;
   std::vector<float> lineColors;
   size_t lineVertexCount = 0;
+  std::vector<float> scopeFillVerts;
+  std::vector<float> scopeFillColors;
+  size_t scopeFillVertexCount = 0;
   bool hasGlossInset = false;
   int glossInsetWidth = 0;
   int glossInsetHeight = 0;
@@ -1556,7 +1618,27 @@ struct MeshData {
   bool hasFitBounds = false;
   Vec3 fitMin{};
   Vec3 fitMax{};
+  bool analyticalScope = false;
+  bool waveformScope = false;
+  int scopeMode = 0;
+  float scopeRangeMin = 0.0f;
+  float scopeRangeMax = 1.0f;
+  std::vector<float> scopeDensity;
+  int scopeWidth = 0;
+  int scopeHeight = 0;
+  int scopeSourceRows = 0;
+  int scopeRangeMode = 0;
+  int scopeLumaMethod = 0;
 };
+
+bool meshHasVisibleData(const MeshData& mesh) {
+  return mesh.pointCount > 0 ||
+         mesh.lineVertexCount > 0 ||
+         mesh.scopeFillVertexCount > 0 ||
+         !mesh.scopeDensity.empty() ||
+         mesh.hasGlossField ||
+         mesh.hasGlossInset;
+}
 
 void setMeshFitBoundsFromVerts(MeshData* mesh) {
   if (!mesh || mesh->pointVerts.empty() || mesh->pointCount == 0) return;
@@ -1622,6 +1704,15 @@ struct InputCloudComputeCache {
   GLint glossViewLoc = -1;
   GLint sourceAspectLoc = -1;
   GLint glossLiftScaleLoc = -1;
+  GLint chromaticityTransferLoc = -1;
+  GLint chromaticityReferenceBasisLoc = -1;
+  GLint chromaticityWhiteLoc = -1;
+  GLint chromaticityMatrixRow0Loc = -1;
+  GLint chromaticityMatrixRow1Loc = -1;
+  GLint chromaticityMatrixRow2Loc = -1;
+  GLint chromaticityInverseRow0Loc = -1;
+  GLint chromaticityInverseRow1Loc = -1;
+  GLint chromaticityInverseRow2Loc = -1;
   uint64_t builtSerial = 0;
   GLsizei pointCount = 0;
   bool available = false;
@@ -1733,6 +1824,34 @@ struct InputCloudSampleComputeCache {
 struct InputCloudSampleMetalCache {
   PointDrawBuffers draw;
 };
+
+bool meshHasResidentInputPointStorage(
+    const MeshData& mesh,
+    const InputCloudComputeCache& computeCache
+#if defined(CHROMASPACE_VIEWER_HAS_CUDA) && !defined(__APPLE__)
+    , const InputCloudCudaCache& cudaCache
+#endif
+    ) {
+  if (mesh.pointCount == 0) return true;
+  if (mesh.pointVerts.size() >= mesh.pointCount * 3u &&
+      mesh.pointColors.size() >= mesh.pointCount * 4u) {
+    return true;
+  }
+#if defined(CHROMASPACE_VIEWER_HAS_CUDA) && !defined(__APPLE__)
+  if (cudaCache.available &&
+      cudaCache.builtSerial == mesh.serial &&
+      cudaCache.verts != 0 &&
+      cudaCache.colors != 0 &&
+      static_cast<size_t>(std::max(cudaCache.pointCount, 0)) >= mesh.pointCount) {
+    return true;
+  }
+#endif
+  return computeCache.available &&
+         computeCache.builtSerial == mesh.serial &&
+         computeCache.verts != 0 &&
+         computeCache.colors != 0 &&
+         static_cast<size_t>(std::max(computeCache.pointCount, 0)) >= mesh.pointCount;
+}
 
 void releasePointBufferCache(PointBufferCache* cache) {
   if (!cache) return;
@@ -2215,10 +2334,11 @@ bool buildIdentityOverlayMeshOnGpu(const ResolvedPayload& payload,
 bool canUseInputCloudComputePath(const ResolvedPayload& payload);
 bool ensureInputCloudComputeProgram(InputCloudComputeCache* cache);
 bool ensureInputCloudBoundsProgram(InputCloudComputeCache* cache);
-bool parseInputCloudSamples(const InputCloudPayload& cloud, std::vector<InputCloudSample>* samples);
+bool parseInputCloudSamples(const InputCloudPayload& cloud,
+                            std::vector<InputCloudSample>* samples,
+                            bool includeWaveformLayer = false);
 bool cubeSliceContainsPoint(const PlotRemapSpec& spec, float r, float g, float b);
 bool cubeSliceContainsPoint(const ResolvedPayload& payload, float r, float g, float b);
-bool parseInputCloudSamples(const InputCloudPayload& cloud, std::vector<InputCloudSample>* samples);
 void filterInputCloudSamples(const ResolvedPayload& payload, std::vector<InputCloudSample>* samples);
 void expandGlossViewFitBounds(const ResolvedPayload& payload, MeshData* mesh);
 float pointAlphaScaleForPlot(float pointSize, float pointDensity, int resolution);
@@ -2323,6 +2443,7 @@ struct PlotRemapSpec {
   float overflowHighlightB = 0.0f;
   WorkshopColor::ChromaticityColorSpec chromaticity{};
   WorkshopColor::Mat3f chromaticityRgbToXyz{};
+  WorkshopColor::Mat3f chromaticityXyzToRgb{};
   WorkshopColor::Vec2f chromaticityWhite{};
 };
 
@@ -2334,6 +2455,11 @@ struct LassoPointNorm {
 struct LassoStroke {
   bool subtract = false;
   std::vector<LassoPointNorm> points;
+  bool boundsValid = false;
+  float minXNorm = 0.0f;
+  float maxXNorm = 0.0f;
+  float minYNorm = 0.0f;
+  float maxYNorm = 0.0f;
 };
 
 struct LassoRegionState {
@@ -2364,12 +2490,26 @@ struct ComputeRemapUniforms {
   GLint normConeNormalized = 1;
   GLint showOverflow = 0;
   GLint highlightOverflow = 1;
+  GLint chromaticityInputTransfer = 0;
+  GLint chromaticityReferenceBasis = 0;
+  GLfloat chromaticityWhiteX = 1.0f / 3.0f;
+  GLfloat chromaticityWhiteY = 1.0f / 3.0f;
+  GLfloat chromaticityRgbToXyz[9] = {
+      1.0f, 0.0f, 0.0f,
+      0.0f, 1.0f, 0.0f,
+      0.0f, 0.0f, 1.0f};
+  GLfloat chromaticityXyzToRgb[9] = {
+      1.0f, 0.0f, 0.0f,
+      0.0f, 1.0f, 0.0f,
+      0.0f, 0.0f, 1.0f};
 };
 
 struct ResolvedPayload {
   uint64_t seq = 0;
+  uint64_t stateRevision = 1;
   std::string senderId;
   std::string sourceMode = "input";
+  bool drawOnImageMode = false;
   std::string plotMode = "rgb";
   std::string cloudSettingsKey;
   bool volumeSlicingEnabled = false;
@@ -2385,6 +2525,9 @@ struct ResolvedPayload {
   bool alwaysOnTop = true;
   bool resetViewOnPlotSwitch = true;
   std::string quality = "Low";
+  std::string sampling = "Balanced";
+  bool occupancyFill = true;
+  std::string scale = "100%";
   int resolution = 25;
   float pointSize = 1.4f;
   float pointDensity = 1.0f;
@@ -2424,18 +2567,26 @@ struct ResolvedPayload {
   bool readIdentityPlot = false;
   bool isolateIdentityData = false;
   int identityReadResolution = 29;
-  int chromaticityInputPrimaries = WorkshopColor::primariesChoiceIndex(WorkshopColor::ColorPrimariesId::DavinciWideGamut);
-  int chromaticityInputTransfer = WorkshopColor::transferFunctionChoiceIndex(WorkshopColor::TransferFunctionId::DavinciIntermediate);
+  int generatedIdentityResolution = 0;
+  bool generatedIdentityDrawCube = false;
+  bool generatedIdentityDrawRamp = false;
+  int generatedIdentityStripBandCount = 0;
+  uint64_t generatedIdentityStripRevision = 0;
+  int chromaticityInputPrimaries = WorkshopColor::primariesChoiceIndex(WorkshopColor::ColorPrimariesId::Rec709);
+  int chromaticityInputTransfer = WorkshopColor::transferFunctionChoiceIndex(WorkshopColor::TransferFunctionId::Gamma24);
   int chromaticityReferenceBasis = 0;
   int chromaticityOverlayPrimaries =
       WorkshopColor::overlayPrimariesChoiceIndex(true, WorkshopColor::ColorPrimariesId::Rec709);
   bool chromaticityPlanckianLocus = true;
   bool chromaticitySpectralLocus3D = true;
   std::string version;
+  ChromaspaceViewer::ViewerRuntimeState viewerState{};
 };
 
 struct InputCloudPayload {
   uint64_t seq = 0;
+  uint64_t contentHash = 0;
+  uint64_t stabilityHash = 0;
   std::string senderId;
   std::string quality = "Low";
   int resolution = 25;
@@ -2443,6 +2594,11 @@ struct InputCloudPayload {
   std::string settingsKey;
   std::string transport = "json";
   uint64_t pointCount = 0;
+  uint64_t primaryPointCount = 0;
+  uint64_t basePointCount = 0;
+  uint64_t waveformPointOffset = 0;
+  uint64_t waveformPointCount = 0;
+  uint64_t waveformContentHash = 0;
   int pointStride = 24;
   std::string shmName;
   uint64_t shmSize = 0;
@@ -2522,6 +2678,7 @@ PlotRemapSpec makePlotRemapSpec(const ResolvedPayload& payload) {
   spec.chromaticity.overlayPrimaries =
       WorkshopColor::overlayPrimariesIdFromChoiceIndex(payload.chromaticityOverlayPrimaries);
   spec.chromaticityRgbToXyz = WorkshopColor::rgbToXyzMatrix(spec.chromaticity.inputPrimaries);
+  spec.chromaticityXyzToRgb = WorkshopColor::xyzToRgbMatrix(spec.chromaticity.inputPrimaries);
   spec.chromaticityWhite = WorkshopColor::whitePoint(spec.chromaticity.inputPrimaries);
   return spec;
 }
@@ -2534,6 +2691,27 @@ PlotRemapSpec makeOverlayPlotRemapSpec(const ResolvedPayload& payload) {
     spec.chromaticity.inputTransfer = WorkshopColor::TransferFunctionId::Linear;
   }
   return spec;
+}
+
+bool viewerPlotLinearApplies(const ResolvedPayload& payload) {
+  return payload.plotDisplayLinear && classifyPlotMode(payload) != PlotModeKind::Chromaticity;
+}
+
+Vec3 viewerPlotInputRgb(const ResolvedPayload& payload, float r, float g, float b) {
+  if (!viewerPlotLinearApplies(payload)) return Vec3{r, g, b};
+  const auto transfer =
+      WorkshopColor::transferFunctionIdFromChoiceIndex(payload.plotDisplayLinearTransfer);
+  const WorkshopColor::Vec3f linear = WorkshopColor::decodeToLinear({r, g, b}, transfer);
+  return Vec3{linear.x, linear.y, linear.z};
+}
+
+InputCloudSample viewerPlotInputSample(const ResolvedPayload& payload, const InputCloudSample& sample) {
+  InputCloudSample out = sample;
+  const Vec3 rgb = viewerPlotInputRgb(payload, sample.r, sample.g, sample.b);
+  out.r = rgb.x;
+  out.g = rgb.y;
+  out.b = rgb.z;
+  return out;
 }
 
 int plotModeIndex(const ResolvedPayload& payload) {
@@ -2552,6 +2730,17 @@ ComputeRemapUniforms makeComputeRemapUniforms(const PlotRemapSpec& spec) {
   uniforms.normConeNormalized = spec.normConeNormalized ? 1 : 0;
   uniforms.showOverflow = spec.showOverflow ? 1 : 0;
   uniforms.highlightOverflow = spec.highlightOverflow ? 1 : 0;
+  uniforms.chromaticityInputTransfer = static_cast<GLint>(spec.chromaticity.inputTransfer);
+  uniforms.chromaticityReferenceBasis =
+      spec.chromaticity.referenceBasis == WorkshopColor::ChromaticityReferenceBasis::InputObserver ? 1 : 0;
+  uniforms.chromaticityWhiteX = spec.chromaticityWhite.x;
+  uniforms.chromaticityWhiteY = spec.chromaticityWhite.y;
+  for (int row = 0; row < 3; ++row) {
+    for (int col = 0; col < 3; ++col) {
+      uniforms.chromaticityRgbToXyz[row * 3 + col] = spec.chromaticityRgbToXyz.m[row][col];
+      uniforms.chromaticityXyzToRgb[row * 3 + col] = spec.chromaticityXyzToRgb.m[row][col];
+    }
+  }
   return uniforms;
 }
 
@@ -2564,6 +2753,14 @@ ChromaspaceMetal::RemapUniforms makeMetalRemapUniforms(const ComputeRemapUniform
   metal.normConeNormalized = uniforms.normConeNormalized;
   metal.showOverflow = uniforms.showOverflow;
   metal.highlightOverflow = uniforms.highlightOverflow;
+  metal.chromaticityInputTransfer = uniforms.chromaticityInputTransfer;
+  metal.chromaticityReferenceBasis = uniforms.chromaticityReferenceBasis;
+  metal.chromaticityWhiteX = uniforms.chromaticityWhiteX;
+  metal.chromaticityWhiteY = uniforms.chromaticityWhiteY;
+  for (int i = 0; i < 9; ++i) {
+    metal.chromaticityRgbToXyz[i] = uniforms.chromaticityRgbToXyz[i];
+    metal.chromaticityXyzToRgb[i] = uniforms.chromaticityXyzToRgb[i];
+  }
   return metal;
 }
 #elif defined(CHROMASPACE_VIEWER_HAS_CUDA)
@@ -2575,6 +2772,14 @@ ChromaspaceCuda::RemapUniforms makeCudaRemapUniforms(const ComputeRemapUniforms&
   cuda.normConeNormalized = uniforms.normConeNormalized;
   cuda.showOverflow = uniforms.showOverflow;
   cuda.highlightOverflow = uniforms.highlightOverflow;
+  cuda.chromaticityInputTransfer = uniforms.chromaticityInputTransfer;
+  cuda.chromaticityReferenceBasis = uniforms.chromaticityReferenceBasis;
+  cuda.chromaticityWhiteX = uniforms.chromaticityWhiteX;
+  cuda.chromaticityWhiteY = uniforms.chromaticityWhiteY;
+  for (int i = 0; i < 9; ++i) {
+    cuda.chromaticityRgbToXyz[i] = uniforms.chromaticityRgbToXyz[i];
+    cuda.chromaticityXyzToRgb[i] = uniforms.chromaticityXyzToRgb[i];
+  }
   return cuda;
 }
 #endif
@@ -2679,6 +2884,8 @@ uniform float uColorSaturation;
 const float kTau = 6.28318530717958647692;
 const float kPi = 3.14159265358979323846;
 
+)GLSL"
+R"GLSL(
 float clamp01(float v) {
   return clamp(v, 0.0, 1.0);
 }
@@ -2702,6 +2909,8 @@ float rawRgbHue01(float r, float g, float b, float cMax, float delta) {
   return wrapHue01(h / 6.0);
 }
 
+)GLSL"
+R"GLSL(
 vec3 mapPlotPosition(float r, float g, float b) {
   if (uPlotMode == 1) {
     float cMax = max(r, max(g, b));
@@ -2753,6 +2962,8 @@ vec3 mapPlotPosition(float r, float g, float b) {
     float angle = wrappedHue;
     return vec3(cos(angle) * radial, l * 2.0 - 1.0, sin(angle) * radial);
   }
+)GLSL"
+R"GLSL(
   if (uPlotMode == 4 || uPlotMode == 5) {
     bool jpOverflow = (uShowOverflow != 0 && uPlotMode == 5);
     float rr = jpOverflow ? r : clamp01(r);
@@ -2819,6 +3030,8 @@ vec3 mapPlotPosition(float r, float g, float b) {
     float angle = hue * kTau;
     return vec3(cos(angle) * chroma, value * 2.0 - 1.0, sin(angle) * chroma);
   }
+)GLSL"
+R"GLSL(
   if (uPlotMode == 7) {
     bool reuleauxOverflow = (uShowOverflow != 0 && uPlotMode == 7);
     float rr = reuleauxOverflow ? r : clamp01(r);
@@ -2891,6 +3104,8 @@ void hslToRgb(float h, float s, float l, out float r, out float g, out float b) 
   b = clamp01(hueToRgbChannel(p, q, h - 1.0 / 3.0));
 }
 
+)GLSL"
+R"GLSL(
 void applyDisplaySaturation(inout float r, inout float g, inout float b) {
   float sat = clamp(uColorSaturation, 0.8, 6.0);
   float baseR = clamp01(r);
@@ -2937,6 +3152,8 @@ void applyDisplaySaturation(inout float r, inout float g, inout float b) {
   b = clamp(b, 0.0, 1.0);
 }
 
+)GLSL"
+R"GLSL(
 void main() {
   uint index = gl_GlobalInvocationID.x;
   uint cubeSize = uint(max(uCubeSize, 1));
@@ -3301,7 +3518,8 @@ bool buildIdentityOverlayMeshOnGpu(const ResolvedPayload& payload,
 }
 
 bool canUseInputCloudComputePath(const ResolvedPayload& payload) {
-  return payload.plotMode != "chromaticity";
+  (void)payload;
+  return true;
 }
 
 size_t plotModeSlot(const PlotRemapSpec& remap) {
@@ -3433,7 +3651,6 @@ std::string inputCloudComputeReason(const ResolvedPayload& payload,
                                     const ViewerGpuCapabilities& gpuCaps,
                                     const ComputeSessionState* state) {
   if (payload.sourceMode != "input") return std::string("source-") + payload.sourceMode;
-  if (classifyPlotMode(payload) == PlotModeKind::Chromaticity) return "cpu-chromaticity";
   if (classifyPlotMode(payload) == PlotModeKind::GlossLift) {
 #if defined(__APPLE__)
     std::string reason;
@@ -3506,6 +3723,15 @@ uniform int uInputStride;
 uniform int uGlossView;
 uniform float uSourceAspect;
 uniform float uGlossLiftScale;
+uniform int uChromaticityInputTransfer;
+uniform int uChromaticityReferenceBasis;
+uniform vec2 uChromaticityWhite;
+uniform vec3 uChromaticityRgbToXyz0;
+uniform vec3 uChromaticityRgbToXyz1;
+uniform vec3 uChromaticityRgbToXyz2;
+uniform vec3 uChromaticityXyzToRgb0;
+uniform vec3 uChromaticityXyzToRgb1;
+uniform vec3 uChromaticityXyzToRgb2;
 
 const float kTau = 6.28318530717958647692;
 const float kPi = 3.14159265358979323846;
@@ -3518,6 +3744,132 @@ float wrapHue01(float h) {
   h = mod(h, 1.0);
   if (h < 0.0) h += 1.0;
   return h;
+}
+
+float safeDiv(float num, float den) {
+  return abs(den) < 1e-6 ? 0.0 : num / den;
+}
+
+float safeExp2Clamped(float value) {
+  return exp2(clamp(value, -126.0, 126.0));
+}
+
+float safePowPos(float value, float exponent) {
+  return value <= 0.0 ? 0.0 : pow(value, exponent);
+}
+
+float signPreservingPow(float value, float exponent) {
+  return value == 0.0 ? 0.0 : sign(value) * safePowPos(abs(value), exponent);
+}
+
+float exp10Compat(float value) {
+  return safeExp2Clamped(value * 3.3219280948873626);
+}
+
+float decodeTransferChannel(float x, int tf) {
+  if (tf == 0) return x;
+  if (tf == 1) {
+    float a = abs(x);
+    float decoded = (a <= 0.04045) ? safeDiv(a, 12.92) : safePowPos(safeDiv(a + 0.055, 1.055), 2.4);
+    return sign(x) * decoded;
+  }
+  if (tf == 2) return signPreservingPow(x, 2.4);
+  if (tf == 3) return x <= 0.02740668 ? safeDiv(x, 10.44426855) : safeExp2Clamped(safeDiv(x, 0.07329248) - 7.0) - 0.0075;
+  if (tf == 4) return x <= 0.155251141552511 ? safeDiv(x - 0.0729055341958355, 10.5402377416545) : safeExp2Clamped(x * 17.52 - 9.72);
+  if (tf == 5) return x < 5.367655 * 0.010591 + 0.092809 ? safeDiv(x - 0.092809, 5.367655) : safeDiv(exp10Compat(safeDiv(x - 0.385537, 0.247190)) - 0.052272, 5.555556);
+  if (tf == 6) return x < -0.7774983977293537 ? x * 0.3033266726886969 - 0.7774983977293537 : safeDiv(safeExp2Clamped(14.0 * safeDiv(x - 0.09286412512218964, 0.9071358748778103) + 6.0) - 64.0, 2231.8263090676883);
+  if (tf == 7) {
+    const float kCut = 0.092864125;
+    const float kScale = 0.24136077;
+    const float kGain = 87.099375;
+    float decoded = x < kCut ? -safeDiv(exp10Compat(safeDiv(kCut - x, kScale)) - 1.0, kGain) : safeDiv(exp10Compat(safeDiv(x - kCut, kScale)) - 1.0, kGain);
+    return decoded * 0.9;
+  }
+  if (tf == 8) return x < 171.2102946929 / 1023.0 ? safeDiv((x * 1023.0 - 95.0) * 0.01125, 171.2102946929 - 95.0) : (exp10Compat(safeDiv(x * 1023.0 - 420.0, 261.5)) * 0.19 - 0.01);
+  if (tf == 9) {
+    if (x < 0.04076162) return -safeDiv(exp10Compat(safeDiv(0.069886632 - x, 0.42889912)) - 1.0, 14.98325);
+    if (x <= 0.105357102) return safeDiv(x - 0.073059361, 2.3069815);
+    return safeDiv(exp10Compat(safeDiv(x - 0.073059361, 0.36726845)) - 1.0, 14.98325);
+  }
+  if (tf == 10) return x < 0.0 ? safeDiv(x, 15.1927) - 0.01 : safeDiv(exp10Compat(safeDiv(x, 0.224282)) - 1.0, 155.975327) - 0.01;
+  if (tf == 11) {
+    const float kA = 8.283605932402494;
+    const float kB = 0.09246575342465753;
+    const float kC = 0.5300133392291939;
+    const float kD = 0.08692876065491224;
+    const float kE = 0.005494072432257808;
+    const float kCut = kA * 0.005 + kB;
+    return x < kCut ? safeDiv(x - kB, kA) : exp(safeDiv(x - kC, kD)) - kE;
+  }
+  if (tf == 12) return x <= 0.14 ? safeDiv(x - 0.0929, 6.025) : safeDiv(exp10Compat(3.89616 * x - 2.27752) - 0.0108, 0.9892);
+  if (tf == 13) {
+    const float kA = 0.555556;
+    const float kB = 0.009468;
+    const float kC = 0.344676;
+    const float kD = 0.790453;
+    const float kE = 8.735631;
+    const float kF = 0.092864;
+    const float kCut = 0.100537775223865;
+    return x >= kCut ? safeDiv(exp10Compat(safeDiv(x - kD, kC)), kA) - safeDiv(kB, kA) : safeDiv(x - kF, kE);
+  }
+  if (tf == 14) {
+    const float kA = 5.555556;
+    const float kB = 0.064829;
+    const float kC = 0.245281;
+    const float kD = 0.384316;
+    const float kE = 8.799461;
+    const float kF = 0.092864;
+    const float kCut = 0.100686685370811;
+    return x >= kCut ? safeDiv(exp10Compat(safeDiv(x - kD, kC)), kA) - safeDiv(kB, kA) : safeDiv(x - kF, kE);
+  }
+  if (tf == 15) return x < 0.181 ? safeDiv(x - 0.125, 5.6) : exp10Compat(safeDiv(x - 0.598206, 0.241514)) - 0.00873;
+  if (tf == 16) return signPreservingPow(x, 2.2);
+  if (tf == 17) return signPreservingPow(x, 2.6);
+  return x;
+}
+
+vec3 mulRows(vec3 row0, vec3 row1, vec3 row2, vec3 v) {
+  return vec3(dot(row0, v), dot(row1, v), dot(row2, v));
+}
+
+vec3 xyToXyz(vec2 xy, float Y) {
+  if (abs(xy.y) <= 1e-8) return vec3(xy.x, Y, 1.0 - xy.x);
+  return vec3(xy.x * Y / xy.y, Y, (1.0 - xy.x - xy.y) * Y / xy.y);
+}
+
+vec3 xyzToXyY(vec3 xyz, vec2 fallbackWhite) {
+  if (abs(xyz.y) <= 1e-8) return vec3(fallbackWhite.x, fallbackWhite.y, 0.0);
+  float sum = xyz.x + xyz.y + xyz.z;
+  if (abs(sum) <= 1e-8) return vec3(fallbackWhite.x, fallbackWhite.y, xyz.y);
+  return vec3(xyz.x / sum, xyz.y / sum, xyz.y);
+}
+
+vec2 chromaticityBasis(vec2 xy) {
+  if (uChromaticityReferenceBasis == 0) return xy;
+  vec3 xyz = xyToXyz(xy, 1.0);
+  vec3 rgb = mulRows(uChromaticityXyzToRgb0, uChromaticityXyzToRgb1, uChromaticityXyzToRgb2, xyz);
+  vec3 xyY = xyzToXyY(rgb, vec2(1.0 / 3.0, 1.0 / 3.0));
+  return xyY.xy;
+}
+
+vec3 mapChromaticityCoordsToViewer(vec2 xy, float Y) {
+  xy = chromaticityBasis(xy);
+  float viewerHeight = ((uShowOverflow != 0) ? Y : clamp(Y, 0.0, 1.0)) * 2.0 - 1.0;
+  return vec3((xy.x - (1.0 / 3.0)) * 3.0,
+              (xy.y - (1.0 / 3.0)) * 3.0,
+              viewerHeight);
+}
+
+vec3 mapChromaticityPlot(float r, float g, float b) {
+  vec3 linear = vec3(decodeTransferChannel(r, uChromaticityInputTransfer),
+                     decodeTransferChannel(g, uChromaticityInputTransfer),
+                     decodeTransferChannel(b, uChromaticityInputTransfer));
+  if (uShowOverflow == 0) linear = clamp(linear, 0.0, 1.0);
+  vec3 xyz = mulRows(uChromaticityRgbToXyz0, uChromaticityRgbToXyz1, uChromaticityRgbToXyz2, linear);
+  float xyzSum = xyz.x + xyz.y + xyz.z;
+  if (abs(xyzSum) <= 1e-8) return mapChromaticityCoordsToViewer(uChromaticityWhite, 0.0);
+  vec3 xyY = xyzToXyY(xyz, uChromaticityWhite);
+  return mapChromaticityCoordsToViewer(xyY.xy, xyY.z);
 }
 
 float rawRgbHue01(float r, float g, float b, float cMax, float delta) {
@@ -3534,6 +3886,9 @@ float rawRgbHue01(float r, float g, float b, float cMax, float delta) {
 }
 
 vec3 mapPlotPosition(float r, float g, float b) {
+  if (uPlotMode == 8) {
+    return mapChromaticityPlot(r, g, b);
+  }
   if (uPlotMode == 1) {
     float cMax = max(r, max(g, b));
     float cMin = min(r, min(g, b));
@@ -3673,20 +4028,22 @@ vec3 mapPlotPosition(float r, float g, float b) {
   return vec3(r * 2.0 - 1.0, g * 2.0 - 1.0, b * 2.0 - 1.0);
 }
 
+)GLSL"
+R"GLSL(
 float glossCommonComponent(float r, float g, float b) {
   return max(0.0, min(r, min(g, b)));
 }
 
 float glossNeutrality(float r, float g, float b) {
-  float common = glossCommonComponent(r, g, b);
+  float commonComponent = glossCommonComponent(r, g, b);
   float maxRgb = max(r, max(g, b));
-  return maxRgb > 1e-6 ? clamp(common / maxRgb, 0.0, 1.0) : 0.0;
+  return maxRgb > 1e-6 ? clamp(commonComponent / maxRgb, 0.0, 1.0) : 0.0;
 }
 
 float glossStrengthCue(float r, float g, float b) {
-  float common = glossCommonComponent(r, g, b);
+  float commonComponent = glossCommonComponent(r, g, b);
   float neutrality = glossNeutrality(r, g, b);
-  return clamp(common * (0.75 + 0.85 * neutrality), 0.0, 1.0);
+  return clamp(commonComponent * (0.75 + 0.85 * neutrality), 0.0, 1.0);
 }
 
 float glossPresenceWeight(float glossCue) {
@@ -3713,6 +4070,8 @@ float hueToRgbChannel(float p, float q, float t) {
   return p;
 }
 
+)GLSL"
+R"GLSL(
 void rgbToHsl(float r, float g, float b, out float h, out float s, out float l) {
   r = clamp01(r);
   g = clamp01(g);
@@ -3835,10 +4194,10 @@ void main() {
     float aspect = clamp(uSourceAspect, 0.25, 4.0);
     float halfWidth = aspect >= 1.0 ? 1.22 : (1.22 * aspect);
     float halfDepth = aspect >= 1.0 ? (1.22 / aspect) : 1.22;
-    float common = glossCommonComponent(plotR, plotG, plotB);
-    float bodyR = max(plotR - common, 0.0);
-    float bodyG = max(plotG - common, 0.0);
-    float bodyB = max(plotB - common, 0.0);
+    float commonComponent = glossCommonComponent(plotR, plotG, plotB);
+    float bodyR = max(plotR - commonComponent, 0.0);
+    float bodyG = max(plotG - commonComponent, 0.0);
+    float bodyB = max(plotB - commonComponent, 0.0);
     float bodyLuma = clamp(bodyR * 0.2126 + bodyG * 0.7152 + bodyB * 0.0722, 0.0, 1.0);
     float glossCue = glossStrengthCue(plotR, plotG, plotB);
     float glossPresence = glossPresenceWeight(glossCue);
@@ -3927,6 +4286,15 @@ void main() {
   cache->glossViewLoc = api.getUniformLocation(program, "uGlossView");
   cache->sourceAspectLoc = api.getUniformLocation(program, "uSourceAspect");
   cache->glossLiftScaleLoc = api.getUniformLocation(program, "uGlossLiftScale");
+  cache->chromaticityTransferLoc = api.getUniformLocation(program, "uChromaticityInputTransfer");
+  cache->chromaticityReferenceBasisLoc = api.getUniformLocation(program, "uChromaticityReferenceBasis");
+  cache->chromaticityWhiteLoc = api.getUniformLocation(program, "uChromaticityWhite");
+  cache->chromaticityMatrixRow0Loc = api.getUniformLocation(program, "uChromaticityRgbToXyz0");
+  cache->chromaticityMatrixRow1Loc = api.getUniformLocation(program, "uChromaticityRgbToXyz1");
+  cache->chromaticityMatrixRow2Loc = api.getUniformLocation(program, "uChromaticityRgbToXyz2");
+  cache->chromaticityInverseRow0Loc = api.getUniformLocation(program, "uChromaticityXyzToRgb0");
+  cache->chromaticityInverseRow1Loc = api.getUniformLocation(program, "uChromaticityXyzToRgb1");
+  cache->chromaticityInverseRow2Loc = api.getUniformLocation(program, "uChromaticityXyzToRgb2");
   cache->available = cache->pointCountLoc >= 0 &&
                      cache->showOverflowLoc >= 0 &&
                      cache->highlightOverflowLoc >= 0 &&
@@ -3940,7 +4308,16 @@ void main() {
                      cache->inputStrideLoc >= 0 &&
                      cache->glossViewLoc >= 0 &&
                      cache->sourceAspectLoc >= 0 &&
-                     cache->glossLiftScaleLoc >= 0;
+                     cache->glossLiftScaleLoc >= 0 &&
+                     cache->chromaticityTransferLoc >= 0 &&
+                     cache->chromaticityReferenceBasisLoc >= 0 &&
+                     cache->chromaticityWhiteLoc >= 0 &&
+                     cache->chromaticityMatrixRow0Loc >= 0 &&
+                     cache->chromaticityMatrixRow1Loc >= 0 &&
+                     cache->chromaticityMatrixRow2Loc >= 0 &&
+                     cache->chromaticityInverseRow0Loc >= 0 &&
+                     cache->chromaticityInverseRow1Loc >= 0 &&
+                     cache->chromaticityInverseRow2Loc >= 0;
   if (!cache->available) {
     logViewerEvent("Input-cloud compute program missing one or more uniforms; falling back to CPU.");
     releaseInputCloudComputeCache(cache);
@@ -4101,6 +4478,25 @@ bool parseViewerFloatStrict(const std::string& text, float* value) {
   return true;
 }
 
+void updateViewerLassoStrokeBounds(LassoStroke* stroke) {
+  if (!stroke || stroke->points.empty()) return;
+  float minX = stroke->points[0].xNorm;
+  float maxX = stroke->points[0].xNorm;
+  float minY = stroke->points[0].yNorm;
+  float maxY = stroke->points[0].yNorm;
+  for (const auto& point : stroke->points) {
+    minX = std::min(minX, point.xNorm);
+    maxX = std::max(maxX, point.xNorm);
+    minY = std::min(minY, point.yNorm);
+    maxY = std::max(maxY, point.yNorm);
+  }
+  stroke->boundsValid = true;
+  stroke->minXNorm = minX;
+  stroke->maxXNorm = maxX;
+  stroke->minYNorm = minY;
+  stroke->maxYNorm = maxY;
+}
+
 LassoRegionState parseViewerLassoRegionState(const std::string& serialized) {
   LassoRegionState state{};
   if (serialized.empty()) return state;
@@ -4125,6 +4521,7 @@ LassoRegionState parseViewerLassoRegionState(const std::string& serialized) {
       }
       stroke.points.push_back({clampf(xNorm, 0.0f, 1.0f), clampf(yNorm, 0.0f, 1.0f)});
     }
+    updateViewerLassoStrokeBounds(&stroke);
     state.strokes.push_back(std::move(stroke));
   }
   return state;
@@ -4149,10 +4546,104 @@ bool pointInViewerLassoPolygon(const std::vector<LassoPointNorm>& polygon, doubl
 bool viewerLassoContainsPoint(const LassoRegionState& state, double xNorm, double yNorm) {
   bool inside = false;
   for (const auto& stroke : state.strokes) {
+    if (stroke.boundsValid &&
+        (xNorm < stroke.minXNorm || xNorm > stroke.maxXNorm ||
+         yNorm < stroke.minYNorm || yNorm > stroke.maxYNorm)) {
+      continue;
+    }
     if (!pointInViewerLassoPolygon(stroke.points, xNorm, yNorm)) continue;
     inside = !stroke.subtract;
   }
   return inside;
+}
+
+bool projectPointToViewportNorm(const float modelView[16],
+                                const float projection[16],
+                                const float point[3],
+                                float* xNorm,
+                                float* yNorm) {
+  if (!modelView || !projection || !point || !xNorm || !yNorm) return false;
+  const float in[4] = {point[0], point[1], point[2], 1.0f};
+  float eye[4] = {};
+  for (int row = 0; row < 4; ++row) {
+    eye[row] = modelView[0 * 4 + row] * in[0] +
+               modelView[1 * 4 + row] * in[1] +
+               modelView[2 * 4 + row] * in[2] +
+               modelView[3 * 4 + row] * in[3];
+  }
+  float clip[4] = {};
+  for (int row = 0; row < 4; ++row) {
+    clip[row] = projection[0 * 4 + row] * eye[0] +
+                projection[1 * 4 + row] * eye[1] +
+                projection[2 * 4 + row] * eye[2] +
+                projection[3 * 4 + row] * eye[3];
+  }
+  if (std::abs(clip[3]) <= 1e-7f) return false;
+  const float invW = 1.0f / clip[3];
+  const float ndcX = clip[0] * invW;
+  const float ndcY = clip[1] * invW;
+  const float ndcZ = clip[2] * invW;
+  if (ndcZ < -1.0f || ndcZ > 1.0f) return false;
+  *xNorm = ndcX * 0.5f + 0.5f;
+  *yNorm = ndcY * 0.5f + 0.5f;
+  return *xNorm >= -0.25f && *xNorm <= 1.25f && *yNorm >= -0.25f && *yNorm <= 1.25f;
+}
+
+bool buildViewerScreenLassoPointBuffers(const ResolvedPayload& payload,
+                                        const float* srcVerts,
+                                        const float* srcColors,
+                                        size_t srcPointCount,
+                                        std::vector<float>* outVerts,
+                                        std::vector<float>* outColors) {
+  if (!srcVerts || !srcColors || srcPointCount == 0 || !outVerts || !outColors) return false;
+  if (!payload.volumeSlicingEnabled || payload.volumeSlicingMode != "lasso" ||
+      payload.lassoRegionEmpty || payload.lassoData.empty()) {
+    return false;
+  }
+  const LassoRegionState lassoState = parseViewerLassoRegionState(payload.lassoData);
+  if (lassoState.strokes.empty()) return false;
+
+  float modelView[16] = {};
+  float projection[16] = {};
+  glGetFloatv(GL_MODELVIEW_MATRIX, modelView);
+  glGetFloatv(GL_PROJECTION_MATRIX, projection);
+
+  outVerts->clear();
+  outColors->clear();
+  outVerts->reserve(srcPointCount * 3u / 4u);
+  outColors->reserve(srcPointCount * 4u / 4u);
+  for (size_t i = 0; i < srcPointCount; ++i) {
+    const size_t v = i * 3u;
+    const size_t c = i * 4u;
+    float xNorm = 0.0f;
+    float yNorm = 0.0f;
+    if (!projectPointToViewportNorm(modelView, projection, srcVerts + v, &xNorm, &yNorm)) continue;
+    if (!viewerLassoContainsPoint(lassoState, xNorm, yNorm)) continue;
+    outVerts->push_back(srcVerts[v + 0]);
+    outVerts->push_back(srcVerts[v + 1]);
+    outVerts->push_back(srcVerts[v + 2]);
+    outColors->push_back(srcColors[c + 0]);
+    outColors->push_back(srcColors[c + 1]);
+    outColors->push_back(srcColors[c + 2]);
+    outColors->push_back(srcColors[c + 3]);
+  }
+  return true;
+}
+
+std::string serializeViewerLassoRegionState(uint64_t revision,
+                                            const std::vector<LassoStroke>& strokes) {
+  std::ostringstream os;
+  os << "v1|" << std::max<uint64_t>(1, revision);
+  os << std::fixed << std::setprecision(6);
+  for (const auto& stroke : strokes) {
+    if (stroke.points.size() < 3) continue;
+    os << "|" << (stroke.subtract ? "s" : "a") << "," << stroke.points.size();
+    for (const auto& point : stroke.points) {
+      os << "," << clampf(point.xNorm, 0.0f, 1.0f)
+         << "," << clampf(point.yNorm, 0.0f, 1.0f);
+    }
+  }
+  return os.str();
 }
 
 bool loadInputCloudSharedMemory(const InputCloudPayload& cloud, std::vector<float>* outPackedPoints) {
@@ -4190,7 +4681,9 @@ bool loadInputCloudSharedMemory(const InputCloudPayload& cloud, std::vector<floa
 #endif
 }
 
-bool parseInputCloudSamples(const InputCloudPayload& cloud, std::vector<InputCloudSample>* samples) {
+bool parseInputCloudSamples(const InputCloudPayload& cloud,
+                            std::vector<InputCloudSample>* samples,
+                            bool includeWaveformLayer) {
   if (!samples) return false;
   samples->clear();
   if (!cloud.packedPoints.empty()) {
@@ -4204,6 +4697,10 @@ bool parseInputCloudSamples(const InputCloudPayload& cloud, std::vector<InputClo
                           cloud.packedPoints[base + 4],
                           cloud.packedPoints[base + 5]});
     }
+    if (!includeWaveformLayer && cloud.basePointCount > 0) {
+      samples->resize(std::min(samples->size(),
+                               static_cast<size_t>(cloud.basePointCount)));
+    }
     return !samples->empty();
   }
   std::string flattened = cloud.points;
@@ -4214,31 +4711,355 @@ bool parseInputCloudSamples(const InputCloudPayload& cloud, std::vector<InputClo
     (void)z;
     samples->push_back({clampf(x, 0.0f, 1.0f), clampf(y, 0.0f, 1.0f), r, g, b});
   }
+  if (!includeWaveformLayer && cloud.basePointCount > 0) {
+    samples->resize(std::min(samples->size(),
+                             static_cast<size_t>(cloud.basePointCount)));
+  }
   return !samples->empty();
 }
 
 void filterInputCloudSamples(const ResolvedPayload& payload, std::vector<InputCloudSample>* samples) {
   if (!samples || samples->empty()) return;
   const PlotRemapSpec remap = makePlotRemapSpec(payload);
-  const bool lassoEnabled = payload.volumeSlicingEnabled && payload.volumeSlicingMode == "lasso";
-  const LassoRegionState lassoState = lassoEnabled ? parseViewerLassoRegionState(payload.lassoData) : LassoRegionState{};
   const bool cubeFilterEnabled = remap.cubeSlicingEnabled || remap.neutralRadiusEnabled;
-  if (!lassoEnabled && !cubeFilterEnabled) return;
-  if (lassoEnabled && (payload.lassoRegionEmpty || lassoState.strokes.empty())) {
+  const bool imageLassoModeEnabled =
+      payload.volumeSlicingEnabled &&
+      payload.volumeSlicingMode == "lasso";
+  LassoRegionState imageLassoState{};
+  if (imageLassoModeEnabled && !payload.lassoData.empty()) {
+    imageLassoState = parseViewerLassoRegionState(payload.lassoData);
+  }
+  const bool imageLassoHasData = !imageLassoState.strokes.empty();
+  const bool transformSamples = viewerPlotLinearApplies(payload);
+  if (!cubeFilterEnabled && !imageLassoModeEnabled && !transformSamples) return;
+  if (imageLassoModeEnabled && !imageLassoHasData) {
     samples->clear();
     return;
   }
   std::vector<InputCloudSample> filtered;
   filtered.reserve(samples->size());
   for (const auto& sample : *samples) {
-    if (lassoEnabled && !viewerLassoContainsPoint(lassoState, sample.xNorm, sample.yNorm)) continue;
-    const float r = sample.r;
-    const float g = sample.g;
-    const float b = sample.b;
-    if (!cubeSliceContainsPoint(remap, r, g, b)) continue;
-    filtered.push_back(sample);
+    InputCloudSample next = transformSamples ? viewerPlotInputSample(payload, sample) : sample;
+    if (imageLassoHasData && !viewerLassoContainsPoint(imageLassoState, sample.xNorm, sample.yNorm)) {
+      continue;
+    }
+    if (cubeFilterEnabled && !cubeSliceContainsPoint(remap, next.r, next.g, next.b)) continue;
+    filtered.push_back(next);
   }
   samples->swap(filtered);
+}
+
+void keepPrimaryInputCloudSamples(const InputCloudPayload& cloud,
+                                  std::vector<InputCloudSample>* samples) {
+  if (!samples || samples->empty() || cloud.primaryPointCount == 0) return;
+  const size_t primaryCount =
+      std::min(samples->size(), static_cast<size_t>(cloud.primaryPointCount));
+  samples->resize(primaryCount);
+}
+
+bool payloadImageLassoModeEnabled(const ResolvedPayload& payload) {
+  if (!payload.volumeSlicingEnabled ||
+      payload.volumeSlicingMode != "lasso") {
+    return false;
+  }
+  return true;
+}
+
+bool payloadHasImageLassoSelection(const ResolvedPayload& payload) {
+  if (!payloadImageLassoModeEnabled(payload) ||
+      payload.lassoData.empty()) {
+    return false;
+  }
+  return !parseViewerLassoRegionState(payload.lassoData).strokes.empty();
+}
+
+std::string cloudSettingsKeyWithoutImageLasso(std::string key) {
+  for (;;) {
+    const std::size_t pipePos = key.find("|imageLasso=");
+    const std::size_t colonPos = key.find(":imageLasso=");
+    std::size_t pos = std::string::npos;
+    if (pipePos != std::string::npos && colonPos != std::string::npos) {
+      pos = std::min(pipePos, colonPos);
+    } else {
+      pos = pipePos != std::string::npos ? pipePos : colonPos;
+    }
+    if (pos == std::string::npos) return key;
+    std::size_t end = key.find_first_of("|:", pos + 1);
+    if (end == std::string::npos) end = key.size();
+    key.erase(pos, end - pos);
+  }
+  return key;
+}
+
+std::string imageLassoSettingsSuffixForData(const std::string& lassoData) {
+  const LassoRegionState state = parseViewerLassoRegionState(lassoData);
+  if (state.strokes.empty()) return "|imageLasso=empty";
+  return std::string("|imageLasso=rev") + std::to_string(state.revision) +
+         ":strokes" + std::to_string(state.strokes.size());
+}
+
+
+bool cloudLooksIdentityRead(const InputCloudPayload& cloud) {
+  return cloud.paramHash.find("drawn-cube") != std::string::npos ||
+         cloud.paramHash.find("drawn-ramp") != std::string::npos ||
+         cloud.paramHash.find("identity-strip") != std::string::npos ||
+         cloud.paramHash.find("instance1=") != std::string::npos;
+}
+
+bool payloadWantsIdentityReadPreview(const ResolvedPayload& payload);
+
+bool cloudParamHashCount(const InputCloudPayload& cloud,
+                         const char* field,
+                         std::size_t* count) {
+  if (!field || !count) return false;
+  const std::string marker = std::string("+") + field + "=";
+  const std::size_t start = cloud.paramHash.find(marker);
+  if (start == std::string::npos) return false;
+  std::size_t value = 0;
+  bool haveDigit = false;
+  for (std::size_t i = start + marker.size(); i < cloud.paramHash.size(); ++i) {
+    const char c = cloud.paramHash[i];
+    if (c < '0' || c > '9') break;
+    haveDigit = true;
+    value = value * 10u + static_cast<std::size_t>(c - '0');
+  }
+  if (!haveDigit) return false;
+  *count = value;
+  return true;
+}
+
+bool cloudHasCombinedIdentityImage(const InputCloudPayload& cloud) {
+  std::size_t imageCount = 0;
+  return cloudLooksIdentityRead(cloud) &&
+         cloudParamHashCount(cloud, "instance1ImagePoints", &imageCount) &&
+         imageCount > 0u;
+}
+
+bool cloudSettingsKeyHasImageLasso(const std::string& settingsKey) {
+  return settingsKey.find("|imageLasso=") != std::string::npos ||
+         settingsKey.find(":imageLasso=") != std::string::npos;
+}
+
+bool cloudSettingsKeyHasEmptyImageLasso(const std::string& settingsKey) {
+  return settingsKey.find("|imageLasso=empty") != std::string::npos ||
+         settingsKey.find(":imageLasso=empty") != std::string::npos;
+}
+
+bool cloudLooksImageLassoVariant(const InputCloudPayload& cloud) {
+  return cloudSettingsKeyHasImageLasso(cloud.settingsKey) ||
+         cloudSettingsKeyHasImageLasso(cloud.paramHash);
+}
+
+bool cloudLooksEmptyImageLassoVariant(const InputCloudPayload& cloud) {
+  return cloudSettingsKeyHasEmptyImageLasso(cloud.settingsKey) ||
+         cloudSettingsKeyHasEmptyImageLasso(cloud.paramHash);
+}
+
+bool cloudCanSeedBaseInputCache(const InputCloudPayload& cloud) {
+  return !cloudLooksIdentityRead(cloud) &&
+         !cloudLooksImageLassoVariant(cloud);
+}
+
+struct SourceCloudStore {
+  InputCloudPayload ordinary{};
+  InputCloudPayload identity{};
+  InputCloudPayload imageLasso{};
+  InputCloudPayload waveformHigh{};
+  bool hasOrdinary = false;
+  bool hasIdentity = false;
+  bool hasImageLasso = false;
+  bool hasWaveformHigh = false;
+};
+
+void rememberSourceCloud(SourceCloudStore* store,
+                         const InputCloudPayload& cloud,
+                         bool replaceMismatchedOrdinary = true) {
+  if (!store) return;
+  if (cloud.waveformPointCount > 0 &&
+      (!store->hasWaveformHigh ||
+       cloud.seq >= store->waveformHigh.seq ||
+       cloud.senderId != store->waveformHigh.senderId)) {
+    store->waveformHigh = cloud;
+    store->hasWaveformHigh = true;
+  }
+  InputCloudPayload* target = nullptr;
+  bool* available = nullptr;
+  if (cloudLooksImageLassoVariant(cloud)) {
+    target = &store->imageLasso;
+    available = &store->hasImageLasso;
+  } else if (cloudLooksIdentityRead(cloud)) {
+    target = &store->identity;
+    available = &store->hasIdentity;
+  } else {
+    target = &store->ordinary;
+    available = &store->hasOrdinary;
+    if (!replaceMismatchedOrdinary && *available &&
+        target->senderId == cloud.senderId) {
+      return;
+    }
+  }
+  if (!*available || cloud.seq >= target->seq || cloud.senderId != target->senderId) {
+    *target = cloud;
+    *available = true;
+  }
+}
+
+bool inputCloudHasSameContent(const InputCloudPayload& a, const InputCloudPayload& b) {
+  if (a.senderId != b.senderId) return false;
+  if (a.stabilityHash != 0 && b.stabilityHash != 0) {
+    return a.stabilityHash == b.stabilityHash &&
+           a.primaryPointCount == b.primaryPointCount &&
+           a.waveformPointCount == b.waveformPointCount &&
+           a.waveformContentHash == b.waveformContentHash;
+  }
+  if (a.contentHash != 0 && b.contentHash != 0) {
+    return a.contentHash == b.contentHash &&
+           a.primaryPointCount == b.primaryPointCount &&
+           a.basePointCount == b.basePointCount &&
+           a.waveformPointCount == b.waveformPointCount &&
+           a.waveformContentHash == b.waveformContentHash &&
+           a.pointCount == b.pointCount;
+  }
+  return a.paramHash == b.paramHash &&
+         a.primaryPointCount == b.primaryPointCount &&
+         a.basePointCount == b.basePointCount &&
+         a.waveformPointCount == b.waveformPointCount &&
+         a.pointCount == b.pointCount;
+}
+
+std::string viewerLocalPreviewBuildKey(const ResolvedPayload& payload,
+                                       const InputCloudPayload& cloud) {
+  std::ostringstream os;
+  os << "cloudContent=" << (cloud.stabilityHash != 0
+                                ? cloud.stabilityHash
+                                : (cloud.contentHash != 0 ? cloud.contentHash : cloud.seq))
+     << "|cloudKey=" << cloud.settingsKey
+     << "|resolvedKey=" << payload.cloudSettingsKey
+     << "|plot=" << payload.plotMode
+     << "|hsl=" << (payload.circularHsl ? 1 : 0)
+     << "|hsv=" << (payload.circularHsv ? 1 : 0)
+     << "|norm=" << (payload.normConeNormalized ? 1 : 0)
+     << "|linear=" << (payload.plotDisplayLinear ? 1 : 0)
+     << "|linearTf=" << payload.plotDisplayLinearTransfer
+     << "|readRamp=" << (payload.readGrayRamp ? 1 : 0)
+     << "|readIdentity=" << (payload.readIdentityPlot ? 1 : 0)
+     << "|isolateIdentity=" << (payload.isolateIdentityData ? 1 : 0)
+     << "|overflow=" << (payload.showOverflow ? 1 : 0)
+     << "|highlight=" << (payload.highlightOverflow ? 1 : 0)
+     << "|slice=" << (payload.cubeSlicingEnabled ? 1 : 0)
+     << (payload.cubeSliceRed ? 'R' : '-')
+     << (payload.cubeSliceYellow ? 'Y' : '-')
+     << (payload.cubeSliceGreen ? 'G' : '-')
+     << (payload.cubeSliceCyan ? 'C' : '-')
+     << (payload.cubeSliceBlue ? 'B' : '-')
+     << (payload.cubeSliceMagenta ? 'M' : '-')
+     << "|neutral=" << (payload.neutralRadiusEnabled ? 1 : 0)
+     << ':' << std::setprecision(6) << payload.neutralRadius
+     << "|lassoMode=" << (payloadImageLassoModeEnabled(payload) ? 1 : 0)
+     << "|lassoEmpty=" << (payloadHasImageLassoSelection(payload) ? 0 : 1)
+     << "|lassoData=" << payload.lassoData
+     << "|pointSize=" << std::setprecision(6) << payload.pointSize
+     << "|density=" << payload.pointDensity
+     << "|sat=" << payload.colorSaturation
+     << "|style=" << payload.plotStyle
+     << "|shape=" << payload.pointShape;
+  return os.str();
+}
+
+bool payloadWantsIdentityReadPreview(const ResolvedPayload& payload) {
+  return payload.sourceMode == "input" && !isGlossViewPlotModeString(payload.plotMode) &&
+         (payload.readIdentityPlot || payload.readGrayRamp);
+}
+
+bool payloadAllowsIntentionalEmptyPlot(const ResolvedPayload& payload) {
+  if (payloadImageLassoModeEnabled(payload)) return true;
+  const PlotRemapSpec remap = makePlotRemapSpec(payload);
+  if (remap.cubeSlicingEnabled || remap.neutralRadiusEnabled) return true;
+  return payload.plotMode == "waveform" &&
+         payload.viewerState.waveformMode != 2 &&
+         !payload.viewerState.waveformChannelRed &&
+         !payload.viewerState.waveformChannelGreen &&
+         !payload.viewerState.waveformChannelBlue;
+}
+
+InputCloudPayload makeSyntheticIdentityReadPreviewCloud(const ResolvedPayload& payload) {
+  // Readback modes must show only pixels actually sampled from the upstream
+  // identity/ramp strip. A synthetic fallback looks like an untouched cube and
+  // hides whether the strip is being read correctly.
+  (void)payload;
+  InputCloudPayload cloud{};
+  return cloud;
+}
+
+void applyViewerIdentityReadPreview(const ResolvedPayload& payload,
+                                     const InputCloudPayload& cloud,
+                                     std::vector<InputCloudSample>* samples) {
+  if (!samples) return;
+  const bool identityReadCloud = cloudLooksIdentityRead(cloud);
+  // Matching identity-read clouds already contain the authoritative strip
+  // samples produced by the OFX instance. Their x/y fields are intentionally
+  // repurposed by the strip sampler, so applying image-space preview filtering
+  // here corrupts the real ramp/cube samples and can hide the gray line.
+  if (identityReadCloud) {
+    std::size_t cubeCount = 0;
+    std::size_t rampCount = 0;
+    const bool hasCubeCount = cloudParamHashCount(cloud, "instance1CubePoints", &cubeCount);
+    const bool hasRampCount = cloudParamHashCount(cloud, "instance1RampPoints", &rampCount);
+    if (!hasCubeCount && !hasRampCount) return;
+
+    cubeCount = std::min(cubeCount, samples->size());
+    rampCount = std::min(rampCount, samples->size() - cubeCount);
+    const std::size_t identityCount = cubeCount + rampCount;
+    std::vector<InputCloudSample> selected;
+    selected.reserve((payload.readIdentityPlot ? cubeCount : 0u) +
+                     (payload.readGrayRamp ? rampCount : 0u) +
+                     (payload.isolateIdentityData ? 0u : samples->size() - identityCount));
+    if (payload.readIdentityPlot) {
+      selected.insert(selected.end(), samples->begin(), samples->begin() + cubeCount);
+    }
+    if (payload.readGrayRamp) {
+      selected.insert(selected.end(),
+                      samples->begin() + cubeCount,
+                      samples->begin() + identityCount);
+    }
+    if (!payload.isolateIdentityData) {
+      selected.insert(selected.end(), samples->begin() + identityCount, samples->end());
+    }
+    samples->swap(selected);
+    return;
+  }
+  if (!payloadWantsIdentityReadPreview(payload)) return;
+  if (payloadHasImageLassoSelection(payload) && !identityReadCloud) {
+    return;
+  }
+  if (samples->empty()) {
+    return;
+  }
+  const int resolution = std::clamp(payload.identityReadResolution, 4, 65);
+  const float stripNorm = clampf(payload.sourceAspect / static_cast<float>(std::max(1, resolution)),
+                                 1.0f / 4096.0f,
+                                 1.0f);
+  const float cubeY0 = 0.0f;
+  const float cubeY1 = payload.readIdentityPlot ? stripNorm : 0.0f;
+  const float rampY0 = payload.readIdentityPlot ? stripNorm : 0.0f;
+  const float rampY1 = payload.readGrayRamp ? std::min(1.0f, rampY0 + stripNorm) : rampY0;
+  std::vector<InputCloudSample> selected;
+  selected.reserve(samples->size());
+  for (const auto& sample : *samples) {
+    const bool inCube = payload.readIdentityPlot && sample.yNorm >= cubeY0 && sample.yNorm <= cubeY1;
+    const bool inRamp = payload.readGrayRamp && sample.yNorm >= rampY0 && sample.yNorm <= rampY1;
+    if (inCube || inRamp) selected.push_back(sample);
+  }
+  if (selected.empty()) {
+    if (payload.isolateIdentityData) {
+      samples->clear();
+    }
+    return;
+  }
+  if (!payload.isolateIdentityData) {
+    selected.insert(selected.end(), samples->begin(), samples->end());
+  }
+  samples->swap(selected);
 }
 
 bool buildInputCloudMeshOnGpu(const ResolvedPayload& payload,
@@ -4424,6 +5245,35 @@ bool buildInputCloudMeshOnGpu(const ResolvedPayload& payload,
   computeApi.uniform1f(cache->denseAlphaBiasLoc,
                        denseAlphaBiasForPlot(payload.pointSize, payload.pointDensity, payload.resolution));
   computeApi.uniform1f(cache->colorSaturationLoc, bakedColorSaturationForPlot(payload));
+  computeApi.uniform1i(cache->chromaticityTransferLoc, uniforms.chromaticityInputTransfer);
+  computeApi.uniform1i(cache->chromaticityReferenceBasisLoc, uniforms.chromaticityReferenceBasis);
+  computeApi.uniform2f(cache->chromaticityWhiteLoc,
+                       uniforms.chromaticityWhiteX,
+                       uniforms.chromaticityWhiteY);
+  computeApi.uniform3f(cache->chromaticityMatrixRow0Loc,
+                       uniforms.chromaticityRgbToXyz[0],
+                       uniforms.chromaticityRgbToXyz[1],
+                       uniforms.chromaticityRgbToXyz[2]);
+  computeApi.uniform3f(cache->chromaticityMatrixRow1Loc,
+                       uniforms.chromaticityRgbToXyz[3],
+                       uniforms.chromaticityRgbToXyz[4],
+                       uniforms.chromaticityRgbToXyz[5]);
+  computeApi.uniform3f(cache->chromaticityMatrixRow2Loc,
+                       uniforms.chromaticityRgbToXyz[6],
+                       uniforms.chromaticityRgbToXyz[7],
+                       uniforms.chromaticityRgbToXyz[8]);
+  computeApi.uniform3f(cache->chromaticityInverseRow0Loc,
+                       uniforms.chromaticityXyzToRgb[0],
+                       uniforms.chromaticityXyzToRgb[1],
+                       uniforms.chromaticityXyzToRgb[2]);
+  computeApi.uniform3f(cache->chromaticityInverseRow1Loc,
+                       uniforms.chromaticityXyzToRgb[3],
+                       uniforms.chromaticityXyzToRgb[4],
+                       uniforms.chromaticityXyzToRgb[5]);
+  computeApi.uniform3f(cache->chromaticityInverseRow2Loc,
+                       uniforms.chromaticityXyzToRgb[6],
+                       uniforms.chromaticityXyzToRgb[7],
+                       uniforms.chromaticityXyzToRgb[8]);
   computeApi.bindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, cache->input);
   computeApi.bindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, cache->verts);
   computeApi.bindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, cache->colors);
@@ -4524,15 +5374,7 @@ std::string cloudSettingsKeyWithoutGlossView(std::string key) {
 }
 
 bool cloudSettingsCompatibleWithResolved(const std::string& resolvedKey, const std::string& cloudKey) {
-  if (!resolvedKey.empty() && cloudKey == resolvedKey) return true;
-  bool resolvedOverflow = false;
-  bool cloudOverflow = false;
-  if (!cloudSettingsKeyShowOverflowValue(resolvedKey, &resolvedOverflow) ||
-      !cloudSettingsKeyShowOverflowValue(cloudKey, &cloudOverflow)) {
-    return false;
-  }
-  return cloudSettingsKeyWithShowOverflowValue(resolvedKey, false) ==
-         cloudSettingsKeyWithShowOverflowValue(cloudKey, false);
+  return !resolvedKey.empty() && cloudKey == resolvedKey;
 }
 
 bool cloudSettingsCompatibleWithGlossViewOnlyDifference(const std::string& resolvedKey,
@@ -4548,10 +5390,9 @@ bool cloudSettingsCompatibleWithGlossViewOnlyDifference(const std::string& resol
          cloudSettingsKeyWithoutGlossView(cloudKey);
 }
 
-// The viewer only trusts clouds from the active sender and for a compatible settings snapshot.
-// showOverflow-only mismatches are accepted as transitional display states while the plugin
-// forces an authoritative cloud refresh. Gloss transitions must arrive re-keyed by the plugin
-// so stale ordinary clouds cannot masquerade as Gloss projection input.
+// The viewer only trusts clouds from the active sender and the exact sample-settings snapshot.
+// Pure interpretation changes are intentionally absent from the key, so mismatches mean the
+// serialized sample payload is stale.
 bool cloudMatchesResolved(const ResolvedPayload& resolved, const InputCloudPayload& cloud) {
   return senderMatchesCurrent(resolved.senderId, cloud.senderId) &&
          cloudSettingsCompatibleWithResolved(resolved.cloudSettingsKey, cloud.settingsKey);
@@ -4561,10 +5402,12 @@ bool mayKeepDrawingCurrentMeshDuringParamHandoff(const ResolvedPayload& previous
                                                  const ResolvedPayload& next,
                                                  const InputCloudPayload& currentCloud) {
   if (previous.sourceMode != "input" || next.sourceMode != "input") return false;
-  if (previous.plotMode != next.plotMode) return false;
   if (isGlossViewPlotModeString(previous.plotMode) || isGlossViewPlotModeString(next.plotMode)) return false;
-  if (!senderMatchesCurrent(next.senderId, currentCloud.senderId)) return false;
-  return true;
+  // A newly active OFX instance sends params before its first matching cloud. Keep the
+  // previous healthy input mesh visible during that short handoff instead of flashing
+  // an empty cube. Cloud acceptance remains sender/settings-gated, so the old mesh is
+  // replaced only when the new instance publishes a valid matching cloud.
+  return senderMatchesCurrent(previous.senderId, currentCloud.senderId);
 }
 
 std::mutex gMsgMutex;
@@ -4579,6 +5422,9 @@ struct PendingViewerCommand {
   bool valid = false;
   uint64_t seq = 0;
   std::string senderId;
+  bool hasViewerState = false;
+  ChromaspaceViewer::ViewerRuntimeState viewerState{};
+  std::string refreshPolicy = "auto";
   int plotModel = 0;
   bool hasCircularHsl = false;
   bool circularHsl = false;
@@ -4615,37 +5461,100 @@ std::string heartbeatJsonEscape(const std::string& value) {
   return out;
 }
 
+void appendViewerStateCommandFields(std::ostringstream& os,
+                                    const ChromaspaceViewer::ViewerRuntimeState& state) {
+  const auto s = ChromaspaceViewer::clampedViewerRuntimeState(state);
+  const std::string sampleKey = s.sampleSettingsKey.empty()
+                                    ? ChromaspaceViewer::sampleSettingsKey(s, false)
+                                    : s.sampleSettingsKey;
+  os << ",\"stateRevision\":" << s.stateRevision
+     << ",\"sampleSettingsKey\":\"" << heartbeatJsonEscape(sampleKey) << "\""
+     << ",\"refreshPolicy\":\"" << heartbeatJsonEscape(s.refreshPolicy) << "\""
+     << ",\"requiresHostSamples\":" << (s.requiresHostSamples ? 1 : 0)
+     << ",\"sourceSessionId\":\"" << heartbeatJsonEscape(s.sourceSessionId) << "\""
+     << ",\"hostRefreshRequestedRevision\":" << s.hostRefreshRequestedRevision
+     << ",\"plotModel\":" << s.plotModel
+     << ",\"circularHsl\":" << (s.circularHsl ? 1 : 0)
+     << ",\"circularHsv\":" << (s.circularHsv ? 1 : 0)
+     << ",\"normConeNormalized\":" << (s.normConeNormalized ? 1 : 0)
+     << ",\"plotDisplayLinear\":" << (s.plotDisplayLinear ? 1 : 0)
+     << ",\"plotDisplayLinearTransfer\":" << s.plotDisplayLinearTransfer
+     << ",\"liveUpdate\":" << (s.liveUpdate ? 1 : 0)
+     << ",\"updateMode\":" << s.updateMode
+     << ",\"quality\":" << s.quality
+     << ",\"scale\":" << s.scale
+     << ",\"sampling\":" << s.sampling
+     << ",\"occupancyFill\":" << (s.occupancyGuidedFill ? 1 : 0)
+     << ",\"plotStyle\":" << s.plotStyle
+     << ",\"pointShape\":" << s.pointShape
+     << ",\"pointSize\":" << std::setprecision(8) << s.pointSize
+     << ",\"colorSaturation\":" << std::setprecision(8) << s.colorSaturation
+     << ",\"keepOnTop\":" << (s.keepOnTop ? 1 : 0)
+     << ",\"resetViewOnPlotSwitch\":" << (s.resetViewOnPlotSwitch ? 1 : 0)
+     << ",\"showOverflow\":" << (s.showOverflow ? 1 : 0)
+     << ",\"highlightOverflow\":" << (s.highlightOverflow ? 1 : 0)
+     << ",\"overflowHighlightColorR\":" << std::setprecision(8) << s.overflowHighlightR
+     << ",\"overflowHighlightColorG\":" << std::setprecision(8) << s.overflowHighlightG
+     << ",\"overflowHighlightColorB\":" << std::setprecision(8) << s.overflowHighlightB
+     << ",\"viewerBackgroundColorR\":" << std::setprecision(8) << s.backgroundR
+     << ",\"viewerBackgroundColorG\":" << std::setprecision(8) << s.backgroundG
+     << ",\"viewerBackgroundColorB\":" << std::setprecision(8) << s.backgroundB
+     << ",\"identityOverlayEnabled\":" << (s.fillVolume ? 1 : 0)
+     << ",\"identityOverlayRamp\":" << (s.fillGrayRamp ? 1 : 0)
+     << ",\"identityOverlayRequestedSize\":" << s.fillResolution
+     << ",\"readGrayRamp\":" << (s.readGrayRamp ? 1 : 0)
+     << ",\"readIdentityPlot\":" << (s.readIdentityPlot ? 1 : 0)
+     << ",\"isolateIdentityData\":" << (s.isolateIdentityData ? 1 : 0)
+     << ",\"identityReadResolution\":" << s.identityReadResolution
+     << ",\"volumeSliceLassoRegion\":" << (s.volumeSliceLassoRegion ? 1 : 0)
+     << ",\"cubeSliceRed\":" << (s.volumeSliceRed ? 1 : 0)
+     << ",\"cubeSliceYellow\":" << (s.volumeSliceYellow ? 1 : 0)
+     << ",\"cubeSliceGreen\":" << (s.volumeSliceGreen ? 1 : 0)
+     << ",\"cubeSliceCyan\":" << (s.volumeSliceCyan ? 1 : 0)
+     << ",\"cubeSliceBlue\":" << (s.volumeSliceBlue ? 1 : 0)
+     << ",\"cubeSliceMagenta\":" << (s.volumeSliceMagenta ? 1 : 0)
+     << ",\"neutralRadius\":" << std::setprecision(8) << s.neutralRadius
+     << ",\"chromaticityInputPrimaries\":" << s.chromaticityInputPrimaries
+     << ",\"chromaticityInputTransfer\":" << s.chromaticityInputTransfer
+     << ",\"chromaticityReferenceBasis\":" << s.chromaticityReferenceBasis
+     << ",\"chromaticityOverlayPrimaries\":" << s.chromaticityOverlayPrimaries
+     << ",\"chromaticityPlanckianLocus\":" << (s.chromaticityPlanckianLocus ? 1 : 0)
+     << ",\"chromaticitySpectralLocus3D\":" << (s.chromaticitySpectralLocus3D ? 1 : 0)
+     << ",\"glossNeighborhood\":" << s.glossNeighborhood
+     << ",\"glossLiftScale\":" << std::setprecision(8) << s.glossLiftScale
+     << ",\"glossSpatialInset\":" << (s.glossSpatialInset ? 1 : 0)
+     << ",\"glossBodyOpacity\":" << std::setprecision(8) << s.glossBodyOpacity
+     << ",\"glossHighlightOpacity\":" << std::setprecision(8) << s.glossHighlightOpacity
+     << ",\"glossPointCrispness\":" << std::setprecision(8) << s.glossPointCrispness
+     << ",\"glossHideText\":" << (s.glossHideText ? 1 : 0)
+     << ",\"waveformMode\":" << s.waveformMode
+     << ",\"waveformHighDetail\":" << (s.waveformHighDetail ? 1 : 0)
+     << ",\"waveformContinuousHighDetail\":" << (s.waveformContinuousHighDetail ? 1 : 0)
+     << ",\"waveformHighDetailRequested\":" << (s.waveformHighDetailRequested ? 1 : 0)
+     << ",\"waveformSampleColumns\":" << s.waveformSampleColumns
+     << ",\"waveformSamplesPerColumn\":" << s.waveformSamplesPerColumn
+     << ",\"waveformPointBrightness\":" << std::setprecision(8) << s.waveformPointBrightness
+     << ",\"waveformGridBrightness\":" << std::setprecision(8) << s.waveformGridBrightness
+     << ",\"waveformSaturation\":" << std::setprecision(8) << s.waveformSaturation
+     << ",\"waveformDotSize\":" << std::setprecision(8) << s.waveformDotSize
+     << ",\"waveformChannelRed\":" << (s.waveformChannelRed ? 1 : 0)
+     << ",\"waveformChannelGreen\":" << (s.waveformChannelGreen ? 1 : 0)
+     << ",\"waveformChannelBlue\":" << (s.waveformChannelBlue ? 1 : 0)
+     << ",\"waveformShowOverflow\":" << (s.waveformShowOverflow ? 1 : 0)
+     << ",\"waveformHighlightOverflow\":" << (s.waveformHighlightOverflow ? 1 : 0)
+     << ",\"waveformLumaMethod\":" << s.waveformLumaMethod
+     << ",\"histogramMode\":" << s.histogramMode
+     << ",\"histogramShowOverflow\":" << (s.histogramShowOverflow ? 1 : 0)
+     << ",\"histogramHighlightOverflow\":" << (s.histogramHighlightOverflow ? 1 : 0)
+     << ",\"scopeRangeMode\":" << s.scopeRangeMode;
+}
+
 std::string heartbeatAckJson(const std::string& senderId) {
+  (void)senderId;
   std::ostringstream os;
   os << "{\"type\":\"heartbeat_ack\",\"visible\":" << gWindowVisible.load()
      << ",\"iconified\":" << gWindowIconified.load()
      << ",\"focused\":" << gWindowFocused.load();
-  PendingViewerCommand command;
-  {
-    std::lock_guard<std::mutex> lock(gViewerCommandMutex);
-    if (gPendingViewerCommand.valid) {
-      command = gPendingViewerCommand;
-      gPendingViewerCommand.valid = false;
-    }
-  }
-  if (command.valid) {
-    const std::string commandSenderId = senderId.empty() ? command.senderId : senderId;
-    if (command.hasIdentityRead) {
-      os << ",\"command\":{\"type\":\"set_identity_read\",\"seq\":" << command.seq;
-      if (!commandSenderId.empty()) os << ",\"senderId\":\"" << heartbeatJsonEscape(commandSenderId) << "\"";
-      if (command.hasReadGrayRamp) os << ",\"readGrayRamp\":" << (command.readGrayRamp ? 1 : 0);
-      if (command.hasReadIdentityPlot) os << ",\"readIdentityPlot\":" << (command.readIdentityPlot ? 1 : 0);
-      if (command.hasIsolateIdentityData) os << ",\"isolateIdentityData\":" << (command.isolateIdentityData ? 1 : 0);
-      if (command.hasIdentityReadResolution) os << ",\"identityReadResolution\":" << command.identityReadResolution;
-    } else {
-      os << ",\"command\":{\"type\":\"set_plot_model\",\"seq\":" << command.seq
-         << ",\"plotModel\":" << command.plotModel;
-      if (!commandSenderId.empty()) os << ",\"senderId\":\"" << heartbeatJsonEscape(commandSenderId) << "\"";
-      if (command.hasCircularHsl) os << ",\"circularHsl\":" << (command.circularHsl ? 1 : 0);
-      if (command.hasCircularHsv) os << ",\"circularHsv\":" << (command.circularHsv ? 1 : 0);
-    }
-    os << "}";
-  }
   os << "}";
   return os.str();
 }
@@ -4699,14 +5608,45 @@ bool extractFloat(const std::string& line, const std::string& key, float* out) {
   return true;
 }
 
+int viewerQualityIndexForLabel(const std::string& label) {
+  if (label == "Medium") return 1;
+  if (label == "High") return 2;
+  return 0;
+}
+
+int viewerScaleIndexForLabel(const std::string& label) {
+  if (label == "25%") return 0;
+  if (label == "50%") return 1;
+  if (label == "75%") return 2;
+  return 3;
+}
+
+int viewerSamplingIndexForLabel(const std::string& label) {
+  if (label == "Stratified") return 1;
+  if (label == "Random") return 2;
+  return 0;
+}
+
+int viewerPlotStyleIndexForLabel(const std::string& label) {
+  return label == "Space" ? 1 : 0;
+}
+
+int viewerPointShapeIndexForLabel(const std::string& label) {
+  return label == "Square" ? 1 : 0;
+}
+
 // Params are the authoritative description of how to interpret clouds, overlays, and draw state.
 // Clamp incoming values here so stale or malformed messages do not destabilize the GL render path.
 bool parseParamsMessage(const std::string& line, ResolvedPayload* out) {
   if (line.find("\"type\":\"params\"") == std::string::npos) return false;
   ResolvedPayload p{};
   extractUInt64(line, "seq", &p.seq);
+  extractUInt64(line, "stateRevision", &p.stateRevision);
   extractQuoted(line, "senderId", &p.senderId);
   extractQuoted(line, "sourceMode", &p.sourceMode);
+  int drawOnImageMode = 0;
+  extractInt(line, "drawOnImageMode", &drawOnImageMode);
+  p.drawOnImageMode = (drawOnImageMode != 0);
   extractQuoted(line, "plotMode", &p.plotMode);
   extractQuoted(line, "cloudSettingsKey", &p.cloudSettingsKey);
   int volumeSlicingEnabled = 0;
@@ -4718,6 +5658,8 @@ bool parseParamsMessage(const std::string& line, ResolvedPayload* out) {
   p.lassoRegionEmpty = (lassoRegionEmpty != 0);
   extractQuoted(line, "lassoData", &p.lassoData);
   extractQuoted(line, "quality", &p.quality);
+  extractQuoted(line, "sampling", &p.sampling);
+  extractQuoted(line, "scale", &p.scale);
   extractQuoted(line, "plotStyle", &p.plotStyle);
   extractQuoted(line, "pointShape", &p.pointShape);
   extractQuoted(line, "version", &p.version);
@@ -4730,6 +5672,15 @@ bool parseParamsMessage(const std::string& line, ResolvedPayload* out) {
   int resetViewOnPlotSwitch = 1;
   extractInt(line, "resetViewOnPlotSwitch", &resetViewOnPlotSwitch);
   p.resetViewOnPlotSwitch = (resetViewOnPlotSwitch != 0);
+  int liveUpdate = 1;
+  extractInt(line, "liveUpdate", &liveUpdate);
+  int updateMode = 0;
+  extractInt(line, "updateMode", &updateMode);
+  int occupancyFill = 1;
+  extractInt(line, "occupancyFill", &occupancyFill);
+  p.occupancyFill = (occupancyFill != 0);
+  int occupancyGuidedFill = occupancyFill;
+  extractInt(line, "occupancyGuidedFill", &occupancyGuidedFill);
   int circularHsl = 0;
   extractInt(line, "circularHsl", &circularHsl);
   p.circularHsl = (circularHsl != 0);
@@ -4795,6 +5746,46 @@ bool parseParamsMessage(const std::string& line, ResolvedPayload* out) {
   int glossHideText = 0;
   extractInt(line, "glossHideText", &glossHideText);
   p.glossHideText = (glossHideText != 0);
+  int waveformMode = 0;
+  int waveformHighDetail = 1;
+  int waveformContinuousHighDetail = 1;
+  int waveformHighDetailRequested = 0;
+  int waveformSampleColumns = 768;
+  int waveformSamplesPerColumn = 96;
+  float waveformPointBrightness = 1.0f;
+  float waveformGridBrightness = 1.0f;
+  float waveformSaturation = 1.0f;
+  float waveformDotSize = 1.0f;
+  int waveformChannelRed = 1;
+  int waveformChannelGreen = 1;
+  int waveformChannelBlue = 1;
+  int waveformShowOverflow = 1;
+  int waveformHighlightOverflow = 1;
+  int waveformLumaMethod = 0;
+  int histogramMode = 0;
+  int histogramShowOverflow = 1;
+  int histogramHighlightOverflow = 1;
+  int scopeRangeMode = 0;
+  extractInt(line, "waveformMode", &waveformMode);
+  extractInt(line, "waveformHighDetail", &waveformHighDetail);
+  extractInt(line, "waveformContinuousHighDetail", &waveformContinuousHighDetail);
+  extractInt(line, "waveformHighDetailRequested", &waveformHighDetailRequested);
+  extractInt(line, "waveformSampleColumns", &waveformSampleColumns);
+  extractInt(line, "waveformSamplesPerColumn", &waveformSamplesPerColumn);
+  extractFloat(line, "waveformPointBrightness", &waveformPointBrightness);
+  extractFloat(line, "waveformGridBrightness", &waveformGridBrightness);
+  extractFloat(line, "waveformSaturation", &waveformSaturation);
+  extractFloat(line, "waveformDotSize", &waveformDotSize);
+  extractInt(line, "waveformChannelRed", &waveformChannelRed);
+  extractInt(line, "waveformChannelGreen", &waveformChannelGreen);
+  extractInt(line, "waveformChannelBlue", &waveformChannelBlue);
+  extractInt(line, "waveformShowOverflow", &waveformShowOverflow);
+  extractInt(line, "waveformHighlightOverflow", &waveformHighlightOverflow);
+  extractInt(line, "waveformLumaMethod", &waveformLumaMethod);
+  extractInt(line, "histogramMode", &histogramMode);
+  extractInt(line, "histogramShowOverflow", &histogramShowOverflow);
+  extractInt(line, "histogramHighlightOverflow", &histogramHighlightOverflow);
+  extractInt(line, "scopeRangeMode", &scopeRangeMode);
   int identityOverlayEnabled = 0;
   extractInt(line, "identityOverlayEnabled", &identityOverlayEnabled);
   p.identityOverlayEnabled = (identityOverlayEnabled != 0);
@@ -4816,6 +5807,15 @@ bool parseParamsMessage(const std::string& line, ResolvedPayload* out) {
   extractInt(line, "isolateIdentityData", &isolateIdentityData);
   p.isolateIdentityData = (isolateIdentityData != 0);
   extractInt(line, "identityReadResolution", &p.identityReadResolution);
+  extractInt(line, "generatedIdentityResolution", &p.generatedIdentityResolution);
+  int generatedIdentityDrawCube = 0;
+  extractInt(line, "generatedIdentityDrawCube", &generatedIdentityDrawCube);
+  p.generatedIdentityDrawCube = generatedIdentityDrawCube != 0;
+  int generatedIdentityDrawRamp = 0;
+  extractInt(line, "generatedIdentityDrawRamp", &generatedIdentityDrawRamp);
+  p.generatedIdentityDrawRamp = generatedIdentityDrawRamp != 0;
+  extractInt(line, "generatedIdentityStripBandCount", &p.generatedIdentityStripBandCount);
+  extractUInt64(line, "generatedIdentityStripRevision", &p.generatedIdentityStripRevision);
   extractInt(line, "chromaticityInputPrimaries", &p.chromaticityInputPrimaries);
   extractInt(line, "chromaticityInputTransfer", &p.chromaticityInputTransfer);
   extractInt(line, "chromaticityReferenceBasis", &p.chromaticityReferenceBasis);
@@ -4847,6 +5847,10 @@ bool parseParamsMessage(const std::string& line, ResolvedPayload* out) {
   p.identityOverlayRequestedSize = std::clamp(p.identityOverlayRequestedSize, 4, 65);
   p.identityOverlaySize = std::clamp(p.identityOverlaySize, 4, 65);
   p.identityReadResolution = std::clamp(p.identityReadResolution, 4, 65);
+  p.generatedIdentityResolution = p.generatedIdentityResolution > 0
+                                      ? std::clamp(p.generatedIdentityResolution, 4, 65)
+                                      : 0;
+  p.generatedIdentityStripBandCount = std::clamp(p.generatedIdentityStripBandCount, 0, 2);
   p.chromaticityInputPrimaries =
       std::clamp(p.chromaticityInputPrimaries, 0, static_cast<int>(WorkshopColor::primariesCount()) - 1);
   p.chromaticityInputTransfer =
@@ -4864,8 +5868,129 @@ bool parseParamsMessage(const std::string& line, ResolvedPayload* out) {
     p.cubeSlicingEnabled = false;
     p.neutralRadiusEnabled = false;
   }
+  p.viewerState.stateRevision = p.stateRevision;
+  p.viewerState.plotModel = ChromaspaceViewer::plotModelForMode(p.plotMode);
+  p.viewerState.circularHsl = p.circularHsl;
+  p.viewerState.circularHsv = p.circularHsv;
+  p.viewerState.normConeNormalized = p.normConeNormalized;
+  p.viewerState.plotDisplayLinear = p.plotDisplayLinear;
+  p.viewerState.plotDisplayLinearTransfer = p.plotDisplayLinearTransfer;
+  p.viewerState.liveUpdate = liveUpdate != 0;
+  p.viewerState.updateMode = std::clamp(updateMode, 0, 2);
+  p.viewerState.quality = viewerQualityIndexForLabel(p.quality);
+  p.viewerState.scale = viewerScaleIndexForLabel(p.scale);
+  p.viewerState.sampling = viewerSamplingIndexForLabel(p.sampling);
+  p.viewerState.occupancyGuidedFill = occupancyGuidedFill != 0;
+  p.viewerState.plotStyle = viewerPlotStyleIndexForLabel(p.plotStyle);
+  p.viewerState.pointShape = viewerPointShapeIndexForLabel(p.pointShape);
+  p.viewerState.pointSize = p.pointSize;
+  p.viewerState.colorSaturation = p.colorSaturation;
+  p.viewerState.waveformMode = waveformMode;
+  p.viewerState.waveformHighDetail = waveformHighDetail != 0;
+  p.viewerState.waveformContinuousHighDetail = waveformContinuousHighDetail != 0;
+  p.viewerState.waveformHighDetailRequested = waveformHighDetailRequested != 0;
+  p.viewerState.waveformSampleColumns = waveformSampleColumns;
+  p.viewerState.waveformSamplesPerColumn = waveformSamplesPerColumn;
+  p.viewerState.waveformPointBrightness = waveformPointBrightness;
+  p.viewerState.waveformGridBrightness = waveformGridBrightness;
+  p.viewerState.waveformSaturation = waveformSaturation;
+  p.viewerState.waveformDotSize = waveformDotSize;
+  p.viewerState.waveformChannelRed = waveformChannelRed != 0;
+  p.viewerState.waveformChannelGreen = waveformChannelGreen != 0;
+  p.viewerState.waveformChannelBlue = waveformChannelBlue != 0;
+  p.viewerState.waveformShowOverflow = waveformShowOverflow != 0;
+  p.viewerState.waveformHighlightOverflow = waveformHighlightOverflow != 0;
+  p.viewerState.waveformLumaMethod = waveformLumaMethod;
+  p.viewerState.histogramMode = histogramMode;
+  p.viewerState.histogramShowOverflow = histogramShowOverflow != 0;
+  p.viewerState.histogramHighlightOverflow = histogramHighlightOverflow != 0;
+  p.viewerState.scopeRangeMode = scopeRangeMode;
+  p.viewerState.keepOnTop = p.alwaysOnTop;
+  p.viewerState.resetViewOnPlotSwitch = p.resetViewOnPlotSwitch;
+  p.viewerState.showOverflow = p.showOverflow;
+  p.viewerState.highlightOverflow = p.highlightOverflow;
+  p.viewerState.overflowHighlightR = p.overflowHighlightR;
+  p.viewerState.overflowHighlightG = p.overflowHighlightG;
+  p.viewerState.overflowHighlightB = p.overflowHighlightB;
+  p.viewerState.backgroundR = p.backgroundColorR;
+  p.viewerState.backgroundG = p.backgroundColorG;
+  p.viewerState.backgroundB = p.backgroundColorB;
+  p.viewerState.fillVolume = p.identityOverlayEnabled;
+  p.viewerState.fillGrayRamp = p.identityOverlayRamp;
+  p.viewerState.fillResolution = p.identityOverlayRequestedSize;
+  p.viewerState.readGrayRamp = p.readGrayRamp;
+  p.viewerState.readIdentityPlot = p.readIdentityPlot;
+  p.viewerState.isolateIdentityData = p.isolateIdentityData;
+  p.viewerState.identityReadResolution = p.identityReadResolution;
+  int volumeSliceLassoRegion = (p.volumeSlicingMode == "lasso") ? 1 : 0;
+  extractInt(line, "volumeSliceLassoRegion", &volumeSliceLassoRegion);
+  p.viewerState.volumeSliceLassoRegion = volumeSliceLassoRegion != 0;
+  p.viewerState.volumeSliceRed = p.cubeSliceRed;
+  p.viewerState.volumeSliceYellow = p.cubeSliceYellow;
+  p.viewerState.volumeSliceGreen = p.cubeSliceGreen;
+  p.viewerState.volumeSliceCyan = p.cubeSliceCyan;
+  p.viewerState.volumeSliceBlue = p.cubeSliceBlue;
+  p.viewerState.volumeSliceMagenta = p.cubeSliceMagenta;
+  p.viewerState.neutralRadius = p.neutralRadius;
+  p.viewerState.chromaticityInputPrimaries = p.chromaticityInputPrimaries;
+  p.viewerState.chromaticityInputTransfer = p.chromaticityInputTransfer;
+  p.viewerState.chromaticityReferenceBasis = p.chromaticityReferenceBasis;
+  p.viewerState.chromaticityOverlayPrimaries = p.chromaticityOverlayPrimaries;
+  p.viewerState.chromaticityPlanckianLocus = p.chromaticityPlanckianLocus;
+  p.viewerState.chromaticitySpectralLocus3D = p.chromaticitySpectralLocus3D;
+  p.viewerState.glossNeighborhood = p.glossNeighborhood;
+  p.viewerState.glossLiftScale = p.glossLiftScale;
+  p.viewerState.glossSpatialInset = p.glossSpatialInset;
+  p.viewerState.glossBodyOpacity = p.glossBodyOpacity;
+  p.viewerState.glossHighlightOpacity = p.glossHighlightOpacity;
+  p.viewerState.glossPointCrispness = p.glossPointCrispness;
+  p.viewerState.glossHideText = p.glossHideText;
+  p.viewerState = ChromaspaceViewer::clampedViewerRuntimeState(p.viewerState);
+  p.viewerState.sourceSessionId = p.senderId;
+  p.viewerState.sampleSettingsKey = p.cloudSettingsKey;
   *out = std::move(p);
   return true;
+}
+
+uint64_t inputCloudContentHashBytes(const void* data, size_t byteCount) {
+  const auto* bytes = static_cast<const unsigned char*>(data);
+  uint64_t hash = 1469598103934665603ull;
+  for (size_t i = 0; i < byteCount; ++i) {
+    hash ^= static_cast<uint64_t>(bytes[i]);
+    hash *= 1099511628211ull;
+  }
+  return hash;
+}
+
+uint64_t inputCloudPrimaryStabilityHash(const InputCloudPayload& cloud) {
+  if (cloud.packedPoints.empty() || cloud.pointStride < 24) return 0;
+  const size_t strideFloats = static_cast<size_t>(cloud.pointStride) / sizeof(float);
+  if (strideFloats < 6u) return 0;
+  const size_t availablePoints = cloud.packedPoints.size() / strideFloats;
+  const size_t primaryPoints =
+      cloud.primaryPointCount > 0
+          ? std::min(availablePoints, static_cast<size_t>(cloud.primaryPointCount))
+          : availablePoints;
+  if (primaryPoints == 0) return 0;
+  uint64_t hash = 1469598103934665603ull;
+  auto addQuantized = [&](float value) {
+    const float bounded = clampf(value, -16.0f, 16.0f);
+    const int32_t quantized = static_cast<int32_t>(std::lround(bounded * 4096.0f));
+    const auto* bytes = reinterpret_cast<const unsigned char*>(&quantized);
+    for (size_t byte = 0; byte < sizeof(quantized); ++byte) {
+      hash ^= static_cast<uint64_t>(bytes[byte]);
+      hash *= 1099511628211ull;
+    }
+  };
+  for (size_t point = 0; point < primaryPoints; ++point) {
+    const float* sample = cloud.packedPoints.data() + point * strideFloats;
+    addQuantized(sample[0]);
+    addQuantized(sample[1]);
+    addQuantized(sample[3]);
+    addQuantized(sample[4]);
+    addQuantized(sample[5]);
+  }
+  return hash;
 }
 
 // Stage: parse the plot cloud payload exactly as shipped by the OFX instance.
@@ -4873,6 +5998,7 @@ bool parseInputCloudMessage(const std::string& line, InputCloudPayload* out) {
   if (line.find("\"type\":\"input_cloud\"") == std::string::npos) return false;
   InputCloudPayload p{};
   extractUInt64(line, "seq", &p.seq);
+  extractUInt64(line, "contentHash", &p.contentHash);
   extractQuoted(line, "senderId", &p.senderId);
   extractQuoted(line, "quality", &p.quality);
   extractQuoted(line, "paramHash", &p.paramHash);
@@ -4886,6 +6012,13 @@ bool parseInputCloudMessage(const std::string& line, InputCloudPayload* out) {
   uint64_t pointCount = 0;
   extractUInt64(line, "pointCount", &pointCount);
   p.pointCount = pointCount;
+  uint64_t primaryPointCount = 0;
+  extractUInt64(line, "primaryPointCount", &primaryPointCount);
+  p.primaryPointCount = primaryPointCount;
+  extractUInt64(line, "basePointCount", &p.basePointCount);
+  extractUInt64(line, "waveformPointOffset", &p.waveformPointOffset);
+  extractUInt64(line, "waveformPointCount", &p.waveformPointCount);
+  extractUInt64(line, "waveformContentHash", &p.waveformContentHash);
   int pointStride = 24;
   extractInt(line, "pointStride", &pointStride);
   p.pointStride = pointStride;
@@ -4896,6 +6029,16 @@ bool parseInputCloudMessage(const std::string& line, InputCloudPayload* out) {
     logViewerEvent(std::string("Failed to load shared-memory cloud: ") + p.shmName);
     return false;
   }
+  if (p.contentHash == 0) {
+    if (!p.packedPoints.empty()) {
+      p.contentHash =
+          inputCloudContentHashBytes(p.packedPoints.data(), p.packedPoints.size() * sizeof(float));
+    } else {
+      p.contentHash = inputCloudContentHashBytes(p.points.data(), p.points.size());
+    }
+  }
+  p.stabilityHash = inputCloudPrimaryStabilityHash(p);
+  if (p.stabilityHash == 0) p.stabilityHash = p.contentHash;
   *out = std::move(p);
   return true;
 }
@@ -7020,6 +8163,13 @@ bool buildGlossViewFieldMeshFromSolvedFields(const ResolvedPayload& payload,
     }
   }
   mesh.pointCount = mesh.pointVerts.size() / 3u;
+  // A standalone Gloss field mesh is also a valid source for the 3D
+  // projection. Multi-window plots build this mesh directly instead of
+  // attaching it to a separate RGB point mesh, so keep the projection
+  // contract complete here.
+  mesh.glossProjectionBaseVerts = mesh.pointVerts;
+  mesh.glossProjectionCellIndices = mesh.glossFieldPointCellIndices;
+  mesh.glossProjectionPointCount = mesh.pointCount;
   mesh.glossBodyPointCount = 0u;
   mesh.glossHighlightPointCount = mesh.pointCount;
   setMeshFitBoundsFromVerts(&mesh);
@@ -7615,6 +8765,7 @@ bool buildInputCloudMeshCpu(const ResolvedPayload& payload,
   if (classifyPlotMode(payload) == PlotModeKind::GlossLift) {
     std::vector<InputCloudSample> samples;
     if (!parseInputCloudSamples(cloud, &samples)) return false;
+    applyViewerIdentityReadPreview(payload, cloud, &samples);
     filterInputCloudSamples(payload, &samples);
     std::vector<float> baseRawPoints;
     baseRawPoints.reserve(samples.size() * 3u);
@@ -7678,7 +8829,14 @@ bool buildInputCloudMeshCpu(const ResolvedPayload& payload,
                                 cr, cg, cb,
                                 overflowPoint));
   }
-  if (mesh.pointVerts.empty()) return false;
+  // A valid filter can intentionally select no points. Report that as a
+  // successful empty mesh so callers can distinguish it from a decode or
+  // reconstruction failure.
+  if (mesh.pointVerts.empty()) {
+    mesh.pointCount = 0;
+    *out = std::move(mesh);
+    return true;
+  }
   mesh.pointCount = mesh.pointVerts.size() / 3u;
   setMeshFitBoundsFromVerts(&mesh);
   *out = std::move(mesh);
@@ -7691,6 +8849,7 @@ bool buildInputCloudFitMeshCpu(const ResolvedPayload& payload,
   if (!out) return false;
   std::vector<InputCloudSample> samples;
   if (!parseInputCloudSamples(cloud, &samples)) return false;
+  applyViewerIdentityReadPreview(payload, cloud, &samples);
   filterInputCloudSamples(payload, &samples);
   if (classifyPlotMode(payload) == PlotModeKind::GlossLift) {
     if (samples.empty()) {
@@ -7725,6 +8884,829 @@ bool buildInputCloudFitMeshCpu(const ResolvedPayload& payload,
   return buildInputCloudMeshCpu(payload, cloud, rawPoints, out);
 }
 
+float analyticalScopeLuma(const InputCloudSample& sample, int method = 0) {
+  switch (ChromaspaceViewer::clampChoice(method, 3, 0)) {
+    case 1:
+      return 0.2627f * sample.r + 0.6780f * sample.g + 0.0593f * sample.b;
+    case 2:
+      return 0.2990f * sample.r + 0.5870f * sample.g + 0.1140f * sample.b;
+    case 3:
+      return (sample.r + sample.g + sample.b) / 3.0f;
+    default:
+      return 0.2126f * sample.r + 0.7152f * sample.g + 0.0722f * sample.b;
+  }
+}
+
+constexpr float kScopePlotLeft = -0.82f;
+constexpr float kScopePlotRight = 0.96f;
+constexpr float kScopePlotBottom = -0.88f;
+constexpr float kScopePlotTop = 0.88f;
+constexpr float kScopePlotWidth = kScopePlotRight - kScopePlotLeft;
+constexpr float kScopePlotHeight = kScopePlotTop - kScopePlotBottom;
+
+Vec3 analyticalScopeChannelColor(int channel, bool lumaOnly) {
+  if (lumaOnly) return Vec3{0.88f, 0.92f, 0.96f};
+  switch (std::clamp(channel, 0, 2)) {
+    case 0: return Vec3{1.00f, 0.16f, 0.12f};
+    case 1: return Vec3{0.20f, 1.00f, 0.28f};
+    default: return Vec3{0.24f, 0.52f, 1.00f};
+  }
+}
+
+Vec3 analyticalScopeOverflowColor(int channel, bool lumaOnly, bool highlighted) {
+  const Vec3 base = analyticalScopeChannelColor(channel, lumaOnly);
+  if (!highlighted) return base;
+  constexpr Vec3 purple{0.82f, 0.24f, 1.00f};
+  constexpr float overlay = 0.68f;
+  return Vec3{
+      base.x * (1.0f - overlay) + purple.x * overlay,
+      base.y * (1.0f - overlay) + purple.y * overlay,
+      base.z * (1.0f - overlay) + purple.z * overlay};
+}
+
+void reconstructWaveformDensity(std::vector<float>* density,
+                                int width,
+                                int height,
+                                int channelCount) {
+  if (!density || width <= 0 || height <= 0 || channelCount <= 0) return;
+  const size_t expected =
+      static_cast<size_t>(width) * static_cast<size_t>(height) * 3u;
+  if (density->size() < expected) return;
+  std::vector<float> horizontal(expected, 0.0f);
+  // Scope reconstruction only bridges gaps between sampled image columns.
+  // Vertical smoothing destroys fine signal structure and creates glow.
+  constexpr float kHorizontalWeights[3] = {1.0f, 2.0f, 1.0f};
+  constexpr float kHorizontalWeightSum = 4.0f;
+  for (int channel = 0; channel < channelCount; ++channel) {
+    for (int x = 0; x < width; ++x) {
+      for (int y = 0; y < height; ++y) {
+        float sum = 0.0f;
+        for (int tap = -1; tap <= 1; ++tap) {
+          const int sourceX = std::clamp(x + tap, 0, width - 1);
+          sum += (*density)[(static_cast<size_t>(channel) * width + sourceX) * height + y] *
+                 kHorizontalWeights[tap + 1];
+        }
+        horizontal[(static_cast<size_t>(channel) * width + x) * height + y] =
+            sum / kHorizontalWeightSum;
+      }
+    }
+  }
+  density->swap(horizontal);
+}
+
+bool ensureAnalyticalScopeComputeProgram(AnalyticalScopeComputeCache* cache) {
+  if (!cache) return false;
+  if (cache->available && cache->program != 0) return true;
+  if (cache->initAttempted) return false;
+  cache->initAttempted = true;
+  const ViewerGlComputeApi& api = viewerGlComputeApi();
+  if (!api.available || !viewerGlBufferApi().getBufferSubData) return false;
+  static const char* kSource = R"GLSL(
+#version 430
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) readonly buffer InputSamples { float samples[]; };
+layout(std430, binding = 1) buffer DensityBins { uint density[]; };
+uniform int uPointCount;
+uniform int uWaveform;
+uniform int uScopeMode;
+uniform int uWidth;
+uniform int uHeight;
+uniform float uRangeMin;
+uniform float uInvRange;
+uniform int uExcludeOverflow;
+
+void accumulate(int channel, float xNorm, float value) {
+  if (uExcludeOverflow != 0 && (value < 0.0 || value > 1.0)) return;
+  int x = clamp(int(xNorm * float(uWidth)), 0, uWidth - 1);
+  int signalBins = uWaveform != 0 ? uHeight : uWidth;
+  int y = clamp(int((value - uRangeMin) * uInvRange * float(signalBins)), 0, signalBins - 1);
+  int index = uWaveform != 0
+      ? (channel * uWidth + x) * uHeight + y
+      : channel * uWidth + y;
+  atomicAdd(density[index], 1u);
+}
+
+void main() {
+  int index = int(gl_GlobalInvocationID.x);
+  if (index >= uPointCount) return;
+  int base = index * 5;
+  float xNorm = samples[base + 0];
+  float r = samples[base + 2];
+  float g = samples[base + 3];
+  float b = samples[base + 4];
+  bool lumaOnly = (uWaveform != 0 && uScopeMode == 2) ||
+                  (uWaveform == 0 && uScopeMode == 1);
+  if (lumaOnly) {
+    accumulate(0, xNorm, 0.2126 * r + 0.7152 * g + 0.0722 * b);
+  } else {
+    accumulate(0, xNorm, r);
+    accumulate(1, xNorm, g);
+    accumulate(2, xNorm, b);
+  }
+}
+)GLSL";
+  const GLuint shader = api.createShader(GL_COMPUTE_SHADER);
+  api.shaderSource(shader, 1, &kSource, nullptr);
+  api.compileShader(shader);
+  GLint compiled = GL_FALSE;
+  api.getShaderiv(shader, GL_COMPILE_STATUS, &compiled);
+  if (compiled != GL_TRUE) {
+    logViewerEvent(std::string("Analytical scope compute compile failed: ") +
+                   readShaderLog(shader, false, api));
+    api.deleteShader(shader);
+    return false;
+  }
+  cache->program = api.createProgram();
+  api.attachShader(cache->program, shader);
+  api.linkProgram(cache->program);
+  api.deleteShader(shader);
+  GLint linked = GL_FALSE;
+  api.getProgramiv(cache->program, GL_LINK_STATUS, &linked);
+  if (linked != GL_TRUE) {
+    logViewerEvent(std::string("Analytical scope compute link failed: ") +
+                   readShaderLog(cache->program, true, api));
+    api.deleteProgram(cache->program);
+    cache->program = 0;
+    return false;
+  }
+  cache->pointCountLoc = api.getUniformLocation(cache->program, "uPointCount");
+  cache->waveformLoc = api.getUniformLocation(cache->program, "uWaveform");
+  cache->scopeModeLoc = api.getUniformLocation(cache->program, "uScopeMode");
+  cache->widthLoc = api.getUniformLocation(cache->program, "uWidth");
+  cache->heightLoc = api.getUniformLocation(cache->program, "uHeight");
+  cache->rangeMinLoc = api.getUniformLocation(cache->program, "uRangeMin");
+  cache->invRangeLoc = api.getUniformLocation(cache->program, "uInvRange");
+  cache->excludeOverflowLoc = api.getUniformLocation(cache->program, "uExcludeOverflow");
+  cache->available = true;
+  return true;
+}
+
+bool buildAnalyticalScopeDensityGlCompute(const std::vector<InputCloudSample>& samples,
+                                          bool waveform,
+                                          int scopeMode,
+                                          int width,
+                                          int height,
+                                          float rangeMin,
+                                          float invRange,
+                                          bool excludeOverflow,
+                                          std::vector<float>* outDensity) {
+  if (!outDensity || samples.empty() || width <= 0 || height <= 0) return false;
+  static AnalyticalScopeComputeCache cache{};
+  if (!ensureAnalyticalScopeComputeProgram(&cache)) return false;
+  const ViewerGlBufferApi& bufferApi = viewerGlBufferApi();
+  const ViewerGlComputeApi& computeApi = viewerGlComputeApi();
+  if (!bufferApi.available || !bufferApi.getBufferSubData || !computeApi.available) return false;
+  while (glGetError() != GL_NO_ERROR) {
+  }
+  if (cache.input == 0) bufferApi.genBuffers(1, &cache.input);
+  if (cache.density == 0) bufferApi.genBuffers(1, &cache.density);
+  if (cache.input == 0 || cache.density == 0) return false;
+  std::vector<float> packed;
+  packed.reserve(samples.size() * 5u);
+  for (const auto& sample : samples) {
+    packed.insert(packed.end(), {sample.xNorm, sample.yNorm, sample.r, sample.g, sample.b});
+  }
+  const size_t binCount = static_cast<size_t>(width) * static_cast<size_t>(height) * 3u;
+  std::vector<unsigned int> zeroBins(binCount, 0u);
+  bufferApi.bindBuffer(GL_SHADER_STORAGE_BUFFER, cache.input);
+  bufferApi.bufferData(GL_SHADER_STORAGE_BUFFER,
+                       static_cast<ViewerGLsizeiptr>(packed.size() * sizeof(float)),
+                       packed.data(),
+                       GL_DYNAMIC_DRAW);
+  bufferApi.bindBuffer(GL_SHADER_STORAGE_BUFFER, cache.density);
+  bufferApi.bufferData(GL_SHADER_STORAGE_BUFFER,
+                       static_cast<ViewerGLsizeiptr>(zeroBins.size() * sizeof(unsigned int)),
+                       zeroBins.data(),
+                       GL_DYNAMIC_DRAW);
+  computeApi.useProgram(cache.program);
+  computeApi.uniform1i(cache.pointCountLoc, static_cast<GLint>(samples.size()));
+  computeApi.uniform1i(cache.waveformLoc, waveform ? 1 : 0);
+  computeApi.uniform1i(cache.scopeModeLoc, scopeMode);
+  computeApi.uniform1i(cache.widthLoc, width);
+  computeApi.uniform1i(cache.heightLoc, height);
+  computeApi.uniform1f(cache.rangeMinLoc, rangeMin);
+  computeApi.uniform1f(cache.invRangeLoc, invRange);
+  computeApi.uniform1i(cache.excludeOverflowLoc, excludeOverflow ? 1 : 0);
+  computeApi.bindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, cache.input);
+  computeApi.bindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, cache.density);
+  computeApi.dispatchCompute(static_cast<GLuint>((samples.size() + 255u) / 256u), 1u, 1u);
+  computeApi.memoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+  computeApi.useProgram(0);
+  bufferApi.bindBuffer(GL_SHADER_STORAGE_BUFFER, cache.density);
+  bufferApi.getBufferSubData(GL_SHADER_STORAGE_BUFFER,
+                             0,
+                             static_cast<ViewerGLsizeiptr>(zeroBins.size() * sizeof(unsigned int)),
+                             zeroBins.data());
+  bufferApi.bindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+  outDensity->resize(binCount);
+  std::transform(zeroBins.begin(), zeroBins.end(), outDensity->begin(),
+                 [](unsigned int value) { return static_cast<float>(value); });
+  return glGetError() == GL_NO_ERROR;
+}
+
+bool validateAnalyticalScopeComputeStartup() {
+  const std::vector<InputCloudSample> samples = {
+      {0.20f, 0.30f, 0.10f, 0.20f, 0.30f},
+      {0.80f, 0.70f, 0.90f, 0.50f, 0.25f},
+  };
+  std::vector<float> density;
+  if (!buildAnalyticalScopeDensityGlCompute(
+          samples, true, 0, 8, 8, 0.0f, 1.0f, false, &density)) {
+    return false;
+  }
+  const float total = std::accumulate(density.begin(), density.end(), 0.0f);
+  return std::abs(total - 6.0f) < 0.5f;
+}
+
+std::pair<float, float> analyticalScopeRange(const ResolvedPayload& payload,
+                                             const std::vector<InputCloudSample>& samples,
+                                             const MeshData* previousScope) {
+  if (payload.viewerState.scopeRangeMode == 0) return {0.0f, 1.0f};
+  if (payload.viewerState.scopeRangeMode == 1) return {0.0f, 4.0f};
+  std::vector<float> values;
+  values.reserve(samples.size() * 3u);
+  const bool lumaOnly =
+      (payload.plotMode == "waveform" && payload.viewerState.waveformMode == 2) ||
+      (payload.plotMode == "histogram" && payload.viewerState.histogramMode == 1);
+  const bool showOverflow =
+      payload.plotMode == "waveform"
+          ? payload.viewerState.waveformShowOverflow
+          : payload.viewerState.histogramShowOverflow;
+  const auto includeRangeValue = [showOverflow](float value) {
+    return showOverflow || (value >= 0.0f && value <= 1.0f);
+  };
+  for (const auto& sample : samples) {
+    if (lumaOnly) {
+      const float value = analyticalScopeLuma(
+          sample,
+          payload.plotMode == "waveform" ? payload.viewerState.waveformLumaMethod : 0);
+      if (includeRangeValue(value)) values.push_back(value);
+    } else {
+      const bool waveform = payload.plotMode == "waveform";
+      if ((!waveform || payload.viewerState.waveformChannelRed) &&
+          includeRangeValue(sample.r)) values.push_back(sample.r);
+      if ((!waveform || payload.viewerState.waveformChannelGreen) &&
+          includeRangeValue(sample.g)) values.push_back(sample.g);
+      if ((!waveform || payload.viewerState.waveformChannelBlue) &&
+          includeRangeValue(sample.b)) values.push_back(sample.b);
+    }
+  }
+  if (values.empty()) return {0.0f, 1.0f};
+  std::sort(values.begin(), values.end());
+  const size_t lowIndex = std::min(values.size() - 1u, values.size() / 1000u);
+  const size_t highIndex = std::min(values.size() - 1u, (values.size() * 999u) / 1000u);
+  float lo = std::min(0.0f, values[lowIndex]);
+  float hi = std::max(1.0f, values[highIndex]);
+  const float pad = std::max(0.02f, (hi - lo) * 0.04f);
+  lo -= pad;
+  hi += pad;
+  if (!(hi > lo + 1e-5f)) return {0.0f, 1.0f};
+  if (previousScope && previousScope->analyticalScope &&
+      previousScope->waveformScope == (payload.plotMode == "waveform") &&
+      previousScope->scopeMode ==
+          (payload.plotMode == "waveform" ? payload.viewerState.waveformMode
+                                          : payload.viewerState.histogramMode) &&
+      previousScope->scopeLumaMethod ==
+          (payload.plotMode == "waveform" ? payload.viewerState.waveformLumaMethod : 0) &&
+      previousScope->scopeRangeMax > previousScope->scopeRangeMin + 1e-5f) {
+    // Expand quickly enough to reveal new excursions, but contract slowly so
+    // small source changes do not make an Auto-range scope visibly breathe.
+    const float previousLo = previousScope->scopeRangeMin;
+    const float previousHi = previousScope->scopeRangeMax;
+    lo = lo < previousLo ? lo : previousLo + (lo - previousLo) * 0.16f;
+    hi = hi > previousHi ? hi : previousHi + (hi - previousHi) * 0.16f;
+  }
+  return {lo, hi};
+}
+
+bool buildAnalyticalScopeMeshCpu(const ResolvedPayload& payload,
+                                 const InputCloudPayload& cloud,
+                                 const MeshData* previousScope,
+                                 MeshData* out) {
+  if (!out || (payload.plotMode != "waveform" && payload.plotMode != "histogram")) return false;
+  std::vector<InputCloudSample> samples;
+  const bool useHighWaveformLayer =
+      payload.plotMode == "waveform" &&
+      payload.viewerState.waveformHighDetail &&
+      !payload.viewerState.readGrayRamp &&
+      !payload.viewerState.readIdentityPlot &&
+      !payload.viewerState.isolateIdentityData &&
+      cloud.waveformPointCount > 0;
+  if (!parseInputCloudSamples(cloud, &samples, useHighWaveformLayer)) return false;
+  if (useHighWaveformLayer) {
+    const size_t offset =
+        std::min(samples.size(),
+                 static_cast<size_t>(cloud.waveformPointOffset));
+    const size_t count =
+        std::min(samples.size() - offset,
+                 static_cast<size_t>(cloud.waveformPointCount));
+    std::vector<InputCloudSample> waveformSamples;
+    waveformSamples.reserve(count);
+    waveformSamples.insert(waveformSamples.end(),
+                           samples.begin() + offset,
+                           samples.begin() + offset + count);
+    samples.swap(waveformSamples);
+  } else {
+    keepPrimaryInputCloudSamples(cloud, &samples);
+  }
+  applyViewerIdentityReadPreview(payload, cloud, &samples);
+  filterInputCloudSamples(payload, &samples);
+  if (payload.plotMode == "waveform" && !samples.empty()) {
+    float minX = 1.0f;
+    float maxX = 0.0f;
+    for (const auto& sample : samples) {
+      minX = std::min(minX, sample.xNorm);
+      maxX = std::max(maxX, sample.xNorm);
+    }
+    if (minX > 0.05f || maxX < 0.95f) {
+      std::ostringstream os;
+      os << "Waveform primary coverage warning: minX=" << std::setprecision(4) << minX
+         << " maxX=" << maxX
+         << " primaryPointCount=" << cloud.primaryPointCount
+         << " cloudPointCount=" << cloud.pointCount
+         << " paramHash=" << cloud.paramHash;
+      logViewerEvent(os.str());
+    }
+  }
+
+  MeshData mesh{};
+  mesh.resolution = cloud.resolution <= 25 ? 25 : (cloud.resolution <= 41 ? 41 : 57);
+  mesh.quality = cloud.quality;
+  mesh.paramHash = cloud.paramHash;
+  mesh.serial = nextMeshSerial();
+  mesh.analyticalScope = true;
+  mesh.waveformScope = payload.plotMode == "waveform";
+  mesh.scopeMode = mesh.waveformScope ? payload.viewerState.waveformMode
+                                     : payload.viewerState.histogramMode;
+  mesh.scopeRangeMode = payload.viewerState.scopeRangeMode;
+  mesh.scopeLumaMethod =
+      mesh.waveformScope ? payload.viewerState.waveformLumaMethod : 0;
+  const auto range = analyticalScopeRange(payload, samples, previousScope);
+  mesh.scopeRangeMin = range.first;
+  mesh.scopeRangeMax = range.second;
+  const float invRange = 1.0f / std::max(1e-6f, range.second - range.first);
+  const bool lumaOnly = (mesh.waveformScope && mesh.scopeMode == 2) ||
+                        (!mesh.waveformScope && mesh.scopeMode == 1);
+  constexpr int kSignalBins = 512;
+
+  auto addScopePoint = [&](float x, float y, float r, float g, float b, float alpha) {
+    mesh.pointVerts.insert(mesh.pointVerts.end(), {x, y, 0.0f});
+    mesh.pointColors.insert(mesh.pointColors.end(), {r, g, b, alpha});
+  };
+  auto addScopeLine = [&](float x0, float y0, float x1, float y1,
+                          float r, float g, float b, float alpha) {
+    mesh.lineVerts.insert(mesh.lineVerts.end(), {x0, y0, 0.0f, x1, y1, 0.0f});
+    mesh.lineColors.insert(mesh.lineColors.end(), {r, g, b, alpha, r, g, b, alpha});
+  };
+  auto addScopeFillSegment = [&](float x0, float y0, float x1, float y1,
+                                 float r, float g, float b, float alpha) {
+    constexpr float baseline = kScopePlotBottom;
+    mesh.scopeFillVerts.insert(mesh.scopeFillVerts.end(),
+                               {x0, baseline, 0.0f, x0, y0, 0.0f, x1, y1, 0.0f,
+                                x0, baseline, 0.0f, x1, y1, 0.0f, x1, baseline, 0.0f});
+    for (int vertex = 0; vertex < 6; ++vertex) {
+      const bool upperVertex = vertex == 1 || vertex == 2 || vertex == 4;
+      mesh.scopeFillColors.insert(mesh.scopeFillColors.end(),
+                                  {r, g, b, upperVertex ? alpha : alpha * 0.12f});
+    }
+  };
+
+  if (mesh.waveformScope) {
+    const int kPositionBins =
+        useHighWaveformLayer
+            ? std::clamp(payload.viewerState.waveformSampleColumns, 384, 1536)
+            : 768;
+    mesh.scopeWidth = kPositionBins;
+    mesh.scopeHeight = kSignalBins;
+    mesh.scopeSourceRows =
+        useHighWaveformLayer
+            ? std::max(1,
+                       static_cast<int>(cloud.waveformPointCount /
+                                        static_cast<uint64_t>(kPositionBins)))
+            : std::max(1,
+                       static_cast<int>(samples.size() /
+                                        static_cast<size_t>(kPositionBins)));
+    mesh.scopeDensity.assign(static_cast<size_t>(kPositionBins * kSignalBins * 3), 0.0f);
+    auto accumulate = [&](int channel, float xNorm, float value) {
+      const int x = std::clamp(static_cast<int>(xNorm * static_cast<float>(kPositionBins)), 0, kPositionBins - 1);
+      const int y = std::clamp(static_cast<int>((value - range.first) * invRange * static_cast<float>(kSignalBins)), 0, kSignalBins - 1);
+      mesh.scopeDensity[(static_cast<size_t>(channel) * kPositionBins + static_cast<size_t>(x)) * kSignalBins +
+                        static_cast<size_t>(y)] += 1.0f;
+    };
+    const bool gpuDensityReady =
+        (!lumaOnly || payload.viewerState.waveformLumaMethod == 0) &&
+        buildAnalyticalScopeDensityGlCompute(samples,
+                                             true,
+                                             mesh.scopeMode,
+                                             kPositionBins,
+                                             kSignalBins,
+                                             range.first,
+                                             invRange,
+                                             true,
+                                             &mesh.scopeDensity);
+    if (!gpuDensityReady) {
+      for (const auto& sample : samples) {
+        if (lumaOnly) {
+          const float value =
+              analyticalScopeLuma(sample, payload.viewerState.waveformLumaMethod);
+          if (value >= 0.0f && value <= 1.0f) {
+            accumulate(0, sample.xNorm, value);
+          }
+        } else {
+          if (sample.r >= 0.0f && sample.r <= 1.0f) {
+            accumulate(0, sample.xNorm, sample.r);
+          }
+          if (sample.g >= 0.0f && sample.g <= 1.0f) {
+            accumulate(1, sample.xNorm, sample.g);
+          }
+          if (sample.b >= 0.0f && sample.b <= 1.0f) {
+            accumulate(2, sample.xNorm, sample.b);
+          }
+        }
+      }
+    }
+    const int channelCount = lumaOnly ? 1 : 3;
+    const bool waveformChannels[3] = {
+        payload.viewerState.waveformChannelRed,
+        payload.viewerState.waveformChannelGreen,
+        payload.viewerState.waveformChannelBlue};
+    const auto waveformChannelEnabled = [&](int channel) {
+      return lumaOnly || waveformChannels[std::clamp(channel, 0, 2)];
+    };
+    reconstructWaveformDensity(&mesh.scopeDensity,
+                               kPositionBins,
+                               kSignalBins,
+                               channelCount);
+    std::vector<float> occupiedDensity;
+    occupiedDensity.reserve(mesh.scopeDensity.size() / 8u);
+    for (int channel = 0; channel < channelCount; ++channel) {
+      if (!waveformChannelEnabled(channel)) continue;
+      for (int x = 0; x < kPositionBins; ++x) {
+        for (int y = 0; y < kSignalBins; ++y) {
+          const float value =
+              mesh.scopeDensity[(static_cast<size_t>(channel) * kPositionBins +
+                                 static_cast<size_t>(x)) *
+                                    kSignalBins +
+                                static_cast<size_t>(y)];
+          if (value > 0.0f) occupiedDensity.push_back(value);
+        }
+      }
+    }
+    float densityReference = 1.0f;
+    if (!occupiedDensity.empty()) {
+      const size_t referenceIndex = std::min(
+          occupiedDensity.size() - 1u,
+          static_cast<size_t>(static_cast<double>(occupiedDensity.size() - 1u) * 0.965));
+      std::nth_element(occupiedDensity.begin(),
+                       occupiedDensity.begin() + referenceIndex,
+                       occupiedDensity.end());
+      densityReference = std::max(1.0f, occupiedDensity[referenceIndex]);
+    }
+    const float invLogReference = 1.0f / std::log1p(densityReference);
+    const float pointBrightness =
+        static_cast<float>(payload.viewerState.waveformPointBrightness);
+    const float waveformSaturation =
+        static_cast<float>(payload.viewerState.waveformSaturation);
+    auto scopeIntensity = [&](float density) {
+      if (density <= 0.0f) return 0.0f;
+      const float normalized =
+          clampf(std::log1p(density) * invLogReference, 0.0f, 1.0f);
+      // Preserve low-population structure without additive glow. The density
+      // is encoded directly into RGB and rendered with ordinary alpha
+      // blending, so a lifted perceptual curve improves readability without
+      // allowing repeated samples to accumulate into white blooms.
+      return clampf((0.22f + 0.78f * std::pow(normalized, 0.62f)) *
+                        pointBrightness,
+                    0.0f,
+                    1.0f);
+    };
+    auto saturatedWaveformColor = [&](float r, float g, float b) {
+      const float luma = 0.2126f * r + 0.7152f * g + 0.0722f * b;
+      return Vec3{
+          clampf(luma + (r - luma) * waveformSaturation, 0.0f, 1.0f),
+          clampf(luma + (g - luma) * waveformSaturation, 0.0f, 1.0f),
+          clampf(luma + (b - luma) * waveformSaturation, 0.0f, 1.0f)};
+    };
+    for (int x = 0; x < kPositionBins; ++x) {
+      for (int y = 0; y < kSignalBins; ++y) {
+        const auto densityAt = [&](int channel) {
+          return mesh.scopeDensity[(static_cast<size_t>(channel) * kPositionBins +
+                                    static_cast<size_t>(x)) *
+                                       kSignalBins +
+                                   static_cast<size_t>(y)];
+        };
+        const float plotY =
+            kScopePlotBottom + kScopePlotHeight * (static_cast<float>(y) + 0.5f) /
+                                       kSignalBins;
+        if (lumaOnly) {
+          const float intensity = scopeIntensity(densityAt(0));
+          if (intensity <= 0.0f) continue;
+          const float plotX =
+              kScopePlotLeft + kScopePlotWidth * (static_cast<float>(x) + 0.5f) /
+                                       kPositionBins;
+          addScopePoint(plotX,
+                        plotY,
+                        0.88f * intensity,
+                        0.92f * intensity,
+                        0.96f * intensity,
+                        1.0f);
+        } else if (mesh.scopeMode == 1) {
+          for (int channel = 0; channel < 3; ++channel) {
+            if (!waveformChannelEnabled(channel)) continue;
+            const float intensity = scopeIntensity(densityAt(channel));
+            if (intensity <= 0.0f) continue;
+            const float plotX =
+                kScopePlotLeft +
+                (static_cast<float>(channel) +
+                 (static_cast<float>(x) + 0.5f) / kPositionBins) *
+                    (kScopePlotWidth / 3.0f);
+            const Vec3 color = saturatedWaveformColor(
+                channel == 0 ? intensity : 0.0f,
+                channel == 1 ? intensity : 0.0f,
+                channel == 2 ? intensity : 0.0f);
+            addScopePoint(plotX,
+                          plotY,
+                          color.x,
+                          color.y,
+                          color.z,
+                          1.0f);
+          }
+        } else {
+          const float red =
+              waveformChannels[0] ? scopeIntensity(densityAt(0)) : 0.0f;
+          const float green =
+              waveformChannels[1] ? scopeIntensity(densityAt(1)) : 0.0f;
+          const float blue =
+              waveformChannels[2] ? scopeIntensity(densityAt(2)) : 0.0f;
+          if (red <= 0.0f && green <= 0.0f && blue <= 0.0f) continue;
+          const float plotX =
+              kScopePlotLeft + kScopePlotWidth * (static_cast<float>(x) + 0.5f) /
+                                       kPositionBins;
+          const Vec3 color = saturatedWaveformColor(red, green, blue);
+          addScopePoint(plotX, plotY, color.x, color.y, color.z, 1.0f);
+        }
+      }
+    }
+    if (payload.viewerState.waveformShowOverflow) {
+      const auto isOverflowValue = [](float value) {
+        return value < 0.0f || value > 1.0f;
+      };
+      const auto overflowPlotY = [&](float value) {
+        // Preserve the selected scale in the default view, but do not clamp
+        // overflow to its boundary. Values outside the range continue in chart
+        // space and can be inspected with the existing scope pan/zoom controls.
+        return kScopePlotBottom + kScopePlotHeight * (value - range.first) * invRange;
+      };
+      const auto overflowPlotX = [&](int channel, float xNorm) {
+        if (mesh.scopeMode == 1 && !lumaOnly) {
+          return kScopePlotLeft +
+                 (static_cast<float>(channel) + clampf(xNorm, 0.0f, 1.0f)) *
+                     (kScopePlotWidth / 3.0f);
+        }
+        return kScopePlotLeft + kScopePlotWidth * clampf(xNorm, 0.0f, 1.0f);
+      };
+      const float overflowIntensity =
+          clampf(0.82f * pointBrightness, 0.20f, 1.0f);
+      for (const auto& sample : samples) {
+        if (lumaOnly) {
+          const float value =
+              analyticalScopeLuma(sample, payload.viewerState.waveformLumaMethod);
+          if (!isOverflowValue(value)) continue;
+          const Vec3 color =
+              analyticalScopeOverflowColor(
+                  0, true, payload.viewerState.waveformHighlightOverflow);
+          addScopePoint(overflowPlotX(0, sample.xNorm),
+                        overflowPlotY(value),
+                        color.x * overflowIntensity,
+                        color.y * overflowIntensity,
+                        color.z * overflowIntensity,
+                        1.0f);
+          continue;
+        }
+        const float values[3] = {sample.r, sample.g, sample.b};
+        for (int channel = 0; channel < 3; ++channel) {
+          if (!waveformChannelEnabled(channel) || !isOverflowValue(values[channel])) {
+            continue;
+          }
+          const Vec3 color =
+              analyticalScopeOverflowColor(
+                  channel, false, payload.viewerState.waveformHighlightOverflow);
+          addScopePoint(overflowPlotX(channel, sample.xNorm),
+                        overflowPlotY(values[channel]),
+                        color.x * overflowIntensity,
+                        color.y * overflowIntensity,
+                        color.z * overflowIntensity,
+                        1.0f);
+        }
+      }
+    }
+  } else {
+    mesh.scopeWidth = kSignalBins;
+    mesh.scopeHeight = 1;
+    mesh.scopeDensity.assign(static_cast<size_t>(kSignalBins * 3), 0.0f);
+    const bool showHistogramOverflow =
+        payload.viewerState.histogramShowOverflow;
+    const bool highlightHistogramOverflow =
+        showHistogramOverflow && payload.viewerState.histogramHighlightOverflow;
+    std::array<std::vector<float>, 3> overflowValuesByChannel;
+    if (showHistogramOverflow) {
+      for (auto& values : overflowValuesByChannel) {
+        values.reserve(samples.size() / static_cast<size_t>(lumaOnly ? 1 : 3));
+      }
+    }
+    const auto recordOverflow = [&](int channel, float value) {
+      if (value < 0.0f || value > 1.0f) {
+        if (showHistogramOverflow) {
+          overflowValuesByChannel[static_cast<size_t>(std::clamp(channel, 0, 2))]
+              .push_back(value);
+        }
+        return true;
+      }
+      return false;
+    };
+    auto accumulate = [&](int channel, float value) {
+      const int bin = std::clamp(static_cast<int>((value - range.first) * invRange * kSignalBins), 0, kSignalBins - 1);
+      mesh.scopeDensity[static_cast<size_t>(channel * kSignalBins + bin)] += 1.0f;
+    };
+    const bool gpuDensityReady =
+        buildAnalyticalScopeDensityGlCompute(samples,
+                                             false,
+                                             mesh.scopeMode,
+                                             kSignalBins,
+                                             1,
+                                             range.first,
+                                             invRange,
+                                             true,
+                                             &mesh.scopeDensity);
+    if (!gpuDensityReady) {
+      for (const auto& sample : samples) {
+        if (lumaOnly) {
+          const float value = analyticalScopeLuma(sample);
+          if (!recordOverflow(0, value)) accumulate(0, value);
+        } else {
+          if (!recordOverflow(0, sample.r)) accumulate(0, sample.r);
+          if (!recordOverflow(1, sample.g)) accumulate(1, sample.g);
+          if (!recordOverflow(2, sample.b)) accumulate(2, sample.b);
+        }
+      }
+    } else if (showHistogramOverflow) {
+      for (const auto& sample : samples) {
+        if (lumaOnly) {
+          (void)recordOverflow(0, analyticalScopeLuma(sample));
+        } else {
+          (void)recordOverflow(0, sample.r);
+          (void)recordOverflow(1, sample.g);
+          (void)recordOverflow(2, sample.b);
+        }
+      }
+    }
+    const int channelCount = lumaOnly ? 1 : 3;
+    std::vector<float> smoothedDensity = mesh.scopeDensity;
+    for (int channel = 0; channel < channelCount; ++channel) {
+      for (int bin = 0; bin < kSignalBins; ++bin) {
+        float sum = 0.0f;
+        float weightSum = 0.0f;
+        constexpr float weights[5] = {1.0f, 4.0f, 6.0f, 4.0f, 1.0f};
+        for (int tap = -2; tap <= 2; ++tap) {
+          const int sourceBin = std::clamp(bin + tap, 0, kSignalBins - 1);
+          const float weight = weights[tap + 2];
+          sum += mesh.scopeDensity[static_cast<size_t>(channel * kSignalBins + sourceBin)] * weight;
+          weightSum += weight;
+        }
+        smoothedDensity[static_cast<size_t>(channel * kSignalBins + bin)] = sum / weightSum;
+      }
+    }
+    mesh.scopeDensity = std::move(smoothedDensity);
+    float maxDensity = 1.0f;
+    for (const float density : mesh.scopeDensity) maxDensity = std::max(maxDensity, density);
+    for (int channel = 0; channel < channelCount; ++channel) {
+      for (int bin = 1; bin < kSignalBins; ++bin) {
+        const float x0 =
+            kScopePlotLeft + kScopePlotWidth * static_cast<float>(bin - 1) /
+                                     (kSignalBins - 1);
+        const float x1 =
+            kScopePlotLeft + kScopePlotWidth * static_cast<float>(bin) /
+                                     (kSignalBins - 1);
+        const float y0 =
+            kScopePlotBottom +
+            (kScopePlotHeight - 0.06f) *
+                std::sqrt(mesh.scopeDensity[static_cast<size_t>(
+                              channel * kSignalBins + bin - 1)] /
+                          maxDensity);
+        const float y1 =
+            kScopePlotBottom +
+            (kScopePlotHeight - 0.06f) *
+                std::sqrt(mesh.scopeDensity[static_cast<size_t>(channel * kSignalBins + bin)] /
+                          maxDensity);
+        if (lumaOnly) {
+          addScopeFillSegment(x0, y0, x1, y1, 0.88f, 0.92f, 0.96f, 0.14f);
+          addScopeLine(x0, y0, x1, y1, 0.88f, 0.92f, 0.96f, 0.88f);
+        } else if (channel == 0) {
+          addScopeFillSegment(x0, y0, x1, y1, 1.0f, 0.16f, 0.12f, 0.10f);
+          addScopeLine(x0, y0, x1, y1, 1.0f, 0.16f, 0.12f, 0.76f);
+        } else if (channel == 1) {
+          addScopeFillSegment(x0, y0, x1, y1, 0.20f, 1.0f, 0.28f, 0.10f);
+          addScopeLine(x0, y0, x1, y1, 0.20f, 1.0f, 0.28f, 0.76f);
+        } else {
+          addScopeFillSegment(x0, y0, x1, y1, 0.24f, 0.52f, 1.0f, 0.10f);
+          addScopeLine(x0, y0, x1, y1, 0.24f, 0.52f, 1.0f, 0.76f);
+        }
+      }
+    }
+    const bool hasHistogramOverflow =
+        std::any_of(overflowValuesByChannel.begin(),
+                    overflowValuesByChannel.end(),
+                    [](const std::vector<float>& values) { return !values.empty(); });
+    if (showHistogramOverflow && hasHistogramOverflow) {
+      constexpr int kOverflowBins = 512;
+      float overflowMin = 0.0f;
+      float overflowMax = 1.0f;
+      for (const auto& channelValues : overflowValuesByChannel) {
+        for (const float value : channelValues) {
+          overflowMin = std::min(overflowMin, value);
+          overflowMax = std::max(overflowMax, value);
+        }
+      }
+      const float overflowSpan = std::max(1e-6f, overflowMax - overflowMin);
+      std::vector<float> overflowDensity(
+          static_cast<size_t>(kOverflowBins * 3), 0.0f);
+      for (int channel = 0; channel < channelCount; ++channel) {
+        for (const float value :
+             overflowValuesByChannel[static_cast<size_t>(channel)]) {
+          const int bin = std::clamp(
+              static_cast<int>((value - overflowMin) / overflowSpan *
+                               kOverflowBins),
+              0,
+              kOverflowBins - 1);
+          overflowDensity[static_cast<size_t>(channel * kOverflowBins + bin)] +=
+              1.0f;
+        }
+      }
+      std::vector<float> smoothedOverflow = overflowDensity;
+      constexpr float weights[5] = {1.0f, 4.0f, 6.0f, 4.0f, 1.0f};
+      for (int channel = 0; channel < channelCount; ++channel) {
+        for (int bin = 0; bin < kOverflowBins; ++bin) {
+          float sum = 0.0f;
+          float weightSum = 0.0f;
+          for (int tap = -2; tap <= 2; ++tap) {
+            const int sourceBin = std::clamp(bin + tap, 0, kOverflowBins - 1);
+            const float weight = weights[tap + 2];
+            sum += overflowDensity[static_cast<size_t>(
+                       channel * kOverflowBins + sourceBin)] *
+                   weight;
+            weightSum += weight;
+          }
+          smoothedOverflow[static_cast<size_t>(
+              channel * kOverflowBins + bin)] = sum / weightSum;
+        }
+      }
+      const auto overflowPlotX = [&](int bin) {
+        const float value =
+            overflowMin + overflowSpan * static_cast<float>(bin) /
+                              static_cast<float>(kOverflowBins - 1);
+        return kScopePlotLeft +
+               kScopePlotWidth * (value - range.first) * invRange;
+      };
+      const auto overflowPlotY = [&](int channel, int bin) {
+        return kScopePlotBottom +
+               (kScopePlotHeight - 0.06f) *
+                   std::sqrt(clampf(
+                       smoothedOverflow[static_cast<size_t>(
+                           channel * kOverflowBins + bin)] /
+                           maxDensity,
+                       0.0f,
+                       1.0f));
+      };
+      for (int channel = 0; channel < channelCount; ++channel) {
+        const Vec3 color = analyticalScopeOverflowColor(
+            channel, lumaOnly, highlightHistogramOverflow);
+        for (int bin = 1; bin < kOverflowBins; ++bin) {
+          const float previousDensity =
+              smoothedOverflow[static_cast<size_t>(
+                  channel * kOverflowBins + bin - 1)];
+          const float currentDensity =
+              smoothedOverflow[static_cast<size_t>(
+                  channel * kOverflowBins + bin)];
+          if (previousDensity <= 0.0f && currentDensity <= 0.0f) continue;
+          const float x0 = overflowPlotX(bin - 1);
+          const float x1 = overflowPlotX(bin);
+          const float y0 = overflowPlotY(channel, bin - 1);
+          const float y1 = overflowPlotY(channel, bin);
+          addScopeFillSegment(x0, y0, x1, y1,
+                              color.x, color.y, color.z, 0.16f);
+          addScopeLine(x0, y0, x1, y1,
+                       color.x, color.y, color.z, 0.94f);
+        }
+      }
+    }
+  }
+  mesh.pointCount = mesh.pointVerts.size() / 3u;
+  mesh.lineVertexCount = mesh.lineVerts.size() / 3u;
+  mesh.scopeFillVertexCount = mesh.scopeFillVerts.size() / 3u;
+  *out = std::move(mesh);
+  return true;
+}
+
 void buildEmptyInputCloudMesh(const InputCloudPayload& cloud, MeshData* out) {
   if (!out) return;
   MeshData mesh{};
@@ -7749,6 +9731,7 @@ bool buildInputCloudMesh(const ResolvedPayload& payload,
   if (classifyPlotMode(payload) == PlotModeKind::GlossLift) {
     std::vector<InputCloudSample> samples;
     if (!parseInputCloudSamples(cloud, &samples)) return false;
+    applyViewerIdentityReadPreview(payload, cloud, &samples);
     filterInputCloudSamples(payload, &samples);
     std::vector<float> rawPoints;
     rawPoints.reserve(samples.size() * 3u);
@@ -7827,6 +9810,7 @@ bool buildInputCloudMesh(const ResolvedPayload& payload,
   std::vector<InputCloudSample> samples;
   std::vector<float> rawPoints;
   if (!parseInputCloudSamples(cloud, &samples)) return false;
+  applyViewerIdentityReadPreview(payload, cloud, &samples);
   filterInputCloudSamples(payload, &samples);
   if (samples.empty()) {
     buildEmptyInputCloudMesh(cloud, out);
@@ -8409,6 +10393,81 @@ bool runInputParityCheck(const ResolvedPayload& payload,
   return runInputParityCheckWithBuffers(payload, cloud, rawPoints, cache.verts, cache.colors, gpuMesh, enabled);
 }
 
+struct PlotWindowRectNorm {
+  float x = 0.0f;
+  float y = 0.0f;
+  float w = 1.0f;
+  float h = 1.0f;
+};
+
+// Reserve only the logical-pixel height occupied by the 30 px toolbar buttons.
+// Plot-window rectangles are remapped through this inset when the viewer is
+// resized, so the toolbar cannot grow into a large normalized dead band.
+constexpr float kViewerWorkspaceToolbarHeight = 42.0f;
+
+struct PlotWindowState {
+  int windowId = 1;
+  PlotWindowRectNorm rect{};
+  ChromaspaceViewer::ViewerRuntimeState viewState{};
+  CameraState camera{};
+  MeshData derivedMesh{};
+  MeshData overlayMesh{};
+  std::string derivedBuildKey;
+  std::string overlayBuildKey;
+  std::string syncLabel = "Waiting for Resolve";
+  bool derivedMeshValid = false;
+  bool overlayMeshValid = false;
+  bool selected = false;
+};
+
+ChromaspaceViewer::ViewerRuntimeState viewerStateForPlotModel(
+    const ChromaspaceViewer::ViewerRuntimeState& source,
+    int plotModel);
+ChromaspaceViewer::ViewerRuntimeState viewerStateWithModelCapabilities(
+    const ChromaspaceViewer::ViewerRuntimeState& source);
+
+const InputCloudPayload* sourceCloudForPlotWindow(const SourceCloudStore& store,
+                                                  const PlotWindowState& window,
+                                                  const std::string& senderId,
+                                                  const InputCloudPayload* fallback) {
+  const auto state = viewerStateWithModelCapabilities(window.viewState);
+  if (state.plotModel == ChromaspaceViewer::kPlotModelWaveform &&
+      state.waveformHighDetail &&
+      !state.readGrayRamp &&
+      !state.readIdentityPlot &&
+      !state.isolateIdentityData &&
+      store.hasWaveformHigh &&
+      senderMatchesCurrent(senderId, store.waveformHigh.senderId)) {
+    return &store.waveformHigh;
+  }
+  if (state.volumeSliceLassoRegion && store.hasImageLasso &&
+      senderMatchesCurrent(senderId, store.imageLasso.senderId) &&
+      !cloudLooksEmptyImageLassoVariant(store.imageLasso)) {
+    return &store.imageLasso;
+  }
+  if ((state.readGrayRamp || state.readIdentityPlot) && store.hasIdentity &&
+      senderMatchesCurrent(senderId, store.identity.senderId)) {
+    return &store.identity;
+  }
+  if (store.hasOrdinary && senderMatchesCurrent(senderId, store.ordinary.senderId)) {
+    return &store.ordinary;
+  }
+  return fallback;
+}
+
+enum class PlotWindowDragMode {
+  None = 0,
+  Move,
+  ResizeLeft,
+  ResizeRight,
+  ResizeTop,
+  ResizeBottom,
+  ResizeTopLeft,
+  ResizeTopRight,
+  ResizeBottomLeft,
+  ResizeBottomRight
+};
+
 struct AppState {
   CameraState cam;
   Quat modelOrientation;
@@ -8459,7 +10518,74 @@ struct AppState {
   bool altHeld = false;
   bool superHeld = false;
   bool rollKeyHeld = false;
+  ChromaspaceViewer::ViewerRuntimeState viewerState{};
+  bool viewerSettingsLoadedFromDisk = false;
+  bool viewerSettingsSentToPlugin = false;
+  bool viewerSettingsImportedFromPlugin = false;
+  bool viewerStateLocalOverride = false;
+  bool generatedIdentityContractKnown = false;
+  bool generatedIdentityResolutionValid = false;
+  int generatedIdentityResolution = 29;
+  bool generatedIdentityDrawCube = false;
+  bool generatedIdentityDrawRamp = false;
+  uint64_t generatedIdentityStripRevision = 0;
+  double generatedIdentitySignalUpdatedAt = -10.0;
+  std::string generatedIdentityResolutionSender;
+  std::string activeCloudSettingsKey;
+  std::string localPreviewSettingsKey;
+  int viewerMenuSection = 0;
+  int viewerMenuHoverTab = -1;
+  int viewerSettingsSubtab = 0;
+  int viewerSettingsHoverSubtab = -1;
+  int viewerMenuHoverChoice = -1;
+  bool viewerMenuDraggingSlider = false;
+  int viewerMenuSliderAction = 0;
+  int viewerMenuChoiceAction = 0;
+  float viewerMenuScroll = 0.0f;
+  float viewerChoiceMenuScroll = 0.0f;
+  double viewerMenuLastClick = -10.0;
+  int viewerMenuLastClickRow = -1;
+  int viewerMenuLastClickAction = 0;
+  std::string viewerPresetSelection;
+  std::string viewerPresetNameInput;
+  bool viewerPresetNameEditing = false;
+  std::vector<LassoStroke> viewerLassoStrokes;
+  LassoStroke viewerLassoActiveStroke;
+  uint64_t viewerLassoRevision = 0;
+  bool viewerLassoDrawing = false;
+  std::string viewerLassoData;
+  std::string cachedOfxImageLassoData;
   bool plotModelMenuVisible = false;
+  bool quickPlotModelMenuVisible = false;
+  int quickPlotModelMenuHover = -1;
+  double quickPlotModelMenuX = 12.0;
+  double quickPlotModelMenuY = 12.0;
+  bool addPlotMenuVisible = false;
+  int addPlotMenuHover = -1;
+  double addPlotMenuX = 48.0;
+  double addPlotMenuY = 12.0;
+  bool layoutMenuVisible = false;
+  int layoutMenuHover = -1;
+  double layoutMenuX = 84.0;
+  double layoutMenuY = 12.0;
+  bool showWorkspaceButtons = true;
+  std::vector<PlotWindowState> plotWindows;
+  int focusedPlotWindowId = 1;
+  int hoveredPlotWindowId = -1;
+  int nextPlotWindowId = 2;
+  PlotWindowDragMode plotWindowDragMode = PlotWindowDragMode::None;
+  int plotWindowDragId = -1;
+  double plotWindowDragStartX = 0.0;
+  double plotWindowDragStartY = 0.0;
+  PlotWindowRectNorm plotWindowDragStartRect{};
+  bool plotWindowSnapPreviewVisible = false;
+  int plotWindowSnapPreviewId = -1;
+  PlotWindowRectNorm plotWindowSnapPreviewRect{};
+  uint64_t workspaceCommandRevision = 0;
+  double lastWorkspaceSave = -10.0;
+  int workspaceLayoutWindowWidth = 0;
+  int workspaceLayoutWindowHeight = 0;
+  float workspaceLayoutTopNorm = -1.0f;
   double plotModelMenuX = 24.0;
   double plotModelMenuY = 24.0;
   int plotModelMenuHoverMain = -1;
@@ -8468,6 +10594,26 @@ struct AppState {
   bool readIdentityPlot = false;
   bool isolateIdentityData = false;
   int identityReadResolution = 29;
+  bool resolveDrawStatusKnown = false;
+  bool resolveDrawStatusAvailable = false;
+  bool resolveDrawInstanceLikely = false;
+  bool resolveDrawInstanceConfirmed = false;
+  int resolveDrawChromaspaceNodeCount = 0;
+  double resolveDrawStatusUpdatedAtUnix = 0.0;
+  double lastResolveDrawStatusPoll = -10.0;
+  double lastResolveDrawScanRequest = -10.0;
+  double lastResolveLivePulseWrite = -10.0;
+  double resolveLivePulseUntil = -10.0;
+  uint64_t lastResolveLivePulseRevisionSeen = 0;
+  uint64_t resolveDrawScanRequestedRevision = 0;
+  uint64_t resolveDrawScanCompletedRevision = 0;
+  std::string resolveDrawStatusMessage;
+  uint64_t focusPlotNodeRequestedRevision = 0;
+  uint64_t clearImageLassoRequestedRevision = 0;
+  bool resolvePlotNodeFocusAvailable = false;
+  bool resolvePlotNodeFocusSucceeded = false;
+  uint64_t resolvePlotNodeFocusRevision = 0;
+  std::string resolvePlotNodeFocusMessage;
   bool fitVolumeRequested = false;
   bool glossOrthoAutoFitRequested = false;
   Quat glossOrthoSnapAnchor;
@@ -8481,35 +10627,3004 @@ struct AppState {
   double lastHoverActivationAttempt = -10.0;
 };
 
-struct ViewerPlotModelChoice {
+PlotWindowState* plotWindowById(AppState* app, int id) {
+  if (!app) return nullptr;
+  for (auto& window : app->plotWindows) {
+    if (window.windowId == id) return &window;
+  }
+  return nullptr;
+}
+
+const PlotWindowState* plotWindowById(const AppState& app, int id) {
+  for (const auto& window : app.plotWindows) {
+    if (window.windowId == id) return &window;
+  }
+  return nullptr;
+}
+
+PlotWindowState* focusedPlotWindow(AppState* app) {
+  if (!app) return nullptr;
+  if (auto* window = plotWindowById(app, app->focusedPlotWindowId)) return window;
+  return app->plotWindows.empty() ? nullptr : &app->plotWindows.front();
+}
+
+const PlotWindowState* focusedPlotWindow(const AppState& app) {
+  if (const auto* window = plotWindowById(app, app.focusedPlotWindowId)) return window;
+  return app.plotWindows.empty() ? nullptr : &app.plotWindows.front();
+}
+
+void captureFocusedPlotWindowFromApp(AppState* app) {
+  if (!app) return;
+  if (auto* window = focusedPlotWindow(app)) {
+    window->viewState = viewerStateWithModelCapabilities(app->viewerState);
+    window->camera = app->cam;
+    window->selected = true;
+  }
+}
+
+void applyPlotWindowToApp(AppState* app, const PlotWindowState& window) {
+  if (!app) return;
+  app->focusedPlotWindowId = window.windowId;
+  app->viewerState = viewerStateWithModelCapabilities(window.viewState);
+  app->plotMode = ChromaspaceViewer::plotModeForModel(app->viewerState.plotModel);
+  app->circularHsl = app->viewerState.circularHsl;
+  app->circularHsv = app->viewerState.circularHsv;
+  app->keepOnTop = app->viewerState.keepOnTop;
+  app->readGrayRamp = app->viewerState.readGrayRamp;
+  app->readIdentityPlot = app->viewerState.readIdentityPlot;
+  app->isolateIdentityData = app->viewerState.isolateIdentityData;
+  app->identityReadResolution = app->viewerState.identityReadResolution;
+  app->cam = window.camera;
+  for (auto& other : app->plotWindows) other.selected = other.windowId == window.windowId;
+}
+
+void ensureDefaultPlotWindow(AppState* app) {
+  if (!app || !app->plotWindows.empty()) return;
+  PlotWindowState window{};
+  window.windowId = 1;
+  window.rect = {0.0f, 0.0f, 1.0f, 1.0f};
+  window.viewState = viewerStateWithModelCapabilities(app->viewerState);
+  window.camera = app->cam;
+  window.selected = true;
+  app->plotWindows.push_back(window);
+  app->focusedPlotWindowId = window.windowId;
+  app->nextPlotWindowId = 2;
+}
+
+void focusPlotWindow(AppState* app, int id) {
+  if (!app) return;
+  captureFocusedPlotWindowFromApp(app);
+  PlotWindowState* window = plotWindowById(app, id);
+  if (!window) return;
+  PlotWindowState copy = *window;
+  applyPlotWindowToApp(app, copy);
+}
+
+float plotWindowMinNormW(int windowWidth) {
+  return std::min(0.88f, 180.0f / static_cast<float>(std::max(1, windowWidth)));
+}
+
+float plotWindowMinNormH(int windowHeight) {
+  return std::min(0.88f, 140.0f / static_cast<float>(std::max(1, windowHeight)));
+}
+
+float plotWorkspaceTopNorm(int windowHeight) {
+  return clampf(kViewerWorkspaceToolbarHeight / static_cast<float>(std::max(1, windowHeight)),
+                0.0f,
+                0.45f);
+}
+
+PlotWindowRectNorm plotWorkspaceRect(float x,
+                                     float y,
+                                     float w,
+                                     float h,
+                                     int windowHeight) {
+  const float top = plotWorkspaceTopNorm(windowHeight);
+  const float availableHeight = 1.0f - top;
+  return {x, top + y * availableHeight, w, h * availableHeight};
+}
+
+PlotWindowRectNorm clampedPlotWindowRect(PlotWindowRectNorm rect, int windowWidth, int windowHeight) {
+  const float minW = plotWindowMinNormW(windowWidth);
+  const float workspaceTop = plotWorkspaceTopNorm(windowHeight);
+  const float maxH = std::max(0.05f, 1.0f - workspaceTop);
+  const float minH = std::min(plotWindowMinNormH(windowHeight), maxH);
+  rect.w = clampf(rect.w, minW, 1.0f);
+  rect.h = clampf(rect.h, minH, maxH);
+  rect.x = clampf(rect.x, 0.0f, std::max(0.0f, 1.0f - rect.w));
+  rect.y = clampf(rect.y, workspaceTop, std::max(workspaceTop, 1.0f - rect.h));
+  return rect;
+}
+
+void reflowPlotWindowsForWorkspaceResize(AppState* app, int windowWidth, int windowHeight) {
+  if (!app || windowWidth <= 0 || windowHeight <= 0) return;
+  if (app->workspaceLayoutWindowWidth <= 0 || app->workspaceLayoutWindowHeight <= 0) {
+    app->workspaceLayoutWindowWidth = windowWidth;
+    app->workspaceLayoutWindowHeight = windowHeight;
+    app->workspaceLayoutTopNorm = plotWorkspaceTopNorm(windowHeight);
+    return;
+  }
+  const float newTop = plotWorkspaceTopNorm(windowHeight);
+  const float oldTop = app->workspaceLayoutTopNorm >= 0.0f
+                           ? clampf(app->workspaceLayoutTopNorm, 0.0f, 0.45f)
+                           : plotWorkspaceTopNorm(app->workspaceLayoutWindowHeight);
+  if (app->workspaceLayoutWindowWidth == windowWidth &&
+      app->workspaceLayoutWindowHeight == windowHeight &&
+      std::fabs(oldTop - newTop) <= 1e-6f) {
+    return;
+  }
+
+  const float oldHeight = std::max(0.05f, 1.0f - oldTop);
+  const float newHeight = std::max(0.05f, 1.0f - newTop);
+  for (auto& window : app->plotWindows) {
+    const float workspaceY = (window.rect.y - oldTop) / oldHeight;
+    const float workspaceH = window.rect.h / oldHeight;
+    window.rect.y = newTop + workspaceY * newHeight;
+    window.rect.h = workspaceH * newHeight;
+    window.rect = clampedPlotWindowRect(window.rect, windowWidth, windowHeight);
+  }
+  app->workspaceLayoutWindowWidth = windowWidth;
+  app->workspaceLayoutWindowHeight = windowHeight;
+  app->workspaceLayoutTopNorm = newTop;
+}
+
+PlotWindowRectNorm defaultPlotWindowRectNearCursor(const AppState& app,
+                                                   int windowWidth,
+                                                   int windowHeight,
+                                                   double cursorX,
+                                                   double cursorY) {
+  const bool first = app.plotWindows.empty();
+  PlotWindowRectNorm rect{};
+  rect.w = first ? 1.0f : 0.46f;
+  rect.h = first ? 1.0f - plotWorkspaceTopNorm(windowHeight) : 0.46f;
+  rect.x = first ? 0.0f : static_cast<float>(cursorX / std::max(1, windowWidth)) - rect.w * 0.5f;
+  rect.y = first ? plotWorkspaceTopNorm(windowHeight)
+                 : static_cast<float>(cursorY / std::max(1, windowHeight)) - rect.h * 0.5f;
+  return clampedPlotWindowRect(rect, windowWidth, windowHeight);
+}
+
+bool pointInPlotWindowRect(const PlotWindowState& window, int windowWidth, int windowHeight, double x, double y) {
+  const float x0 = window.rect.x * static_cast<float>(std::max(1, windowWidth));
+  const float y0 = window.rect.y * static_cast<float>(std::max(1, windowHeight));
+  const float x1 = x0 + window.rect.w * static_cast<float>(std::max(1, windowWidth));
+  const float y1 = y0 + window.rect.h * static_cast<float>(std::max(1, windowHeight));
+  return x >= x0 && x <= x1 && y >= y0 && y <= y1;
+}
+
+int plotWindowAt(const AppState& app, int windowWidth, int windowHeight, double x, double y) {
+  for (auto it = app.plotWindows.rbegin(); it != app.plotWindows.rend(); ++it) {
+    if (pointInPlotWindowRect(*it, windowWidth, windowHeight, x, y)) return it->windowId;
+  }
+  return -1;
+}
+
+void bringPlotWindowToFront(AppState* app, int id) {
+  if (!app || app->plotWindows.size() < 2u) return;
+  auto it = std::find_if(app->plotWindows.begin(), app->plotWindows.end(),
+                         [&](const PlotWindowState& window) { return window.windowId == id; });
+  if (it == app->plotWindows.end()) return;
+  PlotWindowState window = *it;
+  app->plotWindows.erase(it);
+  app->plotWindows.push_back(window);
+}
+
+bool closePlotWindow(AppState* app, int id) {
+  if (!app || app->plotWindows.size() <= 1u) return false;
+  captureFocusedPlotWindowFromApp(app);
+  auto it = std::find_if(app->plotWindows.begin(), app->plotWindows.end(),
+                         [&](const PlotWindowState& window) { return window.windowId == id; });
+  if (it == app->plotWindows.end()) return false;
+  const bool closedFocused = id == app->focusedPlotWindowId;
+  app->plotWindows.erase(it);
+  if (closedFocused && !app->plotWindows.empty()) {
+    focusPlotWindow(app, app->plotWindows.back().windowId);
+  }
+  logViewerEvent(std::string("Closed plot window: id=") + std::to_string(id));
+  return true;
+}
+
+bool plotModelIsAnalyticalScope(int plotModel);
+
+void fitAnalyticalScopeCamera(PlotWindowState* window) {
+  if (!window || !plotModelIsAnalyticalScope(window->viewState.plotModel)) return;
+  float minX = kScopePlotLeft;
+  float maxX = kScopePlotRight;
+  float minY = kScopePlotBottom;
+  float maxY = kScopePlotTop;
+  const auto includeVertices = [&](const std::vector<float>& vertices) {
+    for (size_t i = 0; i + 2u < vertices.size(); i += 3u) {
+      const float x = vertices[i + 0u];
+      const float y = vertices[i + 1u];
+      if (!std::isfinite(x) || !std::isfinite(y)) continue;
+      minX = std::min(minX, x);
+      maxX = std::max(maxX, x);
+      minY = std::min(minY, y);
+      maxY = std::max(maxY, y);
+    }
+  };
+  if (window->derivedMeshValid) {
+    includeVertices(window->derivedMesh.pointVerts);
+    includeVertices(window->derivedMesh.lineVerts);
+    includeVertices(window->derivedMesh.scopeFillVerts);
+  }
+  const bool histogram =
+      window->viewState.plotModel == ChromaspaceViewer::kPlotModelHistogram;
+  if (histogram) {
+    minX -= 0.04f;
+    maxX += 0.16f;
+    minY -= 0.15f;
+    maxY += 0.04f;
+  } else {
+    minX -= 0.18f;
+    maxX += 0.04f;
+    minY -= 0.04f;
+    maxY += 0.04f;
+  }
+  const float centerX = 0.5f * (minX + maxX);
+  const float centerY = 0.5f * (minY + maxY);
+  const float halfExtent =
+      std::max(0.25f,
+               std::max(0.5f * (maxX - minX),
+                        0.5f * (maxY - minY))) *
+      1.035f;
+  window->camera.orthographic = true;
+  window->camera.orthographicView = -1;
+  window->camera.distance = clampf(halfExtent * 6.0f, 1.0f, kMaxCameraDistance);
+  window->camera.panX = -centerX;
+  window->camera.panY = -centerY;
+  window->camera.qx = 0.0f;
+  window->camera.qy = 0.0f;
+  window->camera.qz = 0.0f;
+  window->camera.qw = 1.0f;
+}
+
+void addPlotWindow(AppState* app, int plotModel, int windowWidth, int windowHeight, double cursorX, double cursorY) {
+  if (!app) return;
+  ensureDefaultPlotWindow(app);
+  captureFocusedPlotWindowFromApp(app);
+  PlotWindowState window{};
+  window.windowId = app->nextPlotWindowId++;
+  window.rect = defaultPlotWindowRectNearCursor(*app, windowWidth, windowHeight, cursorX, cursorY);
+  window.viewState = viewerStateWithModelCapabilities(app->viewerState);
+  window.viewState.plotModel =
+      std::clamp(plotModel, 0, ChromaspaceViewer::kPlotModelCount - 1);
+  window.viewState = viewerStateForPlotModel(window.viewState, window.viewState.plotModel);
+  window.viewState.stateRevision = std::max<uint64_t>(window.viewState.stateRevision + 1, 1);
+  if (plotModelIsAnalyticalScope(window.viewState.plotModel)) {
+    resetAnalyticalScopeCamera(
+        &window.camera,
+        window.viewState.plotModel == ChromaspaceViewer::kPlotModelHistogram);
+  } else {
+    resetCamera(&window.camera);
+  }
+  app->plotWindows.push_back(window);
+  focusPlotWindow(app, window.windowId);
+  logViewerEvent(std::string("Added plot window: id=") + std::to_string(window.windowId) +
+                 " model=" + ChromaspaceViewer::plotModelLabel(window.viewState.plotModel));
+}
+
+void ensurePlotWindowCount(AppState* app, int count, int windowWidth, int windowHeight) {
+  if (!app) return;
+  ensureDefaultPlotWindow(app);
+  while (static_cast<int>(app->plotWindows.size()) < count) {
+    const int index = static_cast<int>(app->plotWindows.size());
+    const int model = index % ChromaspaceViewer::kPlotModelCount;
+    addPlotWindow(app,
+                  model,
+                  windowWidth,
+                  windowHeight,
+                  static_cast<double>(windowWidth) * (0.35 + 0.08 * static_cast<double>(index % 4)),
+                  static_cast<double>(windowHeight) * (0.35 + 0.08 * static_cast<double>(index % 3)));
+  }
+}
+
+void applyPlotWindowLayout(AppState* app, int layoutIndex, int windowWidth, int windowHeight) {
+  if (!app) return;
+  const int previousFocus = app->focusedPlotWindowId;
+  const int required = layoutIndex == 1 ? 2
+                     : layoutIndex == 2 ? 3
+                     : layoutIndex == 3 ? 3
+                     : layoutIndex == 4 ? 4
+                     : layoutIndex == 5 ? 6
+                                        : 1;
+  ensurePlotWindowCount(app, required, windowWidth, windowHeight);
+  if (layoutIndex > 0 && static_cast<int>(app->plotWindows.size()) > required) {
+    captureFocusedPlotWindowFromApp(app);
+    app->plotWindows.resize(static_cast<std::size_t>(required));
+  }
+  auto setRect = [&](int index, PlotWindowRectNorm rect) {
+    if (index >= 0 && index < static_cast<int>(app->plotWindows.size())) {
+      app->plotWindows[static_cast<std::size_t>(index)].rect =
+          clampedPlotWindowRect(plotWorkspaceRect(rect.x, rect.y, rect.w, rect.h, windowHeight),
+                                windowWidth,
+                                windowHeight);
+    }
+  };
+  if (layoutIndex == 1) {
+    setRect(0, {0.0f, 0.0f, 0.5f, 1.0f});
+    setRect(1, {0.5f, 0.0f, 0.5f, 1.0f});
+  } else if (layoutIndex == 2) {
+    setRect(0, {0.0f, 0.0f, 1.0f / 3.0f, 1.0f});
+    setRect(1, {1.0f / 3.0f, 0.0f, 1.0f / 3.0f, 1.0f});
+    setRect(2, {2.0f / 3.0f, 0.0f, 1.0f / 3.0f, 1.0f});
+  } else if (layoutIndex == 3) {
+    setRect(0, {0.0f, 0.0f, 2.0f / 3.0f, 1.0f});
+    setRect(1, {2.0f / 3.0f, 0.0f, 1.0f / 3.0f, 0.5f});
+    setRect(2, {2.0f / 3.0f, 0.5f, 1.0f / 3.0f, 0.5f});
+  } else if (layoutIndex == 4) {
+    setRect(0, {0.0f, 0.0f, 0.5f, 0.5f});
+    setRect(1, {0.5f, 0.0f, 0.5f, 0.5f});
+    setRect(2, {0.0f, 0.5f, 0.5f, 0.5f});
+    setRect(3, {0.5f, 0.5f, 0.5f, 0.5f});
+  } else if (layoutIndex == 5) {
+    for (int i = 0; i < 6; ++i) {
+      const int col = i % 3;
+      const int row = i / 3;
+      setRect(i, {static_cast<float>(col) / 3.0f,
+                  static_cast<float>(row) / 2.0f,
+                  1.0f / 3.0f,
+                  0.5f});
+    }
+  } else {
+    setRect(0, {0.0f, 0.0f, 1.0f, 1.0f});
+    for (int i = 1; i < static_cast<int>(app->plotWindows.size()); ++i) {
+      const float offset = 0.05f * static_cast<float>((i - 1) % 5);
+      setRect(i, {0.14f + offset, 0.14f + offset, 0.56f, 0.56f});
+    }
+  }
+  if (plotWindowById(app, previousFocus)) {
+    focusPlotWindow(app, previousFocus);
+  } else if (!app->plotWindows.empty()) {
+    focusPlotWindow(app, app->plotWindows.back().windowId);
+  }
+  logViewerEvent(std::string("Applied plot-window layout index=") + std::to_string(layoutIndex));
+}
+
+void rememberOfxImageLassoSelection(AppState* app, const ResolvedPayload& payload) {
+  if (!app || !payloadImageLassoModeEnabled(payload)) return;
+  if (payloadHasImageLassoSelection(payload)) {
+    app->cachedOfxImageLassoData = payload.lassoData;
+    const LassoRegionState state = parseViewerLassoRegionState(payload.lassoData);
+    if (app->clearImageLassoRequestedRevision > 0 &&
+        state.revision >= app->clearImageLassoRequestedRevision) {
+      app->clearImageLassoRequestedRevision = 0;
+    }
+    return;
+  }
+  // A serialized empty lasso carries an explicit reset revision. Do not restore
+  // the previous selection over it while the matching empty cloud is arriving.
+  const LassoRegionState emptyState = parseViewerLassoRegionState(payload.lassoData);
+  if (payload.lassoRegionEmpty && emptyState.revision > 0) {
+    app->cachedOfxImageLassoData.clear();
+    if (app->clearImageLassoRequestedRevision > 0 &&
+        emptyState.revision >= app->clearImageLassoRequestedRevision) {
+      app->clearImageLassoRequestedRevision = 0;
+    }
+  }
+}
+
+void applyCachedOfxImageLassoSelection(const AppState& app, ResolvedPayload* payload) {
+  if (app.clearImageLassoRequestedRevision > 0) return;
+  if (!payload || !payloadImageLassoModeEnabled(*payload) || payloadHasImageLassoSelection(*payload) ||
+      app.cachedOfxImageLassoData.empty()) {
+    return;
+  }
+  const LassoRegionState current = parseViewerLassoRegionState(payload->lassoData);
+  if (payload->lassoRegionEmpty && current.revision > 0) return;
+  const LassoRegionState cached = parseViewerLassoRegionState(app.cachedOfxImageLassoData);
+  if (cached.strokes.empty()) return;
+  payload->lassoData = app.cachedOfxImageLassoData;
+  payload->lassoRegionEmpty = false;
+  payload->cloudSettingsKey = cloudSettingsKeyWithoutImageLasso(payload->cloudSettingsKey) +
+                              imageLassoSettingsSuffixForData(payload->lassoData);
+}
+
+void applyPendingImageLassoResetToResolvedPayload(const AppState& app, ResolvedPayload* payload) {
+  if (!payload || app.clearImageLassoRequestedRevision == 0 ||
+      !payloadImageLassoModeEnabled(*payload)) {
+    return;
+  }
+  payload->lassoData =
+      serializeViewerLassoRegionState(app.clearImageLassoRequestedRevision, {});
+  payload->lassoRegionEmpty = true;
+  payload->cloudSettingsKey = cloudSettingsKeyWithoutImageLasso(payload->cloudSettingsKey) +
+                              imageLassoSettingsSuffixForData(payload->lassoData);
+}
+bool viewerLassoInteractionEnabled(const AppState& app) {
+  (void)app;
+  return false;
+}
+
+LassoPointNorm viewerLassoPointFromCursor(GLFWwindow* window, double xpos, double ypos) {
+  int windowWidth = 1;
+  int windowHeight = 1;
+  glfwGetWindowSize(window, &windowWidth, &windowHeight);
+  const float xNorm = clampf(static_cast<float>(xpos) / static_cast<float>(std::max(1, windowWidth)),
+                             0.0f,
+                             1.0f);
+  const float yNorm = clampf(1.0f - static_cast<float>(ypos) / static_cast<float>(std::max(1, windowHeight)),
+                             0.0f,
+                             1.0f);
+  return {xNorm, yNorm};
+}
+
+void rebuildViewerLassoData(AppState* app) {
+  if (!app) return;
+  app->viewerLassoData =
+      serializeViewerLassoRegionState(app->viewerLassoRevision, app->viewerLassoStrokes);
+}
+
+void bumpViewerLocalStateRevision(AppState* app) {
+  if (!app) return;
+  app->viewerState.stateRevision = std::max<uint64_t>(app->viewerState.stateRevision + 1, 1);
+  app->viewerStateLocalOverride = true;
+}
+
+bool appendPointToViewerLassoStroke(LassoStroke* stroke, LassoPointNorm point) {
+  if (!stroke) return false;
+  if (!stroke->points.empty()) {
+    const LassoPointNorm last = stroke->points.back();
+    const float dx = point.xNorm - last.xNorm;
+    const float dy = point.yNorm - last.yNorm;
+    if (dx * dx + dy * dy < 0.000012f) return false;
+  }
+  stroke->points.push_back(point);
+  return true;
+}
+
+void beginViewerLassoStroke(AppState* app, GLFWwindow* window, double xpos, double ypos) {
+  if (!app || !window) return;
+  app->viewerLassoDrawing = true;
+  app->viewerLassoActiveStroke = LassoStroke{};
+  app->viewerLassoActiveStroke.subtract = app->altHeld || app->ctrlHeld;
+  appendPointToViewerLassoStroke(&app->viewerLassoActiveStroke,
+                                 viewerLassoPointFromCursor(window, xpos, ypos));
+  app->leftDown = false;
+  app->panMode = false;
+  app->rollMode = false;
+  app->zoomMode = false;
+}
+
+void updateViewerLassoStroke(AppState* app, GLFWwindow* window, double xpos, double ypos) {
+  if (!app || !window || !app->viewerLassoDrawing) return;
+  if (appendPointToViewerLassoStroke(&app->viewerLassoActiveStroke,
+                                     viewerLassoPointFromCursor(window, xpos, ypos))) {
+    bumpViewerLocalStateRevision(app);
+  }
+}
+
+void finishViewerLassoStroke(AppState* app) {
+  if (!app || !app->viewerLassoDrawing) return;
+  app->viewerLassoDrawing = false;
+  if (app->viewerLassoActiveStroke.points.size() >= 3) {
+    app->viewerLassoStrokes.push_back(std::move(app->viewerLassoActiveStroke));
+    app->viewerLassoRevision = std::max<uint64_t>(app->viewerLassoRevision + 1, 1);
+    rebuildViewerLassoData(app);
+    bumpViewerLocalStateRevision(app);
+  }
+  app->viewerLassoActiveStroke = LassoStroke{};
+}
+
+void clearViewerLassoState(AppState* app) {
+  if (!app) return;
+  app->viewerLassoDrawing = false;
+  app->viewerLassoActiveStroke = LassoStroke{};
+  app->viewerLassoStrokes.clear();
+  app->viewerLassoRevision = std::max<uint64_t>(app->viewerLassoRevision + 1, 1);
+  app->viewerLassoData.clear();
+  bumpViewerLocalStateRevision(app);
+}
+
+enum class PlotRenderFamily {
+  PointCloud3D,
+  Chromaticity3D,
+  Gloss,
+  Waveform2D,
+  Histogram2D,
+};
+
+struct PlotModelDescriptor {
+  const char* id;
   const char* label;
   const char* plotMode;
   int plotModel;
+  PlotRenderFamily renderFamily;
+  bool supportsIdentityRead;
+  bool supportsVolumeSlicing;
+  bool supportsOverflow;
+  bool supportsFillVolume;
+  bool supportsOccupancyFill;
+  bool supportsCamera3D;
 };
 
-constexpr ViewerPlotModelChoice kViewerPlotModelChoices[] = {
-    {"Cube", "rgb", 0},
-    {"HSL", "hsl", 1},
-    {"HSV", "hsv", 2},
-    {"Chen", "chen", 3},
-    {"Norm-Cone", "norm_cone", 4},
-    {"JP-Conical", "jp_conical", 5},
-    {"Reuleaux", "reuleaux", 6},
-    {"Chromaticity", "chromaticity", 7},
-    {"Gloss View (beta)", "gloss_view", 8},
+constexpr PlotModelDescriptor kViewerPlotModelChoices[] = {
+    {"cube", "Cube", "rgb", 0, PlotRenderFamily::PointCloud3D, true, true, true, true, true, true},
+    {"hsl", "HSL", "hsl", 1, PlotRenderFamily::PointCloud3D, true, true, true, true, true, true},
+    {"hsv", "HSV", "hsv", 2, PlotRenderFamily::PointCloud3D, true, true, true, true, true, true},
+    {"chen", "Chen", "chen", 3, PlotRenderFamily::PointCloud3D, true, true, true, true, true, true},
+    {"norm_cone", "Norm-Cone", "norm_cone", 4, PlotRenderFamily::PointCloud3D, true, true, false, true, true, true},
+    {"jp_conical", "JP-Conical", "jp_conical", 5, PlotRenderFamily::PointCloud3D, true, true, true, true, true, true},
+    {"reuleaux", "Reuleaux", "reuleaux", 6, PlotRenderFamily::PointCloud3D, true, true, true, true, true, true},
+    {"chromaticity", "Chromaticity", "chromaticity", 7, PlotRenderFamily::Chromaticity3D, true, true, true, true, true, true},
+    {"gloss_view", "Gloss View (beta)", "gloss_view", 8, PlotRenderFamily::Gloss, false, false, true, false, true, true},
+    {"waveform", "Waveform", "waveform", 9, PlotRenderFamily::Waveform2D, false, true, false, false, false, false},
+    {"histogram", "Histogram", "histogram", 10, PlotRenderFamily::Histogram2D, false, true, false, false, false, false},
 };
 
 constexpr int kViewerPlotModelChoiceCount =
     static_cast<int>(sizeof(kViewerPlotModelChoices) / sizeof(kViewerPlotModelChoices[0]));
 
+const PlotModelDescriptor& plotModelDescriptor(int plotModel) {
+  return kViewerPlotModelChoices[static_cast<std::size_t>(
+      std::clamp(plotModel, 0, kViewerPlotModelChoiceCount - 1))];
+}
+
+bool plotModelIsAnalyticalScope(int plotModel) {
+  const PlotRenderFamily family = plotModelDescriptor(plotModel).renderFamily;
+  return family == PlotRenderFamily::Waveform2D || family == PlotRenderFamily::Histogram2D;
+}
+
+ChromaspaceViewer::ViewerRuntimeState viewerStateForPlotModel(
+    const ChromaspaceViewer::ViewerRuntimeState& source,
+    int plotModel) {
+  auto state = ChromaspaceViewer::clampedViewerRuntimeState(source);
+  const PlotModelDescriptor& descriptor = plotModelDescriptor(plotModel);
+  state.plotModel = descriptor.plotModel;
+  if (!descriptor.supportsIdentityRead) {
+    state.readGrayRamp = false;
+    state.readIdentityPlot = false;
+    state.isolateIdentityData = false;
+  }
+  if (!descriptor.supportsVolumeSlicing) {
+    state.volumeSliceLassoRegion = false;
+    state.volumeSliceRed = false;
+    state.volumeSliceYellow = false;
+    state.volumeSliceGreen = false;
+    state.volumeSliceCyan = false;
+    state.volumeSliceBlue = false;
+    state.volumeSliceMagenta = false;
+    state.neutralRadius = 1.0;
+  }
+  if (!descriptor.supportsOverflow) {
+    state.showOverflow = false;
+    state.highlightOverflow = false;
+  }
+  if (!descriptor.supportsFillVolume) {
+    state.fillVolume = false;
+    state.fillGrayRamp = false;
+  }
+  if (!descriptor.supportsOccupancyFill) {
+    state.occupancyGuidedFill = false;
+  }
+  return ChromaspaceViewer::clampedViewerRuntimeState(state);
+}
+
+ChromaspaceViewer::ViewerRuntimeState viewerStateWithModelCapabilities(
+    const ChromaspaceViewer::ViewerRuntimeState& source) {
+  const auto state = ChromaspaceViewer::clampedViewerRuntimeState(source);
+  return viewerStateForPlotModel(state, state.plotModel);
+}
+
 constexpr float kPlotMenuWidth = 176.0f;
 constexpr float kPlotMenuSubWidth = 154.0f;
-constexpr float kPlotMenuRowHeight = 24.0f;
+constexpr float kPlotMenuRowHeight = 42.0f;
 constexpr float kPlotMenuPad = 7.0f;
 constexpr float kPlotMenuGap = 6.0f;
+constexpr float kViewerDrawerHeaderHeight = 52.0f;
+constexpr float kViewerDrawerTabRailWidth = 136.0f;
+constexpr float kViewerDrawerTabHeight = 32.0f;
+constexpr float kViewerDrawerPad = 12.0f;
+constexpr float kViewerSettingsSubtabHeight = 30.0f;
+constexpr float kViewerSettingsSubtabGap = 8.0f;
+constexpr float kViewerMenuIconSize = 30.0f;
+constexpr float kViewerMenuIconInset = 10.0f;
+constexpr float kViewerMenuCloseSize = 28.0f;
+constexpr float kViewerChoiceMenuRowHeight = 30.0f;
+constexpr float kViewerChoiceMenuPad = 7.0f;
+constexpr int kViewerLayoutChoiceCount = 6;
 constexpr float kIdentityReadMenuWidth = 260.0f;
 constexpr float kIdentityReadMenuRowHeight = 31.0f;
 constexpr int kIdentityReadMenuRowCount = 4;
+
+enum class ViewerMenuAction {
+  None,
+  PlotModel,
+  CircularHsl,
+  CircularHsv,
+  NormConeNormalized,
+  PlotLinear,
+  PlotLinearTransfer,
+  LiveUpdate,
+  UpdateMode,
+  Quality,
+  Scale,
+  Sampling,
+  Occupancy,
+  PlotStyle,
+  PointShape,
+  PointSize,
+  Saturation,
+  KeepOnTop,
+  ResetOnSwitch,
+  ShowWorkspaceButtons,
+  ShowOverflow,
+  HighlightOverflow,
+  NeutralRadius,
+  SliceRed,
+  SliceYellow,
+  SliceGreen,
+  SliceCyan,
+  SliceBlue,
+  SliceMagenta,
+  ViewerLasso,
+  ClearViewerLasso,
+  FillVolume,
+  FillResolution,
+  FillRamp,
+  ReadGrayRamp,
+  ReadIdentity,
+  IsolateIdentity,
+  ReadResolution,
+  ChromaticityInputPrimaries,
+  ChromaticityInputTransfer,
+  ChromaticityReferenceBasis,
+  ChromaticityOverlayPrimaries,
+  ChromaticityPlanckian,
+  ChromaticitySpectral,
+  GlossNeighborhood,
+  GlossLift,
+  GlossSpatialInset,
+  GlossBodyOpacity,
+  GlossHighlightOpacity,
+  GlossPointCrispness,
+  GlossHideText,
+  WaveformMode,
+  WaveformDetail,
+  WaveformContinuousHighDetail,
+  WaveformPointBrightness,
+  WaveformGridBrightness,
+  WaveformSaturation,
+  WaveformDotSize,
+  WaveformChannels,
+  WaveformShowOverflow,
+  WaveformHighlightOverflow,
+  WaveformLumaMethod,
+  HistogramMode,
+  HistogramShowOverflow,
+  HistogramHighlightOverflow,
+  ScopeRangeMode,
+  ResetDefaults,
+  SaveUserPreset,
+  LoadUserPreset,
+  UpdateUserPreset,
+  DeleteUserPreset,
+  EditPresetName,
+  SaveDefaults,
+  RestoreDefaults,
+};
+
+enum class ViewerMenuSection {
+  Model = 0,
+  Performance,
+  Appearance,
+  Overflow,
+  Identity,
+  Chromaticity,
+  Gloss,
+  Window,
+  Settings,
+  Presets,
+};
+
+enum class ViewerSettingsSubtab {
+  Performance = 0,
+  Appearance = 1,
+};
+
+struct ViewerMenuTab {
+  ViewerMenuSection section = ViewerMenuSection::Model;
+  const char* label = "";
+};
+
+struct ViewerMenuRow {
+  bool section = false;
+  std::string label;
+  std::string value;
+  ViewerMenuAction action = ViewerMenuAction::None;
+  bool enabled = true;
+  const char* refreshPolicy = "reinterpret";
+  bool slider = false;
+  bool choiceItem = false;
+  bool note = false;
+  bool channelSelector = false;
+  int choiceValue = 0;
+  int sliderMin = 0;
+  int sliderMax = 0;
+  int sliderValue = 0;
+};
+
+struct ViewerChoiceMenuItem {
+  std::string label;
+  int value = 0;
+  bool selected = false;
+  ViewerMenuAction action = ViewerMenuAction::None;
+  const char* refreshPolicy = "reinterpret";
+  bool displayReferred = false;
+};
+
+std::vector<std::string> viewerUserPresetNames();
+bool viewerUserPresetExists();
+bool viewerUserPresetExists(const std::string& name);
+bool saveViewerUserPreset(const ChromaspaceViewer::ViewerRuntimeState& state,
+                          const std::string& requestedName,
+                          std::string* savedName = nullptr);
+bool updateViewerUserPreset(const std::string& name, const ChromaspaceViewer::ViewerRuntimeState& state);
+bool loadViewerUserPreset(const std::string& name, ChromaspaceViewer::ViewerRuntimeState* out);
+bool deleteViewerUserPreset(const std::string& name);
+bool saveViewerDefaultPreset(const ChromaspaceViewer::ViewerRuntimeState& state);
+bool loadViewerDefaultPreset(ChromaspaceViewer::ViewerRuntimeState* out);
+bool viewerPresetNameEditableTarget(const std::string& name);
+std::string sanitizeViewerPresetName(const std::string& name, const std::string& fallback = "");
+
+std::string onOffLabel(bool value) {
+  return value ? "On" : "Off";
+}
+
+std::string fixedValue(double value, int precision = 2) {
+  std::ostringstream os;
+  os << std::fixed << std::setprecision(precision) << value;
+  return os.str();
+}
+
+std::string transferFunctionLabelForIndex(int index) {
+  const int count = static_cast<int>(WorkshopColor::transferFunctionCount());
+  if (count <= 0) return "Unknown";
+  const int clamped = std::clamp(index, 0, count - 1);
+  return WorkshopColor::transferFunctionDefinition(static_cast<std::size_t>(clamped)).label;
+}
+
+std::string primariesLabelForIndex(int index) {
+  const int count = static_cast<int>(WorkshopColor::primariesCount());
+  if (count <= 0) return "Unknown";
+  const int clamped = std::clamp(index, 0, count - 1);
+  return WorkshopColor::primariesDefinition(
+      WorkshopColor::primariesIdFromChoiceIndex(clamped)).label;
+}
+
+std::string overlayPrimariesLabelForIndex(int index) {
+  if (!WorkshopColor::overlayPrimariesChoiceEnabled(index)) return "Off";
+  return WorkshopColor::primariesDefinition(
+      WorkshopColor::overlayPrimariesIdFromChoiceIndex(index)).label;
+}
+
+bool transferChoiceIsDisplayReferred(int index) {
+  const auto id = WorkshopColor::transferFunctionIdFromChoiceIndex(index);
+  return id == WorkshopColor::TransferFunctionId::Gamma22 ||
+         id == WorkshopColor::TransferFunctionId::Gamma24 ||
+         id == WorkshopColor::TransferFunctionId::Gamma26 ||
+         id == WorkshopColor::TransferFunctionId::SRgb;
+}
+
+bool primariesChoiceIsDisplayReferred(int index) {
+  const auto id = WorkshopColor::primariesIdFromChoiceIndex(index);
+  return id == WorkshopColor::ColorPrimariesId::P3D65 ||
+         id == WorkshopColor::ColorPrimariesId::Rec709 ||
+         id == WorkshopColor::ColorPrimariesId::Rec2020;
+}
+
+int primariesMenuGroup(WorkshopColor::ColorPrimariesId id) {
+  switch (id) {
+    case WorkshopColor::ColorPrimariesId::DavinciWideGamut: return 0;
+    case WorkshopColor::ColorPrimariesId::AcesAp0:
+    case WorkshopColor::ColorPrimariesId::AcesAp1: return 1;
+    case WorkshopColor::ColorPrimariesId::P3D65:
+    case WorkshopColor::ColorPrimariesId::Rec709:
+    case WorkshopColor::ColorPrimariesId::Rec2020: return 2;
+    case WorkshopColor::ColorPrimariesId::ArriWideGamut3:
+    case WorkshopColor::ColorPrimariesId::ArriWideGamut4: return 3;
+    case WorkshopColor::ColorPrimariesId::SonySGamut3:
+    case WorkshopColor::ColorPrimariesId::SonySGamut3Cine: return 4;
+    case WorkshopColor::ColorPrimariesId::CanonCinemaGamut: return 5;
+    case WorkshopColor::ColorPrimariesId::RedWideGamutRGB: return 6;
+    default: return 7;
+  }
+}
+
+int transferMenuGroup(WorkshopColor::TransferFunctionId id) {
+  switch (id) {
+    case WorkshopColor::TransferFunctionId::DavinciIntermediate: return 0;
+    case WorkshopColor::TransferFunctionId::AcesCct: return 1;
+    case WorkshopColor::TransferFunctionId::Gamma22:
+    case WorkshopColor::TransferFunctionId::Gamma24:
+    case WorkshopColor::TransferFunctionId::Gamma26:
+    case WorkshopColor::TransferFunctionId::SRgb: return 2;
+    case WorkshopColor::TransferFunctionId::ArriLogC3:
+    case WorkshopColor::TransferFunctionId::ArriLogC4: return 3;
+    case WorkshopColor::TransferFunctionId::SonySLog3: return 4;
+    case WorkshopColor::TransferFunctionId::CanonLog2:
+    case WorkshopColor::TransferFunctionId::CanonLog3: return 5;
+    case WorkshopColor::TransferFunctionId::RedLog3G10: return 6;
+    default: return 7;
+  }
+}
+
+std::vector<int> orderedPrimariesChoiceIndices() {
+  std::vector<int> indices(WorkshopColor::primariesCount());
+  std::iota(indices.begin(), indices.end(), 0);
+  std::stable_sort(indices.begin(), indices.end(), [](int a, int b) {
+    const auto& aDef = WorkshopColor::primariesDefinition(static_cast<std::size_t>(a));
+    const auto& bDef = WorkshopColor::primariesDefinition(static_cast<std::size_t>(b));
+    const int aGroup = primariesMenuGroup(aDef.id);
+    const int bGroup = primariesMenuGroup(bDef.id);
+    if (aGroup != bGroup) return aGroup < bGroup;
+    return std::string(aDef.label) < std::string(bDef.label);
+  });
+  return indices;
+}
+
+std::vector<int> orderedTransferChoiceIndices() {
+  std::vector<int> indices(WorkshopColor::transferFunctionCount());
+  std::iota(indices.begin(), indices.end(), 0);
+  std::stable_sort(indices.begin(), indices.end(), [](int a, int b) {
+    const auto& aDef = WorkshopColor::transferFunctionDefinition(static_cast<std::size_t>(a));
+    const auto& bDef = WorkshopColor::transferFunctionDefinition(static_cast<std::size_t>(b));
+    const int aGroup = transferMenuGroup(aDef.id);
+    const int bGroup = transferMenuGroup(bDef.id);
+    if (aGroup != bGroup) return aGroup < bGroup;
+    return std::string(aDef.label) < std::string(bDef.label);
+  });
+  return indices;
+}
+
+const char* glossNeighborhoodLabelForIndex(int index) {
+  switch (ChromaspaceViewer::clampChoice(index, 2, 1)) {
+    case 0: return "Small";
+    case 2: return "Wide";
+    default: return "Balanced";
+  }
+}
+
+void appendSection(std::vector<ViewerMenuRow>* rows, const char* label) {
+  rows->push_back({true, label ? label : "", "", ViewerMenuAction::None, false, "none"});
+}
+
+void appendRow(std::vector<ViewerMenuRow>* rows,
+               const char* label,
+               const std::string& value,
+               ViewerMenuAction action,
+               bool enabled = true,
+               const char* refreshPolicy = "reinterpret") {
+  rows->push_back({false, label ? label : "", value, action, enabled, refreshPolicy});
+}
+
+void appendNoteRow(std::vector<ViewerMenuRow>* rows,
+                   const char* label,
+                   const std::string& value) {
+  ViewerMenuRow row{};
+  row.label = label ? label : "";
+  row.value = value;
+  row.action = ViewerMenuAction::None;
+  row.enabled = false;
+  row.refreshPolicy = "none";
+  row.note = true;
+  rows->push_back(row);
+}
+
+void appendChoiceRow(std::vector<ViewerMenuRow>* rows,
+                     const char* label,
+                     int value,
+                     int currentValue,
+                     ViewerMenuAction action,
+                     const char* refreshPolicy = "reinterpret") {
+  ViewerMenuRow row{};
+  row.label = label ? label : "";
+  row.value = value == currentValue ? "Selected" : "";
+  row.action = action;
+  row.enabled = true;
+  row.refreshPolicy = refreshPolicy;
+  row.choiceItem = true;
+  row.choiceValue = value;
+  rows->push_back(row);
+}
+
+void appendSliderRow(std::vector<ViewerMenuRow>* rows,
+                     const char* label,
+                     int value,
+                     int minValue,
+                     int maxValue,
+                     ViewerMenuAction action,
+                     bool enabled = true,
+                     const char* refreshPolicy = "resample") {
+  ViewerMenuRow row{};
+  row.label = label ? label : "";
+  row.value = std::to_string(value);
+  row.action = action;
+  row.enabled = enabled;
+  row.refreshPolicy = refreshPolicy;
+  row.slider = true;
+  row.sliderMin = minValue;
+  row.sliderMax = maxValue;
+  row.sliderValue = value;
+  rows->push_back(row);
+}
+
+void appendSliderRowWithValue(std::vector<ViewerMenuRow>* rows,
+                              const char* label,
+                              const std::string& displayValue,
+                              int value,
+                              int minValue,
+                              int maxValue,
+                              ViewerMenuAction action,
+                              bool enabled = true,
+                              const char* refreshPolicy = "reinterpret") {
+  ViewerMenuRow row{};
+  row.label = label ? label : "";
+  row.value = displayValue;
+  row.action = action;
+  row.enabled = enabled;
+  row.refreshPolicy = refreshPolicy;
+  row.slider = true;
+  row.sliderMin = minValue;
+  row.sliderMax = maxValue;
+  row.sliderValue = value;
+  rows->push_back(row);
+}
+
+bool viewerMenuActionUsesChoiceList(ViewerMenuAction action) {
+  return action == ViewerMenuAction::PlotModel ||
+         action == ViewerMenuAction::PlotLinearTransfer ||
+         action == ViewerMenuAction::UpdateMode ||
+         action == ViewerMenuAction::Quality ||
+         action == ViewerMenuAction::Scale ||
+         action == ViewerMenuAction::Sampling ||
+         action == ViewerMenuAction::PlotStyle ||
+         action == ViewerMenuAction::PointShape ||
+         action == ViewerMenuAction::LoadUserPreset ||
+         action == ViewerMenuAction::ChromaticityInputPrimaries ||
+         action == ViewerMenuAction::ChromaticityInputTransfer ||
+         action == ViewerMenuAction::ChromaticityReferenceBasis ||
+         action == ViewerMenuAction::ChromaticityOverlayPrimaries ||
+         action == ViewerMenuAction::GlossNeighborhood ||
+         action == ViewerMenuAction::WaveformMode ||
+         action == ViewerMenuAction::WaveformDetail ||
+         action == ViewerMenuAction::WaveformLumaMethod ||
+         action == ViewerMenuAction::HistogramMode ||
+         action == ViewerMenuAction::ScopeRangeMode;
+}
+
+bool viewerMenuActionCanPreviewFromCachedCloud(ViewerMenuAction action) {
+  return action == ViewerMenuAction::PlotModel ||
+         action == ViewerMenuAction::CircularHsl ||
+         action == ViewerMenuAction::CircularHsv ||
+         action == ViewerMenuAction::NormConeNormalized ||
+         action == ViewerMenuAction::PlotLinear ||
+         action == ViewerMenuAction::PlotLinearTransfer ||
+         action == ViewerMenuAction::Quality ||
+         action == ViewerMenuAction::Scale ||
+         action == ViewerMenuAction::Sampling ||
+         action == ViewerMenuAction::Occupancy ||
+         action == ViewerMenuAction::PlotStyle ||
+         action == ViewerMenuAction::PointShape ||
+         action == ViewerMenuAction::LoadUserPreset ||
+         action == ViewerMenuAction::ShowOverflow ||
+         action == ViewerMenuAction::HighlightOverflow ||
+         action == ViewerMenuAction::ReadGrayRamp ||
+         action == ViewerMenuAction::ReadIdentity ||
+         action == ViewerMenuAction::IsolateIdentity ||
+         action == ViewerMenuAction::ReadResolution ||
+         action == ViewerMenuAction::ViewerLasso ||
+         action == ViewerMenuAction::NeutralRadius ||
+         action == ViewerMenuAction::SliceRed ||
+         action == ViewerMenuAction::SliceYellow ||
+         action == ViewerMenuAction::SliceGreen ||
+         action == ViewerMenuAction::SliceCyan ||
+         action == ViewerMenuAction::SliceBlue ||
+         action == ViewerMenuAction::SliceMagenta ||
+         action == ViewerMenuAction::ClearViewerLasso ||
+         action == ViewerMenuAction::PointSize ||
+         action == ViewerMenuAction::Saturation ||
+         action == ViewerMenuAction::FillVolume ||
+         action == ViewerMenuAction::FillResolution ||
+         action == ViewerMenuAction::FillRamp ||
+         action == ViewerMenuAction::ChromaticityInputPrimaries ||
+         action == ViewerMenuAction::ChromaticityInputTransfer ||
+         action == ViewerMenuAction::ChromaticityReferenceBasis ||
+         action == ViewerMenuAction::ChromaticityOverlayPrimaries ||
+         action == ViewerMenuAction::ChromaticityPlanckian ||
+         action == ViewerMenuAction::ChromaticitySpectral ||
+         action == ViewerMenuAction::GlossNeighborhood ||
+         action == ViewerMenuAction::GlossLift ||
+         action == ViewerMenuAction::GlossSpatialInset ||
+         action == ViewerMenuAction::GlossBodyOpacity ||
+         action == ViewerMenuAction::GlossHighlightOpacity ||
+         action == ViewerMenuAction::GlossPointCrispness ||
+         action == ViewerMenuAction::GlossHideText ||
+         action == ViewerMenuAction::WaveformMode ||
+         action == ViewerMenuAction::WaveformDetail ||
+         action == ViewerMenuAction::WaveformContinuousHighDetail ||
+         action == ViewerMenuAction::WaveformPointBrightness ||
+         action == ViewerMenuAction::WaveformGridBrightness ||
+         action == ViewerMenuAction::WaveformSaturation ||
+         action == ViewerMenuAction::WaveformDotSize ||
+         action == ViewerMenuAction::WaveformChannels ||
+         action == ViewerMenuAction::WaveformShowOverflow ||
+         action == ViewerMenuAction::WaveformHighlightOverflow ||
+         action == ViewerMenuAction::WaveformLumaMethod ||
+         action == ViewerMenuAction::HistogramMode ||
+         action == ViewerMenuAction::HistogramShowOverflow ||
+         action == ViewerMenuAction::HistogramHighlightOverflow ||
+         action == ViewerMenuAction::ScopeRangeMode ||
+         action == ViewerMenuAction::ResetDefaults;
+}
+
+ViewerMenuAction viewerMenuActionFromInt(int value) {
+  return static_cast<ViewerMenuAction>(value);
+}
+
+ViewerMenuSection viewerMenuSectionFromInt(int value) {
+  if (value < 0 || value > static_cast<int>(ViewerMenuSection::Presets)) return ViewerMenuSection::Model;
+  return static_cast<ViewerMenuSection>(value);
+}
+bool viewerMenuActionIsButton(ViewerMenuAction action) {
+  return action == ViewerMenuAction::ResetDefaults ||
+         action == ViewerMenuAction::SaveUserPreset ||
+         action == ViewerMenuAction::UpdateUserPreset ||
+         action == ViewerMenuAction::DeleteUserPreset ||
+         action == ViewerMenuAction::SaveDefaults ||
+         action == ViewerMenuAction::RestoreDefaults;
+}
+
+bool viewerMenuActionIsCheckbox(ViewerMenuAction action) {
+  switch (action) {
+    case ViewerMenuAction::CircularHsl:
+    case ViewerMenuAction::CircularHsv:
+    case ViewerMenuAction::NormConeNormalized:
+    case ViewerMenuAction::PlotLinear:
+    case ViewerMenuAction::ShowOverflow:
+    case ViewerMenuAction::HighlightOverflow:
+    case ViewerMenuAction::FillVolume:
+    case ViewerMenuAction::FillRamp:
+    case ViewerMenuAction::ChromaticityPlanckian:
+    case ViewerMenuAction::ChromaticitySpectral:
+    case ViewerMenuAction::GlossSpatialInset:
+    case ViewerMenuAction::GlossHideText:
+    case ViewerMenuAction::LiveUpdate:
+    case ViewerMenuAction::Occupancy:
+    case ViewerMenuAction::SliceRed:
+    case ViewerMenuAction::SliceYellow:
+    case ViewerMenuAction::SliceGreen:
+    case ViewerMenuAction::SliceCyan:
+    case ViewerMenuAction::SliceBlue:
+    case ViewerMenuAction::SliceMagenta:
+    case ViewerMenuAction::ViewerLasso:
+    case ViewerMenuAction::ReadGrayRamp:
+    case ViewerMenuAction::ReadIdentity:
+    case ViewerMenuAction::IsolateIdentity:
+    case ViewerMenuAction::KeepOnTop:
+    case ViewerMenuAction::ResetOnSwitch:
+    case ViewerMenuAction::ShowWorkspaceButtons:
+    case ViewerMenuAction::WaveformShowOverflow:
+    case ViewerMenuAction::WaveformHighlightOverflow:
+    case ViewerMenuAction::HistogramShowOverflow:
+    case ViewerMenuAction::HistogramHighlightOverflow:
+      return true;
+    default:
+      return false;
+  }
+}
+
+bool viewerMenuActionVectorColor(ViewerMenuAction action, float* r, float* g, float* b) {
+  if (!r || !g || !b) return false;
+  switch (action) {
+    case ViewerMenuAction::SliceRed: *r = 1.0f; *g = 0.18f; *b = 0.14f; return true;
+    case ViewerMenuAction::SliceYellow: *r = 1.0f; *g = 0.86f; *b = 0.16f; return true;
+    case ViewerMenuAction::SliceGreen: *r = 0.22f; *g = 0.86f; *b = 0.22f; return true;
+    case ViewerMenuAction::SliceCyan: *r = 0.16f; *g = 0.88f; *b = 0.94f; return true;
+    case ViewerMenuAction::SliceBlue: *r = 0.28f; *g = 0.48f; *b = 1.0f; return true;
+    case ViewerMenuAction::SliceMagenta: *r = 0.92f; *g = 0.32f; *b = 0.94f; return true;
+    default: break;
+  }
+  return false;
+}
+
+bool viewerIdentityDrawInstanceDetected(const AppState& app) {
+  if (app.generatedIdentityContractKnown) return app.generatedIdentityResolutionValid;
+  const bool freshRequestedScan =
+      app.resolveDrawScanRequestedRevision > 0 &&
+      app.resolveDrawScanCompletedRevision >= app.resolveDrawScanRequestedRevision;
+  if (freshRequestedScan && app.resolveDrawStatusAvailable &&
+      !app.resolveDrawInstanceConfirmed && !app.resolveDrawInstanceLikely) {
+    return false;
+  }
+  return app.resolveDrawInstanceConfirmed || app.resolveDrawInstanceLikely;
+}
+
+bool viewerGeneratedIdentityBandAvailable(const AppState& app, bool cubeBand) {
+  if (!viewerIdentityDrawInstanceDetected(app)) return false;
+  if (!app.generatedIdentityContractKnown) return true;
+  return app.generatedIdentityResolutionValid &&
+         (cubeBand ? app.generatedIdentityDrawCube : app.generatedIdentityDrawRamp);
+}
+
+std::vector<ViewerMenuTab> buildViewerMenuTabs(const AppState& app) {
+  const auto state = viewerStateWithModelCapabilities(app.viewerState);
+  const PlotModelDescriptor& descriptor = plotModelDescriptor(state.plotModel);
+  std::vector<ViewerMenuTab> tabs;
+  tabs.reserve(7);
+  tabs.push_back({ViewerMenuSection::Model, "Model"});
+  if (descriptor.supportsIdentityRead) {
+    tabs.push_back({ViewerMenuSection::Identity, "Identity"});
+  }
+  if (ChromaspaceViewer::volumeSlicingSupported(state, false)) {
+    tabs.push_back({ViewerMenuSection::Overflow, "Slicing"});
+  }
+  tabs.push_back({ViewerMenuSection::Settings, "Settings"});
+  tabs.push_back({ViewerMenuSection::Presets, "Presets"});
+  return tabs;
+}
+
+bool viewerMenuSectionVisible(const AppState& app, ViewerMenuSection section) {
+  const std::vector<ViewerMenuTab> tabs = buildViewerMenuTabs(app);
+  return std::any_of(tabs.begin(), tabs.end(), [section](const ViewerMenuTab& tab) {
+    return tab.section == section;
+  });
+}
+
+ViewerMenuSection coercedViewerMenuSection(const AppState& app) {
+  const ViewerMenuSection requested = viewerMenuSectionFromInt(app.viewerMenuSection);
+  return viewerMenuSectionVisible(app, requested) ? requested : ViewerMenuSection::Model;
+}
+
+std::vector<ViewerMenuRow> buildViewerMenuRows(const AppState& app) {
+  const auto state = viewerStateWithModelCapabilities(app.viewerState);
+  const ViewerMenuSection section = coercedViewerMenuSection(app);
+  std::vector<ViewerMenuRow> rows;
+  rows.reserve(16);
+  switch (section) {
+    case ViewerMenuSection::Model:
+      appendRow(&rows, "Plot Model", ChromaspaceViewer::plotModelLabel(state.plotModel), ViewerMenuAction::PlotModel);
+      if (state.plotModel == 1) appendRow(&rows, "Circular HSL", onOffLabel(state.circularHsl), ViewerMenuAction::CircularHsl);
+      if (state.plotModel == 2) appendRow(&rows, "Circular HSV", onOffLabel(state.circularHsv), ViewerMenuAction::CircularHsv);
+      if (state.plotModel == 4) appendRow(&rows, "Normalized Chroma", onOffLabel(state.normConeNormalized), ViewerMenuAction::NormConeNormalized);
+      if (state.plotModel == ChromaspaceViewer::kPlotModelWaveform) {
+        appendSection(&rows, "Waveform");
+        appendRow(&rows, "Mode", ChromaspaceViewer::waveformModeLabel(state.waveformMode), ViewerMenuAction::WaveformMode);
+        if (state.waveformMode != 2) {
+          ViewerMenuRow channels{};
+          channels.label = "Channels";
+          channels.action = ViewerMenuAction::WaveformChannels;
+          channels.refreshPolicy = "reinterpret";
+          channels.channelSelector = true;
+          rows.push_back(channels);
+        } else {
+          appendRow(&rows,
+                    "Luma Method",
+                    ChromaspaceViewer::waveformLumaMethodLabel(state.waveformLumaMethod),
+                    ViewerMenuAction::WaveformLumaMethod);
+        }
+        appendRow(&rows, "Signal Range", ChromaspaceViewer::scopeRangeModeLabel(state.scopeRangeMode), ViewerMenuAction::ScopeRangeMode);
+        appendRow(&rows,
+                  "Show Overflow",
+                  onOffLabel(state.waveformShowOverflow),
+                  ViewerMenuAction::WaveformShowOverflow);
+        if (state.waveformShowOverflow) {
+        appendRow(&rows,
+                  "Highlight Overflow",
+                  onOffLabel(state.waveformHighlightOverflow),
+                  ViewerMenuAction::WaveformHighlightOverflow);
+        }
+        appendSliderRowWithValue(&rows,
+                                 "Point Brightness",
+                                 fixedValue(state.waveformPointBrightness),
+                                 static_cast<int>(std::round(state.waveformPointBrightness * 100.0)),
+                                 10,
+                                 200,
+                                 ViewerMenuAction::WaveformPointBrightness);
+        appendSliderRowWithValue(&rows,
+                                 "Grid Brightness",
+                                 fixedValue(state.waveformGridBrightness),
+                                 static_cast<int>(std::round(state.waveformGridBrightness * 100.0)),
+                                 0,
+                                 200,
+                                 ViewerMenuAction::WaveformGridBrightness);
+        appendSliderRowWithValue(&rows,
+                                 "Saturation",
+                                 fixedValue(state.waveformSaturation),
+                                 static_cast<int>(std::round(state.waveformSaturation * 100.0)),
+                                 0,
+                                 200,
+                                 ViewerMenuAction::WaveformSaturation);
+        appendSliderRowWithValue(&rows,
+                                 "Dot Size",
+                                 fixedValue(state.waveformDotSize),
+                                 static_cast<int>(std::round(state.waveformDotSize * 100.0)),
+                                 25,
+                                 300,
+                                 ViewerMenuAction::WaveformDotSize);
+        appendRow(&rows,
+                  "Detail",
+                  state.waveformHighDetail ? "High" : "Standard",
+                  ViewerMenuAction::WaveformDetail,
+                  true,
+                  "resample");
+        appendRow(&rows,
+                  "Continuous High Detail",
+                  onOffLabel(state.waveformContinuousHighDetail),
+                  ViewerMenuAction::WaveformContinuousHighDetail,
+                  state.waveformHighDetail,
+                  "resample");
+      }
+      if (state.plotModel == ChromaspaceViewer::kPlotModelHistogram) {
+        appendSection(&rows, "Histogram");
+        appendRow(&rows, "Mode", ChromaspaceViewer::histogramModeLabel(state.histogramMode), ViewerMenuAction::HistogramMode);
+        appendRow(&rows, "Signal Range", ChromaspaceViewer::scopeRangeModeLabel(state.scopeRangeMode), ViewerMenuAction::ScopeRangeMode);
+        appendRow(&rows,
+                  "Show Overflow",
+                  onOffLabel(state.histogramShowOverflow),
+                  ViewerMenuAction::HistogramShowOverflow);
+        if (state.histogramShowOverflow) {
+        appendRow(&rows,
+                  "Highlight Overflow",
+                  onOffLabel(state.histogramHighlightOverflow),
+                  ViewerMenuAction::HistogramHighlightOverflow);
+        }
+      }
+      if (state.plotModel != 7) {
+        appendRow(&rows, "Plot in Linear", onOffLabel(state.plotDisplayLinear), ViewerMenuAction::PlotLinear);
+        if (state.plotDisplayLinear) {
+          appendRow(&rows, "Input Transfer", transferFunctionLabelForIndex(state.plotDisplayLinearTransfer),
+                    ViewerMenuAction::PlotLinearTransfer);
+        }
+      }
+      if (ChromaspaceViewer::showOverflowSupported(state, false)) {
+        appendRow(&rows, "Show Overflow", onOffLabel(state.showOverflow), ViewerMenuAction::ShowOverflow);
+        if (state.showOverflow) appendRow(&rows, "Highlight Overflow", onOffLabel(state.highlightOverflow), ViewerMenuAction::HighlightOverflow);
+      }
+      if (plotModelDescriptor(state.plotModel).supportsFillVolume) {
+        appendRow(&rows, "Fill Volume", onOffLabel(state.fillVolume), ViewerMenuAction::FillVolume);
+        if (state.fillVolume) {
+          appendSliderRow(&rows, "Fill Resolution", state.fillResolution, 4, 65, ViewerMenuAction::FillResolution, true, "reinterpret");
+          appendRow(&rows, "Fill Gray Ramp", onOffLabel(state.fillGrayRamp), ViewerMenuAction::FillRamp);
+        }
+      }
+      if (ChromaspaceViewer::isChromaticity(state)) {
+        appendSection(&rows, "Chromaticity");
+        appendRow(&rows, "Input Primaries", primariesLabelForIndex(state.chromaticityInputPrimaries), ViewerMenuAction::ChromaticityInputPrimaries);
+        appendRow(&rows, "Input Transfer", transferFunctionLabelForIndex(state.chromaticityInputTransfer), ViewerMenuAction::ChromaticityInputTransfer);
+        appendRow(&rows, "Reference Basis", state.chromaticityReferenceBasis == 0 ? "CIE" : "Input", ViewerMenuAction::ChromaticityReferenceBasis);
+        appendRow(&rows, "Overlay Gamut", overlayPrimariesLabelForIndex(state.chromaticityOverlayPrimaries), ViewerMenuAction::ChromaticityOverlayPrimaries);
+        appendRow(&rows, "Planckian Locus", onOffLabel(state.chromaticityPlanckianLocus), ViewerMenuAction::ChromaticityPlanckian);
+        appendRow(&rows, "Spectral Locus 3D", onOffLabel(state.chromaticitySpectralLocus3D), ViewerMenuAction::ChromaticitySpectral);
+      }
+      if (ChromaspaceViewer::isGlossView(state)) {
+        appendSection(&rows, "Gloss View");
+        appendRow(&rows, "Neighborhood", glossNeighborhoodLabelForIndex(state.glossNeighborhood), ViewerMenuAction::GlossNeighborhood);
+        appendSliderRowWithValue(&rows,
+                                 "Signal Scale",
+                                 fixedValue(state.glossLiftScale),
+                                 static_cast<int>(std::round(state.glossLiftScale * 100.0)),
+                                 25,
+                                 300,
+                                 ViewerMenuAction::GlossLift);
+        appendRow(&rows, "Spatial Inset", onOffLabel(state.glossSpatialInset), ViewerMenuAction::GlossSpatialInset);
+        appendSliderRowWithValue(&rows,
+                                 "Body Opacity",
+                                 fixedValue(state.glossBodyOpacity),
+                                 static_cast<int>(std::round(state.glossBodyOpacity * 100.0)),
+                                 0,
+                                 100,
+                                 ViewerMenuAction::GlossBodyOpacity);
+        appendSliderRowWithValue(&rows,
+                                 "Signal Opacity",
+                                 fixedValue(state.glossHighlightOpacity),
+                                 static_cast<int>(std::round(state.glossHighlightOpacity * 100.0)),
+                                 0,
+                                 100,
+                                 ViewerMenuAction::GlossHighlightOpacity);
+        appendSliderRowWithValue(&rows,
+                                 "Crispness",
+                                 fixedValue(state.glossPointCrispness),
+                                 static_cast<int>(std::round(state.glossPointCrispness * 100.0)),
+                                 0,
+                                 100,
+                                 ViewerMenuAction::GlossPointCrispness);
+        appendRow(&rows, "Hide Text", onOffLabel(state.glossHideText), ViewerMenuAction::GlossHideText);
+      }
+      break;
+    case ViewerMenuSection::Settings:
+      if (app.viewerSettingsSubtab == static_cast<int>(ViewerSettingsSubtab::Performance)) {
+        appendRow(&rows, "Live Update", onOffLabel(state.liveUpdate), ViewerMenuAction::LiveUpdate, true, "resample");
+        appendRow(&rows, "Update Mode", ChromaspaceViewer::updateModeLabel(state.updateMode), ViewerMenuAction::UpdateMode, true, "resample");
+        if (state.plotModel != ChromaspaceViewer::kPlotModelWaveform) {
+          appendRow(&rows, "Quality", ChromaspaceViewer::qualityLabel(state.quality), ViewerMenuAction::Quality, true, "resample");
+        }
+        appendRow(&rows, "Scale", ChromaspaceViewer::scaleLabel(state.scale), ViewerMenuAction::Scale, true, "resample");
+        appendRow(&rows, "Sampling", ChromaspaceViewer::samplingLabel(state.sampling), ViewerMenuAction::Sampling, true, "resample");
+        if (plotModelDescriptor(state.plotModel).supportsOccupancyFill) {
+          appendRow(&rows, "Occupancy Fill", onOffLabel(state.occupancyGuidedFill), ViewerMenuAction::Occupancy, true, "resample");
+        }
+      } else {
+        appendSection(&rows, "Appearance");
+        if (!plotModelIsAnalyticalScope(state.plotModel)) {
+          appendRow(&rows, "Plot Style", ChromaspaceViewer::plotStyleLabel(state.plotStyle), ViewerMenuAction::PlotStyle);
+          appendRow(&rows, "Point Shape", ChromaspaceViewer::pointShapeLabel(state.pointShape), ViewerMenuAction::PointShape);
+          appendSliderRowWithValue(&rows,
+                                   "Point Size",
+                                   fixedValue(state.pointSize),
+                                   static_cast<int>(std::round(state.pointSize * 100.0)),
+                                   35,
+                                   300,
+                                   ViewerMenuAction::PointSize);
+          appendSliderRowWithValue(&rows,
+                                   "Saturation",
+                                   fixedValue(state.colorSaturation),
+                                   static_cast<int>(std::round(state.colorSaturation * 100.0)),
+                                   80,
+                                   600,
+                                   ViewerMenuAction::Saturation);
+        }
+        appendSection(&rows, "Window");
+        appendRow(&rows, "Keep on Top", onOffLabel(state.keepOnTop), ViewerMenuAction::KeepOnTop, true, "none");
+        if (plotModelDescriptor(state.plotModel).supportsCamera3D) {
+          appendRow(&rows, "Reset camera on model switch", onOffLabel(state.resetViewOnPlotSwitch), ViewerMenuAction::ResetOnSwitch, true, "none");
+        }
+        appendRow(&rows, "Workspace Buttons", onOffLabel(app.showWorkspaceButtons), ViewerMenuAction::ShowWorkspaceButtons, true, "none");
+      }
+      break;
+    case ViewerMenuSection::Overflow: {
+      if (ChromaspaceViewer::neutralRadiusAllowed(state, false)) {
+        appendSliderRowWithValue(&rows,
+                                 "Neutral Radius",
+                                 fixedValue(state.neutralRadius),
+                                 static_cast<int>(std::round(state.neutralRadius * 100.0)),
+                                 0,
+                                 100,
+                                 ViewerMenuAction::NeutralRadius,
+                                 !state.showOverflow);
+      }
+      if (ChromaspaceViewer::hueSlicingAllowed(state, false)) {
+        appendRow(&rows, "Red Sector", onOffLabel(state.volumeSliceRed), ViewerMenuAction::SliceRed);
+        appendRow(&rows, "Yellow Sector", onOffLabel(state.volumeSliceYellow), ViewerMenuAction::SliceYellow);
+        appendRow(&rows, "Green Sector", onOffLabel(state.volumeSliceGreen), ViewerMenuAction::SliceGreen);
+        appendRow(&rows, "Cyan Sector", onOffLabel(state.volumeSliceCyan), ViewerMenuAction::SliceCyan);
+        appendRow(&rows, "Blue Sector", onOffLabel(state.volumeSliceBlue), ViewerMenuAction::SliceBlue);
+        appendRow(&rows, "Magenta Sector", onOffLabel(state.volumeSliceMagenta), ViewerMenuAction::SliceMagenta);
+      }
+      if (ChromaspaceViewer::volumeSlicingSupported(state, false)) {
+        appendRow(&rows, "Image Lasso", onOffLabel(state.volumeSliceLassoRegion), ViewerMenuAction::ViewerLasso, true, "resample");
+        if (state.volumeSliceLassoRegion) {
+          const bool focusFresh =
+              app.focusPlotNodeRequestedRevision > 0 &&
+              app.resolvePlotNodeFocusRevision >= app.focusPlotNodeRequestedRevision;
+          appendNoteRow(&rows,
+                        "Resolve Overlay",
+                        focusFresh && app.resolvePlotNodeFocusSucceeded
+                            ? "Chromaspace plot node focused for drawing"
+                            : "Select the Chromaspace plot node to draw selections");
+        }
+        if (state.volumeSliceLassoRegion && !app.viewerLassoData.empty()) {
+          appendRow(&rows, "Clear Viewer Lasso", "Clear", ViewerMenuAction::ClearViewerLasso, true, "resample");
+        }
+      }
+      break;
+    }
+    case ViewerMenuSection::Identity:
+      if (plotModelDescriptor(state.plotModel).supportsFillVolume) {
+        const bool grayRampReadEnabled =
+            !state.volumeSliceLassoRegion && viewerGeneratedIdentityBandAvailable(app, false);
+        const bool identityDataReadEnabled =
+            !state.volumeSliceLassoRegion && viewerGeneratedIdentityBandAvailable(app, true);
+        const bool activeIdentityReadsEnabled =
+            (state.readGrayRamp && grayRampReadEnabled) ||
+            (state.readIdentityPlot && identityDataReadEnabled);
+        appendRow(&rows,
+                  "Read Gray Ramp",
+                  onOffLabel(state.readGrayRamp),
+                  ViewerMenuAction::ReadGrayRamp,
+                  grayRampReadEnabled,
+                  "resample");
+        appendRow(&rows,
+                  "Read Identity Data",
+                  onOffLabel(state.readIdentityPlot),
+                  ViewerMenuAction::ReadIdentity,
+                  identityDataReadEnabled,
+                  "resample");
+        if (state.readGrayRamp || state.readIdentityPlot) {
+          appendRow(&rows,
+                    "Isolate Identity Data",
+                    state.volumeSliceLassoRegion
+                        ? "Paused by Lasso"
+                        : (activeIdentityReadsEnabled ? onOffLabel(state.isolateIdentityData) : "No Instance 1"),
+                    ViewerMenuAction::IsolateIdentity,
+                    activeIdentityReadsEnabled,
+                    "resample");
+          appendRow(&rows, "Read Resolution", std::to_string(state.identityReadResolution), ViewerMenuAction::None, false, "none");
+        }
+      }
+      break;
+    case ViewerMenuSection::Chromaticity:
+      if (ChromaspaceViewer::isChromaticity(state)) {
+        appendRow(&rows, "Input Primaries", primariesLabelForIndex(state.chromaticityInputPrimaries), ViewerMenuAction::ChromaticityInputPrimaries);
+        appendRow(&rows, "Input Transfer", transferFunctionLabelForIndex(state.chromaticityInputTransfer), ViewerMenuAction::ChromaticityInputTransfer);
+        appendRow(&rows, "Reference Basis", state.chromaticityReferenceBasis == 0 ? "CIE" : "Input", ViewerMenuAction::ChromaticityReferenceBasis);
+        appendRow(&rows, "Overlay Gamut", overlayPrimariesLabelForIndex(state.chromaticityOverlayPrimaries), ViewerMenuAction::ChromaticityOverlayPrimaries);
+        appendRow(&rows, "Planckian Locus", onOffLabel(state.chromaticityPlanckianLocus), ViewerMenuAction::ChromaticityPlanckian);
+        appendRow(&rows, "Spectral Locus 3D", onOffLabel(state.chromaticitySpectralLocus3D), ViewerMenuAction::ChromaticitySpectral);
+      }
+      break;
+    case ViewerMenuSection::Gloss:
+      if (ChromaspaceViewer::isGlossView(state)) {
+        appendRow(&rows, "Neighborhood", glossNeighborhoodLabelForIndex(state.glossNeighborhood), ViewerMenuAction::GlossNeighborhood);
+        appendSliderRowWithValue(&rows,
+                                 "Signal Scale",
+                                 fixedValue(state.glossLiftScale),
+                                 static_cast<int>(std::round(state.glossLiftScale * 100.0)),
+                                 25,
+                                 300,
+                                 ViewerMenuAction::GlossLift);
+        appendRow(&rows, "Spatial Inset", onOffLabel(state.glossSpatialInset), ViewerMenuAction::GlossSpatialInset);
+        appendSliderRowWithValue(&rows,
+                                 "Body Opacity",
+                                 fixedValue(state.glossBodyOpacity),
+                                 static_cast<int>(std::round(state.glossBodyOpacity * 100.0)),
+                                 0,
+                                 100,
+                                 ViewerMenuAction::GlossBodyOpacity);
+        appendSliderRowWithValue(&rows,
+                                 "Signal Opacity",
+                                 fixedValue(state.glossHighlightOpacity),
+                                 static_cast<int>(std::round(state.glossHighlightOpacity * 100.0)),
+                                 0,
+                                 100,
+                                 ViewerMenuAction::GlossHighlightOpacity);
+        appendSliderRowWithValue(&rows,
+                                 "Crispness",
+                                 fixedValue(state.glossPointCrispness),
+                                 static_cast<int>(std::round(state.glossPointCrispness * 100.0)),
+                                 0,
+                                 100,
+                                 ViewerMenuAction::GlossPointCrispness);
+        appendRow(&rows, "Hide Text", onOffLabel(state.glossHideText), ViewerMenuAction::GlossHideText);
+      }
+      break;
+    case ViewerMenuSection::Performance:
+    case ViewerMenuSection::Appearance:
+    case ViewerMenuSection::Window:
+      break;
+    case ViewerMenuSection::Presets: {
+      const bool hasPresets = viewerUserPresetExists();
+      const bool selectedPreset = viewerUserPresetExists(app.viewerPresetSelection);
+      const std::string requestedName = sanitizeViewerPresetName(app.viewerPresetNameInput);
+      const bool canSaveNew = !requestedName.empty();
+      std::string nameValue = app.viewerPresetNameInput.empty() ? std::string("Click to name") : app.viewerPresetNameInput;
+      if (app.viewerPresetNameEditing) nameValue += "|";
+      const std::string presetValue = !app.viewerPresetSelection.empty()
+                                          ? app.viewerPresetSelection
+                                          : (hasPresets ? std::string("Default") : std::string("No presets"));
+      appendRow(&rows,
+                "Preset",
+                hasPresets ? presetValue : std::string("No presets"),
+                ViewerMenuAction::LoadUserPreset,
+                hasPresets,
+                "resample");
+      appendRow(&rows, "Preset Name", nameValue, ViewerMenuAction::EditPresetName, true, "none");
+      appendRow(&rows, "Save New", "Save", ViewerMenuAction::SaveUserPreset, canSaveNew, "none");
+      appendRow(&rows, "Update Selected", "Update", ViewerMenuAction::UpdateUserPreset,
+                selectedPreset && viewerPresetNameEditableTarget(app.viewerPresetSelection), "none");
+      appendRow(&rows, "Delete Selected", "Delete", ViewerMenuAction::DeleteUserPreset,
+                selectedPreset && viewerPresetNameEditableTarget(app.viewerPresetSelection), "none");
+      appendRow(&rows, "Save Defaults", "Save", ViewerMenuAction::SaveDefaults, true, "none");
+      appendRow(&rows, "Restore Defaults", "Load", ViewerMenuAction::RestoreDefaults, true, "resample");
+      break;
+    }
+  }
+  return rows;
+}
+
+std::vector<ViewerChoiceMenuItem> buildViewerChoiceMenuItems(const AppState& app) {
+  const ViewerMenuAction action = viewerMenuActionFromInt(app.viewerMenuChoiceAction);
+  const auto state = viewerStateWithModelCapabilities(app.viewerState);
+  std::vector<ViewerChoiceMenuItem> items;
+  if (action == ViewerMenuAction::PlotModel) {
+    items.reserve(kViewerPlotModelChoiceCount);
+    for (int i = 0; i < kViewerPlotModelChoiceCount; ++i) {
+      items.push_back({kViewerPlotModelChoices[i].label,
+                       i,
+                       i == state.plotModel,
+                       ViewerMenuAction::PlotModel,
+                       "reinterpret"});
+    }
+  } else if (action == ViewerMenuAction::PlotLinearTransfer) {
+    const std::vector<int> ordered = orderedTransferChoiceIndices();
+    items.reserve(ordered.size());
+    for (const int i : ordered) {
+      items.push_back({WorkshopColor::transferFunctionDefinition(static_cast<std::size_t>(i)).label,
+                       i,
+                       i == state.plotDisplayLinearTransfer,
+                       ViewerMenuAction::PlotLinearTransfer,
+                       "reinterpret",
+                       transferChoiceIsDisplayReferred(i)});
+    }
+  } else if (action == ViewerMenuAction::UpdateMode) {
+    items.reserve(3);
+    for (int i = 0; i < 3; ++i) {
+      items.push_back({ChromaspaceViewer::updateModeLabel(i),
+                       i,
+                       i == state.updateMode,
+                       ViewerMenuAction::UpdateMode,
+                       "none"});
+    }
+  } else if (action == ViewerMenuAction::Quality) {
+    items.reserve(3);
+    for (int i = 0; i < 3; ++i) {
+      items.push_back({ChromaspaceViewer::qualityLabel(i),
+                       i,
+                       i == state.quality,
+                       ViewerMenuAction::Quality,
+                       "resample"});
+    }
+  } else if (action == ViewerMenuAction::Scale) {
+    items.reserve(4);
+    for (int i = 0; i < 4; ++i) {
+      items.push_back({ChromaspaceViewer::scaleLabel(i),
+                       i,
+                       i == state.scale,
+                       ViewerMenuAction::Scale,
+                       "resample"});
+    }
+  } else if (action == ViewerMenuAction::Sampling) {
+    items.reserve(3);
+    for (int i = 0; i < 3; ++i) {
+      items.push_back({ChromaspaceViewer::samplingLabel(i),
+                       i,
+                       i == state.sampling,
+                       ViewerMenuAction::Sampling,
+                       "resample"});
+    }
+  } else if (action == ViewerMenuAction::PlotStyle) {
+    items.reserve(2);
+    for (int i = 0; i < 2; ++i) {
+      items.push_back({ChromaspaceViewer::plotStyleLabel(i),
+                       i,
+                       i == state.plotStyle,
+                       ViewerMenuAction::PlotStyle,
+                       "reinterpret"});
+    }
+  } else if (action == ViewerMenuAction::PointShape) {
+    items.reserve(2);
+    for (int i = 0; i < 2; ++i) {
+      items.push_back({ChromaspaceViewer::pointShapeLabel(i),
+                       i,
+                       i == state.pointShape,
+                       ViewerMenuAction::PointShape,
+                       "reinterpret"});
+    }
+  } else if (action == ViewerMenuAction::WaveformMode) {
+    items.reserve(3);
+    for (int i = 0; i < 3; ++i) {
+      items.push_back({ChromaspaceViewer::waveformModeLabel(i),
+                       i,
+                       i == state.waveformMode,
+                       ViewerMenuAction::WaveformMode,
+                       "reinterpret"});
+    }
+  } else if (action == ViewerMenuAction::WaveformDetail) {
+    items.push_back({"Standard", 0, !state.waveformHighDetail,
+                     ViewerMenuAction::WaveformDetail, "resample"});
+    items.push_back({"High", 1, state.waveformHighDetail,
+                     ViewerMenuAction::WaveformDetail, "resample"});
+  } else if (action == ViewerMenuAction::WaveformLumaMethod) {
+    items.reserve(4);
+    for (int i = 0; i < 4; ++i) {
+      items.push_back({ChromaspaceViewer::waveformLumaMethodLabel(i),
+                       i,
+                       i == state.waveformLumaMethod,
+                       ViewerMenuAction::WaveformLumaMethod,
+                       "reinterpret"});
+    }
+  } else if (action == ViewerMenuAction::HistogramMode) {
+    items.reserve(2);
+    for (int i = 0; i < 2; ++i) {
+      items.push_back({ChromaspaceViewer::histogramModeLabel(i),
+                       i,
+                       i == state.histogramMode,
+                       ViewerMenuAction::HistogramMode,
+                       "reinterpret"});
+    }
+  } else if (action == ViewerMenuAction::ScopeRangeMode) {
+    items.reserve(3);
+    for (int i = 0; i < 3; ++i) {
+      items.push_back({ChromaspaceViewer::scopeRangeModeLabel(i),
+                       i,
+                       i == state.scopeRangeMode,
+                       ViewerMenuAction::ScopeRangeMode,
+                       "reinterpret"});
+    }
+  } else if (action == ViewerMenuAction::ChromaticityInputPrimaries) {
+    const std::vector<int> ordered = orderedPrimariesChoiceIndices();
+    items.reserve(ordered.size());
+    for (const int i : ordered) {
+      items.push_back({WorkshopColor::primariesDefinition(static_cast<std::size_t>(i)).label,
+                       i,
+                       i == state.chromaticityInputPrimaries,
+                       ViewerMenuAction::ChromaticityInputPrimaries,
+                       "reinterpret",
+                       primariesChoiceIsDisplayReferred(i)});
+    }
+  } else if (action == ViewerMenuAction::ChromaticityInputTransfer) {
+    const std::vector<int> ordered = orderedTransferChoiceIndices();
+    items.reserve(ordered.size());
+    for (const int i : ordered) {
+      items.push_back({WorkshopColor::transferFunctionDefinition(static_cast<std::size_t>(i)).label,
+                       i,
+                       i == state.chromaticityInputTransfer,
+                       ViewerMenuAction::ChromaticityInputTransfer,
+                       "reinterpret",
+                       transferChoiceIsDisplayReferred(i)});
+    }
+  } else if (action == ViewerMenuAction::ChromaticityReferenceBasis) {
+    items.push_back({"CIE", 0, state.chromaticityReferenceBasis == 0,
+                     ViewerMenuAction::ChromaticityReferenceBasis, "reinterpret"});
+    items.push_back({"Input", 1, state.chromaticityReferenceBasis == 1,
+                     ViewerMenuAction::ChromaticityReferenceBasis, "reinterpret"});
+  } else if (action == ViewerMenuAction::ChromaticityOverlayPrimaries) {
+    const std::vector<int> ordered = orderedPrimariesChoiceIndices();
+    items.reserve(ordered.size() + 1u);
+    items.push_back({"Off", 0, state.chromaticityOverlayPrimaries == 0,
+                     ViewerMenuAction::ChromaticityOverlayPrimaries, "reinterpret"});
+    for (const int primariesIndex : ordered) {
+      const int overlayIndex = primariesIndex + 1;
+      items.push_back({overlayPrimariesLabelForIndex(overlayIndex),
+                       overlayIndex,
+                       overlayIndex == state.chromaticityOverlayPrimaries,
+                       ViewerMenuAction::ChromaticityOverlayPrimaries,
+                       "reinterpret",
+                       primariesChoiceIsDisplayReferred(primariesIndex)});
+    }
+  } else if (action == ViewerMenuAction::GlossNeighborhood) {
+    items.reserve(3);
+    for (int i = 0; i < 3; ++i) {
+      items.push_back({glossNeighborhoodLabelForIndex(i),
+                       i,
+                       i == state.glossNeighborhood,
+                       ViewerMenuAction::GlossNeighborhood,
+                       "reinterpret"});
+    }
+  } else if (action == ViewerMenuAction::LoadUserPreset) {
+    const std::vector<std::string> names = viewerUserPresetNames();
+    items.reserve(names.size());
+    for (int i = 0; i < static_cast<int>(names.size()); ++i) {
+      items.push_back({names[static_cast<std::size_t>(i)],
+                       i,
+                       names[static_cast<std::size_t>(i)] == app.viewerPresetSelection,
+                       ViewerMenuAction::LoadUserPreset,
+                       "resample"});
+    }
+  }
+  return items;
+}
+
+std::filesystem::path viewerSettingsFilePath() {
+#if defined(_WIN32)
+  const char* localAppData = std::getenv("LOCALAPPDATA");
+  if (localAppData && localAppData[0] != '\0') {
+    return std::filesystem::path(localAppData) / "Chromaspace" / "viewer_settings_v2.json";
+  }
+  return std::filesystem::current_path() / "viewer_settings_v2.json";
+#elif defined(__APPLE__)
+  const char* home = std::getenv("HOME");
+  if (home && home[0] != '\0') {
+    return std::filesystem::path(home) / "Library" / "Application Support" / "Chromaspace" / "viewer_settings_v2.json";
+  }
+  return std::filesystem::path("/tmp") / "chromaspace_viewer_settings_v2.json";
+#else
+  const char* home = std::getenv("HOME");
+  if (home && home[0] != '\0') {
+    return std::filesystem::path(home) / ".config" / "Chromaspace" / "viewer_settings_v2.json";
+  }
+  return std::filesystem::path("/tmp") / "chromaspace_viewer_settings_v2.json";
+#endif
+}
+
+#if defined(_WIN32)
+std::atomic<bool> gResolveBridgeLaunchAttempted{false};
+
+std::filesystem::path viewerExecutableDirectory() {
+  wchar_t buffer[MAX_PATH];
+  const DWORD len = GetModuleFileNameW(nullptr, buffer, static_cast<DWORD>(std::size(buffer)));
+  if (len == 0 || len >= static_cast<DWORD>(std::size(buffer))) return {};
+  return std::filesystem::path(buffer).parent_path();
+}
+
+std::wstring findProgramOnPath(const wchar_t* name) {
+  if (!name || !name[0]) return {};
+  wchar_t buffer[MAX_PATH];
+  const DWORD len = SearchPathW(nullptr, name, nullptr, static_cast<DWORD>(std::size(buffer)), buffer, nullptr);
+  if (len == 0 || len >= static_cast<DWORD>(std::size(buffer))) return {};
+  return std::wstring(buffer, buffer + len);
+}
+
+bool launchResolveBridgeWithPython(const std::filesystem::path& scriptPath) {
+  const std::wstring script = scriptPath.wstring();
+  const std::wstring candidates[] = {
+      findProgramOnPath(L"pythonw.exe"),
+      findProgramOnPath(L"pyw.exe"),
+      findProgramOnPath(L"python.exe"),
+      findProgramOnPath(L"py.exe"),
+  };
+  for (const auto& candidate : candidates) {
+    if (candidate.empty()) continue;
+    std::wstring command = L"\"" + candidate + L"\" \"" + script + L"\"";
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    PROCESS_INFORMATION pi{};
+    const BOOL ok = CreateProcessW(nullptr,
+                                   command.data(),
+                                   nullptr,
+                                   nullptr,
+                                   FALSE,
+                                   CREATE_NO_WINDOW | DETACHED_PROCESS,
+                                   nullptr,
+                                   nullptr,
+                                   &si,
+                                   &pi);
+    if (ok) {
+      CloseHandle(pi.hThread);
+      CloseHandle(pi.hProcess);
+      logViewerEvent(std::string("Started Chromaspace Resolve bridge: ") + scriptPath.string());
+      return true;
+    }
+  }
+  return false;
+}
+
+void ensureResolveBridgeRunning() {
+  if (gResolveBridgeLaunchAttempted.exchange(true)) return;
+  const std::filesystem::path exeDir = viewerExecutableDirectory();
+  std::vector<std::filesystem::path> candidates;
+  if (!exeDir.empty()) {
+    candidates.push_back(exeDir.parent_path() / "Resources" / "chromaspace_resolve_bridge.py");
+    candidates.push_back(exeDir / "chromaspace_resolve_bridge.py");
+  }
+  for (const auto& candidate : candidates) {
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(candidate, ec)) continue;
+    if (launchResolveBridgeWithPython(candidate)) return;
+  }
+  logViewerEvent("Chromaspace Resolve bridge was not started; Python or bundled bridge script was not found.");
+}
+#endif
+
+std::string sanitizeViewerSessionId(const std::string& sessionId) {
+  std::string out;
+  out.reserve(sessionId.size());
+  for (unsigned char ch : sessionId) {
+    if (std::isalnum(ch) || ch == '-' || ch == '_' || ch == '.') {
+      out.push_back(static_cast<char>(ch));
+    } else {
+      out.push_back('_');
+    }
+  }
+  return out.empty() ? std::string("unknown") : out;
+}
+
+std::filesystem::path viewerMailboxRootPath() {
+#if defined(_WIN32)
+  const char* localAppData = std::getenv("LOCALAPPDATA");
+  if (localAppData && localAppData[0] != '\0') {
+    return std::filesystem::path(localAppData) / "Chromaspace" / "sessions";
+  }
+  return std::filesystem::temp_directory_path() / "Chromaspace" / "sessions";
+#elif defined(__APPLE__)
+  const char* home = std::getenv("HOME");
+  if (home && home[0] != '\0') {
+    return std::filesystem::path(home) / "Library" / "Application Support" / "Chromaspace" / "sessions";
+  }
+  return std::filesystem::path("/tmp") / "Chromaspace" / "sessions";
+#else
+  const char* home = std::getenv("HOME");
+  if (home && home[0] != '\0') {
+    return std::filesystem::path(home) / ".config" / "Chromaspace" / "sessions";
+  }
+  return std::filesystem::path("/tmp") / "Chromaspace" / "sessions";
+#endif
+}
+
+std::filesystem::path viewerMailboxSessionPath(const std::string& sessionId) {
+  return viewerMailboxRootPath() / sanitizeViewerSessionId(sessionId);
+}
+
+std::filesystem::path viewerDesiredStatePath(const std::string& sessionId) {
+  return viewerMailboxSessionPath(sessionId) / "desired_state.json";
+}
+
+std::filesystem::path viewerAppliedStatePath(const std::string& sessionId) {
+  return viewerMailboxSessionPath(sessionId) / "applied_state.json";
+}
+
+std::filesystem::path viewerDrawInstanceScanRequestPath(const std::string& sessionId) {
+  return viewerMailboxSessionPath(sessionId) / "draw_instance_scan_request.json";
+}
+
+std::filesystem::path viewerLiveRefreshPulsePath() {
+  return viewerMailboxRootPath().parent_path() / "live_refresh_pulse.json";
+}
+
+std::filesystem::path chromaspaceAppSupportRootPath() {
+  return viewerMailboxRootPath().parent_path();
+}
+
+std::filesystem::path resolveDrawInstanceStatusPath() {
+  return chromaspaceAppSupportRootPath() / "draw_instance_status.json";
+}
+
+std::filesystem::path viewerDrawInstanceStatusPath(const std::string& sessionId) {
+  return viewerMailboxSessionPath(sessionId) / "draw_instance_status.json";
+}
+
+bool readSmallViewerTextFile(const std::filesystem::path& path, std::string* out) {
+  if (!out) return false;
+  std::error_code ec;
+  if (!std::filesystem::is_regular_file(path, ec) || ec) return false;
+  const auto size = std::filesystem::file_size(path, ec);
+  if (ec || size > 1024 * 1024) return false;
+  std::ifstream is(path, std::ios::binary);
+  if (!is.is_open()) return false;
+  std::ostringstream buffer;
+  buffer << is.rdbuf();
+  *out = buffer.str();
+  return true;
+}
+
+bool writeViewerMailboxAtomic(const std::filesystem::path& path, const std::string& text) {
+  std::error_code ec;
+  std::filesystem::create_directories(path.parent_path(), ec);
+  if (ec) return false;
+  const std::filesystem::path tmp = path.parent_path() / (path.filename().string() + ".tmp");
+  {
+    std::ofstream os(tmp, std::ios::binary | std::ios::trunc);
+    if (!os.is_open()) return false;
+    os << text;
+    os.flush();
+    if (!os.good()) return false;
+  }
+  std::filesystem::remove(path, ec);
+  ec.clear();
+  std::filesystem::rename(tmp, path, ec);
+  return !ec;
+}
+
+std::string viewerStateJson(const ChromaspaceViewer::ViewerRuntimeState& state) {
+  std::ostringstream os;
+  os << "{\"type\":\"chromaspace_viewer_settings_v2\",\"defaultsRevision\":2";
+  appendViewerStateCommandFields(os, state);
+  os << "}\n";
+  return os.str();
+}
+
+std::string viewerDesiredStateJson(const ChromaspaceViewer::ViewerRuntimeState& state,
+                                   uint64_t focusPlotNodeRequestedRevision,
+                                   uint64_t clearImageLassoRequestedRevision) {
+  std::string json = viewerStateJson(state);
+  if (focusPlotNodeRequestedRevision == 0 &&
+      clearImageLassoRequestedRevision == 0) {
+    return json;
+  }
+  const std::string suffix = "}\n";
+  if (json.size() >= suffix.size() &&
+      json.compare(json.size() - suffix.size(), suffix.size(), suffix) == 0) {
+    json.resize(json.size() - suffix.size());
+    if (focusPlotNodeRequestedRevision > 0) {
+      json += ",\"focusPlotNodeRequestedRevision\":";
+      json += std::to_string(focusPlotNodeRequestedRevision);
+    }
+    if (clearImageLassoRequestedRevision > 0) {
+      json += ",\"clearImageLassoRequestedRevision\":";
+      json += std::to_string(clearImageLassoRequestedRevision);
+    }
+    json += suffix;
+  }
+  return json;
+}
+
+bool parseViewerStateJson(const std::string& json, ChromaspaceViewer::ViewerRuntimeState* out) {
+  if (!out) return false;
+  ChromaspaceViewer::ViewerRuntimeState s{};
+  int intValue = 0;
+  float floatValue = 0.0f;
+  auto readBool = [&](const char* key, bool* field) {
+    if (field && extractInt(json, key, &intValue)) *field = intValue != 0;
+  };
+  auto readInt = [&](const char* key, int* field) {
+    if (field && extractInt(json, key, &intValue)) *field = intValue;
+  };
+  auto readFloat = [&](const char* key, double* field) {
+    if (field && extractFloat(json, key, &floatValue)) *field = static_cast<double>(floatValue);
+  };
+  uint64_t revision = 0;
+  int defaultsRevision = 0;
+  const bool hasDefaultsRevision = extractInt(json, "defaultsRevision", &defaultsRevision);
+  if (extractUInt64(json, "stateRevision", &revision)) s.stateRevision = std::max<uint64_t>(1, revision);
+  readInt("plotModel", &s.plotModel);
+  readBool("circularHsl", &s.circularHsl);
+  readBool("circularHsv", &s.circularHsv);
+  readBool("normConeNormalized", &s.normConeNormalized);
+  readBool("plotDisplayLinear", &s.plotDisplayLinear);
+  readInt("plotDisplayLinearTransfer", &s.plotDisplayLinearTransfer);
+  readBool("liveUpdate", &s.liveUpdate);
+  readInt("updateMode", &s.updateMode);
+  readInt("quality", &s.quality);
+  readInt("scale", &s.scale);
+  readInt("sampling", &s.sampling);
+  readBool("occupancyFill", &s.occupancyGuidedFill);
+  readInt("plotStyle", &s.plotStyle);
+  readInt("pointShape", &s.pointShape);
+  readFloat("pointSize", &s.pointSize);
+  readFloat("colorSaturation", &s.colorSaturation);
+  readBool("keepOnTop", &s.keepOnTop);
+  readBool("resetViewOnPlotSwitch", &s.resetViewOnPlotSwitch);
+  readBool("showOverflow", &s.showOverflow);
+  readBool("highlightOverflow", &s.highlightOverflow);
+  readFloat("overflowHighlightColorR", &s.overflowHighlightR);
+  readFloat("overflowHighlightColorG", &s.overflowHighlightG);
+  readFloat("overflowHighlightColorB", &s.overflowHighlightB);
+  readFloat("viewerBackgroundColorR", &s.backgroundR);
+  readFloat("viewerBackgroundColorG", &s.backgroundG);
+  readFloat("viewerBackgroundColorB", &s.backgroundB);
+  readBool("identityOverlayEnabled", &s.fillVolume);
+  readBool("identityOverlayRamp", &s.fillGrayRamp);
+  readInt("identityOverlayRequestedSize", &s.fillResolution);
+  readBool("readGrayRamp", &s.readGrayRamp);
+  readBool("readIdentityPlot", &s.readIdentityPlot);
+  readBool("isolateIdentityData", &s.isolateIdentityData);
+  readInt("identityReadResolution", &s.identityReadResolution);
+  readBool("volumeSliceLassoRegion", &s.volumeSliceLassoRegion);
+  readBool("cubeSliceRed", &s.volumeSliceRed);
+  readBool("cubeSliceYellow", &s.volumeSliceYellow);
+  readBool("cubeSliceGreen", &s.volumeSliceGreen);
+  readBool("cubeSliceCyan", &s.volumeSliceCyan);
+  readBool("cubeSliceBlue", &s.volumeSliceBlue);
+  readBool("cubeSliceMagenta", &s.volumeSliceMagenta);
+  readFloat("neutralRadius", &s.neutralRadius);
+  readInt("chromaticityInputPrimaries", &s.chromaticityInputPrimaries);
+  readInt("chromaticityInputTransfer", &s.chromaticityInputTransfer);
+  readInt("chromaticityReferenceBasis", &s.chromaticityReferenceBasis);
+  readInt("chromaticityOverlayPrimaries", &s.chromaticityOverlayPrimaries);
+  readBool("chromaticityPlanckianLocus", &s.chromaticityPlanckianLocus);
+  readBool("chromaticitySpectralLocus3D", &s.chromaticitySpectralLocus3D);
+  readInt("glossNeighborhood", &s.glossNeighborhood);
+  readFloat("glossLiftScale", &s.glossLiftScale);
+  readBool("glossSpatialInset", &s.glossSpatialInset);
+  readFloat("glossBodyOpacity", &s.glossBodyOpacity);
+  readFloat("glossHighlightOpacity", &s.glossHighlightOpacity);
+  readFloat("glossPointCrispness", &s.glossPointCrispness);
+  readBool("glossHideText", &s.glossHideText);
+  readInt("waveformMode", &s.waveformMode);
+  readBool("waveformHighDetail", &s.waveformHighDetail);
+  readBool("waveformContinuousHighDetail", &s.waveformContinuousHighDetail);
+  readBool("waveformHighDetailRequested", &s.waveformHighDetailRequested);
+  readInt("waveformSampleColumns", &s.waveformSampleColumns);
+  readInt("waveformSamplesPerColumn", &s.waveformSamplesPerColumn);
+  readFloat("waveformPointBrightness", &s.waveformPointBrightness);
+  readFloat("waveformGridBrightness", &s.waveformGridBrightness);
+  readFloat("waveformSaturation", &s.waveformSaturation);
+  readFloat("waveformDotSize", &s.waveformDotSize);
+  readBool("waveformChannelRed", &s.waveformChannelRed);
+  readBool("waveformChannelGreen", &s.waveformChannelGreen);
+  readBool("waveformChannelBlue", &s.waveformChannelBlue);
+  readBool("waveformShowOverflow", &s.waveformShowOverflow);
+  readBool("waveformHighlightOverflow", &s.waveformHighlightOverflow);
+  readInt("waveformLumaMethod", &s.waveformLumaMethod);
+  readInt("histogramMode", &s.histogramMode);
+  readBool("histogramShowOverflow", &s.histogramShowOverflow);
+  readBool("histogramHighlightOverflow", &s.histogramHighlightOverflow);
+  readInt("scopeRangeMode", &s.scopeRangeMode);
+  extractQuoted(json, "sampleSettingsKey", &s.sampleSettingsKey);
+  extractQuoted(json, "refreshPolicy", &s.refreshPolicy);
+  readBool("requiresHostSamples", &s.requiresHostSamples);
+  extractQuoted(json, "sourceSessionId", &s.sourceSessionId);
+  if (extractUInt64(json, "hostRefreshRequestedRevision", &revision)) {
+    s.hostRefreshRequestedRevision = revision;
+  }
+  if (!hasDefaultsRevision || defaultsRevision < 2) {
+    if (s.plotDisplayLinearTransfer == 0) {
+      s.plotDisplayLinearTransfer = ChromaspaceViewer::kDefaultGamma24TransferChoice;
+    }
+    if (s.chromaticityInputPrimaries == 0) {
+      s.chromaticityInputPrimaries = ChromaspaceViewer::kDefaultRec709PrimariesChoice;
+    }
+    if (s.chromaticityInputTransfer == 0) {
+      s.chromaticityInputTransfer = ChromaspaceViewer::kDefaultGamma24TransferChoice;
+    }
+  }
+  *out = ChromaspaceViewer::clampedViewerRuntimeState(s);
+  return true;
+}
+
+bool loadViewerStateFromDisk(ChromaspaceViewer::ViewerRuntimeState* out) {
+  const auto path = viewerSettingsFilePath();
+  std::ifstream is(path, std::ios::binary);
+  if (!is.is_open()) return false;
+  std::ostringstream buffer;
+  buffer << is.rdbuf();
+  return parseViewerStateJson(buffer.str(), out);
+}
+
+void saveViewerStateToDisk(const ChromaspaceViewer::ViewerRuntimeState& state) {
+  const auto path = viewerSettingsFilePath();
+  std::error_code ec;
+  std::filesystem::create_directories(path.parent_path(), ec);
+  std::ofstream os(path, std::ios::binary | std::ios::trunc);
+  if (!os.is_open()) return;
+  os << viewerStateJson(state);
+}
+
+std::filesystem::path viewerWorkspaceFilePath() {
+  return viewerSettingsFilePath().parent_path() / "viewer_workspace_v1.jsonl";
+}
+
+void saveViewerWorkspaceToDisk(AppState* app) {
+  if (!app) return;
+  captureFocusedPlotWindowFromApp(app);
+  const auto path = viewerWorkspaceFilePath();
+  std::error_code ec;
+  std::filesystem::create_directories(path.parent_path(), ec);
+  const auto tmp = path.parent_path() / (path.filename().string() + ".tmp");
+  std::ofstream os(tmp, std::ios::binary | std::ios::trunc);
+  if (!os.is_open()) return;
+  os << "{\"type\":\"chromaspace_viewer_workspace_v1\",\"focusedWindowId\":"
+     << app->focusedPlotWindowId << ",\"nextWindowId\":" << app->nextPlotWindowId
+     << ",\"showWorkspaceButtons\":" << (app->showWorkspaceButtons ? 1 : 0)
+     << ",\"windowWidth\":" << app->workspaceLayoutWindowWidth
+     << ",\"windowHeight\":" << app->workspaceLayoutWindowHeight
+     << ",\"workspaceTopNorm\":" << std::setprecision(8) << app->workspaceLayoutTopNorm << "}\n";
+  for (const auto& window : app->plotWindows) {
+    std::ostringstream line;
+    line << "{\"type\":\"plot_window\",\"windowId\":" << window.windowId
+       << ",\"x\":" << std::setprecision(8) << window.rect.x
+       << ",\"y\":" << std::setprecision(8) << window.rect.y
+       << ",\"w\":" << std::setprecision(8) << window.rect.w
+       << ",\"h\":" << std::setprecision(8) << window.rect.h
+       << ",\"camQx\":" << std::setprecision(8) << window.camera.qx
+       << ",\"camQy\":" << std::setprecision(8) << window.camera.qy
+       << ",\"camQz\":" << std::setprecision(8) << window.camera.qz
+       << ",\"camQw\":" << std::setprecision(8) << window.camera.qw
+       << ",\"camDistance\":" << std::setprecision(8) << window.camera.distance
+       << ",\"camPanX\":" << std::setprecision(8) << window.camera.panX
+       << ",\"camPanY\":" << std::setprecision(8) << window.camera.panY
+       << ",\"camOrthographic\":" << (window.camera.orthographic ? 1 : 0)
+       << ",\"camOrthographicView\":" << window.camera.orthographicView;
+    appendViewerStateCommandFields(line, window.viewState);
+    line << "}\n";
+    os << line.str();
+  }
+  os.flush();
+  if (!os.good()) return;
+  os.close();
+  std::filesystem::remove(path, ec);
+  ec.clear();
+  std::filesystem::rename(tmp, path, ec);
+}
+
+bool loadViewerWorkspaceFromDisk(AppState* app) {
+  if (!app) return false;
+  std::ifstream is(viewerWorkspaceFilePath(), std::ios::binary);
+  if (!is.is_open()) return false;
+  std::vector<PlotWindowState> windows;
+  int focusedId = 1;
+  int nextId = 2;
+  std::string line;
+  while (std::getline(is, line)) {
+    std::string type;
+    if (!extractQuoted(line, "type", &type)) continue;
+    if (type == "chromaspace_viewer_workspace_v1") {
+      extractInt(line, "focusedWindowId", &focusedId);
+      extractInt(line, "nextWindowId", &nextId);
+      // Legacy workspaces were created at the viewer's 720x600 startup size.
+      // Remember that source size so the first frame can remove any normalized
+      // toolbar dead space when opening at a different size.
+      app->workspaceLayoutWindowWidth = 720;
+      app->workspaceLayoutWindowHeight = 600;
+      app->workspaceLayoutTopNorm = 50.0f / 600.0f;
+      extractInt(line, "windowWidth", &app->workspaceLayoutWindowWidth);
+      extractInt(line, "windowHeight", &app->workspaceLayoutWindowHeight);
+      extractFloat(line, "workspaceTopNorm", &app->workspaceLayoutTopNorm);
+      int showWorkspaceButtons = app->showWorkspaceButtons ? 1 : 0;
+      if (extractInt(line, "showWorkspaceButtons", &showWorkspaceButtons)) {
+        app->showWorkspaceButtons = showWorkspaceButtons != 0;
+      }
+      continue;
+    }
+    if (type != "plot_window") continue;
+    PlotWindowState window{};
+    float value = 0.0f;
+    int intValue = 0;
+    extractInt(line, "windowId", &window.windowId);
+    if (extractFloat(line, "x", &value)) window.rect.x = value;
+    if (extractFloat(line, "y", &value)) window.rect.y = value;
+    if (extractFloat(line, "w", &value)) window.rect.w = value;
+    if (extractFloat(line, "h", &value)) window.rect.h = value;
+    if (extractFloat(line, "camQx", &value)) window.camera.qx = value;
+    if (extractFloat(line, "camQy", &value)) window.camera.qy = value;
+    if (extractFloat(line, "camQz", &value)) window.camera.qz = value;
+    if (extractFloat(line, "camQw", &value)) window.camera.qw = value;
+    if (extractFloat(line, "camDistance", &value)) window.camera.distance = value;
+    if (extractFloat(line, "camPanX", &value)) window.camera.panX = value;
+    if (extractFloat(line, "camPanY", &value)) window.camera.panY = value;
+    if (extractInt(line, "camOrthographic", &intValue)) window.camera.orthographic = intValue != 0;
+    extractInt(line, "camOrthographicView", &window.camera.orthographicView);
+    if (!parseViewerStateJson(line, &window.viewState)) continue;
+    window.viewState = viewerStateWithModelCapabilities(window.viewState);
+    const bool analyticalScope =
+        plotModelIsAnalyticalScope(window.viewState.plotModel);
+    const bool legacyScopeCamera =
+        analyticalScope &&
+        window.camera.orthographic &&
+        std::abs(window.camera.distance - 6.0f) < 1e-4f &&
+        std::abs(window.camera.panX) < 1e-4f &&
+        std::abs(window.camera.panY) < 1e-4f;
+    if (analyticalScope &&
+        (!window.camera.orthographic || legacyScopeCamera)) {
+      // Early scope workspaces inherited the generic 3D camera. Repair those
+      // once on load so labels and the full frame are visible without
+      // discarding intentional 2D pan/zoom state.
+      resetAnalyticalScopeCamera(
+          &window.camera,
+          window.viewState.plotModel == ChromaspaceViewer::kPlotModelHistogram);
+    }
+    window.rect.x = clampf(window.rect.x, 0.0f, 1.0f);
+    window.rect.y = clampf(window.rect.y, 0.0f, 1.0f);
+    window.rect.w = clampf(window.rect.w, 0.05f, 1.0f);
+    window.rect.h = clampf(window.rect.h, 0.05f, 1.0f);
+    window.selected = window.windowId == focusedId;
+    windows.push_back(window);
+  }
+  if (windows.empty()) return false;
+  app->plotWindows = std::move(windows);
+  app->focusedPlotWindowId = focusedId;
+  app->nextPlotWindowId = std::max(nextId, 2);
+  if (const PlotWindowState* focused = focusedPlotWindow(*app)) {
+    PlotWindowState copy = *focused;
+    applyPlotWindowToApp(app, copy);
+  }
+  return true;
+}
+
+std::filesystem::path viewerLegacyUserPresetFilePath() {
+  return viewerSettingsFilePath().parent_path() / "viewer_user_preset_v1.json";
+}
+
+std::filesystem::path viewerUserPresetDirPath() {
+  return viewerSettingsFilePath().parent_path() / "viewer_presets_v1";
+}
+
+std::filesystem::path chromaspaceSharedPresetFilePath() {
+#if defined(_WIN32)
+  const char* base = std::getenv("APPDATA");
+  if (!base || !*base) base = std::getenv("LOCALAPPDATA");
+  if (base && *base) return std::filesystem::path(base) / "Chromaspace" / "presets_v1.json";
+#else
+  const char* home = std::getenv("HOME");
+  if (home && *home) return std::filesystem::path(home) / ".config" / "Chromaspace" / "presets_v1.json";
+#endif
+  return viewerSettingsFilePath().parent_path() / "presets_v1.json";
+}
+
+std::string viewerNowUtcIso8601() {
+  const std::time_t now = std::time(nullptr);
+  std::tm tm{};
+#if defined(_WIN32)
+  gmtime_s(&tm, &now);
+#else
+  gmtime_r(&now, &tm);
+#endif
+  char buffer[32] = {};
+  std::strftime(buffer, sizeof(buffer), "%Y-%m-%dT%H:%M:%SZ", &tm);
+  return buffer;
+}
+
+std::string viewerMakePresetId() {
+  const auto now = std::chrono::system_clock::now().time_since_epoch();
+  const auto millis = std::chrono::duration_cast<std::chrono::milliseconds>(now).count();
+  return "viewer_" + std::to_string(static_cast<long long>(millis));
+}
+
+bool viewerNamesEqualNoCase(const std::string& a, const std::string& b) {
+  if (a.size() != b.size()) return false;
+  for (size_t i = 0; i < a.size(); ++i) {
+    if (std::tolower(static_cast<unsigned char>(a[i])) !=
+        std::tolower(static_cast<unsigned char>(b[i]))) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool viewerPresetNameReserved(const std::string& name) {
+  return viewerNamesEqualNoCase(name, "Default") ||
+         viewerNamesEqualNoCase(name, "(Custom)") ||
+         viewerNamesEqualNoCase(name, "User Preset");
+}
+
+bool viewerPresetNameEditableTarget(const std::string& name) {
+  return !name.empty() && !viewerPresetNameReserved(name);
+}
+
+std::string sanitizeViewerPresetName(const std::string& name, const std::string& fallback) {
+  std::string out;
+  out.reserve(name.size());
+  bool previousSpace = false;
+  for (unsigned char raw : name) {
+    char ch = static_cast<char>(raw);
+    if (std::iscntrl(raw)) continue;
+    if (std::isspace(raw)) {
+      if (!out.empty() && !previousSpace) {
+        out.push_back(' ');
+        previousSpace = true;
+      }
+      continue;
+    }
+    out.push_back(ch);
+    previousSpace = false;
+  }
+  while (!out.empty() && out.back() == ' ') out.pop_back();
+  if (out.size() > 64) out.resize(64);
+  while (!out.empty() && out.back() == ' ') out.pop_back();
+  return out.empty() ? fallback : out;
+}
+
+bool viewerReadTextFile(const std::filesystem::path& path, std::string* out) {
+  if (!out) return false;
+  std::ifstream is(path, std::ios::binary);
+  if (!is.is_open()) return false;
+  std::ostringstream buffer;
+  buffer << is.rdbuf();
+  *out = buffer.str();
+  return true;
+}
+
+std::string viewerPresetFileStemForName(const std::string& name) {
+  std::string out;
+  out.reserve(name.size());
+  for (unsigned char ch : name) {
+    if (std::isalnum(ch) || ch == '-' || ch == '_') {
+      out.push_back(static_cast<char>(ch));
+    } else if (std::isspace(ch)) {
+      out.push_back('_');
+    }
+  }
+  return out.empty() ? std::string("Preset") : out;
+}
+
+std::string viewerPresetNameFromStem(std::string stem) {
+  for (char& ch : stem) {
+    if (ch == '_') ch = ' ';
+  }
+  return stem.empty() ? std::string("Preset") : stem;
+}
+
+std::filesystem::path viewerUserPresetFilePath(const std::string& name) {
+  return viewerUserPresetDirPath() / (viewerPresetFileStemForName(name) + ".json");
+}
+
+bool viewerJsonFindValue(const std::string& json, const std::string& key, size_t* valueStart) {
+  if (!valueStart) return false;
+  const std::string needle = "\"" + key + "\"";
+  const size_t keyPos = json.find(needle);
+  if (keyPos == std::string::npos) return false;
+  const size_t colon = json.find(':', keyPos + needle.size());
+  if (colon == std::string::npos) return false;
+  size_t pos = colon + 1;
+  while (pos < json.size() && std::isspace(static_cast<unsigned char>(json[pos]))) ++pos;
+  if (pos >= json.size()) return false;
+  *valueStart = pos;
+  return true;
+}
+
+bool viewerExtractJsonStringField(const std::string& json, const std::string& key, std::string* out) {
+  if (!out) return false;
+  size_t pos = 0;
+  if (!viewerJsonFindValue(json, key, &pos) || json[pos] != '"') return false;
+  ++pos;
+  std::string value;
+  bool escaped = false;
+  for (; pos < json.size(); ++pos) {
+    const char c = json[pos];
+    if (escaped) {
+      switch (c) {
+        case 'n': value.push_back('\n'); break;
+        case 'r': value.push_back('\r'); break;
+        case 't': value.push_back('\t'); break;
+        case '"': value.push_back('"'); break;
+        case '\\': value.push_back('\\'); break;
+        default: value.push_back(c); break;
+      }
+      escaped = false;
+      continue;
+    }
+    if (c == '\\') {
+      escaped = true;
+      continue;
+    }
+    if (c == '"') {
+      *out = value;
+      return true;
+    }
+    value.push_back(c);
+  }
+  return false;
+}
+
+bool viewerExtractJsonStructuredField(const std::string& json,
+                                      const std::string& key,
+                                      char openChar,
+                                      char closeChar,
+                                      std::string* out) {
+  if (!out) return false;
+  size_t pos = 0;
+  if (!viewerJsonFindValue(json, key, &pos) || json[pos] != openChar) return false;
+  bool inString = false;
+  bool escaped = false;
+  int depth = 0;
+  for (size_t end = pos; end < json.size(); ++end) {
+    const char c = json[end];
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (c == '\\') {
+        escaped = true;
+      } else if (c == '"') {
+        inString = false;
+      }
+      continue;
+    }
+    if (c == '"') {
+      inString = true;
+      continue;
+    }
+    if (c == openChar) {
+      ++depth;
+    } else if (c == closeChar) {
+      --depth;
+      if (depth == 0) {
+        *out = json.substr(pos, end - pos + 1);
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+bool viewerExtractJsonObjectField(const std::string& json, const std::string& key, std::string* out) {
+  return viewerExtractJsonStructuredField(json, key, '{', '}', out);
+}
+
+bool viewerExtractJsonArrayField(const std::string& json, const std::string& key, std::string* out) {
+  return viewerExtractJsonStructuredField(json, key, '[', ']', out);
+}
+
+std::vector<std::string> viewerExtractJsonObjectsFromArray(const std::string& arrayJson) {
+  std::vector<std::string> out;
+  bool inString = false;
+  bool escaped = false;
+  int depth = 0;
+  size_t objectStart = std::string::npos;
+  for (size_t i = 0; i < arrayJson.size(); ++i) {
+    const char c = arrayJson[i];
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (c == '\\') {
+        escaped = true;
+      } else if (c == '"') {
+        inString = false;
+      }
+      continue;
+    }
+    if (c == '"') {
+      inString = true;
+      continue;
+    }
+    if (c == '{') {
+      if (depth == 0) objectStart = i;
+      ++depth;
+    } else if (c == '}') {
+      --depth;
+      if (depth == 0 && objectStart != std::string::npos) {
+        out.push_back(arrayJson.substr(objectStart, i - objectStart + 1));
+        objectStart = std::string::npos;
+      }
+    }
+  }
+  return out;
+}
+
+bool viewerExtractJsonBoolField(const std::string& json, const std::string& key, bool* out) {
+  if (!out) return false;
+  size_t pos = 0;
+  if (!viewerJsonFindValue(json, key, &pos)) return false;
+  if (json.compare(pos, 4, "true") == 0) {
+    *out = true;
+    return true;
+  }
+  if (json.compare(pos, 5, "false") == 0) {
+    *out = false;
+    return true;
+  }
+  if (json[pos] == '0' || json[pos] == '1') {
+    *out = json[pos] != '0';
+    return true;
+  }
+  return false;
+}
+
+bool viewerExtractJsonIntField(const std::string& json, const std::string& key, int* out) {
+  if (!out) return false;
+  size_t pos = 0;
+  if (!viewerJsonFindValue(json, key, &pos)) return false;
+  char* end = nullptr;
+  const long value = std::strtol(json.c_str() + pos, &end, 10);
+  if (!end || end == json.c_str() + pos) return false;
+  *out = static_cast<int>(value);
+  return true;
+}
+
+bool viewerExtractJsonDoubleField(const std::string& json, const std::string& key, double* out) {
+  if (!out) return false;
+  size_t pos = 0;
+  if (!viewerJsonFindValue(json, key, &pos)) return false;
+  char* end = nullptr;
+  const double value = std::strtod(json.c_str() + pos, &end);
+  if (!end || end == json.c_str() + pos) return false;
+  *out = value;
+  return true;
+}
+
+bool readResolveDrawInstanceStatus(AppState* app, bool force = false) {
+  if (!app) return false;
+  const double now = glfwGetTime();
+  if (!force && now - app->lastResolveDrawStatusPoll < 0.35) return false;
+  app->lastResolveDrawStatusPoll = now;
+  std::string json;
+  const std::filesystem::path sessionStatusPath =
+      app->senderId.empty() ? std::filesystem::path() : viewerDrawInstanceStatusPath(app->senderId);
+  if ((sessionStatusPath.empty() || !readSmallViewerTextFile(sessionStatusPath, &json)) &&
+      !readSmallViewerTextFile(resolveDrawInstanceStatusPath(), &json)) {
+    app->resolveDrawStatusKnown = false;
+    app->resolveDrawStatusAvailable = false;
+    app->resolveDrawInstanceLikely = false;
+    app->resolveDrawInstanceConfirmed = false;
+    app->resolveDrawChromaspaceNodeCount = 0;
+    app->resolveDrawStatusUpdatedAtUnix = 0.0;
+    app->resolveDrawScanCompletedRevision = 0;
+    app->resolveDrawStatusMessage.clear();
+    app->resolvePlotNodeFocusAvailable = false;
+    app->resolvePlotNodeFocusSucceeded = false;
+    app->resolvePlotNodeFocusRevision = 0;
+    app->resolvePlotNodeFocusMessage.clear();
+    return false;
+  }
+
+  bool boolValue = false;
+  int intValue = 0;
+  double doubleValue = 0.0;
+  std::string message;
+  app->resolveDrawStatusKnown = true;
+  app->resolveDrawStatusAvailable =
+      viewerExtractJsonBoolField(json, "available", &boolValue) ? boolValue : true;
+  app->resolveDrawInstanceLikely =
+      viewerExtractJsonBoolField(json, "drawInstanceLikely", &boolValue) ? boolValue : false;
+  app->resolveDrawInstanceConfirmed =
+      viewerExtractJsonBoolField(json, "drawInstanceConfirmed", &boolValue) ? boolValue : false;
+  app->resolveDrawChromaspaceNodeCount =
+      viewerExtractJsonIntField(json, "chromaspaceNodeCount", &intValue) ? intValue : 0;
+  app->resolveDrawScanCompletedRevision =
+      viewerExtractJsonIntField(json, "scanDrawInstanceRequestedRevision", &intValue)
+          ? static_cast<uint64_t>(std::max(0, intValue))
+          : 0;
+  if (viewerExtractJsonDoubleField(json, "updatedAtUnix", &doubleValue)) {
+    app->resolveDrawStatusUpdatedAtUnix = doubleValue;
+  } else {
+    app->resolveDrawStatusUpdatedAtUnix = 0.0;
+  }
+  if (viewerExtractJsonStringField(json, "message", &message)) {
+    app->resolveDrawStatusMessage = message;
+  } else {
+    app->resolveDrawStatusMessage.clear();
+  }
+  app->resolvePlotNodeFocusAvailable =
+      viewerExtractJsonBoolField(json, "plotNodeFocusAvailable", &boolValue) ? boolValue : false;
+  app->resolvePlotNodeFocusSucceeded =
+      viewerExtractJsonBoolField(json, "plotNodeFocusSucceeded", &boolValue) ? boolValue : false;
+  app->resolvePlotNodeFocusRevision =
+      viewerExtractJsonIntField(json, "plotNodeFocusRequestedRevision", &intValue)
+          ? static_cast<uint64_t>(std::max(0, intValue))
+          : 0;
+  if (viewerExtractJsonStringField(json, "plotNodeFocusMessage", &message)) {
+    app->resolvePlotNodeFocusMessage = message;
+  } else {
+    app->resolvePlotNodeFocusMessage.clear();
+  }
+  return true;
+}
+
+ChromaspaceViewer::ViewerRuntimeState viewerStateFromSharedPresetValuesJson(
+    const std::string& valuesJson,
+    const ChromaspaceViewer::ViewerRuntimeState& fallback = ChromaspaceViewer::ViewerRuntimeState{}) {
+  auto state = fallback;
+  int intValue = 0;
+  double doubleValue = 0.0;
+  bool boolValue = false;
+  auto readBool = [&](const char* key, bool* field) {
+    if (field && viewerExtractJsonBoolField(valuesJson, key, &boolValue)) *field = boolValue;
+  };
+  auto readInt = [&](const char* key, int* field) {
+    if (field && viewerExtractJsonIntField(valuesJson, key, &intValue)) *field = intValue;
+  };
+  auto readDouble = [&](const char* key, double* field) {
+    if (field && viewerExtractJsonDoubleField(valuesJson, key, &doubleValue)) *field = doubleValue;
+  };
+  readInt("plotModel", &state.plotModel);
+  readInt("glossNeighborhood", &state.glossNeighborhood);
+  readDouble("glossLiftScale", &state.glossLiftScale);
+  readBool("glossSpatialInset", &state.glossSpatialInset);
+  readDouble("glossBodyOpacity", &state.glossBodyOpacity);
+  readDouble("glossHighlightOpacity", &state.glossHighlightOpacity);
+  readDouble("glossPointCrispness", &state.glossPointCrispness);
+  readBool("glossHideText", &state.glossHideText);
+  readBool("chromaticitySpectralLocus3D", &state.chromaticitySpectralLocus3D);
+  readBool("plotInLinear", &state.plotDisplayLinear);
+  if (viewerExtractJsonIntField(valuesJson, "inputTransferFunction", &intValue)) {
+    state.plotDisplayLinearTransfer =
+        WorkshopColor::transferFunctionChoiceIndex(static_cast<WorkshopColor::TransferFunctionId>(intValue));
+  }
+  readBool("showOverflow", &state.showOverflow);
+  readBool("highlightOverflow", &state.highlightOverflow);
+  readBool("fillVolume", &state.fillVolume);
+  readBool("fillGrayRamp", &state.fillGrayRamp);
+  readInt("fillResolution", &state.fillResolution);
+  readInt("identityReadResolution", &state.identityReadResolution);
+  readBool("volumeSliceLassoRegion", &state.volumeSliceLassoRegion);
+  readBool("volumeSliceRed", &state.volumeSliceRed);
+  readBool("volumeSliceYellow", &state.volumeSliceYellow);
+  readBool("volumeSliceGreen", &state.volumeSliceGreen);
+  readBool("volumeSliceCyan", &state.volumeSliceCyan);
+  readBool("volumeSliceBlue", &state.volumeSliceBlue);
+  readBool("volumeSliceMagenta", &state.volumeSliceMagenta);
+  readDouble("neutralRadius", &state.neutralRadius);
+  readBool("readGrayRamp", &state.readGrayRamp);
+  readBool("readIdentityPlot", &state.readIdentityPlot);
+  readBool("isolateIdentityData", &state.isolateIdentityData);
+  readBool("liveUpdate", &state.liveUpdate);
+  readBool("keepOnTop", &state.keepOnTop);
+  readBool("resetViewOnPlotSwitch", &state.resetViewOnPlotSwitch);
+  readInt("updateMode", &state.updateMode);
+  readInt("quality", &state.quality);
+  readInt("scale", &state.scale);
+  readInt("plotStyle", &state.plotStyle);
+  readDouble("pointSize", &state.pointSize);
+  readDouble("colorSaturation", &state.colorSaturation);
+  readInt("pointShape", &state.pointShape);
+  readInt("sampling", &state.sampling);
+  readBool("occupancyGuidedFill", &state.occupancyGuidedFill);
+  readInt("waveformMode", &state.waveformMode);
+  readBool("waveformHighDetail", &state.waveformHighDetail);
+  readBool("waveformContinuousHighDetail", &state.waveformContinuousHighDetail);
+  readDouble("waveformPointBrightness", &state.waveformPointBrightness);
+  readDouble("waveformGridBrightness", &state.waveformGridBrightness);
+  readDouble("waveformSaturation", &state.waveformSaturation);
+  readDouble("waveformDotSize", &state.waveformDotSize);
+  readBool("waveformChannelRed", &state.waveformChannelRed);
+  readBool("waveformChannelGreen", &state.waveformChannelGreen);
+  readBool("waveformChannelBlue", &state.waveformChannelBlue);
+  readBool("waveformShowOverflow", &state.waveformShowOverflow);
+  readBool("waveformHighlightOverflow", &state.waveformHighlightOverflow);
+  readInt("waveformLumaMethod", &state.waveformLumaMethod);
+  readInt("histogramMode", &state.histogramMode);
+  readBool("histogramShowOverflow", &state.histogramShowOverflow);
+  readBool("histogramHighlightOverflow", &state.histogramHighlightOverflow);
+  readInt("scopeRangeMode", &state.scopeRangeMode);
+  return ChromaspaceViewer::clampedViewerRuntimeState(state);
+}
+
+std::string viewerSharedPresetValuesJsonFromState(
+    const ChromaspaceViewer::ViewerRuntimeState& state,
+    const std::string* preserveValuesJson = nullptr) {
+  const auto s = ChromaspaceViewer::clampedViewerRuntimeState(state);
+  bool identityGeneratorEnabled = false;
+  bool identityGeneratorGrayRamp = false;
+  int identityGeneratorResolution = 29;
+  if (preserveValuesJson) {
+    (void)viewerExtractJsonBoolField(*preserveValuesJson, "identityGeneratorEnabled", &identityGeneratorEnabled);
+    (void)viewerExtractJsonBoolField(*preserveValuesJson, "identityGeneratorGrayRamp", &identityGeneratorGrayRamp);
+    (void)viewerExtractJsonIntField(*preserveValuesJson, "identityGeneratorResolution", &identityGeneratorResolution);
+  }
+  const int transferId =
+      static_cast<int>(WorkshopColor::transferFunctionIdFromChoiceIndex(s.plotDisplayLinearTransfer));
+  std::ostringstream os;
+  os << "{";
+  os << "\"plotModel\":" << s.plotModel << ",";
+  os << "\"glossNeighborhood\":" << s.glossNeighborhood << ",";
+  os << "\"glossLiftScale\":" << std::setprecision(15) << s.glossLiftScale << ",";
+  os << "\"glossSpatialInset\":" << (s.glossSpatialInset ? "true" : "false") << ",";
+  os << "\"glossBodyOpacity\":" << std::setprecision(15) << s.glossBodyOpacity << ",";
+  os << "\"glossHighlightOpacity\":" << std::setprecision(15) << s.glossHighlightOpacity << ",";
+  os << "\"glossPointCrispness\":" << std::setprecision(15) << s.glossPointCrispness << ",";
+  os << "\"glossHideText\":" << (s.glossHideText ? "true" : "false") << ",";
+  os << "\"chromaticitySpectralLocus3D\":" << (s.chromaticitySpectralLocus3D ? "true" : "false") << ",";
+  os << "\"plotInLinear\":" << (s.plotDisplayLinear ? "true" : "false") << ",";
+  os << "\"inputTransferFunction\":" << transferId << ",";
+  os << "\"showOverflow\":" << (s.showOverflow ? "true" : "false") << ",";
+  os << "\"highlightOverflow\":" << (s.highlightOverflow ? "true" : "false") << ",";
+  os << "\"fillVolume\":" << (s.fillVolume ? "true" : "false") << ",";
+  os << "\"fillGrayRamp\":" << (s.fillGrayRamp ? "true" : "false") << ",";
+  os << "\"fillResolution\":" << s.fillResolution << ",";
+  os << "\"identityGeneratorEnabled\":" << (identityGeneratorEnabled ? "true" : "false") << ",";
+  os << "\"identityGeneratorGrayRamp\":" << (identityGeneratorGrayRamp ? "true" : "false") << ",";
+  os << "\"identityGeneratorResolution\":" << ChromaspaceViewer::clampOverlaySize(identityGeneratorResolution) << ",";
+  os << "\"identityReadResolution\":" << s.identityReadResolution << ",";
+  os << "\"volumeSliceLassoRegion\":" << (s.volumeSliceLassoRegion ? "true" : "false") << ",";
+  os << "\"volumeSliceRed\":" << (s.volumeSliceRed ? "true" : "false") << ",";
+  os << "\"volumeSliceYellow\":" << (s.volumeSliceYellow ? "true" : "false") << ",";
+  os << "\"volumeSliceGreen\":" << (s.volumeSliceGreen ? "true" : "false") << ",";
+  os << "\"volumeSliceCyan\":" << (s.volumeSliceCyan ? "true" : "false") << ",";
+  os << "\"volumeSliceBlue\":" << (s.volumeSliceBlue ? "true" : "false") << ",";
+  os << "\"volumeSliceMagenta\":" << (s.volumeSliceMagenta ? "true" : "false") << ",";
+  os << "\"neutralRadius\":" << std::setprecision(15) << s.neutralRadius << ",";
+  os << "\"readGrayRamp\":" << (s.readGrayRamp ? "true" : "false") << ",";
+  os << "\"readIdentityPlot\":" << (s.readIdentityPlot ? "true" : "false") << ",";
+  os << "\"isolateIdentityData\":" << (s.isolateIdentityData ? "true" : "false") << ",";
+  os << "\"liveUpdate\":" << (s.liveUpdate ? "true" : "false") << ",";
+  os << "\"keepOnTop\":" << (s.keepOnTop ? "true" : "false") << ",";
+  os << "\"resetViewOnPlotSwitch\":" << (s.resetViewOnPlotSwitch ? "true" : "false") << ",";
+  os << "\"updateMode\":" << s.updateMode << ",";
+  os << "\"quality\":" << s.quality << ",";
+  os << "\"scale\":" << s.scale << ",";
+  os << "\"plotStyle\":" << s.plotStyle << ",";
+  os << "\"pointSize\":" << std::setprecision(15) << s.pointSize << ",";
+  os << "\"colorSaturation\":" << std::setprecision(15) << s.colorSaturation << ",";
+  os << "\"pointShape\":" << s.pointShape << ",";
+  os << "\"sampling\":" << s.sampling << ",";
+  os << "\"occupancyGuidedFill\":" << (s.occupancyGuidedFill ? "true" : "false") << ",";
+  os << "\"waveformMode\":" << s.waveformMode << ",";
+  os << "\"waveformHighDetail\":" << (s.waveformHighDetail ? "true" : "false") << ",";
+  os << "\"waveformContinuousHighDetail\":" << (s.waveformContinuousHighDetail ? "true" : "false") << ",";
+  os << "\"waveformPointBrightness\":" << std::setprecision(15) << s.waveformPointBrightness << ",";
+  os << "\"waveformGridBrightness\":" << std::setprecision(15) << s.waveformGridBrightness << ",";
+  os << "\"waveformSaturation\":" << std::setprecision(15) << s.waveformSaturation << ",";
+  os << "\"waveformDotSize\":" << std::setprecision(15) << s.waveformDotSize << ",";
+  os << "\"waveformChannelRed\":" << (s.waveformChannelRed ? "true" : "false") << ",";
+  os << "\"waveformChannelGreen\":" << (s.waveformChannelGreen ? "true" : "false") << ",";
+  os << "\"waveformChannelBlue\":" << (s.waveformChannelBlue ? "true" : "false") << ",";
+  os << "\"waveformShowOverflow\":" << (s.waveformShowOverflow ? "true" : "false") << ",";
+  os << "\"waveformHighlightOverflow\":" << (s.waveformHighlightOverflow ? "true" : "false") << ",";
+  os << "\"waveformLumaMethod\":" << s.waveformLumaMethod << ",";
+  os << "\"histogramMode\":" << s.histogramMode << ",";
+  os << "\"histogramShowOverflow\":" << (s.histogramShowOverflow ? "true" : "false") << ",";
+  os << "\"histogramHighlightOverflow\":" << (s.histogramHighlightOverflow ? "true" : "false") << ",";
+  os << "\"scopeRangeMode\":" << s.scopeRangeMode;
+  os << "}";
+  return os.str();
+}
+
+struct ViewerSharedPresetRecord {
+  std::string id;
+  std::string name;
+  std::string createdAtUtc;
+  std::string updatedAtUtc;
+  std::string valuesJson;
+};
+
+struct ViewerSharedPresetStore {
+  std::string defaultUpdatedAtUtc;
+  std::string defaultValuesJson;
+  std::vector<ViewerSharedPresetRecord> userPresets;
+};
+
+bool loadViewerSharedPresetStore(ViewerSharedPresetStore* out) {
+  if (!out) return false;
+  ViewerSharedPresetStore store{};
+  store.defaultUpdatedAtUtc = viewerNowUtcIso8601();
+  store.defaultValuesJson = viewerSharedPresetValuesJsonFromState(ChromaspaceViewer::ViewerRuntimeState{});
+  std::string json;
+  if (!viewerReadTextFile(chromaspaceSharedPresetFilePath(), &json)) {
+    *out = store;
+    return false;
+  }
+  std::string defaultObj;
+  if (viewerExtractJsonObjectField(json, "defaultPreset", &defaultObj)) {
+    std::string valuesJson;
+    if (viewerExtractJsonObjectField(defaultObj, "values", &valuesJson)) {
+      store.defaultValuesJson = valuesJson;
+    }
+    std::string updatedAt;
+    if (viewerExtractJsonStringField(defaultObj, "updatedAtUtc", &updatedAt) && !updatedAt.empty()) {
+      store.defaultUpdatedAtUtc = updatedAt;
+    }
+  }
+  std::string arrayJson;
+  if (viewerExtractJsonArrayField(json, "userPresets", &arrayJson)) {
+    for (const auto& objectJson : viewerExtractJsonObjectsFromArray(arrayJson)) {
+      ViewerSharedPresetRecord record{};
+      if (!viewerExtractJsonStringField(objectJson, "name", &record.name)) continue;
+      record.name = sanitizeViewerPresetName(record.name, "Preset");
+      if (viewerPresetNameReserved(record.name)) continue;
+      if (!viewerExtractJsonObjectField(objectJson, "values", &record.valuesJson)) continue;
+      (void)viewerExtractJsonStringField(objectJson, "id", &record.id);
+      (void)viewerExtractJsonStringField(objectJson, "createdAtUtc", &record.createdAtUtc);
+      (void)viewerExtractJsonStringField(objectJson, "updatedAtUtc", &record.updatedAtUtc);
+      if (record.id.empty()) record.id = viewerMakePresetId();
+      if (record.createdAtUtc.empty()) record.createdAtUtc = viewerNowUtcIso8601();
+      if (record.updatedAtUtc.empty()) record.updatedAtUtc = record.createdAtUtc;
+      const bool duplicate =
+          std::any_of(store.userPresets.begin(), store.userPresets.end(), [&](const ViewerSharedPresetRecord& existing) {
+            return viewerNamesEqualNoCase(existing.name, record.name);
+          });
+      if (!duplicate) store.userPresets.push_back(record);
+    }
+  }
+  *out = store;
+  return true;
+}
+
+bool saveViewerSharedPresetStore(const ViewerSharedPresetStore& store) {
+  const std::string now = viewerNowUtcIso8601();
+  std::ostringstream os;
+  os << "{\n";
+  os << "  \"schemaVersion\":1,\n";
+  os << "  \"updatedAtUtc\":\"" << heartbeatJsonEscape(now) << "\",\n";
+  os << "  \"defaultPreset\":{\n";
+  os << "    \"id\":\"default\",\n";
+  os << "    \"name\":\"Default\",\n";
+  os << "    \"updatedAtUtc\":\"" << heartbeatJsonEscape(store.defaultUpdatedAtUtc.empty() ? now : store.defaultUpdatedAtUtc) << "\",\n";
+  os << "    \"values\":" << store.defaultValuesJson << "\n";
+  os << "  },\n";
+  os << "  \"userPresets\":[\n";
+  for (size_t i = 0; i < store.userPresets.size(); ++i) {
+    const auto& preset = store.userPresets[i];
+    os << "    {\n";
+    os << "      \"id\":\"" << heartbeatJsonEscape(preset.id) << "\",\n";
+    os << "      \"name\":\"" << heartbeatJsonEscape(preset.name) << "\",\n";
+    os << "      \"createdAtUtc\":\"" << heartbeatJsonEscape(preset.createdAtUtc) << "\",\n";
+    os << "      \"updatedAtUtc\":\"" << heartbeatJsonEscape(preset.updatedAtUtc) << "\",\n";
+    os << "      \"values\":" << preset.valuesJson << "\n";
+    os << "    }" << (i + 1 < store.userPresets.size() ? "," : "") << "\n";
+  }
+  os << "  ]\n";
+  os << "}\n";
+  return writeViewerMailboxAtomic(chromaspaceSharedPresetFilePath(), os.str());
+}
+
+bool viewerSharedPresetExists(const std::string& name) {
+  if (name.empty()) return false;
+  ViewerSharedPresetStore store{};
+  (void)loadViewerSharedPresetStore(&store);
+  if (viewerNamesEqualNoCase(name, "Default")) return true;
+  return std::any_of(store.userPresets.begin(), store.userPresets.end(), [&](const ViewerSharedPresetRecord& preset) {
+    return viewerNamesEqualNoCase(preset.name, name);
+  });
+}
+
+bool loadViewerSharedPreset(const std::string& name, ChromaspaceViewer::ViewerRuntimeState* out) {
+  if (!out || name.empty()) return false;
+  ViewerSharedPresetStore store{};
+  (void)loadViewerSharedPresetStore(&store);
+  if (viewerNamesEqualNoCase(name, "Default")) {
+    *out = viewerStateFromSharedPresetValuesJson(store.defaultValuesJson);
+    return true;
+  }
+  for (const auto& preset : store.userPresets) {
+    if (viewerNamesEqualNoCase(preset.name, name)) {
+      *out = viewerStateFromSharedPresetValuesJson(preset.valuesJson);
+      return true;
+    }
+  }
+  return false;
+}
+
+bool saveViewerDefaultPreset(const ChromaspaceViewer::ViewerRuntimeState& state) {
+  ViewerSharedPresetStore store{};
+  (void)loadViewerSharedPresetStore(&store);
+  store.defaultValuesJson = viewerSharedPresetValuesJsonFromState(state, &store.defaultValuesJson);
+  store.defaultUpdatedAtUtc = viewerNowUtcIso8601();
+  return saveViewerSharedPresetStore(store);
+}
+
+bool loadViewerDefaultPreset(ChromaspaceViewer::ViewerRuntimeState* out) {
+  return loadViewerSharedPreset("Default", out);
+}
+
+bool saveViewerSharedUserPreset(const ChromaspaceViewer::ViewerRuntimeState& state,
+                                const std::string& requestedName,
+                                std::string* savedName) {
+  std::string name = sanitizeViewerPresetName(requestedName, "Preset");
+  if (viewerPresetNameReserved(name)) name = "Preset";
+  ViewerSharedPresetStore store{};
+  (void)loadViewerSharedPresetStore(&store);
+  const std::string baseName = name;
+  int suffix = 2;
+  auto nameExists = [&](const std::string& candidate) {
+    return std::any_of(store.userPresets.begin(), store.userPresets.end(), [&](const ViewerSharedPresetRecord& preset) {
+      return viewerNamesEqualNoCase(preset.name, candidate);
+    });
+  };
+  while (nameExists(name)) {
+    name = baseName + " " + std::to_string(suffix++);
+  }
+  ViewerSharedPresetRecord record{};
+  record.id = viewerMakePresetId();
+  record.name = name;
+  record.createdAtUtc = viewerNowUtcIso8601();
+  record.updatedAtUtc = record.createdAtUtc;
+  record.valuesJson = viewerSharedPresetValuesJsonFromState(state);
+  store.userPresets.push_back(record);
+  if (!saveViewerSharedPresetStore(store)) return false;
+  if (savedName) *savedName = name;
+  return true;
+}
+
+bool updateViewerSharedUserPreset(const std::string& name,
+                                  const ChromaspaceViewer::ViewerRuntimeState& state) {
+  if (!viewerPresetNameEditableTarget(name)) return false;
+  ViewerSharedPresetStore store{};
+  (void)loadViewerSharedPresetStore(&store);
+  for (auto& preset : store.userPresets) {
+    if (viewerNamesEqualNoCase(preset.name, name)) {
+      preset.valuesJson = viewerSharedPresetValuesJsonFromState(state, &preset.valuesJson);
+      preset.updatedAtUtc = viewerNowUtcIso8601();
+      return saveViewerSharedPresetStore(store);
+    }
+  }
+  return false;
+}
+
+bool deleteViewerSharedUserPreset(const std::string& name) {
+  if (!viewerPresetNameEditableTarget(name)) return false;
+  ViewerSharedPresetStore store{};
+  (void)loadViewerSharedPresetStore(&store);
+  const auto oldSize = store.userPresets.size();
+  store.userPresets.erase(std::remove_if(store.userPresets.begin(),
+                                         store.userPresets.end(),
+                                         [&](const ViewerSharedPresetRecord& preset) {
+                                           return viewerNamesEqualNoCase(preset.name, name);
+                                         }),
+                          store.userPresets.end());
+  return store.userPresets.size() != oldSize && saveViewerSharedPresetStore(store);
+}
+
+void viewerAppendUniquePresetName(std::vector<std::string>* names, const std::string& name) {
+  if (!names || name.empty()) return;
+  const bool exists = std::any_of(names->begin(), names->end(), [&](const std::string& existing) {
+    return viewerNamesEqualNoCase(existing, name);
+  });
+  if (!exists) names->push_back(name);
+}
+
+std::vector<std::string> viewerUserPresetNames() {
+  std::vector<std::string> names;
+  ViewerSharedPresetStore sharedStore{};
+  (void)loadViewerSharedPresetStore(&sharedStore);
+  viewerAppendUniquePresetName(&names, "Default");
+  for (const auto& preset : sharedStore.userPresets) {
+    viewerAppendUniquePresetName(&names, preset.name);
+  }
+  std::error_code ec;
+  const auto dir = viewerUserPresetDirPath();
+  if (std::filesystem::is_directory(dir, ec)) {
+    for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
+      if (ec) break;
+      if (!entry.is_regular_file(ec) || ec) continue;
+      if (entry.path().extension() != ".json") continue;
+      viewerAppendUniquePresetName(&names, viewerPresetNameFromStem(entry.path().stem().string()));
+    }
+  }
+  if (names.size() > 1) {
+    std::sort(names.begin() + 1, names.end(), [](const std::string& a, const std::string& b) {
+      return std::lexicographical_compare(a.begin(), a.end(), b.begin(), b.end(),
+                                          [](char ca, char cb) {
+                                            return std::tolower(static_cast<unsigned char>(ca)) <
+                                                   std::tolower(static_cast<unsigned char>(cb));
+                                          });
+    });
+  }
+  const auto legacyPath = viewerLegacyUserPresetFilePath();
+  if (std::filesystem::is_regular_file(legacyPath, ec)) {
+    viewerAppendUniquePresetName(&names, "User Preset");
+  }
+  return names;
+}
+
+std::vector<std::string> viewerOnlyPresetNames() {
+  std::vector<std::string> names;
+  std::error_code ec;
+  const auto dir = viewerUserPresetDirPath();
+  if (std::filesystem::is_directory(dir, ec)) {
+    for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
+      if (ec) break;
+      if (!entry.is_regular_file(ec) || ec) continue;
+      if (entry.path().extension() != ".json") continue;
+      viewerAppendUniquePresetName(&names, viewerPresetNameFromStem(entry.path().stem().string()));
+    }
+  }
+  std::sort(names.begin(), names.end(), [](const std::string& a, const std::string& b) {
+    return std::lexicographical_compare(a.begin(), a.end(), b.begin(), b.end(),
+                                        [](char ca, char cb) {
+                                          return std::tolower(static_cast<unsigned char>(ca)) <
+                                                 std::tolower(static_cast<unsigned char>(cb));
+                                        });
+  });
+  return names;
+}
+
+bool viewerUserPresetExists() {
+  return !viewerUserPresetNames().empty();
+}
+
+bool viewerUserPresetExists(const std::string& name) {
+  if (name.empty()) return false;
+  if (viewerSharedPresetExists(name)) return true;
+  std::error_code ec;
+  if (name == "User Preset" && std::filesystem::is_regular_file(viewerLegacyUserPresetFilePath(), ec)) return true;
+  return std::filesystem::is_regular_file(viewerUserPresetFilePath(name), ec);
+}
+
+std::string nextViewerPresetName() {
+  const std::vector<std::string> names = viewerUserPresetNames();
+  for (int i = 1; i < 10000; ++i) {
+    const std::string candidate = "Preset " + std::to_string(i);
+    if (std::find(names.begin(), names.end(), candidate) == names.end()) return candidate;
+  }
+  return "Preset";
+}
+
+bool writeViewerPresetToPath(const std::filesystem::path& path,
+                             const ChromaspaceViewer::ViewerRuntimeState& state) {
+  std::error_code ec;
+  std::filesystem::create_directories(path.parent_path(), ec);
+  std::ofstream os(path, std::ios::binary | std::ios::trunc);
+  if (!os.is_open()) return false;
+  os << viewerStateJson(state);
+  return true;
+}
+
+bool saveViewerUserPreset(const ChromaspaceViewer::ViewerRuntimeState& state,
+                          const std::string& requestedName,
+                          std::string* savedName) {
+  const std::string name = sanitizeViewerPresetName(requestedName);
+  if (!name.empty()) {
+    return saveViewerSharedUserPreset(state, name, savedName);
+  }
+  return saveViewerSharedUserPreset(state, nextViewerPresetName(), savedName);
+}
+
+bool updateViewerUserPreset(const std::string& name, const ChromaspaceViewer::ViewerRuntimeState& state) {
+  if (!viewerPresetNameEditableTarget(name)) return false;
+  if (updateViewerSharedUserPreset(name, state)) return true;
+  if (name == "User Preset" && viewerUserPresetExists(name)) {
+    return writeViewerPresetToPath(viewerLegacyUserPresetFilePath(), state);
+  }
+  return writeViewerPresetToPath(viewerUserPresetFilePath(name), state);
+}
+
+bool loadViewerUserPreset(const std::string& name, ChromaspaceViewer::ViewerRuntimeState* out) {
+  if (!out || name.empty()) return false;
+  if (loadViewerSharedPreset(name, out)) return true;
+  const auto path = (name == "User Preset") ? viewerLegacyUserPresetFilePath() : viewerUserPresetFilePath(name);
+  std::ifstream is(path, std::ios::binary);
+  if (!is.is_open()) return false;
+  std::ostringstream buffer;
+  buffer << is.rdbuf();
+  return parseViewerStateJson(buffer.str(), out);
+}
+
+bool deleteViewerUserPreset(const std::string& name) {
+  if (!viewerPresetNameEditableTarget(name)) return false;
+  if (deleteViewerSharedUserPreset(name)) return true;
+  std::error_code ec;
+  const auto path = (name == "User Preset") ? viewerLegacyUserPresetFilePath() : viewerUserPresetFilePath(name);
+  const bool removed = std::filesystem::remove(path, ec);
+  return removed && !ec;
+}
 
 int plotModelIndexForMode(const std::string& plotMode) {
   for (int i = 0; i < kViewerPlotModelChoiceCount; ++i) {
@@ -8526,27 +13641,274 @@ const char* plotModeForModelIndex(int plotModel) {
   return kViewerPlotModelChoices[clamped].plotMode;
 }
 
+struct WaveformSamplingGrid {
+  int columns = 0;
+  int rowsPerColumn = 0;
+};
+
+WaveformSamplingGrid waveformSamplingGridForWindow(const AppState& app,
+                                                   const PlotWindowState* window) {
+  constexpr int kColumnBuckets[] = {384, 512, 768, 1024, 1280, 1536};
+  constexpr int kMinRows = 48;
+  constexpr int kMaxRows = 192;
+  constexpr int kMaxSamples = 221184;
+  const int workspaceWidth = std::max(1, app.workspaceLayoutWindowWidth);
+  const int workspaceHeight = std::max(1, app.workspaceLayoutWindowHeight);
+  const float widthNorm = window ? window->rect.w : 1.0f;
+  const float heightNorm = window ? window->rect.h : 1.0f;
+  const int contentWidth =
+      std::max(1, static_cast<int>(std::lround(widthNorm * workspaceWidth)));
+  const int contentHeight =
+      std::max(1, static_cast<int>(std::lround(heightNorm * workspaceHeight)) - 22);
+
+  int columns = kColumnBuckets[std::size(kColumnBuckets) - 1];
+  for (const int bucket : kColumnBuckets) {
+    if (contentWidth <= bucket) {
+      columns = bucket;
+      break;
+    }
+  }
+  int rows = std::clamp((contentHeight + 5) / 6, kMinRows, kMaxRows);
+  rows = std::min(rows, kMaxSamples / columns);
+  rows = std::max(kMinRows, (rows / 8) * 8);
+  return {columns, rows};
+}
+
+ChromaspaceViewer::ViewerRuntimeState aggregateHostStateForWorkspace(const AppState& app) {
+  auto aggregate = viewerStateWithModelCapabilities(app.viewerState);
+  if (app.plotWindows.size() <= 1u) {
+    // In a single-window workspace the focused window is the whole viewer, so
+    // identity isolation must remain part of the host/applied state. Clearing it
+    // here makes the next OFX acknowledgement look authoritative and flips the
+    // menu checkbox back off after the user enables it.
+    // Analytical scopes consume the unbiased primary prefix and therefore do
+    // not need to mutate the host sampling contract merely by being visible.
+    // Respect the user's chosen quality so opening a scope cannot create a
+    // permanent low/high request mismatch and refresh loop.
+    aggregate.waveformHighDetailRequested = false;
+    aggregate.waveformSampleColumns = 0;
+    aggregate.waveformSamplesPerColumn = 0;
+    if (aggregate.plotModel == ChromaspaceViewer::kPlotModelWaveform) {
+      aggregate.quality = 0;
+      if (aggregate.waveformHighDetail) {
+        const PlotWindowState* onlyWindow =
+            app.plotWindows.empty() ? nullptr : &app.plotWindows.front();
+        const auto grid = waveformSamplingGridForWindow(app, onlyWindow);
+        aggregate.waveformHighDetailRequested = true;
+        aggregate.waveformSampleColumns = grid.columns;
+        aggregate.waveformSamplesPerColumn = grid.rowsPerColumn;
+      }
+    }
+    aggregate.sampleSettingsKey = ChromaspaceViewer::sampleSettingsKey(aggregate, false);
+    return aggregate;
+  }
+
+  // The host receives one inclusive source request. Display interpretation,
+  // isolation, and model-specific filtering remain owned by each plot window.
+  aggregate.plotModel = 0;
+  aggregate.isolateIdentityData = false;
+  aggregate.quality = 0;
+  aggregate.scale = 0;
+  aggregate.occupancyGuidedFill = false;
+  aggregate.readGrayRamp = false;
+  aggregate.readIdentityPlot = false;
+  aggregate.volumeSliceLassoRegion = false;
+  aggregate.liveUpdate = false;
+  aggregate.requiresHostSamples = false;
+  aggregate.refreshPolicy = "none";
+  aggregate.hostRefreshRequestedRevision = 0;
+  aggregate.waveformHighDetailRequested = false;
+  aggregate.waveformSampleColumns = 0;
+  aggregate.waveformSamplesPerColumn = 0;
+  bool hasOrdinaryQualityConsumer = false;
+  for (const auto& window : app.plotWindows) {
+    const auto state = viewerStateWithModelCapabilities(
+        window.windowId == app.focusedPlotWindowId ? app.viewerState : window.viewState);
+    aggregate.stateRevision = std::max(aggregate.stateRevision, state.stateRevision);
+    if (state.plotModel == ChromaspaceViewer::kPlotModelWaveform) {
+      if (state.waveformHighDetail) {
+        const auto grid = waveformSamplingGridForWindow(app, &window);
+        aggregate.waveformHighDetailRequested = true;
+        aggregate.waveformSampleColumns =
+            std::max(aggregate.waveformSampleColumns, grid.columns);
+        aggregate.waveformSamplesPerColumn =
+            std::max(aggregate.waveformSamplesPerColumn, grid.rowsPerColumn);
+      }
+    } else {
+      hasOrdinaryQualityConsumer = true;
+      aggregate.quality = std::max(aggregate.quality, state.quality);
+    }
+    aggregate.scale = std::max(aggregate.scale, state.scale);
+    aggregate.occupancyGuidedFill = aggregate.occupancyGuidedFill || state.occupancyGuidedFill;
+    aggregate.readGrayRamp = aggregate.readGrayRamp || state.readGrayRamp;
+    aggregate.readIdentityPlot = aggregate.readIdentityPlot || state.readIdentityPlot;
+    aggregate.volumeSliceLassoRegion =
+        aggregate.volumeSliceLassoRegion || state.volumeSliceLassoRegion;
+    aggregate.liveUpdate = aggregate.liveUpdate || state.liveUpdate;
+    aggregate.requiresHostSamples = aggregate.requiresHostSamples || state.requiresHostSamples;
+    if (state.refreshPolicy == "resample") {
+      aggregate.refreshPolicy = "resample";
+    } else if (aggregate.refreshPolicy == "none" && state.refreshPolicy == "reinterpret") {
+      aggregate.refreshPolicy = "reinterpret";
+    }
+  }
+  if (!hasOrdinaryQualityConsumer) aggregate.quality = 0;
+  if (aggregate.waveformHighDetailRequested) {
+    constexpr int kMaxWaveformSamples = 221184;
+    aggregate.waveformSamplesPerColumn =
+        std::min(aggregate.waveformSamplesPerColumn,
+                 kMaxWaveformSamples / std::max(1, aggregate.waveformSampleColumns));
+    aggregate.waveformSamplesPerColumn =
+        std::max(48, (aggregate.waveformSamplesPerColumn / 8) * 8);
+  }
+
+  aggregate = ChromaspaceViewer::clampedViewerRuntimeState(aggregate);
+  aggregate.isolateIdentityData = false;
+  aggregate.sampleSettingsKey = ChromaspaceViewer::sampleSettingsKey(aggregate, false);
+  return aggregate;
+}
+
 void queueViewerPlotModelCommand(const AppState& app,
                                  int plotModel,
                                  bool hasCircularHsl,
                                  bool circularHsl,
                                  bool hasCircularHsv,
                                  bool circularHsv) {
-  PendingViewerCommand command;
-  command.valid = true;
-  command.seq = gViewerCommandSeq.fetch_add(1, std::memory_order_relaxed);
-  command.senderId = app.senderId;
-  command.plotModel = std::clamp(plotModel, 0, kViewerPlotModelChoiceCount - 1);
-  command.hasCircularHsl = hasCircularHsl;
-  command.circularHsl = circularHsl;
-  command.hasCircularHsv = hasCircularHsv;
-  command.circularHsv = circularHsv;
-  {
-    std::lock_guard<std::mutex> lock(gViewerCommandMutex);
-    gPendingViewerCommand = command;
+  auto state = app.viewerState;
+  state.stateRevision = std::max<uint64_t>(state.stateRevision + 1, 1);
+  state.plotModel = std::clamp(plotModel, 0, kViewerPlotModelChoiceCount - 1);
+  if (hasCircularHsl) state.circularHsl = circularHsl;
+  if (hasCircularHsv) state.circularHsv = circularHsv;
+  state = viewerStateForPlotModel(state, state.plotModel);
+  state.sourceSessionId = app.senderId;
+  state.refreshPolicy = "reinterpret";
+  state.sampleSettingsKey = ChromaspaceViewer::sampleSettingsKey(state, false);
+  state.requiresHostSamples = false;
+  state.hostRefreshRequestedRevision = 0;
+  saveViewerStateToDisk(state);
+  if (!app.senderId.empty()) {
+    (void)writeViewerMailboxAtomic(viewerDesiredStatePath(app.senderId), viewerStateJson(state));
   }
-  logViewerEvent(std::string("Queued viewer plot-model command: plotModel=") +
-                 std::to_string(command.plotModel));
+  logViewerEvent(std::string("Wrote viewer plot-model desired state: plotModel=") +
+                 std::to_string(state.plotModel));
+}
+
+void queueViewerStateCommand(AppState& app, const char* refreshPolicy) {
+  auto state = aggregateHostStateForWorkspace(app);
+  app.workspaceCommandRevision =
+      std::max<uint64_t>(app.workspaceCommandRevision + 1u, state.stateRevision + 1u);
+  state.stateRevision = app.workspaceCommandRevision;
+  // The emitted mailbox revision is the authoritative pending viewer state.
+  // Keep the local focused state at least as new so the next params packet from
+  // Resolve cannot roll a just-clicked viewer control, especially image lasso,
+  // back to the older OFX value while the host callback has not consumed the
+  // mailbox yet.
+  app.viewerState.stateRevision = std::max(app.viewerState.stateRevision, state.stateRevision);
+  if (auto* window = focusedPlotWindow(&app)) {
+    window->viewState.stateRevision =
+        std::max(window->viewState.stateRevision, app.viewerState.stateRevision);
+  }
+  state.sourceSessionId = app.senderId;
+  state.refreshPolicy = ChromaspaceViewer::normalizedRefreshPolicy(refreshPolicy ? refreshPolicy : "");
+  state.sampleSettingsKey = ChromaspaceViewer::sampleSettingsKey(state, false);
+  state.requiresHostSamples = state.refreshPolicy == "resample";
+  const bool needsHostRefresh = state.requiresHostSamples;
+  state.hostRefreshRequestedRevision = needsHostRefresh ? state.stateRevision : 0;
+  saveViewerStateToDisk(app.viewerState);
+  if (app.senderId.empty()) {
+    logViewerEvent(std::string("Saved viewer state locally; no OFX session mailbox is active. policy=") +
+                   state.refreshPolicy + " rev=" + std::to_string(state.stateRevision));
+    return;
+  }
+  const std::filesystem::path desiredPath = viewerDesiredStatePath(app.senderId);
+  if (writeViewerMailboxAtomic(desiredPath,
+                               viewerDesiredStateJson(state,
+                                                      app.focusPlotNodeRequestedRevision,
+                                                      app.clearImageLassoRequestedRevision))) {
+    logViewerEvent(std::string("Wrote viewer desired-state mailbox: policy=") + state.refreshPolicy +
+                   " rev=" + std::to_string(state.stateRevision) +
+                   (app.focusPlotNodeRequestedRevision > 0
+                        ? std::string(" focusPlotNodeRev=") + std::to_string(app.focusPlotNodeRequestedRevision)
+                        : std::string()) +
+                   (app.clearImageLassoRequestedRevision > 0
+                        ? std::string(" clearImageLassoRev=") + std::to_string(app.clearImageLassoRequestedRevision)
+                        : std::string()) +
+                   " path=" + desiredPath.string());
+#if defined(_WIN32)
+    if (needsHostRefresh || app.focusPlotNodeRequestedRevision > 0 ||
+        app.clearImageLassoRequestedRevision > 0) {
+      ensureResolveBridgeRunning();
+    }
+#endif
+  } else {
+    logViewerEvent(std::string("Failed to write viewer desired-state mailbox: ") + desiredPath.string());
+  }
+}
+
+void requestResolveDrawInstanceScan(AppState* app, const char* reason, bool force = false) {
+  if (!app) return;
+  const double now = glfwGetTime();
+  constexpr double kIdentityHoverScanCooldownSeconds = 1.5;
+  if (!force && now - app->lastResolveDrawScanRequest < kIdentityHoverScanCooldownSeconds) return;
+  app->lastResolveDrawScanRequest = now;
+  app->resolveLivePulseUntil = std::max(app->resolveLivePulseUntil, now + 2.0);
+  app->resolveDrawScanRequestedRevision =
+      std::max<uint64_t>(app->resolveDrawScanRequestedRevision + 1,
+                         std::max<uint64_t>(app->resolveDrawScanCompletedRevision + 1,
+                                            std::max<uint64_t>(app->viewerState.stateRevision, 1)));
+  if (!app->senderId.empty()) {
+    std::ostringstream request;
+    request << "{\"type\":\"chromaspace_draw_instance_scan_request\",\"revision\":"
+            << app->resolveDrawScanRequestedRevision << "}\n";
+    (void)writeViewerMailboxAtomic(viewerDrawInstanceScanRequestPath(app->senderId), request.str());
+  }
+#if defined(_WIN32)
+  ensureResolveBridgeRunning();
+#endif
+  logViewerEvent(std::string("Requested Resolve draw-instance scan: reason=") +
+                 (reason ? reason : "identity-ui") +
+                 " revision=" + std::to_string(app->resolveDrawScanRequestedRevision));
+}
+
+void updateResolveLiveRefreshPulse(AppState* app) {
+  if (!app) return;
+  const double now = glfwGetTime();
+  constexpr double kLivePulseBurstSeconds = 2.0;
+  const auto aggregate = aggregateHostStateForWorkspace(*app);
+  const uint64_t effectiveRevision =
+      std::max<uint64_t>(aggregate.stateRevision, app->workspaceCommandRevision);
+  if (effectiveRevision != app->lastResolveLivePulseRevisionSeen) {
+    app->lastResolveLivePulseRevisionSeen = effectiveRevision;
+    app->resolveLivePulseUntil = now + kLivePulseBurstSeconds;
+  }
+  if (!aggregate.liveUpdate) {
+    if (app->lastResolveLivePulseWrite >= 0.0) {
+      std::error_code ec;
+      std::filesystem::remove(viewerLiveRefreshPulsePath(), ec);
+      app->lastResolveLivePulseWrite = -10.0;
+      app->resolveLivePulseUntil = -10.0;
+    }
+    return;
+  }
+  if (now > app->resolveLivePulseUntil) {
+    if (app->lastResolveLivePulseWrite >= 0.0) {
+      std::error_code ec;
+      std::filesystem::remove(viewerLiveRefreshPulsePath(), ec);
+      app->lastResolveLivePulseWrite = -10.0;
+    }
+    return;
+  }
+  constexpr double kLivePulseWriteIntervalSeconds = 0.40;
+  if (now - app->lastResolveLivePulseWrite < kLivePulseWriteIntervalSeconds) return;
+  app->lastResolveLivePulseWrite = now;
+  std::ostringstream pulse;
+  pulse << "{\"type\":\"chromaspace_live_refresh_pulse\",\"active\":1,\"stateRevision\":"
+        << effectiveRevision
+        << ",\"sourceSessionId\":\"" << heartbeatJsonEscape(app->senderId) << "\"}\n";
+  (void)writeViewerMailboxAtomic(viewerLiveRefreshPulsePath(), pulse.str());
+#if defined(_WIN32)
+  ensureResolveBridgeRunning();
+#endif
 }
 
 void applyViewerPlotSelectionToPayload(const AppState& app, ResolvedPayload* payload) {
@@ -8590,6 +13952,210 @@ void applyViewerIdentityReadSelectionToPayload(const AppState& app, ResolvedPayl
   (void)payload;
 }
 
+void applyViewerStateToApp(AppState* app, const ChromaspaceViewer::ViewerRuntimeState& state) {
+  if (!app) return;
+  app->viewerState = viewerStateWithModelCapabilities(state);
+  app->plotMode = ChromaspaceViewer::plotModeForModel(app->viewerState.plotModel);
+  app->circularHsl = app->viewerState.circularHsl;
+  app->circularHsv = app->viewerState.circularHsv;
+  app->keepOnTop = app->viewerState.keepOnTop;
+  app->readGrayRamp = app->viewerState.readGrayRamp;
+  app->readIdentityPlot = app->viewerState.readIdentityPlot;
+  app->isolateIdentityData = app->viewerState.isolateIdentityData;
+  app->identityReadResolution = app->viewerState.identityReadResolution;
+  if (auto* window = focusedPlotWindow(app)) {
+    window->viewState = app->viewerState;
+    window->selected = true;
+  }
+}
+
+void applyViewerStateToResolvedViewFields(const ChromaspaceViewer::ViewerRuntimeState& state,
+                                          ResolvedPayload* payload) {
+  if (!payload) return;
+  const std::string previousCloudSettingsKey = payload->cloudSettingsKey;
+  const std::string previousLassoData = payload->lassoData;
+  const bool previousLassoRegionEmpty = payload->lassoRegionEmpty;
+  const auto s = viewerStateWithModelCapabilities(state);
+  const bool imageLassoActive = s.volumeSliceLassoRegion;
+  payload->stateRevision = s.stateRevision;
+  payload->viewerState = s;
+  payload->drawOnImageMode = false;
+  payload->plotMode = ChromaspaceViewer::plotModeForModel(s.plotModel);
+  payload->circularHsl = s.circularHsl;
+  payload->circularHsv = s.circularHsv;
+  payload->normConeNormalized = s.normConeNormalized;
+  payload->plotDisplayLinear = s.plotDisplayLinear;
+  payload->plotDisplayLinearTransfer = s.plotDisplayLinearTransfer;
+  payload->alwaysOnTop = s.keepOnTop;
+  payload->resetViewOnPlotSwitch = s.resetViewOnPlotSwitch;
+  payload->quality = ChromaspaceViewer::qualityLabel(s.quality);
+  payload->sampling = ChromaspaceViewer::samplingLabel(s.sampling);
+  payload->occupancyFill = s.occupancyGuidedFill;
+  payload->scale = ChromaspaceViewer::scaleLabel(s.scale);
+  payload->resolution = ChromaspaceViewer::qualityResolution(s.quality);
+  std::string viewerSampleKey = ChromaspaceViewer::sampleSettingsKey(s, false);
+  payload->plotStyle = ChromaspaceViewer::plotStyleLabel(s.plotStyle);
+  payload->pointShape = ChromaspaceViewer::pointShapeLabel(s.pointShape);
+  payload->pointSize = static_cast<float>(s.pointSize);
+  payload->colorSaturation = static_cast<float>(s.colorSaturation);
+  payload->showOverflow = s.showOverflow;
+  payload->highlightOverflow = s.showOverflow && s.highlightOverflow;
+  payload->overflowHighlightR = static_cast<float>(s.overflowHighlightR);
+  payload->overflowHighlightG = static_cast<float>(s.overflowHighlightG);
+  payload->overflowHighlightB = static_cast<float>(s.overflowHighlightB);
+  payload->backgroundColorR = static_cast<float>(s.backgroundR);
+  payload->backgroundColorG = static_cast<float>(s.backgroundG);
+  payload->backgroundColorB = static_cast<float>(s.backgroundB);
+  payload->cubeSliceRed = s.volumeSliceRed;
+  payload->cubeSliceYellow = s.volumeSliceYellow;
+  payload->cubeSliceGreen = s.volumeSliceGreen;
+  payload->cubeSliceCyan = s.volumeSliceCyan;
+  payload->cubeSliceBlue = s.volumeSliceBlue;
+  payload->cubeSliceMagenta = s.volumeSliceMagenta;
+  payload->neutralRadius = static_cast<float>(s.neutralRadius);
+  payload->cubeSlicingEnabled =
+      ChromaspaceViewer::hueSectorSlicingEnabled(s, false);
+  payload->neutralRadiusEnabled =
+      ChromaspaceViewer::neutralRadiusEnabled(s, false);
+  payload->volumeSlicingEnabled =
+      payload->cubeSlicingEnabled || payload->neutralRadiusEnabled || imageLassoActive;
+  if (imageLassoActive) {
+    payload->volumeSlicingMode = "lasso";
+    payload->lassoData = previousLassoData;
+    payload->lassoRegionEmpty = previousLassoData.empty() ? true : previousLassoRegionEmpty;
+    const std::string lassoBaseKey =
+        cloudSettingsKeyWithoutImageLasso(previousCloudSettingsKey.empty()
+                                             ? viewerSampleKey
+                                             : previousCloudSettingsKey);
+    payload->cloudSettingsKey =
+        lassoBaseKey + imageLassoSettingsSuffixForData(payload->lassoData);
+  } else {
+    payload->cloudSettingsKey = viewerSampleKey;
+    payload->volumeSlicingMode = payload->cubeSlicingEnabled ? "hue" : "neutral";
+    payload->lassoData.clear();
+    payload->lassoRegionEmpty = true;
+  }
+  payload->identityOverlayEnabled = s.fillVolume;
+  payload->identityOverlayRamp = s.fillGrayRamp;
+  payload->identityOverlayRequestedSize = s.fillResolution;
+  payload->identityOverlaySize = s.fillResolution;
+  payload->identityOverlayAuto = false;
+  payload->readGrayRamp = !imageLassoActive && s.readGrayRamp;
+  payload->readIdentityPlot = !imageLassoActive && s.readIdentityPlot;
+  payload->isolateIdentityData = !imageLassoActive && s.isolateIdentityData;
+  payload->identityReadResolution = s.identityReadResolution;
+  payload->chromaticityInputPrimaries = s.chromaticityInputPrimaries;
+  payload->chromaticityInputTransfer = s.chromaticityInputTransfer;
+  payload->chromaticityReferenceBasis = s.chromaticityReferenceBasis;
+  payload->chromaticityOverlayPrimaries = s.chromaticityOverlayPrimaries;
+  payload->chromaticityPlanckianLocus = s.chromaticityPlanckianLocus;
+  payload->chromaticitySpectralLocus3D = s.chromaticitySpectralLocus3D;
+  payload->glossNeighborhood = s.glossNeighborhood;
+  payload->glossLiftScale = static_cast<float>(s.glossLiftScale);
+  payload->glossSpatialInset = s.glossSpatialInset;
+  payload->glossBodyOpacity = static_cast<float>(s.glossBodyOpacity);
+  payload->glossHighlightOpacity = static_cast<float>(s.glossHighlightOpacity);
+  payload->glossPointCrispness = static_cast<float>(s.glossPointCrispness);
+  payload->glossHideText = s.glossHideText;
+}
+
+bool payloadCarriesGeneratedIdentityStrip(const ResolvedPayload& payload) {
+  return payload.generatedIdentityStripBandCount > 0 ||
+         payload.generatedIdentityDrawCube ||
+         payload.generatedIdentityDrawRamp ||
+         (payload.drawOnImageMode && (payload.identityOverlayEnabled || payload.identityOverlayRamp));
+}
+
+void rememberGeneratedIdentityResolution(AppState* app, const ResolvedPayload& payload) {
+  if (!app) return;
+  const bool explicitContract =
+      payload.generatedIdentityStripRevision > 0 ||
+      payload.generatedIdentityStripBandCount > 0 ||
+      payload.generatedIdentityDrawCube ||
+      payload.generatedIdentityDrawRamp;
+  if (explicitContract &&
+      payload.generatedIdentityStripRevision >= app->generatedIdentityStripRevision) {
+    app->generatedIdentityContractKnown = true;
+    const bool hasGeneratedBands =
+        payload.generatedIdentityStripBandCount > 0 &&
+        (payload.generatedIdentityDrawCube || payload.generatedIdentityDrawRamp);
+    if (!hasGeneratedBands) {
+      const bool changed =
+          app->generatedIdentityResolutionValid ||
+          app->generatedIdentityDrawCube ||
+          app->generatedIdentityDrawRamp ||
+          app->generatedIdentityStripRevision != payload.generatedIdentityStripRevision;
+      app->generatedIdentityResolutionValid = false;
+      app->generatedIdentityDrawCube = false;
+      app->generatedIdentityDrawRamp = false;
+      app->generatedIdentityStripRevision = payload.generatedIdentityStripRevision;
+      app->generatedIdentitySignalUpdatedAt = glfwGetTime();
+      app->generatedIdentityResolutionSender = payload.senderId;
+      if (changed) {
+        logViewerEvent(std::string("Cleared generated identity-strip signal from explicit zero-band contract: revision=") +
+                       std::to_string(app->generatedIdentityStripRevision) +
+                       (payload.senderId.empty() ? std::string() : std::string(" sender=") + payload.senderId));
+      }
+      return;
+    }
+  }
+  int resolution = payload.generatedIdentityResolution;
+  if (resolution <= 0 && payloadCarriesGeneratedIdentityStrip(payload)) {
+    resolution = payload.identityOverlayRequestedSize;
+  }
+  if (resolution <= 0) return;
+  resolution = ChromaspaceViewer::clampOverlaySize(resolution);
+  if (!app->generatedIdentityResolutionValid ||
+      app->generatedIdentityResolution != resolution ||
+      app->generatedIdentityDrawCube != payload.generatedIdentityDrawCube ||
+      app->generatedIdentityDrawRamp != payload.generatedIdentityDrawRamp ||
+      app->generatedIdentityStripRevision != payload.generatedIdentityStripRevision ||
+      app->generatedIdentityResolutionSender != payload.senderId) {
+    app->generatedIdentityResolutionValid = true;
+    app->generatedIdentityContractKnown = true;
+    app->generatedIdentityResolution = resolution;
+    app->generatedIdentityDrawCube = payload.generatedIdentityDrawCube;
+    app->generatedIdentityDrawRamp = payload.generatedIdentityDrawRamp;
+    app->generatedIdentityStripRevision = payload.generatedIdentityStripRevision;
+    app->generatedIdentitySignalUpdatedAt = glfwGetTime();
+    app->generatedIdentityResolutionSender = payload.senderId;
+    logViewerEvent(std::string("Remembered generated identity-strip resolution: ") +
+                   std::to_string(resolution) +
+                   " drawCube=" + (app->generatedIdentityDrawCube ? "1" : "0") +
+                   " drawRamp=" + (app->generatedIdentityDrawRamp ? "1" : "0") +
+                   " revision=" + std::to_string(app->generatedIdentityStripRevision) +
+                   (payload.senderId.empty() ? std::string() : std::string(" sender=") + payload.senderId));
+  }
+}
+
+bool autoMatchIdentityReadResolution(AppState* app, ResolvedPayload* payload) {
+  if (!app || !app->generatedIdentityResolutionValid) return false;
+  if (payload && payload->drawOnImageMode) return false;
+
+  auto state = viewerStateWithModelCapabilities(app->viewerState);
+  if (!state.readIdentityPlot && !state.readGrayRamp) return false;
+
+  const int target = ChromaspaceViewer::clampOverlaySize(app->generatedIdentityResolution);
+  if (state.identityReadResolution == target) return false;
+
+  state.identityReadResolution = target;
+  state.stateRevision = std::max<uint64_t>(state.stateRevision + 1, 1);
+  applyViewerStateToApp(app, state);
+  app->viewerStateLocalOverride = true;
+  if (payload) applyViewerStateToResolvedViewFields(app->viewerState, payload);
+  queueViewerStateCommand(*app, "resample");
+  logViewerEvent(std::string("Auto-matched identity read resolution to generated strip: ") +
+                 std::to_string(target));
+  return true;
+}
+
+void applyViewerLassoStateToResolvedPayload(const AppState& app, ResolvedPayload* payload) {
+  if (!payload || !app.viewerState.volumeSliceLassoRegion) return;
+  payload->volumeSlicingEnabled = true;
+  payload->volumeSlicingMode = "lasso";
+  payload->lassoRegionEmpty = payload->lassoData.empty();
+}
+
 struct PlotMenuRect {
   float x0 = 0.0f;
   float y0 = 0.0f;
@@ -8597,13 +14163,776 @@ struct PlotMenuRect {
   float y1 = 0.0f;
 };
 
+std::array<PlotMenuRect, 3> waveformChannelSelectorRects(const PlotMenuRect& rowRect) {
+  constexpr float kSize = 17.0f;
+  constexpr float kGap = 8.0f;
+  const float y0 = rowRect.y0 + (kPlotMenuRowHeight - kSize) * 0.5f;
+  const float right = rowRect.x1 - 14.0f;
+  std::array<PlotMenuRect, 3> rects{};
+  for (int channel = 2; channel >= 0; --channel) {
+    const float x1 = right - static_cast<float>(2 - channel) * (kSize + kGap);
+    rects[static_cast<size_t>(channel)] = {x1 - kSize, y0, x1, y0 + kSize};
+  }
+  return rects;
+}
+
+void toggleWaveformChannel(AppState* app, int channel) {
+  if (!app || channel < 0 || channel > 2) return;
+  auto state = viewerStateWithModelCapabilities(app->viewerState);
+  bool* enabled = channel == 0 ? &state.waveformChannelRed
+                              : (channel == 1 ? &state.waveformChannelGreen
+                                              : &state.waveformChannelBlue);
+  *enabled = !*enabled;
+  state.stateRevision = std::max<uint64_t>(state.stateRevision + 1, 1);
+  applyViewerStateToApp(app, state);
+  app->viewerStateLocalOverride = true;
+  queueViewerStateCommand(*app, "reinterpret");
+}
+
+PlotMenuRect plotWindowCloseWindowRect(const PlotWindowState& window,
+                                       int windowWidth,
+                                       int windowHeight) {
+  const float x1 = (window.rect.x + window.rect.w) * static_cast<float>(std::max(1, windowWidth)) - 5.0f;
+  const float y0 = window.rect.y * static_cast<float>(std::max(1, windowHeight)) + 4.0f;
+  return {x1 - 18.0f, y0, x1, y0 + 18.0f};
+}
+
+bool pointInPlotMenuRect(const PlotMenuRect& rect, double x, double y);
+PlotMenuRect viewerChoiceMenuWindowRect(const AppState& app, int width, int height);
+
+void applyDefaultCameraForViewerPlotSelection(AppState* app, const std::string& prevPlotMode);
+
+bool copyViewerPresetParameter(ViewerMenuAction action,
+                               ChromaspaceViewer::ViewerRuntimeState* state,
+                               const ChromaspaceViewer::ViewerRuntimeState& preset) {
+  if (!state) return false;
+  switch (action) {
+    case ViewerMenuAction::PlotModel: state->plotModel = preset.plotModel; return true;
+    case ViewerMenuAction::CircularHsl: state->circularHsl = preset.circularHsl; return true;
+    case ViewerMenuAction::CircularHsv: state->circularHsv = preset.circularHsv; return true;
+    case ViewerMenuAction::NormConeNormalized: state->normConeNormalized = preset.normConeNormalized; return true;
+    case ViewerMenuAction::PlotLinear: state->plotDisplayLinear = preset.plotDisplayLinear; return true;
+    case ViewerMenuAction::PlotLinearTransfer: state->plotDisplayLinearTransfer = preset.plotDisplayLinearTransfer; return true;
+    case ViewerMenuAction::LiveUpdate: state->liveUpdate = preset.liveUpdate; return true;
+    case ViewerMenuAction::UpdateMode: state->updateMode = preset.updateMode; return true;
+    case ViewerMenuAction::Quality: state->quality = preset.quality; return true;
+    case ViewerMenuAction::Scale: state->scale = preset.scale; return true;
+    case ViewerMenuAction::Sampling: state->sampling = preset.sampling; return true;
+    case ViewerMenuAction::Occupancy: state->occupancyGuidedFill = preset.occupancyGuidedFill; return true;
+    case ViewerMenuAction::PlotStyle: state->plotStyle = preset.plotStyle; return true;
+    case ViewerMenuAction::PointShape: state->pointShape = preset.pointShape; return true;
+    case ViewerMenuAction::PointSize: state->pointSize = preset.pointSize; return true;
+    case ViewerMenuAction::Saturation: state->colorSaturation = preset.colorSaturation; return true;
+    case ViewerMenuAction::KeepOnTop: state->keepOnTop = preset.keepOnTop; return true;
+    case ViewerMenuAction::ResetOnSwitch: state->resetViewOnPlotSwitch = preset.resetViewOnPlotSwitch; return true;
+    case ViewerMenuAction::ShowOverflow: state->showOverflow = preset.showOverflow; return true;
+    case ViewerMenuAction::HighlightOverflow: state->highlightOverflow = preset.highlightOverflow; return true;
+    case ViewerMenuAction::NeutralRadius: state->neutralRadius = preset.neutralRadius; return true;
+    case ViewerMenuAction::SliceRed: state->volumeSliceRed = preset.volumeSliceRed; return true;
+    case ViewerMenuAction::SliceYellow: state->volumeSliceYellow = preset.volumeSliceYellow; return true;
+    case ViewerMenuAction::SliceGreen: state->volumeSliceGreen = preset.volumeSliceGreen; return true;
+    case ViewerMenuAction::SliceCyan: state->volumeSliceCyan = preset.volumeSliceCyan; return true;
+    case ViewerMenuAction::SliceBlue: state->volumeSliceBlue = preset.volumeSliceBlue; return true;
+    case ViewerMenuAction::SliceMagenta: state->volumeSliceMagenta = preset.volumeSliceMagenta; return true;
+    case ViewerMenuAction::ViewerLasso: state->volumeSliceLassoRegion = preset.volumeSliceLassoRegion; return true;
+    case ViewerMenuAction::FillVolume: state->fillVolume = preset.fillVolume; return true;
+    case ViewerMenuAction::FillResolution: state->fillResolution = preset.fillResolution; return true;
+    case ViewerMenuAction::FillRamp: state->fillGrayRamp = preset.fillGrayRamp; return true;
+    case ViewerMenuAction::ReadGrayRamp: state->readGrayRamp = preset.readGrayRamp; return true;
+    case ViewerMenuAction::ReadIdentity: state->readIdentityPlot = preset.readIdentityPlot; return true;
+    case ViewerMenuAction::IsolateIdentity: state->isolateIdentityData = preset.isolateIdentityData; return true;
+    case ViewerMenuAction::ReadResolution: state->identityReadResolution = preset.identityReadResolution; return true;
+    case ViewerMenuAction::ChromaticityInputPrimaries: state->chromaticityInputPrimaries = preset.chromaticityInputPrimaries; return true;
+    case ViewerMenuAction::ChromaticityInputTransfer: state->chromaticityInputTransfer = preset.chromaticityInputTransfer; return true;
+    case ViewerMenuAction::ChromaticityReferenceBasis: state->chromaticityReferenceBasis = preset.chromaticityReferenceBasis; return true;
+    case ViewerMenuAction::ChromaticityOverlayPrimaries: state->chromaticityOverlayPrimaries = preset.chromaticityOverlayPrimaries; return true;
+    case ViewerMenuAction::ChromaticityPlanckian: state->chromaticityPlanckianLocus = preset.chromaticityPlanckianLocus; return true;
+    case ViewerMenuAction::ChromaticitySpectral: state->chromaticitySpectralLocus3D = preset.chromaticitySpectralLocus3D; return true;
+    case ViewerMenuAction::GlossNeighborhood: state->glossNeighborhood = preset.glossNeighborhood; return true;
+    case ViewerMenuAction::GlossLift: state->glossLiftScale = preset.glossLiftScale; return true;
+    case ViewerMenuAction::GlossSpatialInset: state->glossSpatialInset = preset.glossSpatialInset; return true;
+    case ViewerMenuAction::GlossBodyOpacity: state->glossBodyOpacity = preset.glossBodyOpacity; return true;
+    case ViewerMenuAction::GlossHighlightOpacity: state->glossHighlightOpacity = preset.glossHighlightOpacity; return true;
+    case ViewerMenuAction::GlossPointCrispness: state->glossPointCrispness = preset.glossPointCrispness; return true;
+    case ViewerMenuAction::GlossHideText: state->glossHideText = preset.glossHideText; return true;
+    case ViewerMenuAction::WaveformMode: state->waveformMode = preset.waveformMode; return true;
+    case ViewerMenuAction::WaveformDetail: state->waveformHighDetail = preset.waveformHighDetail; return true;
+    case ViewerMenuAction::WaveformContinuousHighDetail:
+      state->waveformContinuousHighDetail = preset.waveformContinuousHighDetail;
+      return true;
+    case ViewerMenuAction::WaveformPointBrightness:
+      state->waveformPointBrightness = preset.waveformPointBrightness;
+      return true;
+    case ViewerMenuAction::WaveformGridBrightness:
+      state->waveformGridBrightness = preset.waveformGridBrightness;
+      return true;
+    case ViewerMenuAction::WaveformSaturation:
+      state->waveformSaturation = preset.waveformSaturation;
+      return true;
+    case ViewerMenuAction::WaveformDotSize:
+      state->waveformDotSize = preset.waveformDotSize;
+      return true;
+    case ViewerMenuAction::WaveformChannels:
+      state->waveformChannelRed = preset.waveformChannelRed;
+      state->waveformChannelGreen = preset.waveformChannelGreen;
+      state->waveformChannelBlue = preset.waveformChannelBlue;
+      return true;
+    case ViewerMenuAction::WaveformShowOverflow:
+      state->waveformShowOverflow = preset.waveformShowOverflow;
+      return true;
+    case ViewerMenuAction::WaveformHighlightOverflow:
+      state->waveformHighlightOverflow = preset.waveformHighlightOverflow;
+      return true;
+    case ViewerMenuAction::WaveformLumaMethod:
+      state->waveformLumaMethod = preset.waveformLumaMethod;
+      return true;
+    case ViewerMenuAction::HistogramMode: state->histogramMode = preset.histogramMode; return true;
+    case ViewerMenuAction::HistogramShowOverflow:
+      state->histogramShowOverflow = preset.histogramShowOverflow;
+      return true;
+    case ViewerMenuAction::HistogramHighlightOverflow:
+      state->histogramHighlightOverflow = preset.histogramHighlightOverflow;
+      return true;
+    case ViewerMenuAction::ScopeRangeMode: state->scopeRangeMode = preset.scopeRangeMode; return true;
+    default: break;
+  }
+  return false;
+}
+
+bool resetViewerMenuParameterFromSelectedPreset(AppState* app, const ViewerMenuRow& row) {
+  if (!app || row.section || row.action == ViewerMenuAction::None) return false;
+  ChromaspaceViewer::ViewerRuntimeState preset{};
+  std::string presetName = app->viewerPresetSelection.empty() ? std::string("Default") : app->viewerPresetSelection;
+  if (!loadViewerUserPreset(presetName, &preset)) {
+    presetName = "Default";
+    if (!loadViewerUserPreset(presetName, &preset)) return false;
+  }
+
+  auto state = viewerStateWithModelCapabilities(app->viewerState);
+  const std::string previousSampleKey = ChromaspaceViewer::sampleSettingsKey(state, false);
+  const std::string previousPlotMode = app->plotMode;
+  const int previousPlotModel = state.plotModel;
+  preset = viewerStateWithModelCapabilities(preset);
+  if (!copyViewerPresetParameter(row.action, &state, preset)) return false;
+  if (row.action == ViewerMenuAction::ViewerLasso && !state.volumeSliceLassoRegion) {
+    clearViewerLassoState(app);
+  }
+  state = viewerStateWithModelCapabilities(state);
+  state.stateRevision = std::max<uint64_t>(app->viewerState.stateRevision + 1, state.stateRevision + 1);
+  applyViewerStateToApp(app, state);
+  if (previousPlotModel != app->viewerState.plotModel && app->viewerState.resetViewOnPlotSwitch) {
+    applyDefaultCameraForViewerPlotSelection(app, previousPlotMode);
+  }
+  app->viewerMenuChoiceAction = static_cast<int>(ViewerMenuAction::None);
+  app->viewerMenuHoverChoice = -1;
+  app->viewerChoiceMenuScroll = 0.0f;
+  app->viewerStateLocalOverride =
+      viewerMenuActionCanPreviewFromCachedCloud(row.action) ||
+      previousSampleKey == ChromaspaceViewer::sampleSettingsKey(app->viewerState, false);
+  queueViewerStateCommand(*app, (row.refreshPolicy && row.refreshPolicy[0]) ? row.refreshPolicy : "resample");
+  logViewerEvent(std::string("Reset viewer menu parameter from preset: ") + row.label + " preset=" + presetName);
+  return true;
+}
+
+void activateViewerMenuRow(AppState* app, const ViewerMenuRow& row) {
+  if (!app || row.section || !row.enabled) return;
+  if (row.slider) return;
+  if (row.action == ViewerMenuAction::ShowWorkspaceButtons) {
+    app->showWorkspaceButtons = !app->showWorkspaceButtons;
+    app->workspaceCommandRevision = std::max<uint64_t>(app->workspaceCommandRevision + 1u, 1u);
+    saveViewerWorkspaceToDisk(app);
+    return;
+  }
+  const bool cachedPreviewAction = viewerMenuActionCanPreviewFromCachedCloud(row.action);
+  if (!row.choiceItem && viewerMenuActionUsesChoiceList(row.action)) {
+    const int action = static_cast<int>(row.action);
+    app->viewerMenuChoiceAction = app->viewerMenuChoiceAction == action
+                                      ? static_cast<int>(ViewerMenuAction::None)
+                                      : action;
+    app->viewerMenuHoverChoice = -1;
+    app->viewerChoiceMenuScroll = 0.0f;
+    return;
+  }
+  auto state = viewerStateWithModelCapabilities(app->viewerState);
+  const std::string previousSampleKey = ChromaspaceViewer::sampleSettingsKey(state, false);
+  const std::string previousPlotMode = app->plotMode;
+  const int previousPlotModel = state.plotModel;
+  auto bump = [&]() {
+    state.stateRevision = std::max<uint64_t>(state.stateRevision + 1, 1);
+  };
+  switch (row.action) {
+    case ViewerMenuAction::PlotModel:
+      state.plotModel = row.choiceItem
+                            ? std::clamp(row.choiceValue, 0, ChromaspaceViewer::kPlotModelCount - 1)
+                            : state.plotModel;
+      if (state.plotModel == ChromaspaceViewer::kPlotModelGlossView) {
+        state.fillVolume = false;
+        state.readGrayRamp = false;
+        state.readIdentityPlot = false;
+        state.isolateIdentityData = false;
+      }
+      state = viewerStateForPlotModel(state, state.plotModel);
+      bump();
+      break;
+    case ViewerMenuAction::CircularHsl: state.circularHsl = !state.circularHsl; bump(); break;
+    case ViewerMenuAction::CircularHsv: state.circularHsv = !state.circularHsv; bump(); break;
+    case ViewerMenuAction::NormConeNormalized: state.normConeNormalized = !state.normConeNormalized; bump(); break;
+    case ViewerMenuAction::PlotLinear: state.plotDisplayLinear = !state.plotDisplayLinear; bump(); break;
+    case ViewerMenuAction::PlotLinearTransfer:
+      state.plotDisplayLinearTransfer =
+          row.choiceItem
+              ? std::clamp(row.choiceValue, 0, std::max(0, static_cast<int>(WorkshopColor::transferFunctionCount()) - 1))
+              : state.plotDisplayLinearTransfer;
+      bump();
+      break;
+    case ViewerMenuAction::LiveUpdate: state.liveUpdate = !state.liveUpdate; bump(); break;
+    case ViewerMenuAction::UpdateMode:
+      state.updateMode = row.choiceItem ? std::clamp(row.choiceValue, 0, 2) : state.updateMode;
+      bump();
+      break;
+    case ViewerMenuAction::Quality:
+      state.quality = row.choiceItem ? std::clamp(row.choiceValue, 0, 2) : state.quality;
+      bump();
+      break;
+    case ViewerMenuAction::Scale:
+      state.scale = row.choiceItem ? std::clamp(row.choiceValue, 0, 3) : state.scale;
+      bump();
+      break;
+    case ViewerMenuAction::Sampling:
+      state.sampling = row.choiceItem ? std::clamp(row.choiceValue, 0, 2) : state.sampling;
+      bump();
+      break;
+    case ViewerMenuAction::Occupancy: state.occupancyGuidedFill = !state.occupancyGuidedFill; bump(); break;
+    case ViewerMenuAction::PlotStyle:
+      state.plotStyle = row.choiceItem ? std::clamp(row.choiceValue, 0, 1) : state.plotStyle;
+      bump();
+      break;
+    case ViewerMenuAction::PointShape:
+      state.pointShape = row.choiceItem ? std::clamp(row.choiceValue, 0, 1) : state.pointShape;
+      bump();
+      break;
+    case ViewerMenuAction::PointSize:
+      state.pointSize = state.pointSize >= 3.0 ? 0.35 : ChromaspaceViewer::clampDouble(state.pointSize + 0.10, 0.35, 3.0);
+      bump();
+      break;
+    case ViewerMenuAction::Saturation:
+      state.colorSaturation = state.colorSaturation >= 6.0 ? 0.8 : ChromaspaceViewer::clampDouble(state.colorSaturation + 0.25, 0.8, 6.0);
+      bump();
+      break;
+    case ViewerMenuAction::KeepOnTop: state.keepOnTop = !state.keepOnTop; bump(); break;
+    case ViewerMenuAction::ResetOnSwitch: state.resetViewOnPlotSwitch = !state.resetViewOnPlotSwitch; bump(); break;
+    case ViewerMenuAction::ShowOverflow: state.showOverflow = !state.showOverflow; bump(); break;
+    case ViewerMenuAction::HighlightOverflow: state.highlightOverflow = !state.highlightOverflow; bump(); break;
+    case ViewerMenuAction::NeutralRadius:
+      state.neutralRadius = state.neutralRadius <= 0.05 ? 1.0 : ChromaspaceViewer::clampDouble(state.neutralRadius - 0.10, 0.0, 1.0);
+      bump();
+      break;
+    case ViewerMenuAction::SliceRed: state.volumeSliceRed = !state.volumeSliceRed; bump(); break;
+    case ViewerMenuAction::SliceYellow: state.volumeSliceYellow = !state.volumeSliceYellow; bump(); break;
+    case ViewerMenuAction::SliceGreen: state.volumeSliceGreen = !state.volumeSliceGreen; bump(); break;
+    case ViewerMenuAction::SliceCyan: state.volumeSliceCyan = !state.volumeSliceCyan; bump(); break;
+    case ViewerMenuAction::SliceBlue: state.volumeSliceBlue = !state.volumeSliceBlue; bump(); break;
+    case ViewerMenuAction::SliceMagenta: state.volumeSliceMagenta = !state.volumeSliceMagenta; bump(); break;
+    case ViewerMenuAction::ViewerLasso:
+      {
+        const bool enablingLasso = !state.volumeSliceLassoRegion;
+        state.volumeSliceLassoRegion = !state.volumeSliceLassoRegion;
+        bump();
+        if (enablingLasso) {
+          app->focusPlotNodeRequestedRevision = state.stateRevision;
+          app->clearImageLassoRequestedRevision = state.stateRevision;
+          app->cachedOfxImageLassoData.clear();
+        }
+      }
+      break;
+    case ViewerMenuAction::ClearViewerLasso:
+      clearViewerLassoState(app);
+      state = viewerStateWithModelCapabilities(app->viewerState);
+      bump();
+      app->clearImageLassoRequestedRevision = state.stateRevision;
+      app->cachedOfxImageLassoData.clear();
+      break;
+    case ViewerMenuAction::FillVolume: state.fillVolume = !state.fillVolume; bump(); break;
+    case ViewerMenuAction::FillResolution:
+      state.fillResolution = state.fillResolution >= 65 ? 4 : ChromaspaceViewer::clampOverlaySize(state.fillResolution + 4);
+      bump();
+      break;
+    case ViewerMenuAction::FillRamp: state.fillGrayRamp = !state.fillGrayRamp; bump(); break;
+    case ViewerMenuAction::ReadGrayRamp:
+      state.readGrayRamp = !state.readGrayRamp;
+      bump();
+      break;
+    case ViewerMenuAction::ReadIdentity:
+      state.readIdentityPlot = !state.readIdentityPlot;
+      bump();
+      break;
+    case ViewerMenuAction::IsolateIdentity: state.isolateIdentityData = !state.isolateIdentityData; bump(); break;
+    case ViewerMenuAction::ReadResolution:
+      state.identityReadResolution =
+          state.identityReadResolution >= 65 ? 4 : ChromaspaceViewer::clampOverlaySize(state.identityReadResolution + 4);
+      bump();
+      break;
+    case ViewerMenuAction::ChromaticityInputPrimaries:
+      state.chromaticityInputPrimaries =
+          row.choiceItem
+              ? std::clamp(row.choiceValue, 0, std::max(0, static_cast<int>(WorkshopColor::primariesCount()) - 1))
+              : state.chromaticityInputPrimaries;
+      bump();
+      break;
+    case ViewerMenuAction::ChromaticityInputTransfer:
+      state.chromaticityInputTransfer =
+          row.choiceItem
+              ? std::clamp(row.choiceValue, 0, std::max(0, static_cast<int>(WorkshopColor::transferFunctionCount()) - 1))
+              : state.chromaticityInputTransfer;
+      bump();
+      break;
+    case ViewerMenuAction::ChromaticityReferenceBasis:
+      state.chromaticityReferenceBasis = row.choiceItem ? std::clamp(row.choiceValue, 0, 1) : state.chromaticityReferenceBasis;
+      bump();
+      break;
+    case ViewerMenuAction::ChromaticityOverlayPrimaries:
+      state.chromaticityOverlayPrimaries =
+          row.choiceItem
+              ? std::clamp(row.choiceValue, 0, static_cast<int>(WorkshopColor::primariesCount()))
+              : state.chromaticityOverlayPrimaries;
+      bump();
+      break;
+    case ViewerMenuAction::ChromaticityPlanckian: state.chromaticityPlanckianLocus = !state.chromaticityPlanckianLocus; bump(); break;
+    case ViewerMenuAction::ChromaticitySpectral: state.chromaticitySpectralLocus3D = !state.chromaticitySpectralLocus3D; bump(); break;
+    case ViewerMenuAction::GlossNeighborhood:
+      state.glossNeighborhood = row.choiceItem ? std::clamp(row.choiceValue, 0, 2) : state.glossNeighborhood;
+      bump();
+      break;
+    case ViewerMenuAction::GlossLift:
+      state.glossLiftScale = state.glossLiftScale >= 3.0 ? 0.25 : ChromaspaceViewer::clampDouble(state.glossLiftScale + 0.25, 0.25, 3.0);
+      bump();
+      break;
+    case ViewerMenuAction::GlossSpatialInset: state.glossSpatialInset = !state.glossSpatialInset; bump(); break;
+    case ViewerMenuAction::GlossBodyOpacity:
+      state.glossBodyOpacity = state.glossBodyOpacity >= 1.0 ? 0.0 : ChromaspaceViewer::clampDouble(state.glossBodyOpacity + 0.10, 0.0, 1.0);
+      bump();
+      break;
+    case ViewerMenuAction::GlossHighlightOpacity:
+      state.glossHighlightOpacity = state.glossHighlightOpacity >= 1.0 ? 0.0 : ChromaspaceViewer::clampDouble(state.glossHighlightOpacity + 0.10, 0.0, 1.0);
+      bump();
+      break;
+    case ViewerMenuAction::GlossPointCrispness:
+      state.glossPointCrispness = state.glossPointCrispness >= 1.0 ? 0.0 : ChromaspaceViewer::clampDouble(state.glossPointCrispness + 0.10, 0.0, 1.0);
+      bump();
+      break;
+    case ViewerMenuAction::GlossHideText: state.glossHideText = !state.glossHideText; bump(); break;
+    case ViewerMenuAction::WaveformMode:
+      state.waveformMode = row.choiceItem ? std::clamp(row.choiceValue, 0, 2) : state.waveformMode;
+      bump();
+      break;
+    case ViewerMenuAction::WaveformDetail:
+      state.waveformHighDetail = row.choiceItem ? row.choiceValue != 0 : !state.waveformHighDetail;
+      bump();
+      break;
+    case ViewerMenuAction::WaveformContinuousHighDetail:
+      state.waveformContinuousHighDetail = !state.waveformContinuousHighDetail;
+      bump();
+      break;
+    case ViewerMenuAction::WaveformShowOverflow:
+      state.waveformShowOverflow = !state.waveformShowOverflow;
+      bump();
+      break;
+    case ViewerMenuAction::WaveformHighlightOverflow:
+      state.waveformHighlightOverflow = !state.waveformHighlightOverflow;
+      bump();
+      break;
+    case ViewerMenuAction::WaveformLumaMethod:
+      state.waveformLumaMethod =
+          row.choiceItem ? std::clamp(row.choiceValue, 0, 3) : state.waveformLumaMethod;
+      bump();
+      break;
+    case ViewerMenuAction::HistogramMode:
+      state.histogramMode = row.choiceItem ? std::clamp(row.choiceValue, 0, 1) : state.histogramMode;
+      bump();
+      break;
+    case ViewerMenuAction::HistogramShowOverflow:
+      state.histogramShowOverflow = !state.histogramShowOverflow;
+      bump();
+      break;
+    case ViewerMenuAction::HistogramHighlightOverflow:
+      state.histogramHighlightOverflow = !state.histogramHighlightOverflow;
+      bump();
+      break;
+    case ViewerMenuAction::ScopeRangeMode:
+      state.scopeRangeMode = row.choiceItem ? std::clamp(row.choiceValue, 0, 2) : state.scopeRangeMode;
+      bump();
+      break;
+    case ViewerMenuAction::ResetDefaults:
+      clearViewerLassoState(app);
+      state = ChromaspaceViewer::ViewerRuntimeState{};
+      state.stateRevision = app->viewerState.stateRevision + 1;
+      break;
+    case ViewerMenuAction::EditPresetName:
+      app->viewerPresetNameEditing = true;
+      app->viewerMenuChoiceAction = static_cast<int>(ViewerMenuAction::None);
+      if (app->viewerPresetNameInput.empty() && viewerPresetNameEditableTarget(app->viewerPresetSelection)) {
+        app->viewerPresetNameInput = app->viewerPresetSelection;
+      }
+      return;
+    case ViewerMenuAction::SaveUserPreset: {
+      std::string savedName;
+      if (saveViewerUserPreset(state, app->viewerPresetNameInput, &savedName)) {
+        app->viewerPresetSelection = savedName;
+        app->viewerPresetNameInput = savedName;
+      }
+      return;
+    }
+    case ViewerMenuAction::LoadUserPreset: {
+      const std::vector<std::string> names = viewerUserPresetNames();
+      if (!row.choiceItem || row.choiceValue < 0 || row.choiceValue >= static_cast<int>(names.size())) return;
+      const std::string presetName = names[static_cast<std::size_t>(row.choiceValue)];
+      ChromaspaceViewer::ViewerRuntimeState preset{};
+      if (!loadViewerUserPreset(presetName, &preset)) return;
+      app->viewerPresetSelection = presetName;
+      app->viewerPresetNameInput = viewerPresetNameEditableTarget(presetName) ? presetName : std::string();
+      if (!preset.volumeSliceLassoRegion) clearViewerLassoState(app);
+      state = viewerStateWithModelCapabilities(preset);
+      state.stateRevision = std::max<uint64_t>(app->viewerState.stateRevision + 1, state.stateRevision + 1);
+      break;
+    }
+    case ViewerMenuAction::UpdateUserPreset:
+      (void)updateViewerUserPreset(app->viewerPresetSelection, state);
+      return;
+    case ViewerMenuAction::DeleteUserPreset:
+      if (deleteViewerUserPreset(app->viewerPresetSelection)) {
+        const std::vector<std::string> names = viewerUserPresetNames();
+        app->viewerPresetSelection = names.empty() ? std::string() : names.front();
+        app->viewerPresetNameInput = viewerPresetNameEditableTarget(app->viewerPresetSelection) ? app->viewerPresetSelection : std::string();
+      }
+      return;
+    case ViewerMenuAction::SaveDefaults:
+      (void)saveViewerDefaultPreset(state);
+      app->viewerPresetSelection = "Default";
+      return;
+    case ViewerMenuAction::RestoreDefaults: {
+      ChromaspaceViewer::ViewerRuntimeState preset{};
+      if (!loadViewerDefaultPreset(&preset)) return;
+      app->viewerPresetSelection = "Default";
+      app->viewerPresetNameInput.clear();
+      if (!preset.volumeSliceLassoRegion) clearViewerLassoState(app);
+      state = viewerStateWithModelCapabilities(preset);
+      state.stateRevision = std::max<uint64_t>(app->viewerState.stateRevision + 1, state.stateRevision + 1);
+      break;
+    }
+    default:
+      return;
+  }
+  applyViewerStateToApp(app, state);
+  if (previousPlotModel != app->viewerState.plotModel && app->viewerState.resetViewOnPlotSwitch) {
+    applyDefaultCameraForViewerPlotSelection(app, previousPlotMode);
+  }
+  app->viewerMenuChoiceAction = static_cast<int>(ViewerMenuAction::None);
+  app->viewerMenuHoverChoice = -1;
+  app->viewerChoiceMenuScroll = 0.0f;
+  app->viewerChoiceMenuScroll = 0.0f;
+  if (!viewerMenuSectionVisible(*app, viewerMenuSectionFromInt(app->viewerMenuSection))) {
+    app->viewerMenuSection = static_cast<int>(ViewerMenuSection::Model);
+    app->viewerMenuScroll = 0.0f;
+  }
+  app->viewerStateLocalOverride =
+      cachedPreviewAction ||
+      previousSampleKey == ChromaspaceViewer::sampleSettingsKey(app->viewerState, false);
+  if ((row.action == ViewerMenuAction::ReadGrayRamp ||
+       row.action == ViewerMenuAction::ReadIdentity) &&
+      autoMatchIdentityReadResolution(app, nullptr)) {
+    return;
+  }
+  queueViewerStateCommand(*app, row.refreshPolicy);
+}
+
+void activateViewerChoiceMenuItem(AppState* app, const ViewerChoiceMenuItem& item) {
+  if (!app || item.action == ViewerMenuAction::None) return;
+  ViewerMenuRow row{};
+  row.label = item.label;
+  row.action = item.action;
+  row.enabled = true;
+  row.refreshPolicy = item.refreshPolicy;
+  row.choiceItem = true;
+  row.choiceValue = item.value;
+  activateViewerMenuRow(app, row);
+}
+
+int viewerMenuSliderValueForX(const ViewerMenuRow& row, const PlotMenuRect& rowRect, double x) {
+  const float rowWidth = rowRect.x1 - rowRect.x0;
+  const float sliderX0 = rowRect.x0 + clampf(rowWidth * 0.44f, 112.0f, 170.0f);
+  const float sliderX1 = rowRect.x1 - 48.0f;
+  const float t = clampf((static_cast<float>(x) - sliderX0) / std::max(1.0f, sliderX1 - sliderX0), 0.0f, 1.0f);
+  return std::clamp(static_cast<int>(std::round(static_cast<float>(row.sliderMin) +
+                                                t * static_cast<float>(row.sliderMax - row.sliderMin))),
+                    row.sliderMin,
+                    row.sliderMax);
+}
+
+void updateViewerMenuSlider(AppState* app, ViewerMenuAction action, int value, const char* refreshPolicy) {
+  if (!app) return;
+  auto state = viewerStateWithModelCapabilities(app->viewerState);
+  const std::string previousSampleKey = ChromaspaceViewer::sampleSettingsKey(state, false);
+  bool changed = false;
+  switch (action) {
+    case ViewerMenuAction::PointSize: {
+      const double next = ChromaspaceViewer::clampDouble(static_cast<double>(value) / 100.0, 0.35, 3.0);
+      changed = std::abs(state.pointSize - next) > 1e-6;
+      state.pointSize = next;
+      break;
+    }
+    case ViewerMenuAction::Saturation: {
+      const double next = ChromaspaceViewer::clampDouble(static_cast<double>(value) / 100.0, 0.8, 6.0);
+      changed = std::abs(state.colorSaturation - next) > 1e-6;
+      state.colorSaturation = next;
+      break;
+    }
+    case ViewerMenuAction::NeutralRadius: {
+      const double next = ChromaspaceViewer::clampDouble(static_cast<double>(value) / 100.0, 0.0, 1.0);
+      changed = std::abs(state.neutralRadius - next) > 1e-6;
+      state.neutralRadius = next;
+      break;
+    }
+    case ViewerMenuAction::FillResolution:
+      value = ChromaspaceViewer::clampOverlaySize(value);
+      changed = state.fillResolution != value;
+      state.fillResolution = value;
+      break;
+    case ViewerMenuAction::GlossLift: {
+      const double next = ChromaspaceViewer::clampDouble(static_cast<double>(value) / 100.0, 0.25, 3.0);
+      changed = std::abs(state.glossLiftScale - next) > 1e-6;
+      state.glossLiftScale = next;
+      break;
+    }
+    case ViewerMenuAction::GlossBodyOpacity: {
+      const double next = ChromaspaceViewer::clampDouble(static_cast<double>(value) / 100.0, 0.0, 1.0);
+      changed = std::abs(state.glossBodyOpacity - next) > 1e-6;
+      state.glossBodyOpacity = next;
+      break;
+    }
+    case ViewerMenuAction::GlossHighlightOpacity: {
+      const double next = ChromaspaceViewer::clampDouble(static_cast<double>(value) / 100.0, 0.0, 1.0);
+      changed = std::abs(state.glossHighlightOpacity - next) > 1e-6;
+      state.glossHighlightOpacity = next;
+      break;
+    }
+    case ViewerMenuAction::GlossPointCrispness: {
+      const double next = ChromaspaceViewer::clampDouble(static_cast<double>(value) / 100.0, 0.0, 1.0);
+      changed = std::abs(state.glossPointCrispness - next) > 1e-6;
+      state.glossPointCrispness = next;
+      break;
+    }
+    case ViewerMenuAction::WaveformPointBrightness: {
+      const double next =
+          ChromaspaceViewer::clampDouble(static_cast<double>(value) / 100.0, 0.1, 2.0);
+      changed = std::abs(state.waveformPointBrightness - next) > 1e-6;
+      state.waveformPointBrightness = next;
+      break;
+    }
+    case ViewerMenuAction::WaveformGridBrightness: {
+      const double next =
+          ChromaspaceViewer::clampDouble(static_cast<double>(value) / 100.0, 0.0, 2.0);
+      changed = std::abs(state.waveformGridBrightness - next) > 1e-6;
+      state.waveformGridBrightness = next;
+      break;
+    }
+    case ViewerMenuAction::WaveformSaturation: {
+      const double next =
+          ChromaspaceViewer::clampDouble(static_cast<double>(value) / 100.0, 0.0, 2.0);
+      changed = std::abs(state.waveformSaturation - next) > 1e-6;
+      state.waveformSaturation = next;
+      break;
+    }
+    case ViewerMenuAction::WaveformDotSize: {
+      const double next =
+          ChromaspaceViewer::clampDouble(static_cast<double>(value) / 100.0, 0.25, 3.0);
+      changed = std::abs(state.waveformDotSize - next) > 1e-6;
+      state.waveformDotSize = next;
+      break;
+    }
+    case ViewerMenuAction::ReadResolution:
+      value = ChromaspaceViewer::clampOverlaySize(value);
+      changed = state.identityReadResolution != value;
+      state.identityReadResolution = value;
+      break;
+    default:
+      return;
+  }
+  if (!changed) return;
+  state.stateRevision = std::max<uint64_t>(state.stateRevision + 1, 1);
+  applyViewerStateToApp(app, state);
+  app->viewerStateLocalOverride =
+      viewerMenuActionCanPreviewFromCachedCloud(action) ||
+      previousSampleKey == ChromaspaceViewer::sampleSettingsKey(app->viewerState, false);
+  queueViewerStateCommand(*app, refreshPolicy && refreshPolicy[0] ? refreshPolicy : "resample");
+}
+
+void toggleViewerShowOverflowFromPopover(AppState* app) {
+  if (!app) return;
+  auto state = viewerStateWithModelCapabilities(app->viewerState);
+  const std::string previousSampleKey = ChromaspaceViewer::sampleSettingsKey(state, false);
+  state.showOverflow = !state.showOverflow;
+  state.stateRevision = std::max<uint64_t>(state.stateRevision + 1, 1);
+  applyViewerStateToApp(app, state);
+  app->viewerStateLocalOverride =
+      viewerMenuActionCanPreviewFromCachedCloud(ViewerMenuAction::ShowOverflow) ||
+      previousSampleKey == ChromaspaceViewer::sampleSettingsKey(app->viewerState, false);
+  queueViewerStateCommand(*app, "reinterpret");
+}
+
+void toggleViewerLassoFromIdentityPopover(AppState* app) {
+  if (!app) return;
+  if (app->viewerState.volumeSliceLassoRegion) clearViewerLassoState(app);
+  auto state = viewerStateWithModelCapabilities(app->viewerState);
+  const std::string previousSampleKey = ChromaspaceViewer::sampleSettingsKey(state, false);
+  const bool enablingLasso = !state.volumeSliceLassoRegion;
+  state.volumeSliceLassoRegion = !state.volumeSliceLassoRegion;
+  state.stateRevision = std::max<uint64_t>(state.stateRevision + 1, 1);
+  if (enablingLasso) {
+    app->focusPlotNodeRequestedRevision = state.stateRevision;
+    app->clearImageLassoRequestedRevision = state.stateRevision;
+    app->cachedOfxImageLassoData.clear();
+  }
+  applyViewerStateToApp(app, state);
+  app->viewerStateLocalOverride =
+      viewerMenuActionCanPreviewFromCachedCloud(ViewerMenuAction::ViewerLasso) ||
+      previousSampleKey == ChromaspaceViewer::sampleSettingsKey(app->viewerState, false);
+  queueViewerStateCommand(*app, "resample");
+}
+
 PlotMenuRect plotMenuMainRect(const AppState& app, int width, int height) {
-  const float menuHeight = kPlotMenuPad * 2.0f + kPlotMenuRowHeight * static_cast<float>(kViewerPlotModelChoiceCount);
-  float x0 = static_cast<float>(app.plotModelMenuX);
-  float y0 = static_cast<float>(app.plotModelMenuY);
-  x0 = clampf(x0, 8.0f, std::max(8.0f, static_cast<float>(width) - kPlotMenuWidth - 8.0f));
-  y0 = clampf(y0, 8.0f, std::max(8.0f, static_cast<float>(height) - menuHeight - 8.0f));
-  return {x0, y0, x0 + kPlotMenuWidth, y0 + menuHeight};
+  (void)app;
+  const float w = static_cast<float>(width);
+  const float h = static_cast<float>(height);
+  const float maxWidth = std::max(160.0f, w - 16.0f);
+  const float minWidth = std::min(340.0f, maxWidth);
+  const float menuWidth = clampf(w < 720.0f ? w - 16.0f : 560.0f, minWidth, maxWidth);
+  return {0.0f, 0.0f, menuWidth, h};
+}
+
+PlotMenuRect viewerMenuIconWindowRect(int width, int height) {
+  (void)width;
+  (void)height;
+  return {kViewerMenuIconInset,
+          kViewerMenuIconInset,
+          kViewerMenuIconInset + kViewerMenuIconSize,
+          kViewerMenuIconInset + kViewerMenuIconSize};
+}
+
+PlotMenuRect viewerAddPlotIconWindowRect(int width, int height) {
+  (void)width;
+  (void)height;
+  const float x0 = kViewerMenuIconInset + kViewerMenuIconSize + 7.0f;
+  return {x0,
+          kViewerMenuIconInset,
+          x0 + kViewerMenuIconSize,
+          kViewerMenuIconInset + kViewerMenuIconSize};
+}
+
+PlotMenuRect viewerLayoutIconWindowRect(int width, int height) {
+  (void)width;
+  (void)height;
+  const float x0 = kViewerMenuIconInset + (kViewerMenuIconSize + 7.0f) * 2.0f;
+  return {x0,
+          kViewerMenuIconInset,
+          x0 + kViewerMenuIconSize,
+          kViewerMenuIconInset + kViewerMenuIconSize};
+}
+
+PlotMenuRect viewerMenuCloseWindowRect(const AppState& app, int width, int height) {
+  const PlotMenuRect drawer = plotMenuMainRect(app, width, height);
+  return {std::max(drawer.x0 + 8.0f, drawer.x1 - kViewerMenuCloseSize - 12.0f),
+          12.0f,
+          std::max(drawer.x0 + 8.0f, drawer.x1 - 12.0f),
+          12.0f + kViewerMenuCloseSize};
+}
+
+PlotMenuRect quickPlotModelMenuRect(const AppState& app, int width, int height) {
+  const float w = static_cast<float>(width);
+  const float h = static_cast<float>(height);
+  const float menuWidth = std::min(std::max(210.0f, w * 0.28f), std::max(210.0f, w - 16.0f));
+  const float headerHeight = 24.0f;
+  const float menuHeight = kPlotMenuPad * 2.0f + headerHeight +
+                           kViewerChoiceMenuRowHeight * static_cast<float>(kViewerPlotModelChoiceCount);
+  const float x0 = clampf(static_cast<float>(app.quickPlotModelMenuX),
+                          8.0f,
+                          std::max(8.0f, w - menuWidth - 8.0f));
+  const float y0 = clampf(static_cast<float>(app.quickPlotModelMenuY),
+                          8.0f,
+                          std::max(8.0f, h - menuHeight - 8.0f));
+  return {x0, y0, std::min(w - 8.0f, x0 + menuWidth), std::min(h - 8.0f, y0 + menuHeight)};
+}
+
+PlotMenuRect addPlotMenuRect(const AppState& app, int width, int height) {
+  const float w = static_cast<float>(width);
+  const float h = static_cast<float>(height);
+  const float menuWidth = std::min(std::max(220.0f, w * 0.28f), std::max(220.0f, w - 16.0f));
+  const float headerHeight = 24.0f;
+  const float menuHeight = kPlotMenuPad * 2.0f + headerHeight +
+                           kViewerChoiceMenuRowHeight * static_cast<float>(kViewerPlotModelChoiceCount);
+  const float x0 = clampf(static_cast<float>(app.addPlotMenuX),
+                          8.0f,
+                          std::max(8.0f, w - menuWidth - 8.0f));
+  const float y0 = clampf(static_cast<float>(app.addPlotMenuY),
+                          8.0f,
+                          std::max(8.0f, h - menuHeight - 8.0f));
+  return {x0, y0, std::min(w - 8.0f, x0 + menuWidth), std::min(h - 8.0f, y0 + menuHeight)};
+}
+
+PlotMenuRect layoutMenuRect(const AppState& app, int width, int height) {
+  const float w = static_cast<float>(width);
+  const float h = static_cast<float>(height);
+  const float menuWidth = std::min(240.0f, std::max(180.0f, w - 16.0f));
+  const float menuHeight =
+      kPlotMenuPad * 2.0f + 24.0f + kViewerChoiceMenuRowHeight * static_cast<float>(kViewerLayoutChoiceCount);
+  const float x0 = clampf(static_cast<float>(app.layoutMenuX), 8.0f, std::max(8.0f, w - menuWidth - 8.0f));
+  const float y0 = clampf(static_cast<float>(app.layoutMenuY), 8.0f, std::max(8.0f, h - menuHeight - 8.0f));
+  return {x0, y0, std::min(w - 8.0f, x0 + menuWidth), std::min(h - 8.0f, y0 + menuHeight)};
+}
+
+int quickPlotModelMenuIndexAt(const AppState& app, int width, int height, double x, double y) {
+  const PlotMenuRect rect = quickPlotModelMenuRect(app, width, height);
+  if (!pointInPlotMenuRect(rect, x, y)) return -1;
+  const float localY = static_cast<float>(y) - rect.y0 - kPlotMenuPad - 24.0f;
+  if (localY < 0.0f) return -1;
+  const int index = static_cast<int>(localY / kViewerChoiceMenuRowHeight);
+  return (index >= 0 && index < kViewerPlotModelChoiceCount) ? index : -1;
+}
+
+int addPlotMenuIndexAt(const AppState& app, int width, int height, double x, double y) {
+  const PlotMenuRect rect = addPlotMenuRect(app, width, height);
+  if (!pointInPlotMenuRect(rect, x, y)) return -1;
+  const float localY = static_cast<float>(y) - rect.y0 - kPlotMenuPad - 24.0f;
+  if (localY < 0.0f) return -1;
+  const int index = static_cast<int>(localY / kViewerChoiceMenuRowHeight);
+  return (index >= 0 && index < kViewerPlotModelChoiceCount) ? index : -1;
+}
+
+int layoutMenuIndexAt(const AppState& app, int width, int height, double x, double y) {
+  const PlotMenuRect rect = layoutMenuRect(app, width, height);
+  if (!pointInPlotMenuRect(rect, x, y)) return -1;
+  const float localY = static_cast<float>(y) - rect.y0 - kPlotMenuPad - 24.0f;
+  if (localY < 0.0f) return -1;
+  const int index = static_cast<int>(localY / kViewerChoiceMenuRowHeight);
+  return (index >= 0 && index < kViewerLayoutChoiceCount) ? index : -1;
+}
+
+bool pointerInViewerMenuUi(const AppState& app, int width, int height, double x, double y) {
+  if (app.quickPlotModelMenuVisible &&
+      pointInPlotMenuRect(quickPlotModelMenuRect(app, width, height), x, y)) {
+    return true;
+  }
+  if (app.addPlotMenuVisible &&
+      pointInPlotMenuRect(addPlotMenuRect(app, width, height), x, y)) {
+    return true;
+  }
+  if (app.layoutMenuVisible &&
+      pointInPlotMenuRect(layoutMenuRect(app, width, height), x, y)) {
+    return true;
+  }
+  if (!app.plotModelMenuVisible) return false;
+  if (pointInPlotMenuRect(plotMenuMainRect(app, width, height), x, y)) return true;
+  const PlotMenuRect choice = viewerChoiceMenuWindowRect(app, width, height);
+  return choice.x1 > choice.x0 && choice.y1 > choice.y0 && pointInPlotMenuRect(choice, x, y);
 }
 
 PlotMenuRect plotMenuSubRect(const PlotMenuRect& mainRect, int hoverMain, int width, int height) {
@@ -8621,21 +14950,449 @@ bool pointInPlotMenuRect(const PlotMenuRect& rect, double x, double y) {
   return x >= rect.x0 && x <= rect.x1 && y >= rect.y0 && y <= rect.y1;
 }
 
+float viewerMenuRowHeight(const ViewerMenuRow& row) {
+  return row.note ? (kPlotMenuRowHeight * 2.25f) : kPlotMenuRowHeight;
+}
+
+float viewerMenuRowsHeight(const std::vector<ViewerMenuRow>& rows) {
+  float height = 0.0f;
+  for (const ViewerMenuRow& row : rows) height += viewerMenuRowHeight(row);
+  return height;
+}
+
+float viewerMenuRowTopOffset(const std::vector<ViewerMenuRow>& rows, int rowIndex) {
+  float offset = 0.0f;
+  const int count = std::min(rowIndex, static_cast<int>(rows.size()));
+  for (int i = 0; i < count; ++i) {
+    offset += viewerMenuRowHeight(rows[static_cast<std::size_t>(i)]);
+  }
+  return offset;
+}
+
+bool viewerSettingsSubtabsVisible(const AppState& app) {
+  return coercedViewerMenuSection(app) == ViewerMenuSection::Settings;
+}
+
+float viewerMenuRowsX0(const PlotMenuRect& rect) {
+  return rect.x0 + kViewerDrawerPad + kViewerDrawerTabRailWidth + kViewerDrawerPad;
+}
+
+float viewerMenuRowsY0(const AppState& app, const PlotMenuRect& rect) {
+  float y0 = rect.y0 + kViewerDrawerHeaderHeight + kViewerDrawerPad;
+  if (viewerSettingsSubtabsVisible(app)) {
+    y0 += kViewerSettingsSubtabHeight + kViewerSettingsSubtabGap;
+  }
+  return y0;
+}
+
+PlotMenuRect viewerSettingsSubtabWindowRect(const AppState& app, int width, int height, int index) {
+  (void)height;
+  if (!viewerSettingsSubtabsVisible(app) || index < 0 || index > 1) return {};
+  const PlotMenuRect rect = plotMenuMainRect(app, width, height);
+  const float x0 = viewerMenuRowsX0(rect);
+  const float x1 = rect.x1 - kViewerDrawerPad;
+  const float tabGap = 6.0f;
+  const float tabWidth = std::max(70.0f, (x1 - x0 - tabGap) * 0.5f);
+  const float tabX0 = x0 + static_cast<float>(index) * (tabWidth + tabGap);
+  const float tabY0 = rect.y0 + kViewerDrawerHeaderHeight + kViewerDrawerPad;
+  return {tabX0, tabY0, std::min(x1, tabX0 + tabWidth), tabY0 + kViewerSettingsSubtabHeight};
+}
+
+int viewerSettingsSubtabIndexAt(const AppState& app, int width, int height, double x, double y) {
+  for (int i = 0; i < 2; ++i) {
+    const PlotMenuRect rect = viewerSettingsSubtabWindowRect(app, width, height, i);
+    if (rect.x1 > rect.x0 && rect.y1 > rect.y0 && pointInPlotMenuRect(rect, x, y)) return i;
+  }
+  return -1;
+}
+
 int plotMenuMainIndexAt(const AppState& app, int width, int height, double x, double y) {
   const PlotMenuRect rect = plotMenuMainRect(app, width, height);
   if (!pointInPlotMenuRect(rect, x, y)) return -1;
-  const float localY = static_cast<float>(y) - rect.y0 - kPlotMenuPad;
+  const float rowsX0 = viewerMenuRowsX0(rect);
+  if (static_cast<float>(x) < rowsX0 || static_cast<float>(x) > rect.x1 - kViewerDrawerPad) return -1;
+  const float rowsY0 = viewerMenuRowsY0(app, rect);
+  const float localY = static_cast<float>(y) - rowsY0 + app.viewerMenuScroll;
   if (localY < 0.0f) return -1;
-  const int index = static_cast<int>(localY / kPlotMenuRowHeight);
-  return (index >= 0 && index < kViewerPlotModelChoiceCount) ? index : -1;
+  const std::vector<ViewerMenuRow> rows = buildViewerMenuRows(app);
+  float top = 0.0f;
+  for (int i = 0; i < static_cast<int>(rows.size()); ++i) {
+    const float bottom = top + viewerMenuRowHeight(rows[static_cast<std::size_t>(i)]);
+    if (localY >= top && localY < bottom) return i;
+    top = bottom;
+  }
+  return -1;
+}
+
+int viewerMenuTabIndexAt(const AppState& app, int width, int height, double x, double y) {
+  const PlotMenuRect rect = plotMenuMainRect(app, width, height);
+  if (!pointInPlotMenuRect(rect, x, y)) return -1;
+  const float tabsX0 = rect.x0 + kViewerDrawerPad;
+  const float tabsX1 = tabsX0 + kViewerDrawerTabRailWidth;
+  const float tabsY0 = rect.y0 + kViewerDrawerHeaderHeight + kViewerDrawerPad;
+  if (static_cast<float>(x) < tabsX0 || static_cast<float>(x) > tabsX1 ||
+      static_cast<float>(y) < tabsY0 || static_cast<float>(y) > rect.y1 - kViewerDrawerPad) {
+    return -1;
+  }
+  const int index = static_cast<int>((static_cast<float>(y) - tabsY0) / kViewerDrawerTabHeight);
+  const int count = static_cast<int>(buildViewerMenuTabs(app).size());
+  return (index >= 0 && index < count) ? index : -1;
+}
+
+PlotMenuRect viewerMenuRowWindowRect(const AppState& app, int width, int height, int rowIndex) {
+  const PlotMenuRect rect = plotMenuMainRect(app, width, height);
+  const std::vector<ViewerMenuRow> rows = buildViewerMenuRows(app);
+  if (rowIndex < 0 || rowIndex >= static_cast<int>(rows.size())) return {};
+  const float rowsX0 = viewerMenuRowsX0(rect);
+  const float rowsY0 = viewerMenuRowsY0(app, rect);
+  const float y0 = rowsY0 + viewerMenuRowTopOffset(rows, rowIndex) - app.viewerMenuScroll;
+  return {rowsX0, y0, rect.x1 - kViewerDrawerPad, y0 + viewerMenuRowHeight(rows[static_cast<std::size_t>(rowIndex)])};
+}
+
+int viewerMenuRowIndexForAction(const AppState& app, ViewerMenuAction action) {
+  const std::vector<ViewerMenuRow> rows = buildViewerMenuRows(app);
+  for (int i = 0; i < static_cast<int>(rows.size()); ++i) {
+    const ViewerMenuRow& row = rows[static_cast<std::size_t>(i)];
+    if (!row.section && row.action == action) return i;
+  }
+  return -1;
+}
+
+int neutralRadiusOverflowPopoverRowIndex(const AppState& app) {
+  const auto state = viewerStateWithModelCapabilities(app.viewerState);
+  if (!state.showOverflow) return -1;
+  const std::vector<ViewerMenuRow> rows = buildViewerMenuRows(app);
+  for (int i = 0; i < static_cast<int>(rows.size()); ++i) {
+    const ViewerMenuRow& row = rows[static_cast<std::size_t>(i)];
+    if (!row.section && row.action == ViewerMenuAction::NeutralRadius && !row.enabled) return i;
+  }
+  return -1;
+}
+
+PlotMenuRect neutralRadiusOverflowPopoverWindowRect(const AppState& app, int width, int height) {
+  const int rowIndex = neutralRadiusOverflowPopoverRowIndex(app);
+  if (rowIndex < 0) return {};
+  const PlotMenuRect rowRect = viewerMenuRowWindowRect(app, width, height, rowIndex);
+  const PlotMenuRect drawer = plotMenuMainRect(app, width, height);
+  const float popoverWidth = std::min(std::max(292.0f, rowRect.x1 - rowRect.x0 - 18.0f),
+                                      std::max(220.0f, drawer.x1 - rowRect.x0 - 16.0f));
+  const float popoverHeight = 88.0f;
+  float x0 = clampf(rowRect.x0 + 8.0f,
+                    drawer.x0 + 8.0f,
+                    std::max(drawer.x0 + 8.0f, drawer.x1 - popoverWidth - 8.0f));
+  float y0 = rowRect.y0 - popoverHeight - 6.0f;
+  const float minY = drawer.y0 + kViewerDrawerHeaderHeight + 6.0f;
+  if (y0 < minY) y0 = rowRect.y1 + 6.0f;
+  y0 = clampf(y0, minY, std::max(minY, drawer.y1 - popoverHeight - 8.0f));
+  return {x0, y0, x0 + popoverWidth, y0 + popoverHeight};
+}
+
+PlotMenuRect neutralRadiusOverflowCheckboxWindowRect(const PlotMenuRect& popoverRect) {
+  if (popoverRect.x1 <= popoverRect.x0 || popoverRect.y1 <= popoverRect.y0) return {};
+  const float size = 15.0f;
+  return {popoverRect.x0 + 12.0f,
+          popoverRect.y0 + 62.0f,
+          popoverRect.x0 + 12.0f + size,
+          popoverRect.y0 + 62.0f + size};
+}
+
+bool pointInNeutralRadiusOverflowPopoverToggle(const AppState& app,
+                                               int width,
+                                               int height,
+                                               double x,
+                                               double y) {
+  const PlotMenuRect popoverRect = neutralRadiusOverflowPopoverWindowRect(app, width, height);
+  if (popoverRect.x1 <= popoverRect.x0 || popoverRect.y1 <= popoverRect.y0) return false;
+  const PlotMenuRect checkboxRect = neutralRadiusOverflowCheckboxWindowRect(popoverRect);
+  const PlotMenuRect hitRect{checkboxRect.x0,
+                             checkboxRect.y0 - 4.0f,
+                             std::min(popoverRect.x1 - 10.0f, checkboxRect.x1 + 118.0f),
+                             checkboxRect.y1 + 4.0f};
+  return pointInPlotMenuRect(hitRect, x, y);
+}
+
+bool neutralRadiusOverflowPopoverVisible(const AppState& app, int width, int height) {
+  const int rowIndex = neutralRadiusOverflowPopoverRowIndex(app);
+  if (rowIndex < 0) return false;
+  if (app.plotModelMenuHoverMain == rowIndex) return true;
+  const PlotMenuRect popoverRect = neutralRadiusOverflowPopoverWindowRect(app, width, height);
+  return pointInPlotMenuRect(popoverRect, app.hoverX, app.hoverY);
+}
+
+bool viewerMenuIdentityLassoLockedAction(ViewerMenuAction action) {
+  return action == ViewerMenuAction::ReadGrayRamp || action == ViewerMenuAction::ReadIdentity;
+}
+
+int identityLassoPopoverRowIndexForPoint(const AppState& app,
+                                         int width,
+                                         int height,
+                                         double x,
+                                         double y) {
+  const auto state = viewerStateWithModelCapabilities(app.viewerState);
+  if (!state.volumeSliceLassoRegion || coercedViewerMenuSection(app) != ViewerMenuSection::Identity) return -1;
+  const std::vector<ViewerMenuRow> rows = buildViewerMenuRows(app);
+  if (app.plotModelMenuHoverMain >= 0 && app.plotModelMenuHoverMain < static_cast<int>(rows.size())) {
+    const ViewerMenuRow& row = rows[static_cast<std::size_t>(app.plotModelMenuHoverMain)];
+    if (!row.section && !row.enabled && viewerMenuIdentityLassoLockedAction(row.action)) {
+      return app.plotModelMenuHoverMain;
+    }
+  }
+  for (int i = 0; i < static_cast<int>(rows.size()); ++i) {
+    const ViewerMenuRow& row = rows[static_cast<std::size_t>(i)];
+    if (row.section || row.enabled || !viewerMenuIdentityLassoLockedAction(row.action)) continue;
+    const PlotMenuRect rowRect = viewerMenuRowWindowRect(app, width, height, i);
+    const PlotMenuRect drawer = plotMenuMainRect(app, width, height);
+    const float popoverWidth = std::min(std::max(354.0f, rowRect.x1 - rowRect.x0 - 10.0f),
+                                        std::max(250.0f, drawer.x1 - rowRect.x0 - 12.0f));
+    const float popoverHeight = 112.0f;
+    float x0 = clampf(rowRect.x0 + 8.0f,
+                      drawer.x0 + 8.0f,
+                      std::max(drawer.x0 + 8.0f, drawer.x1 - popoverWidth - 8.0f));
+    float y0 = rowRect.y1 + 6.0f;
+    const float maxY = drawer.y1 - popoverHeight - 8.0f;
+    if (y0 > maxY) y0 = rowRect.y0 - popoverHeight - 6.0f;
+    const float minY = drawer.y0 + kViewerDrawerHeaderHeight + 6.0f;
+    y0 = clampf(y0, minY, std::max(minY, maxY));
+    if (pointInPlotMenuRect({x0, y0, x0 + popoverWidth, y0 + popoverHeight}, x, y)) return i;
+  }
+  return -1;
+}
+
+int identityLassoPopoverRowIndex(const AppState& app, int width, int height) {
+  return identityLassoPopoverRowIndexForPoint(app, width, height, app.hoverX, app.hoverY);
+}
+
+PlotMenuRect identityLassoPopoverWindowRectForRow(const AppState& app, int width, int height, int rowIndex) {
+  if (rowIndex < 0) return {};
+  const PlotMenuRect rowRect = viewerMenuRowWindowRect(app, width, height, rowIndex);
+  const PlotMenuRect drawer = plotMenuMainRect(app, width, height);
+  const float popoverWidth = std::min(std::max(354.0f, rowRect.x1 - rowRect.x0 - 10.0f),
+                                      std::max(250.0f, drawer.x1 - rowRect.x0 - 12.0f));
+  const float popoverHeight = 112.0f;
+  float x0 = clampf(rowRect.x0 + 8.0f,
+                    drawer.x0 + 8.0f,
+                    std::max(drawer.x0 + 8.0f, drawer.x1 - popoverWidth - 8.0f));
+  float y0 = rowRect.y1 + 6.0f;
+  const float maxY = drawer.y1 - popoverHeight - 8.0f;
+  if (y0 > maxY) y0 = rowRect.y0 - popoverHeight - 6.0f;
+  const float minY = drawer.y0 + kViewerDrawerHeaderHeight + 6.0f;
+  y0 = clampf(y0, minY, std::max(minY, maxY));
+  return {x0, y0, x0 + popoverWidth, y0 + popoverHeight};
+}
+
+PlotMenuRect identityLassoCheckboxWindowRect(const PlotMenuRect& popoverRect) {
+  if (popoverRect.x1 <= popoverRect.x0 || popoverRect.y1 <= popoverRect.y0) return {};
+  const float size = 15.0f;
+  return {popoverRect.x0 + 12.0f,
+          popoverRect.y0 + 84.0f,
+          popoverRect.x0 + 12.0f + size,
+          popoverRect.y0 + 84.0f + size};
+}
+
+bool pointInIdentityLassoPopoverToggle(const AppState& app,
+                                       int width,
+                                       int height,
+                                       double x,
+                                       double y) {
+  const int rowIndex = identityLassoPopoverRowIndexForPoint(app, width, height, x, y);
+  const PlotMenuRect popoverRect = identityLassoPopoverWindowRectForRow(app, width, height, rowIndex);
+  if (popoverRect.x1 <= popoverRect.x0 || popoverRect.y1 <= popoverRect.y0) return false;
+  const PlotMenuRect checkboxRect = identityLassoCheckboxWindowRect(popoverRect);
+  const PlotMenuRect hitRect{checkboxRect.x0,
+                             checkboxRect.y0 - 4.0f,
+                             std::min(popoverRect.x1 - 10.0f, checkboxRect.x1 + 104.0f),
+                             checkboxRect.y1 + 4.0f};
+  return pointInPlotMenuRect(hitRect, x, y);
+}
+
+bool identityLassoPopoverVisible(const AppState& app, int width, int height) {
+  return identityLassoPopoverRowIndex(app, width, height) >= 0;
+}
+
+bool identityReadOptionNeedsGeneratorFlagPopover(const AppState& app,
+                                                 const ViewerMenuRow& row) {
+  const auto state = viewerStateWithModelCapabilities(app.viewerState);
+  if (ChromaspaceViewer::isGlossView(state)) return false;
+  if (coercedViewerMenuSection(app) != ViewerMenuSection::Identity) return false;
+  if (state.volumeSliceLassoRegion) return false;
+  if (row.enabled || row.section) return false;
+  if (!viewerIdentityDrawInstanceDetected(app)) return false;
+  if (!app.generatedIdentityContractKnown || !app.generatedIdentityResolutionValid) return false;
+  if (row.action == ViewerMenuAction::ReadGrayRamp) return !app.generatedIdentityDrawRamp;
+  if (row.action == ViewerMenuAction::ReadIdentity) return !app.generatedIdentityDrawCube;
+  return false;
+}
+
+int identityReadGeneratorFlagPopoverRowIndex(const AppState& app) {
+  if (app.plotModelMenuHoverMain < 0) return -1;
+  const std::vector<ViewerMenuRow> rows = buildViewerMenuRows(app);
+  if (app.plotModelMenuHoverMain >= static_cast<int>(rows.size())) return -1;
+  const ViewerMenuRow& row = rows[static_cast<std::size_t>(app.plotModelMenuHoverMain)];
+  return identityReadOptionNeedsGeneratorFlagPopover(app, row) ? app.plotModelMenuHoverMain : -1;
+}
+
+PlotMenuRect identityReadGeneratorFlagPopoverWindowRect(const AppState& app,
+                                                        int width,
+                                                        int height,
+                                                        int rowIndex) {
+  if (rowIndex < 0) return {};
+  const PlotMenuRect rowRect = viewerMenuRowWindowRect(app, width, height, rowIndex);
+  const PlotMenuRect drawer = plotMenuMainRect(app, width, height);
+  const float popoverWidth = std::min(std::max(360.0f, rowRect.x1 - rowRect.x0 - 10.0f),
+                                      std::max(250.0f, drawer.x1 - rowRect.x0 - 12.0f));
+  const float popoverHeight = 88.0f;
+  float x0 = clampf(rowRect.x0 + 8.0f,
+                    drawer.x0 + 8.0f,
+                    std::max(drawer.x0 + 8.0f, drawer.x1 - popoverWidth - 8.0f));
+  float y0 = rowRect.y1 + 6.0f;
+  const float maxY = drawer.y1 - popoverHeight - 8.0f;
+  if (y0 > maxY) y0 = rowRect.y0 - popoverHeight - 6.0f;
+  const float minY = drawer.y0 + kViewerDrawerHeaderHeight + 6.0f;
+  y0 = clampf(y0, minY, std::max(minY, maxY));
+  return {x0, y0, x0 + popoverWidth, y0 + popoverHeight};
+}
+
+std::string identityReadGeneratorFlagPopoverText(const AppState& app, int rowIndex) {
+  const std::vector<ViewerMenuRow> rows = buildViewerMenuRows(app);
+  if (rowIndex < 0 || rowIndex >= static_cast<int>(rows.size())) return {};
+  const ViewerMenuAction action = rows[static_cast<std::size_t>(rowIndex)].action;
+  if (action == ViewerMenuAction::ReadGrayRamp) {
+    return "Enable Generate Gray Ramp on instance 1 to use Read Gray Ramp.";
+  }
+  if (action == ViewerMenuAction::ReadIdentity) {
+    return "Enable Generate Identity Data on instance 1 to use Read Identity Data.";
+  }
+  return {};
+}
+
+bool identityReadNeedsDrawInstancePrompt(const AppState& app) {
+  const auto state = viewerStateWithModelCapabilities(app.viewerState);
+  if (ChromaspaceViewer::isGlossView(state)) return false;
+  if (coercedViewerMenuSection(app) != ViewerMenuSection::Identity) return false;
+  if (state.volumeSliceLassoRegion) return false;
+  return !viewerIdentityDrawInstanceDetected(app);
+}
+
+int identityReadDrawInstancePromptRowIndex(const AppState& app) {
+  if (!identityReadNeedsDrawInstancePrompt(app)) return -1;
+  const auto state = viewerStateWithModelCapabilities(app.viewerState);
+  const ViewerMenuAction preferred =
+      state.readIdentityPlot ? ViewerMenuAction::ReadIdentity : ViewerMenuAction::ReadGrayRamp;
+  const std::vector<ViewerMenuRow> rows = buildViewerMenuRows(app);
+  for (int pass = 0; pass < 2; ++pass) {
+    for (int i = 0; i < static_cast<int>(rows.size()); ++i) {
+      const ViewerMenuRow& row = rows[static_cast<std::size_t>(i)];
+      if (row.section) continue;
+      if (pass == 0 && row.action == preferred) return i;
+      if (pass == 1 &&
+          (row.action == ViewerMenuAction::ReadGrayRamp || row.action == ViewerMenuAction::ReadIdentity)) {
+        return i;
+      }
+    }
+  }
+  return -1;
+}
+
+PlotMenuRect identityReadDrawInstancePromptWindowRect(const AppState& app, int width, int height, int rowIndex) {
+  if (rowIndex < 0) return {};
+  const PlotMenuRect rowRect = viewerMenuRowWindowRect(app, width, height, rowIndex);
+  const PlotMenuRect drawer = plotMenuMainRect(app, width, height);
+  const float popoverWidth = std::min(std::max(372.0f, rowRect.x1 - rowRect.x0 - 10.0f),
+                                      std::max(250.0f, drawer.x1 - rowRect.x0 - 12.0f));
+  const float popoverHeight = 116.0f;
+  float x0 = clampf(rowRect.x0 + 8.0f,
+                    drawer.x0 + 8.0f,
+                    std::max(drawer.x0 + 8.0f, drawer.x1 - popoverWidth - 8.0f));
+  float y0 = rowRect.y1 + 6.0f;
+  const float maxY = drawer.y1 - popoverHeight - 8.0f;
+  if (y0 > maxY) y0 = rowRect.y0 - popoverHeight - 6.0f;
+  const float minY = drawer.y0 + kViewerDrawerHeaderHeight + 6.0f;
+  y0 = clampf(y0, minY, std::max(minY, maxY));
+  return {x0, y0, x0 + popoverWidth, y0 + popoverHeight};
+}
+
+std::string identityReadDrawInstancePromptText(const AppState& app) {
+  if (!app.resolveDrawStatusMessage.empty() &&
+      app.resolveDrawScanCompletedRevision >= app.resolveDrawScanRequestedRevision) {
+    return app.resolveDrawStatusMessage +
+           " Add a Chromaspace instance before your grade and switch it to Identity Generator.";
+  }
+  if (!app.resolveDrawStatusKnown || !app.resolveDrawStatusAvailable) {
+    return "No instance 1 signal has arrived yet. Add a Chromaspace instance before your grade and switch it to Identity Generator.";
+  }
+  return "Add a Chromaspace instance before your grade and switch it to Identity Generator.";
+}
+
+float updateViewerMenuPopoverFade(bool visible, float* alpha, double* lastTime) {
+  if (!alpha || !lastTime) return visible ? 1.0f : 0.0f;
+  const double now = glfwGetTime();
+  const double dt = *lastTime > 0.0 ? std::clamp(now - *lastTime, 0.0, 0.10) : 0.016;
+  *lastTime = now;
+  const float target = visible ? 1.0f : 0.0f;
+  const float step = static_cast<float>(dt) * (visible ? 9.0f : 7.0f);
+  if (*alpha < target) {
+    *alpha = std::min(target, *alpha + step);
+  } else if (*alpha > target) {
+    *alpha = std::max(target, *alpha - step);
+  }
+  return *alpha;
+}
+
+PlotMenuRect viewerChoiceMenuWindowRect(const AppState& app, int width, int height) {
+  const std::vector<ViewerChoiceMenuItem> items = buildViewerChoiceMenuItems(app);
+  if (items.empty()) return {};
+  const ViewerMenuAction action = viewerMenuActionFromInt(app.viewerMenuChoiceAction);
+  const int rowIndex = viewerMenuRowIndexForAction(app, action);
+  if (rowIndex < 0) return {};
+  const PlotMenuRect drawer = plotMenuMainRect(app, width, height);
+  const PlotMenuRect rowRect = viewerMenuRowWindowRect(app, width, height, rowIndex);
+  const float rowsX0 = drawer.x0 + kViewerDrawerPad + kViewerDrawerTabRailWidth + kViewerDrawerPad;
+  const float rowsX1 = drawer.x1 - kViewerDrawerPad;
+  const float availableWidth = std::max(1.0f, rowsX1 - rowsX0);
+  const float menuWidth = std::min(availableWidth, std::max(220.0f, std::min(360.0f, availableWidth)));
+  const float naturalHeight =
+      kViewerChoiceMenuPad * 2.0f + kViewerChoiceMenuRowHeight * static_cast<float>(items.size());
+  const float x1 = rowsX1;
+  const float x0 = x1 - menuWidth;
+  const float minY = drawer.y0 + kViewerDrawerHeaderHeight + kViewerDrawerPad;
+  const float maxY = drawer.y1 - kViewerDrawerPad;
+  const float availableHeight = std::max(kViewerChoiceMenuPad * 2.0f + kViewerChoiceMenuRowHeight,
+                                         maxY - minY);
+  const float menuHeight = std::min(naturalHeight, availableHeight);
+  float y0 = rowRect.y1 + 4.0f;
+  if (y0 + menuHeight > maxY) y0 = rowRect.y0 - 4.0f - menuHeight;
+  y0 = clampf(y0, minY, std::max(minY, maxY - menuHeight));
+  return {x0, y0, x1, y0 + menuHeight};
+}
+
+float viewerChoiceMenuMaxScroll(const AppState& app, int width, int height) {
+  const std::vector<ViewerChoiceMenuItem> items = buildViewerChoiceMenuItems(app);
+  if (items.empty()) return 0.0f;
+  const PlotMenuRect rect = viewerChoiceMenuWindowRect(app, width, height);
+  const float contentHeight = kViewerChoiceMenuRowHeight * static_cast<float>(items.size());
+  const float visibleHeight = std::max(1.0f, rect.y1 - rect.y0 - kViewerChoiceMenuPad * 2.0f);
+  return std::max(0.0f, contentHeight - visibleHeight);
+}
+
+int viewerChoiceMenuIndexAt(const AppState& app, int width, int height, double x, double y) {
+  const std::vector<ViewerChoiceMenuItem> items = buildViewerChoiceMenuItems(app);
+  if (items.empty()) return -1;
+  const PlotMenuRect rect = viewerChoiceMenuWindowRect(app, width, height);
+  if (!pointInPlotMenuRect(rect, x, y)) return -1;
+  const float scroll = clampf(app.viewerChoiceMenuScroll, 0.0f, viewerChoiceMenuMaxScroll(app, width, height));
+  const float localY = static_cast<float>(y) - rect.y0 - kViewerChoiceMenuPad + scroll;
+  if (localY < 0.0f) return -1;
+  const int index = static_cast<int>(localY / kViewerChoiceMenuRowHeight);
+  return (index >= 0 && index < static_cast<int>(items.size())) ? index : -1;
 }
 
 int plotMenuSubIndexAt(const AppState& app, int width, int height, double x, double y) {
-  const int hoverMain = app.plotModelMenuHoverMain;
-  if (hoverMain != 1 && hoverMain != 2) return -1;
-  const PlotMenuRect mainRect = plotMenuMainRect(app, width, height);
-  const PlotMenuRect subRect = plotMenuSubRect(mainRect, hoverMain, width, height);
-  return pointInPlotMenuRect(subRect, x, y) ? 0 : -1;
+  (void)app;
+  (void)width;
+  (void)height;
+  (void)x;
+  (void)y;
+  return -1;
 }
 
 PlotMenuRect identityReadMenuRect(const AppState& app, int width, int height) {
@@ -8684,6 +15441,10 @@ void requestGlossViewOrthoInspectionFit(AppState* app) {
 void resetCameraForCurrentPlotMode(AppState* app, bool vectorscopeVariant) {
   if (!app) return;
   app->modelOrientation = Quat{};
+  if (app->plotMode == "waveform" || app->plotMode == "histogram") {
+    resetAnalyticalScopeCamera(&app->cam, app->plotMode == "histogram");
+    return;
+  }
   if (vectorscopeVariant) {
     if (app->plotMode == "hsl") {
       resetHslTopCamera(&app->cam);
@@ -8754,6 +15515,206 @@ bool platformRollModifierPressed(const AppState& app) {
 #else
   return false;
 #endif
+}
+
+PlotWindowDragMode plotWindowDragModeAt(const PlotWindowState& window,
+                                        int windowWidth,
+                                        int windowHeight,
+                                        double x,
+                                        double y) {
+  if (!pointInPlotWindowRect(window, windowWidth, windowHeight, x, y)) {
+    return PlotWindowDragMode::None;
+  }
+  const float px0 = window.rect.x * static_cast<float>(std::max(1, windowWidth));
+  const float py0 = window.rect.y * static_cast<float>(std::max(1, windowHeight));
+  const float px1 = px0 + window.rect.w * static_cast<float>(std::max(1, windowWidth));
+  const float py1 = py0 + window.rect.h * static_cast<float>(std::max(1, windowHeight));
+  const float handle = 9.0f;
+  const bool left = std::fabs(static_cast<float>(x) - px0) <= handle;
+  const bool right = std::fabs(static_cast<float>(x) - px1) <= handle;
+  const bool top = std::fabs(static_cast<float>(y) - py0) <= handle;
+  const bool bottom = std::fabs(static_cast<float>(y) - py1) <= handle;
+  if (top && left) return PlotWindowDragMode::ResizeTopLeft;
+  if (top && right) return PlotWindowDragMode::ResizeTopRight;
+  if (bottom && left) return PlotWindowDragMode::ResizeBottomLeft;
+  if (bottom && right) return PlotWindowDragMode::ResizeBottomRight;
+  if (left) return PlotWindowDragMode::ResizeLeft;
+  if (right) return PlotWindowDragMode::ResizeRight;
+  if (top) return PlotWindowDragMode::ResizeTop;
+  if (bottom) return PlotWindowDragMode::ResizeBottom;
+  if ((static_cast<float>(y) - py0) <= 26.0f && window.rect.w < 0.995f && window.rect.h < 0.995f) {
+    return PlotWindowDragMode::Move;
+  }
+  return PlotWindowDragMode::None;
+}
+
+void updatePlotWindowSnapPreview(AppState* app,
+                                 int windowWidth,
+                                 int windowHeight,
+                                 double cursorX,
+                                 double cursorY);
+
+void updatePlotWindowDrag(AppState* app, int windowWidth, int windowHeight, double x, double y) {
+  if (!app || app->plotWindowDragMode == PlotWindowDragMode::None) return;
+  PlotWindowState* window = plotWindowById(app, app->plotWindowDragId);
+  if (!window) return;
+  PlotWindowRectNorm rect = app->plotWindowDragStartRect;
+  const float dx = static_cast<float>((x - app->plotWindowDragStartX) / static_cast<double>(std::max(1, windowWidth)));
+  const float dy = static_cast<float>((y - app->plotWindowDragStartY) / static_cast<double>(std::max(1, windowHeight)));
+  const float minW = plotWindowMinNormW(windowWidth);
+  const float minH = plotWindowMinNormH(windowHeight);
+  auto resizeLeft = [&]() {
+    const float right = rect.x + rect.w;
+    rect.x = clampf(rect.x + dx, 0.0f, right - minW);
+    rect.w = right - rect.x;
+  };
+  auto resizeRight = [&]() {
+    rect.w = clampf(rect.w + dx, minW, 1.0f - rect.x);
+  };
+  auto resizeTop = [&]() {
+    const float bottom = rect.y + rect.h;
+    rect.y = clampf(rect.y + dy, plotWorkspaceTopNorm(windowHeight), bottom - minH);
+    rect.h = bottom - rect.y;
+  };
+  auto resizeBottom = [&]() {
+    rect.h = clampf(rect.h + dy, minH, 1.0f - rect.y);
+  };
+  switch (app->plotWindowDragMode) {
+    case PlotWindowDragMode::Move:
+      rect.x = app->plotWindowDragStartRect.x + dx;
+      rect.y = app->plotWindowDragStartRect.y + dy;
+      break;
+    case PlotWindowDragMode::ResizeLeft: resizeLeft(); break;
+    case PlotWindowDragMode::ResizeRight: resizeRight(); break;
+    case PlotWindowDragMode::ResizeTop: resizeTop(); break;
+    case PlotWindowDragMode::ResizeBottom: resizeBottom(); break;
+    case PlotWindowDragMode::ResizeTopLeft: resizeTop(); resizeLeft(); break;
+    case PlotWindowDragMode::ResizeTopRight: resizeTop(); resizeRight(); break;
+    case PlotWindowDragMode::ResizeBottomLeft: resizeBottom(); resizeLeft(); break;
+    case PlotWindowDragMode::ResizeBottomRight: resizeBottom(); resizeRight(); break;
+    case PlotWindowDragMode::None: break;
+  }
+  window->rect = clampedPlotWindowRect(rect, windowWidth, windowHeight);
+  updatePlotWindowSnapPreview(app, windowWidth, windowHeight, x, y);
+}
+
+void updatePlotWindowSnapPreview(AppState* app,
+                                 int windowWidth,
+                                 int windowHeight,
+                                 double cursorX,
+                                 double cursorY) {
+  if (!app) return;
+  PlotWindowState* window = plotWindowById(app, app->plotWindowDragId);
+  app->plotWindowSnapPreviewVisible = false;
+  app->plotWindowSnapPreviewId = -1;
+  if (!window) return;
+
+  const float w = static_cast<float>(std::max(1, windowWidth));
+  const float h = static_cast<float>(std::max(1, windowHeight));
+  const float nx = static_cast<float>(cursorX) / w;
+  const float ny = static_cast<float>(cursorY) / h;
+  const float workspaceTop = plotWorkspaceTopNorm(windowHeight);
+  const float workspaceHeight = std::max(0.05f, 1.0f - workspaceTop);
+  const float workspaceNy = clampf((ny - workspaceTop) / workspaceHeight, 0.0f, 1.0f);
+  const float edgeX = 22.0f / w;
+  const float edgeY = 22.0f / (h * workspaceHeight);
+  const float cornerX = 34.0f / w;
+  const float cornerY = 34.0f / (h * workspaceHeight);
+  PlotWindowRectNorm candidate = window->rect;
+  bool haveCandidate = false;
+  auto workspaceCandidate = [&](float x, float y, float width, float height) {
+    return plotWorkspaceRect(x, y, width, height, windowHeight);
+  };
+
+  if (nx <= cornerX && workspaceNy <= cornerY) {
+    candidate = workspaceCandidate(0.0f, 0.0f, 0.5f, 0.5f);
+    haveCandidate = true;
+  } else if (nx >= 1.0f - cornerX && workspaceNy <= cornerY) {
+    candidate = workspaceCandidate(0.5f, 0.0f, 0.5f, 0.5f);
+    haveCandidate = true;
+  } else if (nx <= cornerX && workspaceNy >= 1.0f - cornerY) {
+    candidate = workspaceCandidate(0.0f, 0.5f, 0.5f, 0.5f);
+    haveCandidate = true;
+  } else if (nx >= 1.0f - cornerX && workspaceNy >= 1.0f - cornerY) {
+    candidate = workspaceCandidate(0.5f, 0.5f, 0.5f, 0.5f);
+    haveCandidate = true;
+  } else if (nx <= edgeX) {
+    candidate = workspaceCandidate(0.0f, 0.0f, 0.5f, 1.0f);
+    haveCandidate = true;
+  } else if (nx >= 1.0f - edgeX) {
+    candidate = workspaceCandidate(0.5f, 0.0f, 0.5f, 1.0f);
+    haveCandidate = true;
+  } else if (workspaceNy <= edgeY) {
+    candidate = workspaceCandidate(0.0f, 0.0f, 1.0f, 0.5f);
+    haveCandidate = true;
+  } else if (workspaceNy >= 1.0f - edgeY) {
+    candidate = workspaceCandidate(0.0f, 0.5f, 1.0f, 0.5f);
+    haveCandidate = true;
+  } else {
+    constexpr float kGuideDistancePx = 11.0f;
+    float bestDxPx = kGuideDistancePx + 1.0f;
+    float bestDyPx = kGuideDistancePx + 1.0f;
+    float snappedX = candidate.x;
+    float snappedY = candidate.y;
+    const float currentLeft = candidate.x;
+    const float currentRight = candidate.x + candidate.w;
+    const float currentTop = candidate.y;
+    const float currentBottom = candidate.y + candidate.h;
+    for (const auto& other : app->plotWindows) {
+      if (other.windowId == window->windowId) continue;
+      const float xGuides[] = {other.rect.x, other.rect.x + other.rect.w};
+      const float yGuides[] = {other.rect.y, other.rect.y + other.rect.h};
+      for (const float guide : xGuides) {
+        const float leftDeltaPx = std::fabs(currentLeft - guide) * w;
+        if (leftDeltaPx < bestDxPx) {
+          bestDxPx = leftDeltaPx;
+          snappedX = guide;
+        }
+        const float rightDeltaPx = std::fabs(currentRight - guide) * w;
+        if (rightDeltaPx < bestDxPx) {
+          bestDxPx = rightDeltaPx;
+          snappedX = guide - candidate.w;
+        }
+      }
+      for (const float guide : yGuides) {
+        const float topDeltaPx = std::fabs(currentTop - guide) * h;
+        if (topDeltaPx < bestDyPx) {
+          bestDyPx = topDeltaPx;
+          snappedY = guide;
+        }
+        const float bottomDeltaPx = std::fabs(currentBottom - guide) * h;
+        if (bottomDeltaPx < bestDyPx) {
+          bestDyPx = bottomDeltaPx;
+          snappedY = guide - candidate.h;
+        }
+      }
+    }
+    if (bestDxPx <= kGuideDistancePx) {
+      candidate.x = snappedX;
+      haveCandidate = true;
+    }
+    if (bestDyPx <= kGuideDistancePx) {
+      candidate.y = snappedY;
+      haveCandidate = true;
+    }
+  }
+
+  if (haveCandidate) {
+    app->plotWindowSnapPreviewRect = clampedPlotWindowRect(candidate, windowWidth, windowHeight);
+    app->plotWindowSnapPreviewId = window->windowId;
+    app->plotWindowSnapPreviewVisible = true;
+  }
+}
+
+void commitPlotWindowSnapPreview(AppState* app, int windowWidth, int windowHeight) {
+  if (!app) return;
+  if (app->plotWindowSnapPreviewVisible) {
+    if (PlotWindowState* window = plotWindowById(app, app->plotWindowSnapPreviewId)) {
+      window->rect = clampedPlotWindowRect(app->plotWindowSnapPreviewRect, windowWidth, windowHeight);
+    }
+  }
+  app->plotWindowSnapPreviewVisible = false;
+  app->plotWindowSnapPreviewId = -1;
 }
 
 struct HudTextRenderer {
@@ -8906,17 +15867,132 @@ void keyCallback(GLFWwindow* window, int key, int, int action, int) {
   AppState* app = reinterpret_cast<AppState*>(glfwGetWindowUserPointer(window));
   if (!app) return;
   refreshModifierState(window, app);
-  if (action == GLFW_PRESS && key == GLFW_KEY_S && app->shiftHeld) {
+  if (app->viewerPresetNameEditing) {
+    if (action == GLFW_PRESS || action == GLFW_REPEAT) {
+      if (key == GLFW_KEY_BACKSPACE) {
+        if (!app->viewerPresetNameInput.empty()) app->viewerPresetNameInput.pop_back();
+      } else if (key == GLFW_KEY_ENTER || key == GLFW_KEY_KP_ENTER) {
+        app->viewerPresetNameInput = sanitizeViewerPresetName(app->viewerPresetNameInput);
+        app->viewerPresetNameEditing = false;
+      } else if (key == GLFW_KEY_ESCAPE) {
+        app->viewerPresetNameEditing = false;
+      }
+    }
+    return;
+  }
+  if (action == GLFW_PRESS && key == GLFW_KEY_ESCAPE &&
+      (app->plotModelMenuVisible || app->quickPlotModelMenuVisible || app->addPlotMenuVisible ||
+       app->layoutMenuVisible)) {
+    app->plotModelMenuVisible = false;
+    app->quickPlotModelMenuVisible = false;
+    app->addPlotMenuVisible = false;
+    app->layoutMenuVisible = false;
+    app->plotModelMenuHoverMain = -1;
+    app->plotModelMenuHoverSub = -1;
+    app->quickPlotModelMenuHover = -1;
+    app->addPlotMenuHover = -1;
+    app->layoutMenuHover = -1;
+    app->viewerMenuHoverTab = -1;
+    app->viewerMenuHoverChoice = -1;
+    app->viewerMenuDraggingSlider = false;
+    app->viewerMenuChoiceAction = static_cast<int>(ViewerMenuAction::None);
+    app->viewerChoiceMenuScroll = 0.0f;
+    clearPointerInteractionState(app);
+    return;
+  }
+  if (action == GLFW_PRESS && key == GLFW_KEY_M) {
+    if (app->plotModelMenuVisible) {
+      app->plotModelMenuVisible = false;
+      app->plotModelMenuHoverMain = -1;
+      app->plotModelMenuHoverSub = -1;
+      app->viewerMenuHoverTab = -1;
+      app->viewerMenuHoverChoice = -1;
+      app->viewerMenuDraggingSlider = false;
+      app->viewerMenuChoiceAction = static_cast<int>(ViewerMenuAction::None);
+      app->viewerChoiceMenuScroll = 0.0f;
+    } else {
+      app->plotModelMenuVisible = true;
+      app->quickPlotModelMenuVisible = false;
+      app->addPlotMenuVisible = false;
+      app->layoutMenuVisible = false;
+      app->plotModelMenuHoverMain = -1;
+      app->plotModelMenuHoverSub = -1;
+      app->quickPlotModelMenuHover = -1;
+      app->addPlotMenuHover = -1;
+      app->layoutMenuHover = -1;
+      app->viewerMenuHoverTab = -1;
+      app->viewerMenuHoverChoice = -1;
+      app->viewerMenuChoiceAction = static_cast<int>(ViewerMenuAction::None);
+      app->viewerChoiceMenuScroll = 0.0f;
+      if (coercedViewerMenuSection(*app) == ViewerMenuSection::Identity) {
+        requestResolveDrawInstanceScan(app, "identity-tab-open", true);
+      }
+    }
+    clearPointerInteractionState(app);
+    return;
+  }
+  if (action == GLFW_PRESS && key == GLFW_KEY_S && app->ctrlHeld) {
     double cursorX = app->hoverX;
     double cursorY = app->hoverY;
     glfwGetCursorPos(window, &cursorX, &cursorY);
-    if (!app->plotModelMenuVisible) {
-      app->plotModelMenuX = cursorX + 10.0;
-      app->plotModelMenuY = cursorY + 10.0;
-    }
-    app->plotModelMenuVisible = true;
+    app->quickPlotModelMenuVisible = !app->quickPlotModelMenuVisible;
+    app->plotModelMenuVisible = false;
+    app->addPlotMenuVisible = false;
+    app->layoutMenuVisible = false;
+    app->quickPlotModelMenuX = cursorX;
+    app->quickPlotModelMenuY = cursorY;
+    app->viewerMenuChoiceAction = static_cast<int>(ViewerMenuAction::None);
+    app->viewerChoiceMenuScroll = 0.0f;
     app->plotModelMenuHoverMain = -1;
     app->plotModelMenuHoverSub = -1;
+    app->quickPlotModelMenuHover = app->quickPlotModelMenuVisible ? app->viewerState.plotModel : -1;
+    app->addPlotMenuHover = -1;
+    app->layoutMenuHover = -1;
+    app->viewerMenuHoverTab = -1;
+    app->viewerMenuHoverChoice = -1;
+    clearPointerInteractionState(app);
+    return;
+  }
+  if (action == GLFW_PRESS && key == GLFW_KEY_A && app->shiftHeld) {
+    double cursorX = app->hoverX;
+    double cursorY = app->hoverY;
+    glfwGetCursorPos(window, &cursorX, &cursorY);
+    app->addPlotMenuVisible = !app->addPlotMenuVisible;
+    app->quickPlotModelMenuVisible = false;
+    app->plotModelMenuVisible = false;
+    app->layoutMenuVisible = false;
+    app->addPlotMenuX = cursorX;
+    app->addPlotMenuY = cursorY;
+    app->addPlotMenuHover = app->addPlotMenuVisible ? app->viewerState.plotModel : -1;
+    app->quickPlotModelMenuHover = -1;
+    app->layoutMenuHover = -1;
+    app->viewerMenuChoiceAction = static_cast<int>(ViewerMenuAction::None);
+    app->viewerChoiceMenuScroll = 0.0f;
+    app->plotModelMenuHoverMain = -1;
+    app->plotModelMenuHoverSub = -1;
+    app->viewerMenuHoverTab = -1;
+    app->viewerMenuHoverChoice = -1;
+    clearPointerInteractionState(app);
+    return;
+  }
+  if (action == GLFW_PRESS && key == GLFW_KEY_L &&
+      !app->ctrlHeld && !app->shiftHeld && !app->altHeld && !app->superHeld) {
+    double cursorX = app->hoverX;
+    double cursorY = app->hoverY;
+    glfwGetCursorPos(window, &cursorX, &cursorY);
+    app->layoutMenuVisible = !app->layoutMenuVisible;
+    app->quickPlotModelMenuVisible = false;
+    app->plotModelMenuVisible = false;
+    app->addPlotMenuVisible = false;
+    app->layoutMenuX = cursorX;
+    app->layoutMenuY = cursorY;
+    app->layoutMenuHover = -1;
+    app->addPlotMenuHover = -1;
+    app->quickPlotModelMenuHover = -1;
+    app->plotModelMenuHoverMain = -1;
+    app->plotModelMenuHoverSub = -1;
+    app->viewerMenuHoverTab = -1;
+    app->viewerMenuHoverChoice = -1;
     clearPointerInteractionState(app);
     return;
   }
@@ -8957,15 +16033,30 @@ void keyCallback(GLFWwindow* window, int key, int, int action, int) {
       return;
     }
   }
+  if (action == GLFW_PRESS && key == GLFW_KEY_F) {
+    PlotWindowState* focused = focusedPlotWindow(app);
+    if (focused && plotModelIsAnalyticalScope(focused->viewState.plotModel)) {
+      fitAnalyticalScopeCamera(focused);
+      app->cam = focused->camera;
+      app->fitVolumeRequested = false;
+    } else {
+      app->fitVolumeRequested = true;
+    }
+    app->fitFeedbackUntil = glfwGetTime() + 0.55;
+  }
   if (action == GLFW_PRESS && key == GLFW_KEY_S) {
     app->orthographicSnapEnabled = !app->orthographicSnapEnabled;
     if (!app->orthographicSnapEnabled) resetGlossViewOrthoInteractionState(app);
     return;
   }
-  if (action == GLFW_PRESS && key == GLFW_KEY_F) {
-    app->fitVolumeRequested = true;
-    app->fitFeedbackUntil = glfwGetTime() + 0.55;
-  }
+}
+
+void charCallback(GLFWwindow* window, unsigned int codepoint) {
+  AppState* app = reinterpret_cast<AppState*>(glfwGetWindowUserPointer(window));
+  if (!app || !app->viewerPresetNameEditing) return;
+  if (codepoint < 32 || codepoint > 126) return;
+  if (app->viewerPresetNameInput.size() >= 64) return;
+  app->viewerPresetNameInput.push_back(static_cast<char>(codepoint));
 }
 
 void tryActivateViewerOnHover(GLFWwindow* window, AppState* app) {
@@ -9605,6 +16696,97 @@ void drawHudTextLine(const HudTextRenderer& renderer,
   glDisable(GL_TEXTURE_2D);
 }
 
+float hudTextWidth(const HudTextRenderer& renderer, const std::string& text, float scale) {
+  if (text.empty()) return 0.0f;
+  if (renderer.available) return WorkshopText::measureTextWidth(renderer.atlas, text, scale);
+  return static_cast<float>(text.size()) * 7.0f * scale;
+}
+
+std::string fitHudText(const HudTextRenderer& renderer,
+                       const std::string& text,
+                       float maxWidth,
+                       float scale) {
+  if (text.empty()) return std::string();
+  if (maxWidth <= 0.0f) return std::string();
+  if (hudTextWidth(renderer, text, scale) <= maxWidth) return text;
+  const std::string suffix = "...";
+  if (hudTextWidth(renderer, suffix, scale) > maxWidth) return std::string();
+  std::string out = text;
+  while (!out.empty()) {
+    out.pop_back();
+    const std::string candidate = out + suffix;
+    if (hudTextWidth(renderer, candidate, scale) <= maxWidth) return candidate;
+  }
+  return suffix;
+}
+
+std::vector<std::string> wrapHudText(const HudTextRenderer& renderer,
+                                     const std::string& text,
+                                     float maxWidth,
+                                     float scale,
+                                     int maxLines = 3) {
+  std::vector<std::string> lines;
+  if (text.empty() || maxWidth <= 0.0f || maxLines <= 0) return lines;
+  std::istringstream words(text);
+  std::string word;
+  std::string current;
+  while (words >> word) {
+    const std::string candidate = current.empty() ? word : current + " " + word;
+    if (hudTextWidth(renderer, candidate, scale) <= maxWidth) {
+      current = candidate;
+      continue;
+    }
+    if (!current.empty()) {
+      lines.push_back(current);
+      current.clear();
+      if (static_cast<int>(lines.size()) >= maxLines) break;
+    }
+    if (hudTextWidth(renderer, word, scale) <= maxWidth) {
+      current = word;
+    } else {
+      lines.push_back(fitHudText(renderer, word, maxWidth, scale));
+      if (static_cast<int>(lines.size()) >= maxLines) break;
+    }
+  }
+  if (!current.empty() && static_cast<int>(lines.size()) < maxLines) {
+    lines.push_back(current);
+  }
+  return lines;
+}
+
+void drawWrappedHudText(const HudTextRenderer& renderer,
+                        const std::string& text,
+                        float x,
+                        float topBaselineY,
+                        float maxWidth,
+                        float scale,
+                        int maxLines,
+                        float alpha,
+                        float r,
+                        float g,
+                        float b) {
+  const std::vector<std::string> lines = wrapHudText(renderer, text, maxWidth, scale, maxLines);
+  const float lineStep = renderer.available ? 17.0f : 15.0f;
+  for (int i = 0; i < static_cast<int>(lines.size()); ++i) {
+    drawHudTextLine(renderer, lines[static_cast<std::size_t>(i)], x, topBaselineY - lineStep * static_cast<float>(i),
+                    scale, alpha, r, g, b);
+  }
+}
+
+void drawHudTextLineRight(const HudTextRenderer& renderer,
+                          const std::string& text,
+                          float rightX,
+                          float baselineY,
+                          float scale,
+                          float alpha,
+                          float r,
+                          float g,
+                          float b) {
+  if (text.empty()) return;
+  const float width = hudTextWidth(renderer, text, scale);
+  drawHudTextLine(renderer, text, rightX - width, baselineY, scale, alpha, r, g, b);
+}
+
 void drawHudBackdrop(float x0, float y0, float x1, float y1, float alpha) {
   if (alpha <= 0.0f || x1 <= x0 || y1 <= y0) return;
   glDisable(GL_TEXTURE_2D);
@@ -9629,15 +16811,100 @@ void drawPlotMenuRect(float x0, float y0, float x1, float y1, float r, float g, 
   glEnd();
 }
 
-void drawPlotModelMenuOverlay(const AppState& app,
-                              const ResolvedPayload& payload,
-                              int width,
-                              int height,
-                              int windowWidth,
-                              int windowHeight,
-                              const HudTextRenderer& renderer) {
-  if (!app.plotModelMenuVisible ||
-      width <= 0 || height <= 0 || windowWidth <= 0 || windowHeight <= 0) return;
+void drawViewerDisplayGlyph(float x0, float y0, bool selected, bool enabled = true) {
+  const float alpha = enabled ? (selected ? 0.94f : 0.76f) : 0.34f;
+  const float screenW = 14.0f;
+  const float screenH = 9.0f;
+  drawPlotMenuRect(x0, y0 + 3.0f, x0 + screenW, y0 + 3.0f + screenH,
+                   0.16f, 0.24f, 0.31f, alpha * 0.72f);
+  drawPlotMenuRect(x0, y0 + 3.0f, x0 + screenW, y0 + 4.0f,
+                   0.68f, 0.84f, 0.96f, alpha);
+  drawPlotMenuRect(x0, y0 + 11.0f, x0 + screenW, y0 + 12.0f,
+                   0.68f, 0.84f, 0.96f, alpha);
+  drawPlotMenuRect(x0, y0 + 3.0f, x0 + 1.0f, y0 + 12.0f,
+                   0.68f, 0.84f, 0.96f, alpha);
+  drawPlotMenuRect(x0 + screenW - 1.0f, y0 + 3.0f, x0 + screenW, y0 + 12.0f,
+                   0.68f, 0.84f, 0.96f, alpha);
+  drawPlotMenuRect(x0 + 6.0f, y0 + 1.0f, x0 + 8.0f, y0 + 3.0f,
+                   0.68f, 0.84f, 0.96f, alpha);
+  drawPlotMenuRect(x0 + 3.5f, y0, x0 + 10.5f, y0 + 1.0f,
+                   0.68f, 0.84f, 0.96f, alpha);
+}
+
+void drawViewerMenuListGlyph(float x0, float y0, float x1, float y1, bool active, bool hovered) {
+  drawPlotMenuRect(x0, y0, x1, y1,
+                   active ? 0.10f : (hovered ? 0.08f : 0.035f),
+                   active ? 0.19f : (hovered ? 0.13f : 0.045f),
+                   active ? 0.26f : (hovered ? 0.18f : 0.060f),
+                   active ? 0.88f : (hovered ? 0.78f : 0.58f));
+  drawPlotMenuRect(x0, y1 - 1.0f, x1, y1, 0.70f, 0.84f, 0.94f, active ? 0.44f : 0.24f);
+  drawPlotMenuRect(x0, y0, x0 + 1.0f, y1, 0.70f, 0.84f, 0.94f, active ? 0.34f : 0.18f);
+  drawPlotMenuRect(x1 - 1.0f, y0, x1, y1, 0.70f, 0.84f, 0.94f, active ? 0.28f : 0.14f);
+  drawPlotMenuRect(x0, y0, x1, y0 + 1.0f, 0.70f, 0.84f, 0.94f, active ? 0.22f : 0.12f);
+
+  const float dotX0 = x0 + 7.0f;
+  const float lineX0 = x0 + 13.0f;
+  const float lineX1 = x1 - 7.0f;
+  const float ys[3] = {y0 + 9.0f, y0 + 15.0f, y0 + 21.0f};
+  for (float yy : ys) {
+    drawPlotMenuRect(dotX0, yy - 1.2f, dotX0 + 2.4f, yy + 1.2f, 0.82f, 0.92f, 1.0f, active ? 0.94f : 0.76f);
+    drawPlotMenuRect(lineX0, yy - 1.0f, lineX1, yy + 1.0f, 0.82f, 0.92f, 1.0f, active ? 0.92f : 0.72f);
+  }
+}
+
+void drawViewerAddPlotGlyph(float x0, float y0, float x1, float y1, bool active, bool hovered) {
+  drawPlotMenuRect(x0, y0, x1, y1,
+                   active ? 0.10f : (hovered ? 0.08f : 0.035f),
+                   active ? 0.19f : (hovered ? 0.13f : 0.045f),
+                   active ? 0.26f : (hovered ? 0.18f : 0.060f),
+                   active ? 0.82f : (hovered ? 0.72f : 0.46f));
+  drawPlotMenuRect(x0, y1 - 1.0f, x1, y1, 0.70f, 0.84f, 0.94f, active ? 0.42f : 0.20f);
+  drawPlotMenuRect(x0, y0, x0 + 1.0f, y1, 0.70f, 0.84f, 0.94f, active ? 0.30f : 0.14f);
+  drawPlotMenuRect(x1 - 1.0f, y0, x1, y1, 0.70f, 0.84f, 0.94f, active ? 0.25f : 0.11f);
+  drawPlotMenuRect(x0, y0, x1, y0 + 1.0f, 0.70f, 0.84f, 0.94f, active ? 0.20f : 0.10f);
+  glDisable(GL_TEXTURE_2D);
+  glLineWidth(2.1f);
+  glBegin(GL_LINES);
+  glColor4f(0.82f, 0.94f, 1.0f, hovered || active ? 0.94f : 0.72f);
+  const float cx = (x0 + x1) * 0.5f;
+  const float cy = (y0 + y1) * 0.5f;
+  glVertex2f(cx - 7.0f, cy);
+  glVertex2f(cx + 7.0f, cy);
+  glVertex2f(cx, cy - 7.0f);
+  glVertex2f(cx, cy + 7.0f);
+  glEnd();
+  glLineWidth(1.0f);
+}
+
+void drawViewerLayoutGlyph(float x0, float y0, float x1, float y1, bool active, bool hovered) {
+  drawPlotMenuRect(x0, y0, x1, y1,
+                   active ? 0.10f : (hovered ? 0.08f : 0.035f),
+                   active ? 0.19f : (hovered ? 0.13f : 0.045f),
+                   active ? 0.26f : (hovered ? 0.18f : 0.060f),
+                   active ? 0.82f : (hovered ? 0.72f : 0.46f));
+  const float inset = 6.0f;
+  const float gap = 2.0f;
+  const float cellW = (x1 - x0 - inset * 2.0f - gap) * 0.5f;
+  const float cellH = (y1 - y0 - inset * 2.0f - gap) * 0.5f;
+  for (int row = 0; row < 2; ++row) {
+    for (int col = 0; col < 2; ++col) {
+      const float cx0 = x0 + inset + static_cast<float>(col) * (cellW + gap);
+      const float cy0 = y0 + inset + static_cast<float>(row) * (cellH + gap);
+      drawPlotMenuRect(cx0, cy0, cx0 + cellW, cy0 + cellH,
+                       0.58f, 0.82f, 1.0f, hovered || active ? 0.80f : 0.52f);
+    }
+  }
+}
+
+void drawViewerMenuIconOverlay(const AppState& app,
+                               int width,
+                               int height,
+                               int windowWidth,
+                               int windowHeight) {
+  if (!app.showWorkspaceButtons || app.plotModelMenuVisible ||
+      width <= 0 || height <= 0 || windowWidth <= 0 || windowHeight <= 0) {
+    return;
+  }
   const float sx = static_cast<float>(width) / static_cast<float>(windowWidth);
   const float sy = static_cast<float>(height) / static_cast<float>(windowHeight);
   auto scaleRect = [&](const PlotMenuRect& rect) -> PlotMenuRect {
@@ -9646,15 +16913,192 @@ void drawPlotModelMenuOverlay(const AppState& app,
             rect.x1 * sx,
             static_cast<float>(height) - rect.y0 * sy};
   };
-  auto rowRect = [&](const PlotMenuRect& menuRect, int row) -> PlotMenuRect {
-    const float top = menuRect.y0 + kPlotMenuPad + kPlotMenuRowHeight * static_cast<float>(row);
-    const float bottom = top + kPlotMenuRowHeight;
-    return scaleRect({menuRect.x0 + 4.0f, top, menuRect.x1 - 4.0f, bottom});
-  };
+  const PlotMenuRect iconWindowRect = viewerMenuIconWindowRect(windowWidth, windowHeight);
+  const PlotMenuRect iconRect = scaleRect(iconWindowRect);
+  const PlotMenuRect addWindowRect = viewerAddPlotIconWindowRect(windowWidth, windowHeight);
+  const PlotMenuRect addRect = scaleRect(addWindowRect);
+  const PlotMenuRect layoutWindowRect = viewerLayoutIconWindowRect(windowWidth, windowHeight);
+  const PlotMenuRect layoutRect = scaleRect(layoutWindowRect);
+  const bool hovered = pointInPlotMenuRect(iconWindowRect, app.hoverX, app.hoverY);
+  const bool addHovered = pointInPlotMenuRect(addWindowRect, app.hoverX, app.hoverY);
+  const bool layoutHovered = pointInPlotMenuRect(layoutWindowRect, app.hoverX, app.hoverY);
 
-  const PlotMenuRect mainWindowRect = plotMenuMainRect(app, windowWidth, windowHeight);
-  const PlotMenuRect mainRect = scaleRect(mainWindowRect);
-  const int currentIndex = plotModelIndexForMode(payload.plotMode);
+  glMatrixMode(GL_PROJECTION);
+  glPushMatrix();
+  glLoadIdentity();
+  glOrtho(0.0, static_cast<double>(width), 0.0, static_cast<double>(height), -1.0, 1.0);
+  glMatrixMode(GL_MODELVIEW);
+  glPushMatrix();
+  glLoadIdentity();
+  glDisable(GL_DEPTH_TEST);
+  glEnable(GL_BLEND);
+  glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+  drawViewerMenuListGlyph(iconRect.x0, iconRect.y0, iconRect.x1, iconRect.y1, false, hovered);
+  drawViewerAddPlotGlyph(addRect.x0, addRect.y0, addRect.x1, addRect.y1, app.addPlotMenuVisible, addHovered);
+  drawViewerLayoutGlyph(layoutRect.x0,
+                        layoutRect.y0,
+                        layoutRect.x1,
+                        layoutRect.y1,
+                        app.layoutMenuVisible,
+                        layoutHovered);
+  glDisable(GL_BLEND);
+  glEnable(GL_DEPTH_TEST);
+  glPopMatrix();
+  glMatrixMode(GL_PROJECTION);
+  glPopMatrix();
+  glMatrixMode(GL_MODELVIEW);
+}
+
+void drawViewerMenuCloseButton(const PlotMenuRect& rect, bool hovered) {
+  drawPlotMenuRect(rect.x0, rect.y0, rect.x1, rect.y1,
+                   hovered ? 0.16f : 0.065f,
+                   hovered ? 0.10f : 0.070f,
+                   hovered ? 0.11f : 0.085f,
+                   hovered ? 0.82f : 0.50f);
+  drawPlotMenuRect(rect.x0, rect.y1 - 1.0f, rect.x1, rect.y1, 0.90f, 0.78f, 0.82f, hovered ? 0.46f : 0.22f);
+  glDisable(GL_TEXTURE_2D);
+  glLineWidth(1.8f);
+  glBegin(GL_LINES);
+  glColor4f(0.94f, 0.92f, 0.94f, hovered ? 0.98f : 0.76f);
+  glVertex2f(rect.x0 + 8.0f, rect.y0 + 8.0f);
+  glVertex2f(rect.x1 - 8.0f, rect.y1 - 8.0f);
+  glVertex2f(rect.x1 - 8.0f, rect.y0 + 8.0f);
+  glVertex2f(rect.x0 + 8.0f, rect.y1 - 8.0f);
+  glEnd();
+  glLineWidth(1.0f);
+}
+
+void drawViewerMenuCheckbox(float x0,
+                            float y0,
+                            float size,
+                            bool checked,
+                            bool enabled,
+                            bool hovered,
+                            float alphaScale = 1.0f) {
+  const float x1 = x0 + size;
+  const float y1 = y0 + size;
+  alphaScale = clampf(alphaScale, 0.0f, 1.0f);
+  drawPlotMenuRect(x0, y0, x1, y1,
+                   hovered ? 0.12f : 0.075f,
+                   hovered ? 0.20f : 0.105f,
+                   hovered ? 0.27f : 0.135f,
+                   (enabled ? 0.86f : 0.32f) * alphaScale);
+  drawPlotMenuRect(x0, y1 - 1.0f, x1, y1,
+                   0.72f, 0.84f, 0.94f, (enabled ? 0.44f : 0.16f) * alphaScale);
+  drawPlotMenuRect(x0, y0, x0 + 1.0f, y1,
+                   0.72f, 0.84f, 0.94f, (enabled ? 0.34f : 0.13f) * alphaScale);
+  drawPlotMenuRect(x1 - 1.0f, y0, x1, y1,
+                   0.72f, 0.84f, 0.94f, (enabled ? 0.24f : 0.10f) * alphaScale);
+  drawPlotMenuRect(x0, y0, x1, y0 + 1.0f,
+                   0.72f, 0.84f, 0.94f, (enabled ? 0.22f : 0.09f) * alphaScale);
+  if (!checked) return;
+  glDisable(GL_TEXTURE_2D);
+  glLineWidth(2.0f);
+  glBegin(GL_LINES);
+  glColor4f(enabled ? 0.55f : 0.35f,
+            enabled ? 0.88f : 0.44f,
+            enabled ? 1.0f : 0.50f,
+            (enabled ? 0.96f : 0.34f) * alphaScale);
+  glVertex2f(x0 + size * 0.24f, y0 + size * 0.52f);
+  glVertex2f(x0 + size * 0.42f, y0 + size * 0.30f);
+  glVertex2f(x0 + size * 0.42f, y0 + size * 0.30f);
+  glVertex2f(x0 + size * 0.78f, y0 + size * 0.74f);
+  glEnd();
+  glLineWidth(1.0f);
+}
+
+void drawViewerLassoOverlay(const AppState& app, int width, int height) {
+  if ((!app.viewerState.volumeSliceLassoRegion && !app.viewerLassoDrawing) ||
+      (app.viewerLassoStrokes.empty() && !app.viewerLassoDrawing) ||
+      width <= 0 || height <= 0) {
+    return;
+  }
+  glMatrixMode(GL_PROJECTION);
+  glPushMatrix();
+  glLoadIdentity();
+  glOrtho(0.0, static_cast<double>(width), 0.0, static_cast<double>(height), -1.0, 1.0);
+  glMatrixMode(GL_MODELVIEW);
+  glPushMatrix();
+  glLoadIdentity();
+  glDisable(GL_DEPTH_TEST);
+  glEnable(GL_BLEND);
+  glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+  glEnable(GL_LINE_SMOOTH);
+  glHint(GL_LINE_SMOOTH_HINT, GL_NICEST);
+  auto drawStroke = [&](const LassoStroke& stroke, float alpha, bool closed) {
+    if (stroke.points.size() < 2) return;
+    glLineWidth(stroke.subtract ? 1.4f : 1.8f);
+    glColor4f(stroke.subtract ? 1.0f : 0.42f,
+              stroke.subtract ? 0.42f : 0.78f,
+              stroke.subtract ? 0.36f : 1.0f,
+              alpha);
+    glBegin(closed ? GL_LINE_LOOP : GL_LINE_STRIP);
+    for (const auto& point : stroke.points) {
+      glVertex2f(point.xNorm * static_cast<float>(width),
+                 point.yNorm * static_cast<float>(height));
+    }
+    glEnd();
+  };
+  for (const auto& stroke : app.viewerLassoStrokes) drawStroke(stroke, 0.78f, true);
+  if (app.viewerLassoDrawing) drawStroke(app.viewerLassoActiveStroke, 0.94f, false);
+  glDisable(GL_LINE_SMOOTH);
+  glDisable(GL_BLEND);
+  glEnable(GL_DEPTH_TEST);
+  glPopMatrix();
+  glMatrixMode(GL_PROJECTION);
+  glPopMatrix();
+  glMatrixMode(GL_MODELVIEW);
+}
+
+void drawImageLassoWaitingOverlay(int width,
+                                  int height,
+                                  const HudTextRenderer& renderer) {
+  if (width <= 0 || height <= 0) return;
+  glMatrixMode(GL_PROJECTION);
+  glPushMatrix();
+  glLoadIdentity();
+  glOrtho(0.0, static_cast<double>(width), 0.0, static_cast<double>(height), -1.0, 1.0);
+  glMatrixMode(GL_MODELVIEW);
+  glPushMatrix();
+  glLoadIdentity();
+  glDisable(GL_DEPTH_TEST);
+  glEnable(GL_BLEND);
+  glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+  const float scale = renderer.available ? 0.54f : 5.2f;
+  const std::string label = "Waiting for a Lasso shape...";
+  const float textWidth = hudTextWidth(renderer, label, scale);
+  const float x = std::max(12.0f, static_cast<float>(width) - textWidth - 16.0f);
+  const float y = static_cast<float>(height) - (renderer.available ? 28.0f : 24.0f);
+  drawHudTextLine(renderer, label, x + 1.0f, y - 1.0f, scale, 0.48f, 0.02f, 0.05f, 0.08f);
+  drawHudTextLine(renderer, label, x, y, scale, 0.92f, 0.58f, 0.82f, 1.0f);
+  glEnable(GL_DEPTH_TEST);
+  glDisable(GL_BLEND);
+  glPopMatrix();
+  glMatrixMode(GL_PROJECTION);
+  glPopMatrix();
+  glMatrixMode(GL_MODELVIEW);
+}
+
+void drawQuickPlotModelMenuOverlay(const AppState& app,
+                                   int width,
+                                   int height,
+                                   int windowWidth,
+                                   int windowHeight,
+                                   const HudTextRenderer& renderer) {
+  if (!app.quickPlotModelMenuVisible ||
+      width <= 0 || height <= 0 || windowWidth <= 0 || windowHeight <= 0) {
+    return;
+  }
+  const float sx = static_cast<float>(width) / static_cast<float>(windowWidth);
+  const float sy = static_cast<float>(height) / static_cast<float>(windowHeight);
+  auto scaleRect = [&](const PlotMenuRect& rect) -> PlotMenuRect {
+    return {rect.x0 * sx,
+            static_cast<float>(height) - rect.y1 * sy,
+            rect.x1 * sx,
+            static_cast<float>(height) - rect.y0 * sy};
+  };
+  const PlotMenuRect menuWindowRect = quickPlotModelMenuRect(app, windowWidth, windowHeight);
+  const PlotMenuRect menuRect = scaleRect(menuWindowRect);
 
   glMatrixMode(GL_PROJECTION);
   glPushMatrix();
@@ -9667,53 +17111,2006 @@ void drawPlotModelMenuOverlay(const AppState& app,
   glEnable(GL_BLEND);
   glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 
-  drawPlotMenuRect(mainRect.x0, mainRect.y0, mainRect.x1, mainRect.y1, 0.015f, 0.017f, 0.022f, 0.88f);
-  drawPlotMenuRect(mainRect.x0, mainRect.y1 - 1.0f, mainRect.x1, mainRect.y1, 0.75f, 0.82f, 0.92f, 0.22f);
-  drawPlotMenuRect(mainRect.x0, mainRect.y0, mainRect.x1, mainRect.y0 + 1.0f, 0.75f, 0.82f, 0.92f, 0.16f);
-  drawPlotMenuRect(mainRect.x0, mainRect.y0, mainRect.x0 + 1.0f, mainRect.y1, 0.75f, 0.82f, 0.92f, 0.16f);
-  drawPlotMenuRect(mainRect.x1 - 1.0f, mainRect.y0, mainRect.x1, mainRect.y1, 0.75f, 0.82f, 0.92f, 0.16f);
+  drawPlotMenuRect(menuRect.x0, menuRect.y0, menuRect.x1, menuRect.y1, 0.012f, 0.014f, 0.019f, 0.94f);
+  drawPlotMenuRect(menuRect.x0, menuRect.y1 - 1.0f, menuRect.x1, menuRect.y1, 0.75f, 0.82f, 0.92f, 0.20f);
+  drawPlotMenuRect(menuRect.x0, menuRect.y0, menuRect.x1, menuRect.y0 + 1.0f, 0.75f, 0.82f, 0.92f, 0.12f);
+  drawPlotMenuRect(menuRect.x0, menuRect.y0, menuRect.x0 + 1.0f, menuRect.y1, 0.75f, 0.82f, 0.92f, 0.18f);
+  drawPlotMenuRect(menuRect.x1 - 1.0f, menuRect.y0, menuRect.x1, menuRect.y1, 0.75f, 0.82f, 0.92f, 0.16f);
 
   const float textScale = 1.0f;
-  for (int i = 0; i < kViewerPlotModelChoiceCount; ++i) {
-    const PlotMenuRect rr = rowRect(mainWindowRect, i);
-    const bool hovered = app.plotModelMenuHoverMain == i;
-    const bool current = currentIndex == i;
-    if (hovered) drawPlotMenuRect(rr.x0, rr.y0, rr.x1, rr.y1, 0.18f, 0.30f, 0.42f, 0.58f);
-    if (current) drawPlotMenuRect(rr.x0 + 4.0f, rr.y0 + 5.0f, rr.x0 + 7.0f, rr.y1 - 5.0f, 0.42f, 0.78f, 1.0f, 0.82f);
-    const bool circularCurrent = (i == 1 && payload.circularHsl) || (i == 2 && payload.circularHsv);
-    std::string label = kViewerPlotModelChoices[i].label;
-    if (circularCurrent) label += "  *";
-    const float baseline = rr.y0 + (renderer.available ? 8.0f : 9.0f);
-    drawHudTextLine(renderer, label, rr.x0 + 14.0f, baseline, textScale, current ? 0.98f : 0.86f, 0.90f, 0.94f, 0.98f);
-    if (i == 1 || i == 2) {
-      drawHudTextLine(renderer, ">", rr.x1 - 16.0f, baseline, textScale, hovered ? 0.95f : 0.55f, 0.80f, 0.86f, 0.94f);
-    }
-  }
+  drawHudTextLine(renderer,
+                  "Plot Model",
+                  menuRect.x0 + 12.0f,
+                  menuRect.y1 - 20.0f,
+                  textScale,
+                  0.96f,
+                  0.92f,
+                  0.96f,
+                  1.0f);
+  drawHudTextLineRight(renderer,
+                       "Ctrl+S closes",
+                       menuRect.x1 - 12.0f,
+                       menuRect.y1 - 20.0f,
+                       0.82f,
+                       0.56f,
+                       0.80f,
+                       0.86f,
+                       0.94f);
 
-  if (app.plotModelMenuHoverMain == 1 || app.plotModelMenuHoverMain == 2) {
-    const PlotMenuRect subWindowRect = plotMenuSubRect(mainWindowRect, app.plotModelMenuHoverMain, windowWidth, windowHeight);
-    const PlotMenuRect subRect = scaleRect(subWindowRect);
-    const PlotMenuRect rr = rowRect(subWindowRect, 0);
-    const bool hovered = app.plotModelMenuHoverSub == 0;
-    const bool hsl = app.plotModelMenuHoverMain == 1;
-    drawPlotMenuRect(subRect.x0, subRect.y0, subRect.x1, subRect.y1, 0.015f, 0.017f, 0.022f, 0.90f);
-    drawPlotMenuRect(subRect.x0, subRect.y1 - 1.0f, subRect.x1, subRect.y1, 0.75f, 0.82f, 0.92f, 0.20f);
-    drawPlotMenuRect(subRect.x0, subRect.y0, subRect.x1, subRect.y0 + 1.0f, 0.75f, 0.82f, 0.92f, 0.14f);
-    if (hovered) drawPlotMenuRect(rr.x0, rr.y0, rr.x1, rr.y1, 0.18f, 0.30f, 0.42f, 0.58f);
-    const bool current = hsl ? (payload.plotMode == "hsl" && payload.circularHsl)
-                             : (payload.plotMode == "hsv" && payload.circularHsv);
-    if (current) drawPlotMenuRect(rr.x0 + 4.0f, rr.y0 + 5.0f, rr.x0 + 7.0f, rr.y1 - 5.0f, 0.42f, 0.78f, 1.0f, 0.82f);
+  for (int i = 0; i < kViewerPlotModelChoiceCount; ++i) {
+    const float itemY0 = menuWindowRect.y0 + kPlotMenuPad +
+                         static_cast<float>(i) * kViewerChoiceMenuRowHeight + 24.0f;
+    const PlotMenuRect itemRect = scaleRect({menuWindowRect.x0 + kPlotMenuPad,
+                                             itemY0,
+                                             menuWindowRect.x1 - kPlotMenuPad,
+                                             itemY0 + kViewerChoiceMenuRowHeight});
+    const bool selected = i == app.viewerState.plotModel;
+    const bool hovered = i == app.quickPlotModelMenuHover;
+    if (hovered) {
+      drawPlotMenuRect(itemRect.x0, itemRect.y0, itemRect.x1, itemRect.y1,
+                       0.18f, 0.30f, 0.42f, 0.62f);
+    }
+    if (selected) {
+      drawPlotMenuRect(itemRect.x0 + 4.0f,
+                       itemRect.y0 + 5.0f,
+                       itemRect.x0 + 7.0f,
+                       itemRect.y1 - 5.0f,
+                       0.48f,
+                       0.78f,
+                       1.0f,
+                       0.86f);
+    }
     drawHudTextLine(renderer,
-                    hsl ? "Circular HSL" : "Circular HSV",
-                    rr.x0 + 14.0f,
-                    rr.y0 + (renderer.available ? 8.0f : 9.0f),
+                    kViewerPlotModelChoices[i].label,
+                    itemRect.x0 + (selected ? 14.0f : 10.0f),
+                    itemRect.y0 + (renderer.available ? 8.0f : 9.0f),
                     textScale,
-                    current ? 0.98f : 0.88f,
-                    0.90f,
-                    0.94f,
+                    selected ? 0.98f : 0.82f,
+                    0.88f,
+                    0.93f,
                     0.98f);
   }
 
+  glDisable(GL_BLEND);
+  glEnable(GL_DEPTH_TEST);
+  glPopMatrix();
+  glMatrixMode(GL_PROJECTION);
+  glPopMatrix();
+  glMatrixMode(GL_MODELVIEW);
+}
+
+void drawAddPlotMenuOverlay(const AppState& app,
+                            int width,
+                            int height,
+                            int windowWidth,
+                            int windowHeight,
+                            const HudTextRenderer& renderer) {
+  if (!app.addPlotMenuVisible ||
+      width <= 0 || height <= 0 || windowWidth <= 0 || windowHeight <= 0) {
+    return;
+  }
+  const float sx = static_cast<float>(width) / static_cast<float>(windowWidth);
+  const float sy = static_cast<float>(height) / static_cast<float>(windowHeight);
+  auto scaleRect = [&](const PlotMenuRect& rect) -> PlotMenuRect {
+    return {rect.x0 * sx,
+            static_cast<float>(height) - rect.y1 * sy,
+            rect.x1 * sx,
+            static_cast<float>(height) - rect.y0 * sy};
+  };
+  const PlotMenuRect menuWindowRect = addPlotMenuRect(app, windowWidth, windowHeight);
+  const PlotMenuRect menuRect = scaleRect(menuWindowRect);
+
+  glMatrixMode(GL_PROJECTION);
+  glPushMatrix();
+  glLoadIdentity();
+  glOrtho(0.0, static_cast<double>(width), 0.0, static_cast<double>(height), -1.0, 1.0);
+  glMatrixMode(GL_MODELVIEW);
+  glPushMatrix();
+  glLoadIdentity();
+  glDisable(GL_DEPTH_TEST);
+  glEnable(GL_BLEND);
+  glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+
+  drawPlotMenuRect(menuRect.x0, menuRect.y0, menuRect.x1, menuRect.y1, 0.012f, 0.014f, 0.019f, 0.94f);
+  drawPlotMenuRect(menuRect.x0, menuRect.y1 - 1.0f, menuRect.x1, menuRect.y1, 0.75f, 0.82f, 0.92f, 0.20f);
+  drawPlotMenuRect(menuRect.x0, menuRect.y0, menuRect.x1, menuRect.y0 + 1.0f, 0.75f, 0.82f, 0.92f, 0.12f);
+  drawPlotMenuRect(menuRect.x0, menuRect.y0, menuRect.x0 + 1.0f, menuRect.y1, 0.75f, 0.82f, 0.92f, 0.18f);
+  drawPlotMenuRect(menuRect.x1 - 1.0f, menuRect.y0, menuRect.x1, menuRect.y1, 0.75f, 0.82f, 0.92f, 0.16f);
+
+  const float textScale = 1.0f;
+  drawHudTextLine(renderer,
+                  "Add Plot",
+                  menuRect.x0 + 12.0f,
+                  menuRect.y1 - 20.0f,
+                  textScale,
+                  0.96f,
+                  0.92f,
+                  0.96f,
+                  1.0f);
+  drawHudTextLineRight(renderer,
+                       "Shift+A closes",
+                       menuRect.x1 - 12.0f,
+                       menuRect.y1 - 20.0f,
+                       0.82f,
+                       0.56f,
+                       0.80f,
+                       0.86f,
+                       0.94f);
+
+  for (int i = 0; i < kViewerPlotModelChoiceCount; ++i) {
+    const float itemY0 = menuWindowRect.y0 + kPlotMenuPad +
+                         static_cast<float>(i) * kViewerChoiceMenuRowHeight + 24.0f;
+    const PlotMenuRect itemRect = scaleRect({menuWindowRect.x0 + kPlotMenuPad,
+                                             itemY0,
+                                             menuWindowRect.x1 - kPlotMenuPad,
+                                             itemY0 + kViewerChoiceMenuRowHeight});
+    const bool hovered = i == app.addPlotMenuHover;
+    if (hovered) {
+      drawPlotMenuRect(itemRect.x0, itemRect.y0, itemRect.x1, itemRect.y1,
+                       0.18f, 0.30f, 0.42f, 0.62f);
+    }
+    drawHudTextLine(renderer,
+                    kViewerPlotModelChoices[i].label,
+                    itemRect.x0 + 10.0f,
+                    itemRect.y0 + (renderer.available ? 8.0f : 9.0f),
+                    textScale,
+                    hovered ? 0.98f : 0.82f,
+                    0.88f,
+                    0.93f,
+                    0.98f);
+  }
+
+  glDisable(GL_BLEND);
+  glEnable(GL_DEPTH_TEST);
+  glPopMatrix();
+  glMatrixMode(GL_PROJECTION);
+  glPopMatrix();
+  glMatrixMode(GL_MODELVIEW);
+}
+
+void drawLayoutMenuOverlay(const AppState& app,
+                           int width,
+                           int height,
+                           int windowWidth,
+                           int windowHeight,
+                           const HudTextRenderer& renderer) {
+  if (!app.layoutMenuVisible ||
+      width <= 0 || height <= 0 || windowWidth <= 0 || windowHeight <= 0) {
+    return;
+  }
+  const char* labels[kViewerLayoutChoiceCount] = {
+      "Reset Layout", "Split 2", "Triple Columns", "Triple 2 + 1", "Quadrants", "Six Views"};
+  const float sx = static_cast<float>(width) / static_cast<float>(windowWidth);
+  const float sy = static_cast<float>(height) / static_cast<float>(windowHeight);
+  auto scaleRect = [&](const PlotMenuRect& rect) -> PlotMenuRect {
+    return {rect.x0 * sx,
+            static_cast<float>(height) - rect.y1 * sy,
+            rect.x1 * sx,
+            static_cast<float>(height) - rect.y0 * sy};
+  };
+  const PlotMenuRect menuWindowRect = layoutMenuRect(app, windowWidth, windowHeight);
+  const PlotMenuRect menuRect = scaleRect(menuWindowRect);
+  glMatrixMode(GL_PROJECTION);
+  glPushMatrix();
+  glLoadIdentity();
+  glOrtho(0.0, static_cast<double>(width), 0.0, static_cast<double>(height), -1.0, 1.0);
+  glMatrixMode(GL_MODELVIEW);
+  glPushMatrix();
+  glLoadIdentity();
+  glDisable(GL_DEPTH_TEST);
+  glEnable(GL_BLEND);
+  glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+  drawPlotMenuRect(menuRect.x0, menuRect.y0, menuRect.x1, menuRect.y1, 0.012f, 0.014f, 0.019f, 0.94f);
+  drawPlotMenuRect(menuRect.x0, menuRect.y1 - 1.0f, menuRect.x1, menuRect.y1, 0.75f, 0.82f, 0.92f, 0.20f);
+  drawHudTextLine(renderer, "Arrange Plots", menuRect.x0 + 12.0f, menuRect.y1 - 20.0f,
+                  1.0f, 0.96f, 0.92f, 0.96f, 1.0f);
+  for (int i = 0; i < kViewerLayoutChoiceCount; ++i) {
+    const float itemY0 = menuWindowRect.y0 + kPlotMenuPad +
+                         static_cast<float>(i) * kViewerChoiceMenuRowHeight + 24.0f;
+    const PlotMenuRect itemRect = scaleRect({menuWindowRect.x0 + kPlotMenuPad,
+                                             itemY0,
+                                             menuWindowRect.x1 - kPlotMenuPad,
+                                             itemY0 + kViewerChoiceMenuRowHeight});
+    const bool hovered = i == app.layoutMenuHover;
+    if (hovered) {
+      drawPlotMenuRect(itemRect.x0, itemRect.y0, itemRect.x1, itemRect.y1,
+                       0.18f, 0.30f, 0.42f, 0.62f);
+    }
+    drawHudTextLine(renderer, labels[i], itemRect.x0 + 10.0f,
+                    itemRect.y0 + (renderer.available ? 8.0f : 9.0f),
+                    1.0f, hovered ? 0.98f : 0.82f, 0.88f, 0.93f, 0.98f);
+  }
+  glDisable(GL_BLEND);
+  glEnable(GL_DEPTH_TEST);
+  glPopMatrix();
+  glMatrixMode(GL_PROJECTION);
+  glPopMatrix();
+  glMatrixMode(GL_MODELVIEW);
+}
+
+void drawPlotModelMenuOverlay(const AppState& app,
+                              const ResolvedPayload& payload,
+                              int width,
+                              int height,
+                              int windowWidth,
+                              int windowHeight,
+                              const HudTextRenderer& renderer) {
+  if (width <= 0 || height <= 0 || windowWidth <= 0 || windowHeight <= 0) return;
+  drawViewerMenuIconOverlay(app, width, height, windowWidth, windowHeight);
+  drawQuickPlotModelMenuOverlay(app, width, height, windowWidth, windowHeight, renderer);
+  drawAddPlotMenuOverlay(app, width, height, windowWidth, windowHeight, renderer);
+  drawLayoutMenuOverlay(app, width, height, windowWidth, windowHeight, renderer);
+  if (!app.plotModelMenuVisible) return;
+  const float sx = static_cast<float>(width) / static_cast<float>(windowWidth);
+  const float sy = static_cast<float>(height) / static_cast<float>(windowHeight);
+  auto scaleRect = [&](const PlotMenuRect& rect) -> PlotMenuRect {
+    return {rect.x0 * sx,
+            static_cast<float>(height) - rect.y1 * sy,
+            rect.x1 * sx,
+            static_cast<float>(height) - rect.y0 * sy};
+  };
+  const PlotMenuRect mainWindowRect = plotMenuMainRect(app, windowWidth, windowHeight);
+  const PlotMenuRect mainRect = scaleRect(mainWindowRect);
+  const PlotMenuRect closeWindowRect = viewerMenuCloseWindowRect(app, windowWidth, windowHeight);
+  const PlotMenuRect closeRect = scaleRect(closeWindowRect);
+  const bool closeHovered = pointInPlotMenuRect(closeWindowRect, app.hoverX, app.hoverY);
+  const std::vector<ViewerMenuRow> rows = buildViewerMenuRows(app);
+  const std::vector<ViewerMenuTab> tabs = buildViewerMenuTabs(app);
+  const ViewerMenuSection activeSection = coercedViewerMenuSection(app);
+
+  glMatrixMode(GL_PROJECTION);
+  glPushMatrix();
+  glLoadIdentity();
+  glOrtho(0.0, static_cast<double>(width), 0.0, static_cast<double>(height), -1.0, 1.0);
+  glMatrixMode(GL_MODELVIEW);
+  glPushMatrix();
+  glLoadIdentity();
+  glDisable(GL_DEPTH_TEST);
+  glEnable(GL_BLEND);
+  glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+
+  drawPlotMenuRect(mainRect.x0, mainRect.y0, mainRect.x1, mainRect.y1, 0.012f, 0.014f, 0.019f, 0.93f);
+  drawPlotMenuRect(mainRect.x0, mainRect.y1 - 1.0f, mainRect.x1, mainRect.y1, 0.75f, 0.82f, 0.92f, 0.20f);
+  drawPlotMenuRect(mainRect.x0, mainRect.y0, mainRect.x1, mainRect.y0 + 1.0f, 0.75f, 0.82f, 0.92f, 0.12f);
+  drawPlotMenuRect(mainRect.x0, mainRect.y0, mainRect.x0 + 1.0f, mainRect.y1, 0.75f, 0.82f, 0.92f, 0.18f);
+  drawPlotMenuRect(mainRect.x1 - 1.0f, mainRect.y0, mainRect.x1, mainRect.y1, 0.75f, 0.82f, 0.92f, 0.16f);
+
+  const float textScale = 1.0f;
+  drawHudTextLine(renderer,
+                  "Viewer Menu",
+                  mainRect.x0 + 14.0f,
+                  mainRect.y1 - 26.0f,
+                  textScale,
+                  0.96f,
+                  0.92f,
+                  0.96f,
+                  1.0f);
+  drawViewerMenuCloseButton(closeRect, closeHovered);
+  const std::string desiredKey = payload.cloudSettingsKey.empty()
+                                     ? ChromaspaceViewer::sampleSettingsKey(app.viewerState, false)
+                                     : payload.cloudSettingsKey;
+  std::string syncLabel = "Live";
+  if (!app.activeCloudSettingsKey.empty() && desiredKey == app.activeCloudSettingsKey) {
+    syncLabel = "Live";
+  } else if (!app.localPreviewSettingsKey.empty() && desiredKey == app.localPreviewSettingsKey) {
+    syncLabel = "Using cache";
+  } else if (!app.localPreviewSettingsKey.empty() && app.viewerStateLocalOverride) {
+    syncLabel = "Using cache";
+  } else if (app.viewerStateLocalOverride) {
+    syncLabel = "Waiting for Resolve";
+  }
+  if (const PlotWindowState* focused = focusedPlotWindow(app)) {
+    if (app.plotWindows.size() > 1u ||
+        plotModelIsAnalyticalScope(focused->viewState.plotModel)) {
+      syncLabel = focused->syncLabel;
+    }
+  }
+  const bool waitingForResolve = syncLabel == "Waiting for Resolve";
+  const bool refining = syncLabel == "Refining";
+  drawHudTextLineRight(renderer,
+                       syncLabel,
+                       mainRect.x1 - 14.0f,
+                       mainRect.y1 - 48.0f,
+                       0.82f,
+                       waitingForResolve ? 0.98f : (refining ? 0.72f : 0.60f),
+                       waitingForResolve ? 0.72f : (refining ? 0.82f : 0.82f),
+                       waitingForResolve ? 0.42f : (refining ? 0.98f : 0.88f),
+                       0.96f);
+
+  for (int i = 0; i < static_cast<int>(tabs.size()); ++i) {
+    const float tabX0 = mainWindowRect.x0 + kViewerDrawerPad;
+    const float tabY0 = mainWindowRect.y0 + kViewerDrawerHeaderHeight + kViewerDrawerPad +
+                        static_cast<float>(i) * kViewerDrawerTabHeight;
+    const PlotMenuRect tabRect = scaleRect({tabX0,
+                                            tabY0,
+                                            tabX0 + kViewerDrawerTabRailWidth,
+                                            tabY0 + kViewerDrawerTabHeight - 3.0f});
+    const bool active = tabs[static_cast<std::size_t>(i)].section == activeSection;
+    const bool hovered = app.viewerMenuHoverTab == i;
+    drawPlotMenuRect(tabRect.x0, tabRect.y0, tabRect.x1, tabRect.y1,
+                     active ? 0.12f : (hovered ? 0.08f : 0.035f),
+                     active ? 0.22f : (hovered ? 0.12f : 0.045f),
+                     active ? 0.30f : (hovered ? 0.17f : 0.060f),
+                     active ? 0.86f : (hovered ? 0.72f : 0.52f));
+    drawHudTextLine(renderer,
+                    tabs[static_cast<std::size_t>(i)].label,
+                    tabRect.x0 + 10.0f,
+                    tabRect.y0 + (renderer.available ? 10.0f : 11.0f),
+                    textScale,
+                    active ? 0.98f : 0.72f,
+                    0.88f,
+                    0.93f,
+                    0.98f);
+  }
+
+  if (viewerSettingsSubtabsVisible(app)) {
+    const char* labels[2] = {"Performance", "Appearance"};
+    const int activeSubtab = std::clamp(app.viewerSettingsSubtab, 0, 1);
+    for (int i = 0; i < 2; ++i) {
+      const PlotMenuRect subtabWindowRect =
+          viewerSettingsSubtabWindowRect(app, windowWidth, windowHeight, i);
+      const PlotMenuRect subtabRect = scaleRect(subtabWindowRect);
+      const bool active = i == activeSubtab;
+      const bool hovered = i == app.viewerSettingsHoverSubtab;
+      drawPlotMenuRect(subtabRect.x0,
+                       subtabRect.y0,
+                       subtabRect.x1,
+                       subtabRect.y1,
+                       active ? 0.13f : (hovered ? 0.08f : 0.035f),
+                       active ? 0.23f : (hovered ? 0.13f : 0.045f),
+                       active ? 0.31f : (hovered ? 0.18f : 0.060f),
+                       active ? 0.82f : (hovered ? 0.68f : 0.50f));
+      drawPlotMenuRect(subtabRect.x0,
+                       subtabRect.y1 - 1.0f,
+                       subtabRect.x1,
+                       subtabRect.y1,
+                       0.72f,
+                       0.84f,
+                       0.98f,
+                       active ? 0.34f : 0.12f);
+      const std::string fittedLabel =
+          fitHudText(renderer, labels[i], std::max(24.0f, subtabRect.x1 - subtabRect.x0 - 16.0f), textScale);
+      drawHudTextLine(renderer,
+                      fittedLabel,
+                      subtabRect.x0 + 9.0f,
+                      subtabRect.y0 + (renderer.available ? 9.0f : 10.0f),
+                      textScale,
+                      active ? 0.98f : 0.72f,
+                      0.88f,
+                      0.93f,
+                      0.98f);
+    }
+  }
+
+  for (int i = 0; i < static_cast<int>(rows.size()); ++i) {
+    const PlotMenuRect rr = scaleRect(viewerMenuRowWindowRect(app, windowWidth, windowHeight, i));
+    if (rr.y1 < mainRect.y0 + 8.0f || rr.y0 > mainRect.y1 - kViewerDrawerHeaderHeight) continue;
+    const ViewerMenuRow& row = rows[static_cast<std::size_t>(i)];
+    const bool hovered = app.plotModelMenuHoverMain == i && row.enabled;
+    if (hovered) drawPlotMenuRect(rr.x0, rr.y0, rr.x1, rr.y1, 0.18f, 0.30f, 0.42f, 0.58f);
+    const float alpha = row.enabled ? 0.90f : 0.36f;
+    const float rowWidth = rr.x1 - rr.x0;
+    const float labelX = rr.x0 + (row.choiceItem ? 30.0f : 14.0f);
+    const bool rowHasDisplayGlyph =
+        (row.action == ViewerMenuAction::PlotLinearTransfer &&
+         transferChoiceIsDisplayReferred(app.viewerState.plotDisplayLinearTransfer)) ||
+        (row.action == ViewerMenuAction::ChromaticityInputPrimaries &&
+         primariesChoiceIsDisplayReferred(app.viewerState.chromaticityInputPrimaries)) ||
+        (row.action == ViewerMenuAction::ChromaticityInputTransfer &&
+         transferChoiceIsDisplayReferred(app.viewerState.chromaticityInputTransfer)) ||
+        (row.action == ViewerMenuAction::ChromaticityOverlayPrimaries &&
+         WorkshopColor::overlayPrimariesChoiceEnabled(app.viewerState.chromaticityOverlayPrimaries) &&
+         primariesChoiceIsDisplayReferred(app.viewerState.chromaticityOverlayPrimaries - 1));
+    const float valueRightX = rr.x1 - 14.0f - (rowHasDisplayGlyph ? 23.0f : 0.0f);
+    const float singleBaseline = rr.y0 + (renderer.available ? 15.0f : 16.0f);
+    float vectorR = 0.0f, vectorG = 0.0f, vectorB = 0.0f;
+    const bool hasVectorSwatch = viewerMenuActionVectorColor(row.action, &vectorR, &vectorG, &vectorB);
+    const float swatchSize = renderer.available ? 10.0f : 8.0f;
+    const float swatchX = labelX;
+    const float swatchY = rr.y0 + (kPlotMenuRowHeight - swatchSize) * 0.5f;
+    const float textLabelX = hasVectorSwatch ? (labelX + swatchSize + 8.0f) : labelX;
+    if (hasVectorSwatch) {
+      drawPlotMenuRect(swatchX, swatchY, swatchX + swatchSize, swatchY + swatchSize,
+                       vectorR, vectorG, vectorB, row.enabled ? 0.92f : 0.34f);
+      drawPlotMenuRect(swatchX, swatchY, swatchX + swatchSize, swatchY + 1.0f,
+                       1.0f, 1.0f, 1.0f, row.enabled ? 0.18f : 0.06f);
+    }
+    if (row.channelSelector) {
+      const std::string fittedLabel =
+          fitHudText(renderer, row.label, std::max(24.0f, rowWidth - 126.0f), textScale);
+      drawHudTextLine(renderer, fittedLabel, textLabelX, singleBaseline, textScale,
+                      alpha, 0.90f, 0.94f, 0.98f);
+      constexpr float cubeSize = 17.0f;
+      constexpr float cubeGap = 8.0f;
+      const float y0 = rr.y0 + (rr.y1 - rr.y0 - cubeSize) * 0.5f;
+      const float right = rr.x1 - 14.0f;
+      const bool active[3] = {
+          app.viewerState.waveformChannelRed,
+          app.viewerState.waveformChannelGreen,
+          app.viewerState.waveformChannelBlue};
+      const float colors[3][3] = {
+          {1.0f, 0.16f, 0.12f},
+          {0.20f, 1.0f, 0.28f},
+          {0.24f, 0.52f, 1.0f}};
+      for (int channel = 2; channel >= 0; --channel) {
+        const float x1 = right - static_cast<float>(2 - channel) * (cubeSize + cubeGap);
+        const float x0 = x1 - cubeSize;
+        const float level = active[channel] ? 1.0f : 0.24f;
+        drawPlotMenuRect(x0, y0, x1, y0 + cubeSize,
+                         colors[channel][0] * level,
+                         colors[channel][1] * level,
+                         colors[channel][2] * level,
+                         active[channel] ? 0.94f : 0.58f);
+        drawPlotMenuRect(x0, y0 + cubeSize - 1.0f, x1, y0 + cubeSize,
+                         1.0f, 1.0f, 1.0f, active[channel] ? 0.25f : 0.08f);
+      }
+    } else if (row.slider) {
+      const float sliderX0 = rr.x0 + clampf(rowWidth * 0.44f, 112.0f, 170.0f);
+      const float sliderX1 = rr.x1 - 48.0f;
+      const float sliderY = rr.y0 + 21.0f;
+      const std::string fittedLabel =
+          fitHudText(renderer, row.label, std::max(12.0f, sliderX0 - textLabelX - 10.0f), textScale);
+      drawHudTextLine(renderer, fittedLabel, textLabelX, singleBaseline, textScale,
+                      alpha, 0.90f, 0.94f, 0.98f);
+      const float t = (row.sliderMax > row.sliderMin)
+                          ? clampf(static_cast<float>(row.sliderValue - row.sliderMin) /
+                                       static_cast<float>(row.sliderMax - row.sliderMin),
+                                   0.0f,
+                                   1.0f)
+                          : 0.0f;
+      drawPlotMenuRect(sliderX0, sliderY - 2.0f, sliderX1, sliderY + 2.0f,
+                       row.enabled ? 0.36f : 0.22f,
+                       row.enabled ? 0.42f : 0.23f,
+                       row.enabled ? 0.50f : 0.25f,
+                       row.enabled ? 0.56f : 0.38f);
+      drawPlotMenuRect(sliderX0, sliderY - 2.0f, sliderX0 + (sliderX1 - sliderX0) * t, sliderY + 2.0f,
+                       row.enabled ? 0.35f : 0.42f,
+                       row.enabled ? 0.66f : 0.44f,
+                       row.enabled ? 0.88f : 0.47f,
+                       row.enabled ? 0.82f : 0.48f);
+      const float knobX = sliderX0 + (sliderX1 - sliderX0) * t;
+      drawPlotMenuRect(knobX - 4.0f, sliderY - 7.0f, knobX + 4.0f, sliderY + 7.0f,
+                       row.enabled ? 0.82f : 0.52f,
+                       row.enabled ? 0.92f : 0.54f,
+                       row.enabled ? 1.0f : 0.58f,
+                       row.enabled ? 0.96f : 0.58f);
+      const std::string fittedValue =
+          fitHudText(renderer, row.value, std::max(28.0f, rr.x1 - sliderX1 - 12.0f), textScale);
+      drawHudTextLineRight(renderer, fittedValue, rr.x1 - 12.0f, singleBaseline, textScale,
+                           row.enabled ? 0.86f : 0.42f,
+                           row.enabled ? 0.84f : 0.45f,
+                           row.enabled ? 0.90f : 0.50f,
+                           row.enabled ? 0.96f : 0.62f);
+    } else if (viewerMenuActionIsCheckbox(row.action)) {
+      const float checkboxSize = renderer.available ? 15.0f : 13.0f;
+      const float checkboxX = rr.x1 - checkboxSize - 14.0f;
+      const float checkboxY = rr.y0 + (kPlotMenuRowHeight - checkboxSize) * 0.5f;
+      const std::string fittedLabel =
+          fitHudText(renderer,
+                     row.label,
+                     std::max(24.0f, checkboxX - textLabelX - 12.0f),
+                     textScale);
+      drawHudTextLine(renderer, fittedLabel, textLabelX, singleBaseline, textScale,
+                      alpha, 0.90f, 0.94f, 0.98f);
+      drawViewerMenuCheckbox(checkboxX,
+                             checkboxY,
+                             checkboxSize,
+                             row.value == "On",
+                             row.enabled,
+                             hovered);
+    } else if (viewerMenuActionIsButton(row.action)) {
+      const float buttonW = std::min(150.0f, std::max(92.0f, rowWidth * 0.38f));
+      const PlotMenuRect buttonRect{rr.x1 - buttonW - 10.0f, rr.y0 + 5.0f, rr.x1 - 10.0f, rr.y1 - 5.0f};
+      const std::string fittedLabel = fitHudText(renderer,
+                                                 row.label,
+                                                 std::max(24.0f, buttonRect.x0 - textLabelX - 12.0f),
+                                                 textScale);
+      drawHudTextLine(renderer, fittedLabel, textLabelX, singleBaseline, textScale,
+                      alpha, 0.90f, 0.94f, 0.98f);
+      drawPlotMenuRect(buttonRect.x0,
+                       buttonRect.y0,
+                       buttonRect.x1,
+                       buttonRect.y1,
+                       hovered ? 0.22f : 0.12f,
+                       hovered ? 0.36f : 0.22f,
+                       hovered ? 0.48f : 0.30f,
+                       row.enabled ? (hovered ? 0.86f : 0.70f) : 0.28f);
+      drawPlotMenuRect(buttonRect.x0,
+                       buttonRect.y1 - 1.0f,
+                       buttonRect.x1,
+                       buttonRect.y1,
+                       0.80f,
+                       0.88f,
+                       0.98f,
+                       row.enabled ? 0.20f : 0.08f);
+      const std::string fittedValue = fitHudText(renderer, row.value, std::max(24.0f, buttonW - 18.0f), textScale);
+      drawHudTextLineRight(renderer, fittedValue, buttonRect.x1 - 9.0f, singleBaseline, textScale,
+                           row.enabled ? 0.92f : 0.42f, 0.92f, 0.96f, 0.98f);
+    } else if (row.note) {
+      const float noteMaxWidth = std::max(24.0f, rowWidth - (textLabelX - rr.x0) - 18.0f);
+      const std::string fittedLabel = fitHudText(renderer, row.label, noteMaxWidth, textScale);
+      drawHudTextLine(renderer,
+                      fittedLabel,
+                      textLabelX,
+                      rr.y1 - (renderer.available ? 16.0f : 15.0f),
+                      textScale,
+                      0.62f,
+                      0.84f,
+                      0.90f,
+                      0.98f);
+      drawWrappedHudText(renderer,
+                         row.value,
+                         textLabelX,
+                         rr.y1 - (renderer.available ? 34.0f : 32.0f),
+                         noteMaxWidth,
+                         0.86f,
+                         2,
+                         0.52f,
+                         0.82f,
+                         0.87f,
+                         0.94f);
+    } else {
+      const float indent = textLabelX - rr.x0;
+      const float labelWidth = hudTextWidth(renderer, row.label, textScale);
+      const float valueWidth = hudTextWidth(renderer, row.value, textScale);
+      const bool splitValue =
+          !row.value.empty() && (indent + labelWidth + valueWidth + 36.0f > rowWidth);
+      if (splitValue) {
+        const float maxLineWidth = std::max(24.0f, rowWidth - indent - 14.0f);
+        const std::string fittedLabel = fitHudText(renderer, row.label, maxLineWidth, textScale);
+        const std::string fittedValue = fitHudText(renderer, row.value, rowWidth - 28.0f, textScale);
+        drawHudTextLine(renderer, fittedLabel, textLabelX, rr.y0 + (renderer.available ? 25.0f : 26.0f),
+                        textScale, alpha, 0.90f, 0.94f, 0.98f);
+        drawHudTextLineRight(renderer, fittedValue, valueRightX, rr.y0 + (renderer.available ? 8.0f : 9.0f),
+                             textScale, row.enabled ? 0.82f : 0.34f, 0.84f, 0.90f, 0.96f);
+      } else {
+        const float valueMaxWidth = row.value.empty() ? 0.0f : std::min(rowWidth * 0.55f, valueWidth);
+        const float labelMaxWidth = row.value.empty()
+                                        ? std::max(24.0f, rowWidth - indent - 14.0f)
+                                        : std::max(24.0f, valueRightX - valueMaxWidth - textLabelX - 16.0f);
+        const std::string fittedLabel = fitHudText(renderer, row.label, labelMaxWidth, textScale);
+        const std::string fittedValue = fitHudText(renderer, row.value, valueMaxWidth, textScale);
+        drawHudTextLine(renderer, fittedLabel, textLabelX, singleBaseline, textScale,
+                        alpha, 0.90f, 0.94f, 0.98f);
+        drawHudTextLineRight(renderer, fittedValue, valueRightX, singleBaseline, textScale,
+                             row.enabled ? 0.82f : 0.34f, 0.84f, 0.90f, 0.96f);
+      }
+    }
+    if (rowHasDisplayGlyph) {
+      drawViewerDisplayGlyph(rr.x1 - 29.0f,
+                             rr.y0 + (kPlotMenuRowHeight - 12.0f) * 0.5f,
+                             false,
+                             row.enabled);
+    }
+  }
+
+  static float neutralRadiusPopoverAlpha = 0.0f;
+  static double neutralRadiusPopoverLastTime = 0.0;
+  const bool neutralRadiusPopoverVisibleNow =
+      neutralRadiusOverflowPopoverVisible(app, windowWidth, windowHeight);
+  const float neutralRadiusAlpha =
+      updateViewerMenuPopoverFade(neutralRadiusPopoverVisibleNow,
+                                  &neutralRadiusPopoverAlpha,
+                                  &neutralRadiusPopoverLastTime);
+  if (neutralRadiusAlpha > 0.01f) {
+    const PlotMenuRect popoverWindowRect = neutralRadiusOverflowPopoverWindowRect(app, windowWidth, windowHeight);
+    const PlotMenuRect checkboxWindowRect = neutralRadiusOverflowCheckboxWindowRect(popoverWindowRect);
+    const PlotMenuRect popoverRect = scaleRect(popoverWindowRect);
+    const PlotMenuRect checkboxRect = scaleRect(checkboxWindowRect);
+    if (popoverWindowRect.x1 > popoverWindowRect.x0 && popoverWindowRect.y1 > popoverWindowRect.y0) {
+      const bool toggleHovered =
+          pointInNeutralRadiusOverflowPopoverToggle(app, windowWidth, windowHeight, app.hoverX, app.hoverY);
+      drawPlotMenuRect(popoverRect.x0, popoverRect.y0, popoverRect.x1, popoverRect.y1,
+                       0.020f, 0.024f, 0.032f, 0.96f * neutralRadiusAlpha);
+      drawPlotMenuRect(popoverRect.x0, popoverRect.y1 - 2.0f, popoverRect.x1, popoverRect.y1,
+                       0.42f, 0.74f, 0.92f, 0.68f * neutralRadiusAlpha);
+      drawPlotMenuRect(popoverRect.x0, popoverRect.y0, popoverRect.x1, popoverRect.y0 + 2.0f,
+                       0.34f, 0.60f, 0.78f, 0.46f * neutralRadiusAlpha);
+      drawPlotMenuRect(popoverRect.x0, popoverRect.y0, popoverRect.x0 + 2.0f, popoverRect.y1,
+                       0.38f, 0.68f, 0.86f, 0.58f * neutralRadiusAlpha);
+      drawPlotMenuRect(popoverRect.x1 - 2.0f, popoverRect.y0, popoverRect.x1, popoverRect.y1,
+                       0.38f, 0.68f, 0.86f, 0.58f * neutralRadiusAlpha);
+      drawWrappedHudText(renderer,
+                         "Turn off Overflow to reenable Neutral Radius",
+                         popoverRect.x0 + 11.0f,
+                         popoverRect.y1 - (renderer.available ? 19.0f : 18.0f),
+                         std::max(48.0f, popoverRect.x1 - popoverRect.x0 - 22.0f),
+                         textScale,
+                         2,
+                         0.92f * neutralRadiusAlpha,
+                         0.90f,
+                         0.94f,
+                         0.98f);
+      drawViewerMenuCheckbox(checkboxRect.x0,
+                             checkboxRect.y0,
+                             checkboxRect.x1 - checkboxRect.x0,
+                             app.viewerState.showOverflow,
+                             true,
+                             toggleHovered,
+                             neutralRadiusAlpha);
+      drawHudTextLine(renderer,
+                      "Show Overflow",
+                      checkboxRect.x1 + 8.0f,
+                      checkboxRect.y0 + (renderer.available ? 4.0f : 5.0f),
+                      textScale,
+                      (toggleHovered ? 0.98f : 0.82f) * neutralRadiusAlpha,
+                      0.88f,
+                      0.94f,
+                      0.98f);
+    }
+  }
+
+  static float identityLassoPopoverAlpha = 0.0f;
+  static double identityLassoPopoverLastTime = 0.0;
+  static int identityLassoPopoverLastRow = -1;
+  const int identityLassoPopoverCurrentRow = identityLassoPopoverRowIndex(app, windowWidth, windowHeight);
+  const bool identityLassoPopoverVisibleNow = identityLassoPopoverCurrentRow >= 0;
+  if (identityLassoPopoverVisibleNow) identityLassoPopoverLastRow = identityLassoPopoverCurrentRow;
+  const float identityLassoAlpha =
+      updateViewerMenuPopoverFade(identityLassoPopoverVisibleNow,
+                                  &identityLassoPopoverAlpha,
+                                  &identityLassoPopoverLastTime);
+  if (identityLassoAlpha > 0.01f) {
+    const int popoverRowIndex =
+        identityLassoPopoverCurrentRow >= 0 ? identityLassoPopoverCurrentRow : identityLassoPopoverLastRow;
+    const PlotMenuRect popoverWindowRect =
+        identityLassoPopoverWindowRectForRow(app, windowWidth, windowHeight, popoverRowIndex);
+    const PlotMenuRect checkboxWindowRect = identityLassoCheckboxWindowRect(popoverWindowRect);
+    const PlotMenuRect popoverRect = scaleRect(popoverWindowRect);
+    const PlotMenuRect checkboxRect = scaleRect(checkboxWindowRect);
+    if (popoverWindowRect.x1 > popoverWindowRect.x0 && popoverWindowRect.y1 > popoverWindowRect.y0) {
+      const bool toggleHovered =
+          pointInIdentityLassoPopoverToggle(app, windowWidth, windowHeight, app.hoverX, app.hoverY);
+      drawPlotMenuRect(popoverRect.x0, popoverRect.y0, popoverRect.x1, popoverRect.y1,
+                       0.020f, 0.024f, 0.032f, 0.96f * identityLassoAlpha);
+      drawPlotMenuRect(popoverRect.x0, popoverRect.y1 - 2.0f, popoverRect.x1, popoverRect.y1,
+                       0.48f, 0.78f, 0.94f, 0.68f * identityLassoAlpha);
+      drawPlotMenuRect(popoverRect.x0, popoverRect.y0, popoverRect.x1, popoverRect.y0 + 2.0f,
+                       0.34f, 0.60f, 0.78f, 0.46f * identityLassoAlpha);
+      drawPlotMenuRect(popoverRect.x0, popoverRect.y0, popoverRect.x0 + 2.0f, popoverRect.y1,
+                       0.38f, 0.68f, 0.86f, 0.58f * identityLassoAlpha);
+      drawPlotMenuRect(popoverRect.x1 - 2.0f, popoverRect.y0, popoverRect.x1, popoverRect.y1,
+                       0.38f, 0.68f, 0.86f, 0.58f * identityLassoAlpha);
+      drawWrappedHudText(renderer,
+                         "This feature is disabled when in Lasso mode, disable Lasso to use it",
+                         popoverRect.x0 + 11.0f,
+                         popoverRect.y1 - (renderer.available ? 21.0f : 20.0f),
+                         std::max(48.0f, popoverRect.x1 - popoverRect.x0 - 22.0f),
+                         textScale,
+                         3,
+                         0.90f * identityLassoAlpha,
+                         0.90f,
+                         0.94f,
+                         0.98f);
+      drawViewerMenuCheckbox(checkboxRect.x0,
+                             checkboxRect.y0,
+                             checkboxRect.x1 - checkboxRect.x0,
+                             app.viewerState.volumeSliceLassoRegion,
+                             true,
+                             toggleHovered,
+                             identityLassoAlpha);
+      drawHudTextLine(renderer,
+                      "Image Lasso",
+                      checkboxRect.x1 + 8.0f,
+                      checkboxRect.y0 + (renderer.available ? 4.0f : 5.0f),
+                      textScale,
+                      (toggleHovered ? 0.98f : 0.82f) * identityLassoAlpha,
+                      0.88f,
+                      0.94f,
+                      0.98f);
+    }
+  } else if (!identityLassoPopoverVisibleNow) {
+    identityLassoPopoverLastRow = -1;
+  }
+
+  static float identityFlagPopoverAlpha = 0.0f;
+  static double identityFlagPopoverLastTime = 0.0;
+  static int identityFlagPopoverLastRow = -1;
+  const int identityFlagPopoverCurrentRow = identityReadGeneratorFlagPopoverRowIndex(app);
+  const bool identityFlagPopoverVisibleNow = identityFlagPopoverCurrentRow >= 0;
+  if (identityFlagPopoverVisibleNow) identityFlagPopoverLastRow = identityFlagPopoverCurrentRow;
+  const float identityFlagPopoverAlphaNow =
+      updateViewerMenuPopoverFade(identityFlagPopoverVisibleNow,
+                                  &identityFlagPopoverAlpha,
+                                  &identityFlagPopoverLastTime);
+  if (identityFlagPopoverAlphaNow > 0.01f) {
+    const int popoverRowIndex =
+        identityFlagPopoverCurrentRow >= 0 ? identityFlagPopoverCurrentRow : identityFlagPopoverLastRow;
+    const PlotMenuRect popoverWindowRect =
+        identityReadGeneratorFlagPopoverWindowRect(app, windowWidth, windowHeight, popoverRowIndex);
+    const PlotMenuRect popoverRect = scaleRect(popoverWindowRect);
+    if (popoverWindowRect.x1 > popoverWindowRect.x0 && popoverWindowRect.y1 > popoverWindowRect.y0) {
+      drawPlotMenuRect(popoverRect.x0, popoverRect.y0, popoverRect.x1, popoverRect.y1,
+                       0.026f, 0.026f, 0.032f, 0.96f * identityFlagPopoverAlphaNow);
+      drawPlotMenuRect(popoverRect.x0, popoverRect.y1 - 2.0f, popoverRect.x1, popoverRect.y1,
+                       0.88f, 0.64f, 0.30f, 0.72f * identityFlagPopoverAlphaNow);
+      drawPlotMenuRect(popoverRect.x0, popoverRect.y0, popoverRect.x1, popoverRect.y0 + 2.0f,
+                       0.78f, 0.52f, 0.22f, 0.46f * identityFlagPopoverAlphaNow);
+      drawPlotMenuRect(popoverRect.x0, popoverRect.y0, popoverRect.x0 + 2.0f, popoverRect.y1,
+                       0.82f, 0.58f, 0.28f, 0.60f * identityFlagPopoverAlphaNow);
+      drawPlotMenuRect(popoverRect.x1 - 2.0f, popoverRect.y0, popoverRect.x1, popoverRect.y1,
+                       0.82f, 0.58f, 0.28f, 0.60f * identityFlagPopoverAlphaNow);
+      drawHudTextLine(renderer,
+                      "Generator option needed",
+                      popoverRect.x0 + 11.0f,
+                      popoverRect.y0 + (renderer.available ? 17.0f : 18.0f),
+                      textScale,
+                      0.90f * identityFlagPopoverAlphaNow,
+                      0.94f,
+                      0.86f,
+                      0.72f);
+      drawWrappedHudText(renderer,
+                         identityReadGeneratorFlagPopoverText(app, popoverRowIndex),
+                         popoverRect.x0 + 11.0f,
+                         popoverRect.y1 - (renderer.available ? 22.0f : 21.0f),
+                         std::max(48.0f, popoverRect.x1 - popoverRect.x0 - 22.0f),
+                         textScale,
+                         3,
+                         0.88f * identityFlagPopoverAlphaNow,
+                         0.90f,
+                         0.94f,
+                         0.98f);
+    }
+  } else if (!identityFlagPopoverVisibleNow) {
+    identityFlagPopoverLastRow = -1;
+  }
+
+  static float identityDrawPromptAlpha = 0.0f;
+  static double identityDrawPromptLastTime = 0.0;
+  static int identityDrawPromptLastRow = -1;
+  const int identityDrawPromptCurrentRow = identityReadDrawInstancePromptRowIndex(app);
+  const bool identityDrawPromptVisibleNow = identityDrawPromptCurrentRow >= 0;
+  if (identityDrawPromptVisibleNow) identityDrawPromptLastRow = identityDrawPromptCurrentRow;
+  const float identityDrawPromptAlphaNow =
+      updateViewerMenuPopoverFade(identityDrawPromptVisibleNow,
+                                  &identityDrawPromptAlpha,
+                                  &identityDrawPromptLastTime);
+  if (identityDrawPromptAlphaNow > 0.01f) {
+    const int popoverRowIndex =
+        identityDrawPromptCurrentRow >= 0 ? identityDrawPromptCurrentRow : identityDrawPromptLastRow;
+    const PlotMenuRect popoverWindowRect =
+        identityReadDrawInstancePromptWindowRect(app, windowWidth, windowHeight, popoverRowIndex);
+    const PlotMenuRect popoverRect = scaleRect(popoverWindowRect);
+    if (popoverWindowRect.x1 > popoverWindowRect.x0 && popoverWindowRect.y1 > popoverWindowRect.y0) {
+      drawPlotMenuRect(popoverRect.x0, popoverRect.y0, popoverRect.x1, popoverRect.y1,
+                       0.026f, 0.026f, 0.032f, 0.96f * identityDrawPromptAlphaNow);
+      drawPlotMenuRect(popoverRect.x0, popoverRect.y1 - 2.0f, popoverRect.x1, popoverRect.y1,
+                       0.88f, 0.64f, 0.30f, 0.74f * identityDrawPromptAlphaNow);
+      drawPlotMenuRect(popoverRect.x0, popoverRect.y0, popoverRect.x1, popoverRect.y0 + 2.0f,
+                       0.78f, 0.52f, 0.22f, 0.48f * identityDrawPromptAlphaNow);
+      drawPlotMenuRect(popoverRect.x0, popoverRect.y0, popoverRect.x0 + 2.0f, popoverRect.y1,
+                       0.82f, 0.58f, 0.28f, 0.62f * identityDrawPromptAlphaNow);
+      drawPlotMenuRect(popoverRect.x1 - 2.0f, popoverRect.y0, popoverRect.x1, popoverRect.y1,
+                       0.82f, 0.58f, 0.28f, 0.62f * identityDrawPromptAlphaNow);
+      drawHudTextLine(renderer,
+                      "Identity source needed",
+                      popoverRect.x0 + 11.0f,
+                      popoverRect.y0 + (renderer.available ? 17.0f : 18.0f),
+                      textScale,
+                      0.90f * identityDrawPromptAlphaNow,
+                      0.94f,
+                      0.86f,
+                      0.72f);
+      drawWrappedHudText(renderer,
+                         identityReadDrawInstancePromptText(app),
+                         popoverRect.x0 + 11.0f,
+                         popoverRect.y1 - (renderer.available ? 22.0f : 21.0f),
+                         std::max(48.0f, popoverRect.x1 - popoverRect.x0 - 22.0f),
+                         textScale,
+                         4,
+                         0.88f * identityDrawPromptAlphaNow,
+                         0.90f,
+                         0.94f,
+                         0.98f);
+    }
+  } else if (!identityDrawPromptVisibleNow) {
+    identityDrawPromptLastRow = -1;
+  }
+
+  const float activeRowsY0 = viewerMenuRowsY0(app, mainWindowRect);
+  const float contentHeight = viewerMenuRowsHeight(rows);
+  const float visibleHeight = std::max(1.0f, mainWindowRect.y1 - activeRowsY0 - kViewerDrawerPad);
+  if (contentHeight > visibleHeight + 1.0f) {
+    const float scrollT = clampf(app.viewerMenuScroll / std::max(1.0f, contentHeight - visibleHeight), 0.0f, 1.0f);
+    const float barX0 = mainRect.x1 - 6.0f;
+    const float barX1 = mainRect.x1 - 3.0f;
+    const float trackY0 = mainRect.y0 + 8.0f;
+    const float trackY1 = mainRect.y1 - kViewerDrawerHeaderHeight;
+    const float thumbH = std::max(26.0f, (trackY1 - trackY0) * visibleHeight / contentHeight);
+    const float thumbY1 = trackY1 - (trackY1 - trackY0 - thumbH) * scrollT;
+    drawPlotMenuRect(barX0, trackY0, barX1, trackY1, 0.52f, 0.62f, 0.72f, 0.20f);
+    drawPlotMenuRect(barX0, thumbY1 - thumbH, barX1, thumbY1, 0.55f, 0.76f, 0.92f, 0.72f);
+  }
+
+  const std::vector<ViewerChoiceMenuItem> choiceItems = buildViewerChoiceMenuItems(app);
+  if (!choiceItems.empty()) {
+    const PlotMenuRect choiceWindowRect = viewerChoiceMenuWindowRect(app, windowWidth, windowHeight);
+    if (choiceWindowRect.x1 > choiceWindowRect.x0 && choiceWindowRect.y1 > choiceWindowRect.y0) {
+      const PlotMenuRect choiceRect = scaleRect(choiceWindowRect);
+      const float choiceScroll = clampf(app.viewerChoiceMenuScroll,
+                                        0.0f,
+                                        viewerChoiceMenuMaxScroll(app, windowWidth, windowHeight));
+      drawPlotMenuRect(choiceRect.x0, choiceRect.y0, choiceRect.x1, choiceRect.y1,
+                       0.018f, 0.021f, 0.028f, 0.96f);
+      drawPlotMenuRect(choiceRect.x0, choiceRect.y1 - 1.0f, choiceRect.x1, choiceRect.y1,
+                       0.75f, 0.82f, 0.92f, 0.22f);
+      drawPlotMenuRect(choiceRect.x0, choiceRect.y0, choiceRect.x1, choiceRect.y0 + 1.0f,
+                       0.75f, 0.82f, 0.92f, 0.14f);
+      drawPlotMenuRect(choiceRect.x0, choiceRect.y0, choiceRect.x0 + 1.0f, choiceRect.y1,
+                       0.75f, 0.82f, 0.92f, 0.18f);
+      drawPlotMenuRect(choiceRect.x1 - 1.0f, choiceRect.y0, choiceRect.x1, choiceRect.y1,
+                       0.75f, 0.82f, 0.92f, 0.18f);
+      for (int i = 0; i < static_cast<int>(choiceItems.size()); ++i) {
+        const float itemY0 = choiceWindowRect.y0 + kViewerChoiceMenuPad +
+                             static_cast<float>(i) * kViewerChoiceMenuRowHeight - choiceScroll;
+        if (itemY0 + kViewerChoiceMenuRowHeight < choiceWindowRect.y0 + kViewerChoiceMenuPad ||
+            itemY0 > choiceWindowRect.y1 - kViewerChoiceMenuPad) {
+          continue;
+        }
+        const PlotMenuRect itemRect = scaleRect({choiceWindowRect.x0 + kViewerChoiceMenuPad,
+                                                 itemY0,
+                                                 choiceWindowRect.x1 - kViewerChoiceMenuPad,
+                                                 itemY0 + kViewerChoiceMenuRowHeight});
+        const bool hovered = app.viewerMenuHoverChoice == i;
+        const bool selected = choiceItems[static_cast<std::size_t>(i)].selected;
+        if (hovered) {
+          drawPlotMenuRect(itemRect.x0, itemRect.y0, itemRect.x1, itemRect.y1,
+                           0.18f, 0.30f, 0.42f, 0.62f);
+        }
+        if (selected) {
+          drawPlotMenuRect(itemRect.x0 + 4.0f, itemRect.y0 + 5.0f,
+                           itemRect.x0 + 7.0f, itemRect.y1 - 5.0f,
+                           0.42f, 0.78f, 1.0f, 0.86f);
+        }
+        const float labelX = itemRect.x0 + (selected ? 14.0f : 10.0f);
+        const bool displayReferred = choiceItems[static_cast<std::size_t>(i)].displayReferred;
+        const float glyphReserve = displayReferred ? 24.0f : 0.0f;
+        const std::string fittedLabel =
+            fitHudText(renderer,
+                       choiceItems[static_cast<std::size_t>(i)].label,
+                       std::max(24.0f, itemRect.x1 - labelX - 8.0f - glyphReserve),
+                       textScale);
+        drawHudTextLine(renderer,
+                        fittedLabel,
+                        labelX,
+                        itemRect.y0 + (renderer.available ? 9.0f : 10.0f),
+                        textScale,
+                        selected ? 0.98f : 0.88f,
+                        0.90f,
+                        0.94f,
+                        0.98f);
+        if (displayReferred) {
+          const float labelWidth = hudTextWidth(renderer, fittedLabel, textScale);
+          const float glyphX = std::min(labelX + labelWidth + 7.0f, itemRect.x1 - 18.0f);
+          drawViewerDisplayGlyph(glyphX,
+                                 itemRect.y0 + (kViewerChoiceMenuRowHeight - 12.0f) * 0.5f,
+                                 selected);
+        }
+      }
+      const float maxChoiceScroll = viewerChoiceMenuMaxScroll(app, windowWidth, windowHeight);
+      if (maxChoiceScroll > 0.5f) {
+        const float contentHeight = kViewerChoiceMenuRowHeight * static_cast<float>(choiceItems.size());
+        const float visibleHeight = std::max(1.0f, choiceWindowRect.y1 - choiceWindowRect.y0 - kViewerChoiceMenuPad * 2.0f);
+        const float scrollT = clampf(choiceScroll / maxChoiceScroll, 0.0f, 1.0f);
+        const PlotMenuRect trackRect = scaleRect({choiceWindowRect.x1 - 7.0f,
+                                                  choiceWindowRect.y0 + kViewerChoiceMenuPad,
+                                                  choiceWindowRect.x1 - 4.0f,
+                                                  choiceWindowRect.y1 - kViewerChoiceMenuPad});
+        const float thumbH = std::max(20.0f, (trackRect.y1 - trackRect.y0) * visibleHeight / std::max(visibleHeight, contentHeight));
+        const float thumbY1 = trackRect.y1 - (trackRect.y1 - trackRect.y0 - thumbH) * scrollT;
+        drawPlotMenuRect(trackRect.x0, trackRect.y0, trackRect.x1, trackRect.y1,
+                         0.52f, 0.62f, 0.72f, 0.18f);
+        drawPlotMenuRect(trackRect.x0, thumbY1 - thumbH, trackRect.x1, thumbY1,
+                         0.55f, 0.76f, 0.92f, 0.72f);
+      }
+    }
+  }
+
+  glDisable(GL_BLEND);
+  glEnable(GL_DEPTH_TEST);
+  glPopMatrix();
+  glMatrixMode(GL_PROJECTION);
+  glPopMatrix();
+  glMatrixMode(GL_MODELVIEW);
+}
+
+struct PlotWindowFramebufferRect {
+  int x = 0;
+  int y = 0;
+  int w = 1;
+  int h = 1;
+};
+
+PlotWindowFramebufferRect plotWindowFramebufferRect(const PlotWindowState& window, int fbWidth, int fbHeight) {
+  PlotWindowFramebufferRect rect{};
+  rect.x = static_cast<int>(std::round(window.rect.x * static_cast<float>(std::max(1, fbWidth))));
+  const int top = static_cast<int>(std::round(window.rect.y * static_cast<float>(std::max(1, fbHeight))));
+  rect.w = std::max(1, static_cast<int>(std::round(window.rect.w * static_cast<float>(std::max(1, fbWidth)))));
+  rect.h = std::max(1, static_cast<int>(std::round(window.rect.h * static_cast<float>(std::max(1, fbHeight)))));
+  rect.y = std::max(0, fbHeight - top - rect.h);
+  rect.x = std::clamp(rect.x, 0, std::max(0, fbWidth - 1));
+  rect.y = std::clamp(rect.y, 0, std::max(0, fbHeight - 1));
+  rect.w = std::min(rect.w, std::max(1, fbWidth - rect.x));
+  rect.h = std::min(rect.h, std::max(1, fbHeight - rect.y));
+  return rect;
+}
+
+std::string plotWindowDerivedBuildKey(const PlotWindowState& window,
+                                      const ResolvedPayload& payload,
+                                      const InputCloudPayload& cloud) {
+  const auto state = viewerStateWithModelCapabilities(window.viewState);
+  std::ostringstream os;
+  os << "win=" << window.windowId
+     << "|cloud=" << (cloud.stabilityHash != 0
+                          ? cloud.stabilityHash
+                          : (cloud.contentHash != 0 ? cloud.contentHash : cloud.seq))
+     << "|settings=" << cloud.settingsKey
+     << "|payload=" << payload.stateRevision
+     << "|view=" << state.stateRevision
+     << "|model=" << state.plotModel
+     << "|waveformMode=" << state.waveformMode
+     << "|waveformPointBrightness=" << std::setprecision(4)
+     << state.waveformPointBrightness
+     << "|waveformGridBrightness=" << state.waveformGridBrightness
+     << "|waveformSaturation=" << state.waveformSaturation
+     << "|waveformDotSize=" << state.waveformDotSize
+     << "|waveformChannels=" << (state.waveformChannelRed ? 1 : 0)
+     << (state.waveformChannelGreen ? 1 : 0)
+     << (state.waveformChannelBlue ? 1 : 0)
+     << "|waveformShowOverflow=" << (state.waveformShowOverflow ? 1 : 0)
+     << "|waveformOverflow=" << (state.waveformHighlightOverflow ? 1 : 0)
+     << "|waveformLumaMethod=" << state.waveformLumaMethod
+     << "|histogramMode=" << state.histogramMode
+     << "|histogramShowOverflow=" << (state.histogramShowOverflow ? 1 : 0)
+     << "|histogramOverflow=" << (state.histogramHighlightOverflow ? 1 : 0)
+     << "|scopeRange=" << state.scopeRangeMode
+     << "|linear=" << (state.plotDisplayLinear ? 1 : 0)
+     << "|readRamp=" << (state.readGrayRamp ? 1 : 0)
+     << "|readIdentity=" << (state.readIdentityPlot ? 1 : 0)
+     << "|isolateIdentity=" << (state.isolateIdentityData ? 1 : 0)
+     << "|imageLasso=" << (state.volumeSliceLassoRegion ? 1 : 0)
+     << "|slices=" << (state.volumeSliceRed ? 1 : 0)
+     << (state.volumeSliceYellow ? 1 : 0)
+     << (state.volumeSliceGreen ? 1 : 0)
+     << (state.volumeSliceCyan ? 1 : 0)
+     << (state.volumeSliceBlue ? 1 : 0)
+     << (state.volumeSliceMagenta ? 1 : 0)
+     << "|neutral=" << std::setprecision(4) << state.neutralRadius;
+  return os.str();
+}
+
+std::string plotWindowOverlayBuildKey(const PlotWindowState& window,
+                                      const ResolvedPayload& payload) {
+  std::ostringstream os;
+  os << "view=" << window.viewState.stateRevision
+     << "|model=" << window.viewState.plotModel
+     << "|enabled=" << (payload.identityOverlayEnabled ? 1 : 0)
+     << "|ramp=" << (payload.identityOverlayRamp ? 1 : 0)
+     << "|size=" << payload.identityOverlaySize
+     << "|linear=" << (payload.plotDisplayLinear ? 1 : 0)
+     << "|slices=" << (payload.cubeSliceRed ? 1 : 0)
+     << (payload.cubeSliceYellow ? 1 : 0)
+     << (payload.cubeSliceGreen ? 1 : 0)
+     << (payload.cubeSliceCyan ? 1 : 0)
+     << (payload.cubeSliceBlue ? 1 : 0)
+     << (payload.cubeSliceMagenta ? 1 : 0)
+     << "|neutral=" << std::setprecision(4) << payload.neutralRadius;
+  return os.str();
+}
+
+void rebuildPlotWindowOverlayMeshIfNeeded(PlotWindowState* window,
+                                          const ResolvedPayload& payload) {
+  if (!window) return;
+  const std::string key = plotWindowOverlayBuildKey(*window, payload);
+  if (window->overlayMeshValid && window->overlayBuildKey == key) return;
+  MeshData overlay{};
+  if (payload.identityOverlayEnabled && !isGlossViewPlotModeString(payload.plotMode)) {
+    (void)buildIdentityOverlayMesh(payload, &overlay);
+  }
+  window->overlayMesh = std::move(overlay);
+  window->overlayBuildKey = key;
+  window->overlayMeshValid = true;
+}
+
+bool rebuildPlotWindowDerivedMeshIfNeeded(PlotWindowState* window,
+                                          const AppState& app,
+                                          const ResolvedPayload& resolved,
+                                          const InputCloudPayload* cloud) {
+  if (!window) return false;
+  const bool analyticalScope = plotModelIsAnalyticalScope(window->viewState.plotModel);
+  ResolvedPayload payload = resolved;
+  applyViewerStateToResolvedViewFields(window->viewState, &payload);
+  applyCachedOfxImageLassoSelection(app, &payload);
+  rebuildPlotWindowOverlayMeshIfNeeded(window, payload);
+  const auto aggregateState = aggregateHostStateForWorkspace(app);
+  const std::string aggregateKey = ChromaspaceViewer::sampleSettingsKey(aggregateState, false);
+  const bool workspaceCloudLive =
+      cloud && senderMatchesCurrent(resolved.senderId, cloud->senderId) &&
+      cloud->settingsKey == aggregateKey;
+  const bool scopeCloudIsCurrentApproximation =
+      analyticalScope && cloud &&
+      senderMatchesCurrent(resolved.senderId, cloud->senderId) &&
+      ((payloadImageLassoModeEnabled(payload) &&
+        (cloudSettingsKeyHasImageLasso(cloud->settingsKey) ||
+         cloudSettingsKeyHasImageLasso(cloud->paramHash))) ||
+       (payloadWantsIdentityReadPreview(payload) && cloudLooksIdentityRead(*cloud)) ||
+       (!payloadImageLassoModeEnabled(payload) &&
+        !payloadWantsIdentityReadPreview(payload) &&
+        cloudCanSeedBaseInputCache(*cloud)));
+  const bool plotCloudLive =
+      cloud && (workspaceCloudLive ||
+                cloudMatchesResolved(resolved, *cloud) ||
+                cloudMatchesResolved(payload, *cloud));
+  window->syncLabel =
+      !cloud ? "Waiting for Resolve"
+             : (plotCloudLive ? "Live"
+                              : (scopeCloudIsCurrentApproximation ? "Refining" : "Using cache"));
+  if (resolved.sourceMode == "identity" && !analyticalScope) {
+    const std::string key = std::string("identity|") + std::to_string(window->viewState.stateRevision) +
+                            "|" + std::to_string(resolved.resolution);
+    if (window->derivedMeshValid && window->derivedBuildKey == key) return true;
+    MeshData mesh{};
+    if (!buildIdentityMesh(payload, &mesh)) return false;
+    window->derivedMesh = std::move(mesh);
+    window->derivedBuildKey = key;
+    window->derivedMeshValid = true;
+    return true;
+  }
+  if (!cloud) {
+    const std::string key = std::string("waiting|") + std::to_string(window->viewState.stateRevision);
+    if (window->derivedMeshValid && window->derivedBuildKey == key) return true;
+    MeshData waiting{};
+    waiting.quality = "Waiting";
+    waiting.resolution = resolved.resolution;
+    waiting.serial = nextMeshSerial();
+    waiting.analyticalScope = analyticalScope;
+    waiting.waveformScope =
+        window->viewState.plotModel == ChromaspaceViewer::kPlotModelWaveform;
+    waiting.scopeMode = waiting.waveformScope ? window->viewState.waveformMode
+                                              : window->viewState.histogramMode;
+    window->derivedMesh = std::move(waiting);
+    window->derivedBuildKey = key;
+    window->derivedMeshValid = true;
+    return true;
+  }
+
+  const std::string key = plotWindowDerivedBuildKey(*window, payload, *cloud);
+  if (window->derivedMeshValid && window->derivedBuildKey == key) return true;
+  MeshData mesh{};
+  const bool built = analyticalScope
+                         ? buildAnalyticalScopeMeshCpu(payload,
+                                                       *cloud,
+                                                       window->derivedMeshValid ? &window->derivedMesh : nullptr,
+                                                       &mesh)
+                         : buildInputCloudFitMeshCpu(payload, *cloud, &mesh);
+  if (!built) {
+    if (window->derivedMeshValid && meshHasVisibleData(window->derivedMesh)) {
+      logViewerEvent(std::string("Kept previous plot mesh after derived rebuild failure: window=") +
+                     std::to_string(window->windowId) +
+                     " model=" + ChromaspaceViewer::plotModelLabel(window->viewState.plotModel) +
+                     " sync=" + window->syncLabel);
+      return true;
+    }
+    mesh = MeshData{};
+    mesh.resolution = cloud->resolution <= 25 ? 25 : (cloud->resolution <= 41 ? 41 : 57);
+    mesh.quality = cloud->quality;
+    mesh.paramHash = cloud->paramHash;
+    mesh.serial = nextMeshSerial();
+    mesh.analyticalScope = analyticalScope;
+    mesh.waveformScope =
+        window->viewState.plotModel == ChromaspaceViewer::kPlotModelWaveform;
+    mesh.scopeMode = mesh.waveformScope ? window->viewState.waveformMode
+                                        : window->viewState.histogramMode;
+  }
+  const bool intentionalEmptyAllowed = payloadAllowsIntentionalEmptyPlot(payload);
+  const uint64_t cloudIdentity =
+      cloud->stabilityHash != 0
+          ? cloud->stabilityHash
+          : (cloud->contentHash != 0 ? cloud->contentHash : cloud->seq);
+  const std::string cloudIdentityMarker =
+      std::string("|cloud=") + std::to_string(cloudIdentity) + "|";
+  const bool sameSourceReinterpretation =
+      window->derivedBuildKey.find(cloudIdentityMarker) != std::string::npos;
+  const std::string viewRevisionMarker =
+      std::string("|view=") + std::to_string(window->viewState.stateRevision) + "|";
+  const bool sameViewState =
+      window->derivedBuildKey.find(viewRevisionMarker) != std::string::npos;
+  if (!intentionalEmptyAllowed &&
+      (sameSourceReinterpretation || sameViewState) &&
+      !meshHasVisibleData(mesh) &&
+      window->derivedMeshValid &&
+      meshHasVisibleData(window->derivedMesh)) {
+    logViewerEvent(std::string("Kept previous plot mesh after unexpected empty refinement: window=") +
+                   std::to_string(window->windowId) +
+                   " model=" + ChromaspaceViewer::plotModelLabel(window->viewState.plotModel) +
+                   " sync=" + window->syncLabel +
+                   " live=" + (plotCloudLive ? "1" : "0"));
+    return true;
+  }
+  window->derivedMesh = std::move(mesh);
+  window->derivedBuildKey = key;
+  window->derivedMeshValid = true;
+  return true;
+}
+
+void setupPlotWindowProjection(const PlotWindowState& window,
+                               const MeshData& mesh,
+                               int viewportWidth,
+                               int viewportHeight) {
+  const float aspect = viewportHeight > 0
+                           ? static_cast<float>(viewportWidth) / static_cast<float>(viewportHeight)
+                           : 1.0f;
+  const float fovy = kViewerFovYDegrees;
+  float sceneMinX = 0.0f;
+  float sceneMinY = 0.0f;
+  float sceneMinZ = -1.0f;
+  float sceneMaxX = 0.0f;
+  float sceneMaxY = 0.0f;
+  float sceneMaxZ = 1.0f;
+  bool haveSceneBounds = false;
+  if (mesh.hasFitBounds) {
+    haveSceneBounds = computeViewBoundsFromAabb(Quat{window.camera.qx, window.camera.qy, window.camera.qz, window.camera.qw},
+                                                Quat{},
+                                                mesh.fitMin,
+                                                mesh.fitMax,
+                                                &sceneMinX,
+                                                &sceneMinY,
+                                                &sceneMinZ,
+                                                &sceneMaxX,
+                                                &sceneMaxY,
+                                                &sceneMaxZ);
+  }
+  const float zNear = clampf(window.camera.distance * 0.025f, 0.0018f, 0.08f);
+  float zFar = 100.0f;
+  if (haveSceneBounds) {
+    const float depthToBack = std::max(0.2f, window.camera.distance - sceneMinZ + 1.5f);
+    zFar = clampf(depthToBack, 100.0f, 4000.0f);
+  }
+  const float ymax = zNear * tanHalfFovDegrees(fovy);
+  const float xmax = ymax * aspect;
+  glMatrixMode(GL_PROJECTION);
+  glLoadIdentity();
+  if (window.camera.orthographic) {
+    const float orthoHalfHeight = std::max(kMinOrthoHalfHeight, window.camera.distance * tanHalfFovDegrees(fovy));
+    const float orthoHalfWidth = orthoHalfHeight * aspect;
+    glOrtho(-orthoHalfWidth, orthoHalfWidth, -orthoHalfHeight, orthoHalfHeight, zNear, zFar);
+  } else {
+    glFrustum(-xmax, xmax, -ymax, ymax, zNear, zFar);
+  }
+  glMatrixMode(GL_MODELVIEW);
+  glLoadIdentity();
+  glTranslatef(window.camera.panX, window.camera.panY, -window.camera.distance);
+  float rotM[16];
+  quatToMatrix(Quat{window.camera.qx, window.camera.qy, window.camera.qz, window.camera.qw}, rotM);
+  glMultMatrixf(rotM);
+}
+
+void drawGlossViewFieldOverlay(int width,
+                               int height,
+                               const ResolvedPayload& payload,
+                               const MeshData& mesh,
+                               GlossViewFieldAlgorithm algorithm,
+                               GlossViewColorMode colorMode,
+                               GlossViewDebugFieldMode debugMode,
+                               GlossViewDiagnosticOverlay diagnosticMode);
+void drawChromaticityInfoOverlay(const PlotRemapSpec& spec,
+                                 int width,
+                                 int height,
+                                 double hoverX,
+                                 double hoverY,
+                                 const HudTextRenderer& renderer);
+void drawGlossLiftInfoOverlay(int width,
+                              int height,
+                              const ResolvedPayload& payload,
+                              const MeshData& mesh,
+                              const HudTextRenderer& renderer,
+                              GlossViewPresentationMode presentationMode,
+                              GlossViewFieldAlgorithm algorithm,
+                              GlossViewColorMode colorMode,
+                              GlossViewDebugFieldMode debugMode,
+                              GlossViewDiagnosticOverlay diagnosticMode);
+void drawGlossLiftSpatialInsetOverlay(int width,
+                                      int height,
+                                      const ResolvedPayload& payload,
+                                      const MeshData& mesh,
+                                      const HudTextRenderer& renderer,
+                                      GlossViewFieldAlgorithm algorithm,
+                                      GlossViewColorMode colorMode,
+                                      GlossViewDebugFieldMode debugMode,
+                                      GlossViewDiagnosticOverlay diagnosticMode);
+
+void drawAnalyticalScopePlot(const PlotWindowState& window,
+                             const MeshData& mesh,
+                             int width,
+                             int height,
+                             const HudTextRenderer& renderer) {
+  glMatrixMode(GL_PROJECTION);
+  glPushMatrix();
+  glLoadIdentity();
+  const float zoom = clampf(6.0f / std::max(1.0f, window.camera.distance), 0.35f, 4.0f);
+  const float half = 1.0f / zoom;
+  glOrtho(-half - window.camera.panX,
+          half - window.camera.panX,
+          -half - window.camera.panY,
+          half - window.camera.panY,
+          -1.0,
+          1.0);
+  glMatrixMode(GL_MODELVIEW);
+  glPushMatrix();
+  glLoadIdentity();
+  glDisable(GL_DEPTH_TEST);
+  glEnable(GL_BLEND);
+  glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+
+  const float gridBrightness =
+      mesh.waveformScope
+          ? clampf(static_cast<float>(window.viewState.waveformGridBrightness),
+                   0.0f,
+                   2.0f)
+          : 1.0f;
+  const float gridColorGain = std::sqrt(gridBrightness);
+  glColor4f(clampf(0.48f * gridColorGain, 0.0f, 1.0f),
+            clampf(0.55f * gridColorGain, 0.0f, 1.0f),
+            clampf(0.64f * gridColorGain, 0.0f, 1.0f),
+            clampf(0.13f * gridBrightness, 0.0f, 0.42f));
+  glLineWidth(1.0f);
+  glBegin(GL_LINES);
+  const int horizontalDivisions = mesh.waveformScope ? 32 : 16;
+  for (int i = 0; i <= horizontalDivisions; ++i) {
+    const float y =
+        kScopePlotBottom + kScopePlotHeight * static_cast<float>(i) / horizontalDivisions;
+    glVertex2f(kScopePlotLeft, y);
+    glVertex2f(kScopePlotRight, y);
+  }
+  for (int i = 0; i <= 8; ++i) {
+    const float x = kScopePlotLeft + kScopePlotWidth * static_cast<float>(i) / 8.0f;
+    glVertex2f(x, kScopePlotBottom);
+    glVertex2f(x, kScopePlotTop);
+  }
+  glEnd();
+
+  glColor4f(clampf(0.64f * gridColorGain, 0.0f, 1.0f),
+            clampf(0.71f * gridColorGain, 0.0f, 1.0f),
+            clampf(0.80f * gridColorGain, 0.0f, 1.0f),
+            clampf(0.34f * gridBrightness, 0.0f, 0.82f));
+  glLineWidth(1.0f);
+  glBegin(GL_LINES);
+  const int majorDivisions = mesh.waveformScope ? 8 : 4;
+  for (int i = 0; i <= majorDivisions; ++i) {
+    const float y =
+        kScopePlotBottom + kScopePlotHeight * static_cast<float>(i) / majorDivisions;
+    glVertex2f(kScopePlotLeft, y);
+    glVertex2f(kScopePlotRight, y);
+    glVertex2f(kScopePlotLeft - 0.018f, y);
+    glVertex2f(kScopePlotLeft, y);
+  }
+  glEnd();
+
+  if (mesh.waveformScope && mesh.scopeMode == 1) {
+    glColor4f(clampf(0.70f * gridColorGain, 0.0f, 1.0f),
+              clampf(0.76f * gridColorGain, 0.0f, 1.0f),
+              clampf(0.84f * gridColorGain, 0.0f, 1.0f),
+              clampf(0.36f * gridBrightness, 0.0f, 0.86f));
+    glBegin(GL_LINES);
+    for (int i = 1; i < 3; ++i) {
+      const float x = kScopePlotLeft + kScopePlotWidth * static_cast<float>(i) / 3.0f;
+      glVertex2f(x, kScopePlotBottom);
+      glVertex2f(x, kScopePlotTop);
+    }
+    glEnd();
+  }
+
+  if (mesh.pointCount > 0 && !mesh.pointVerts.empty() && !mesh.pointColors.empty()) {
+    glEnableClientState(GL_VERTEX_ARRAY);
+    glEnableClientState(GL_COLOR_ARRAY);
+    // Density is already baked into RGB. Point smoothing is used only for
+    // subpixel edge coverage, with ordinary background blending rather than
+    // additive phosphor-style accumulation.
+    glEnable(GL_POINT_SMOOTH);
+    glHint(GL_POINT_SMOOTH_HINT, GL_NICEST);
+    const float horizontalSpacing =
+        static_cast<float>(width) / static_cast<float>(std::max(1, mesh.scopeWidth));
+    const float verticalSampleSpacing =
+        static_cast<float>(height) /
+        static_cast<float>(std::max(1, mesh.scopeSourceRows));
+    const float scopePointSize =
+        mesh.waveformScope
+            ? clampf(1.30f + 0.28f * std::sqrt(
+                                   std::max(0.0f,
+                                            horizontalSpacing * verticalSampleSpacing)),
+                     1.45f,
+                     2.45f)
+            : 1.45f;
+    const float waveformDotSize =
+        mesh.waveformScope
+            ? clampf(static_cast<float>(window.viewState.waveformDotSize), 0.25f, 3.0f)
+            : 1.0f;
+    glPointSize(clampf(scopePointSize * waveformDotSize, 0.75f, 7.0f));
+    glVertexPointer(3, GL_FLOAT, 0, mesh.pointVerts.data());
+    glColorPointer(4, GL_FLOAT, 0, mesh.pointColors.data());
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glDrawArrays(GL_POINTS, 0, static_cast<GLsizei>(mesh.pointCount));
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glDisableClientState(GL_COLOR_ARRAY);
+    glDisableClientState(GL_VERTEX_ARRAY);
+    glDisable(GL_POINT_SMOOTH);
+  }
+  if (mesh.scopeFillVertexCount > 0 && !mesh.scopeFillVerts.empty() &&
+      !mesh.scopeFillColors.empty()) {
+    glEnableClientState(GL_VERTEX_ARRAY);
+    glEnableClientState(GL_COLOR_ARRAY);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glVertexPointer(3, GL_FLOAT, 0, mesh.scopeFillVerts.data());
+    glColorPointer(4, GL_FLOAT, 0, mesh.scopeFillColors.data());
+    glDrawArrays(GL_TRIANGLES, 0, static_cast<GLsizei>(mesh.scopeFillVertexCount));
+    glDisableClientState(GL_COLOR_ARRAY);
+    glDisableClientState(GL_VERTEX_ARRAY);
+  }
+  if (mesh.lineVertexCount > 0 && !mesh.lineVerts.empty() && !mesh.lineColors.empty()) {
+    glEnableClientState(GL_VERTEX_ARRAY);
+    glEnableClientState(GL_COLOR_ARRAY);
+    glEnable(GL_LINE_SMOOTH);
+    glLineWidth(1.6f);
+    glVertexPointer(3, GL_FLOAT, 0, mesh.lineVerts.data());
+    glColorPointer(4, GL_FLOAT, 0, mesh.lineColors.data());
+    glDrawArrays(GL_LINES, 0, static_cast<GLsizei>(mesh.lineVertexCount));
+    glLineWidth(1.0f);
+    glDisable(GL_LINE_SMOOTH);
+    glDisableClientState(GL_COLOR_ARRAY);
+    glDisableClientState(GL_VERTEX_ARRAY);
+  }
+  if (mesh.scopeRangeMax > mesh.scopeRangeMin + 1e-6f) {
+    const auto signalLinePosition = [&](float signal) {
+      return (signal - mesh.scopeRangeMin) /
+             (mesh.scopeRangeMax - mesh.scopeRangeMin);
+    };
+    glColor4f(1.0f, 0.48f, 0.08f, 0.96f);
+    glLineWidth(1.8f);
+    glBegin(GL_LINES);
+    const float zeroPosition = signalLinePosition(0.0f);
+    if (mesh.waveformScope) {
+      const float zeroY =
+          kScopePlotBottom + zeroPosition * kScopePlotHeight;
+      glVertex2f(kScopePlotLeft, zeroY);
+      glVertex2f(kScopePlotRight, zeroY);
+    } else {
+      const float zeroX =
+          kScopePlotLeft + zeroPosition * kScopePlotWidth;
+      glVertex2f(zeroX, kScopePlotBottom);
+      glVertex2f(zeroX, kScopePlotTop);
+    }
+    if (mesh.scopeRangeMode == 0) {
+      const float onePosition = signalLinePosition(1.0f);
+      if (mesh.waveformScope) {
+        const float oneY =
+            kScopePlotBottom + onePosition * kScopePlotHeight;
+        glVertex2f(kScopePlotLeft, oneY);
+        glVertex2f(kScopePlotRight, oneY);
+      } else {
+        const float oneX =
+            kScopePlotLeft + onePosition * kScopePlotWidth;
+        glVertex2f(oneX, kScopePlotBottom);
+        glVertex2f(oneX, kScopePlotTop);
+      }
+    }
+    glEnd();
+    glLineWidth(1.0f);
+  }
+
+  glEnable(GL_DEPTH_TEST);
+  glPopMatrix();
+  glMatrixMode(GL_PROJECTION);
+  glPopMatrix();
+  glMatrixMode(GL_MODELVIEW);
+
+  glMatrixMode(GL_PROJECTION);
+  glPushMatrix();
+  glLoadIdentity();
+  glOrtho(0.0, static_cast<double>(width), 0.0, static_cast<double>(height), -1.0, 1.0);
+  glMatrixMode(GL_MODELVIEW);
+  glPushMatrix();
+  glLoadIdentity();
+  glDisable(GL_DEPTH_TEST);
+  glEnable(GL_BLEND);
+  glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+  const float shorterWindowDimension =
+      static_cast<float>(std::max(1, std::min(width, height)));
+  const float labelScale =
+      renderer.available
+          ? clampf(0.68f * std::sqrt(shorterWindowDimension / 360.0f),
+                   0.68f,
+                   1.35f)
+          : 1.0f;
+  auto rangeLabel = [](float value) {
+    std::ostringstream os;
+    os << std::fixed << std::setprecision(std::abs(value) < 10.0f ? 2 : 1) << value;
+    return os.str();
+  };
+  const float orthoLeft = -half - window.camera.panX;
+  const float orthoBottom = -half - window.camera.panY;
+  auto worldToPixelX = [&](float x) {
+    return (x - orthoLeft) / (2.0f * half) * static_cast<float>(width);
+  };
+  auto worldToPixelY = [&](float y) {
+    return (y - orthoBottom) / (2.0f * half) * static_cast<float>(height);
+  };
+  if (mesh.waveformScope) {
+    for (int i = 0; i <= 8; ++i) {
+      const float fraction = static_cast<float>(i) / 8.0f;
+      std::string label;
+      if (mesh.scopeRangeMode == 0) {
+        const int codeValue = i == 8 ? 1023 : i * 128;
+        label = std::to_string(codeValue);
+      } else {
+        label = rangeLabel(mesh.scopeRangeMin +
+                           fraction * (mesh.scopeRangeMax - mesh.scopeRangeMin));
+      }
+      drawHudTextLineRight(renderer,
+                           label,
+                           worldToPixelX(kScopePlotLeft) - 5.0f,
+                           worldToPixelY(kScopePlotBottom +
+                                         fraction * kScopePlotHeight) -
+                               8.0f * labelScale,
+                           labelScale,
+                           0.72f,
+                           0.75f,
+                           0.81f,
+                           0.90f);
+    }
+  } else {
+    for (int i = 0; i <= 8; ++i) {
+      const float fraction = static_cast<float>(i) / 8.0f;
+      std::string label;
+      if (mesh.scopeRangeMode == 0) {
+        const int codeValue = i == 8 ? 1023 : i * 128;
+        label = std::to_string(codeValue);
+      } else {
+        label = rangeLabel(mesh.scopeRangeMin +
+                           fraction * (mesh.scopeRangeMax - mesh.scopeRangeMin));
+      }
+      const float x =
+          worldToPixelX(kScopePlotLeft + fraction * kScopePlotWidth);
+      drawHudTextLine(renderer,
+                      label,
+                      x - hudTextWidth(renderer, label, labelScale) * 0.5f,
+                      worldToPixelY(kScopePlotBottom) - 15.0f * labelScale,
+                      labelScale,
+                      0.72f,
+                      0.75f,
+                      0.81f,
+                      0.90f);
+    }
+  }
+  const std::string modeLabel =
+      mesh.waveformScope ? ChromaspaceViewer::waveformModeLabel(mesh.scopeMode)
+                         : ChromaspaceViewer::histogramModeLabel(mesh.scopeMode);
+  drawHudTextLineRight(renderer,
+                       modeLabel,
+                       static_cast<float>(width) - 8.0f,
+                       static_cast<float>(height) - 10.0f,
+                       labelScale,
+                       0.72f,
+                       0.74f,
+                       0.82f,
+                       0.92f);
+  if (window.syncLabel == "Waiting for Resolve") {
+    const std::string waiting = "Waiting for Resolve";
+    drawHudTextLine(renderer,
+                    waiting,
+                    std::max(8.0f,
+                             (static_cast<float>(width) -
+                              hudTextWidth(renderer, waiting, labelScale)) *
+                                 0.5f),
+                    static_cast<float>(height) * 0.5f,
+                    labelScale,
+                    0.78f,
+                    0.62f,
+                    0.72f,
+                    0.86f);
+  }
+  glDisable(GL_BLEND);
+  glEnable(GL_DEPTH_TEST);
+  glPopMatrix();
+  glMatrixMode(GL_PROJECTION);
+  glPopMatrix();
+  glMatrixMode(GL_MODELVIEW);
+}
+
+void drawSecondaryPlotWindow(AppState* app,
+                             PlotWindowState* window,
+                             const ResolvedPayload& resolved,
+                             const InputCloudPayload* cloud,
+                             int fbWidth,
+                             int fbHeight,
+                             const HudTextRenderer& renderer,
+                             PointRenderProgramCache* pointRenderProgramCache) {
+  if (!app || !window) return;
+  // In a multi-window workspace every plot must use the same per-window draw
+  // path. Otherwise moving focus switches that plot between the primary GPU
+  // path and the secondary CPU path, visibly changing its density/shape.
+  if (window->windowId == app->focusedPlotWindowId && app->plotWindows.size() <= 1u &&
+      !plotModelIsAnalyticalScope(window->viewState.plotModel)) return;
+  if (!rebuildPlotWindowDerivedMeshIfNeeded(window, *app, resolved, cloud)) return;
+  ResolvedPayload payload = resolved;
+  applyViewerStateToResolvedViewFields(window->viewState, &payload);
+  const PlotWindowFramebufferRect rect = plotWindowFramebufferRect(*window, fbWidth, fbHeight);
+  glEnable(GL_SCISSOR_TEST);
+  glScissor(rect.x, rect.y, rect.w, rect.h);
+  glViewport(rect.x, rect.y, rect.w, rect.h);
+  float backgroundR = payload.backgroundColorR;
+  float backgroundG = payload.backgroundColorG;
+  float backgroundB = payload.backgroundColorB;
+  if (payloadImageLassoModeEnabled(payload) && !payloadHasImageLassoSelection(payload)) {
+    backgroundR = clamp01(backgroundR * 0.82f + 0.05f);
+    backgroundG = clamp01(backgroundG * 0.86f + 0.09f);
+    backgroundB = clamp01(backgroundB * 1.10f + 0.20f);
+  } else if (payload.neutralRadiusEnabled) {
+    backgroundR = 0.118f;
+    backgroundG = 0.110f;
+    backgroundB = 0.102f;
+  }
+  glClearColor(backgroundR, backgroundG, backgroundB, 1.0f);
+  glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+  if (window->derivedMesh.analyticalScope) {
+    drawAnalyticalScopePlot(*window, window->derivedMesh, rect.w, rect.h, renderer);
+    glDisable(GL_SCISSOR_TEST);
+    return;
+  }
+  setupPlotWindowProjection(*window, window->derivedMesh, rect.w, rect.h);
+  float modelRotM[16];
+  quatToMatrix(app->modelOrientation, modelRotM);
+  glMultMatrixf(modelRotM);
+  glEnable(GL_DEPTH_TEST);
+  glEnable(GL_BLEND);
+  glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+  const bool glossViewMode = isGlossViewPlotModeString(payload.plotMode);
+  const bool glossField2DMode =
+      glossViewMode && app->glossViewPresentation == GlossViewPresentationMode::Field2D &&
+      window->derivedMesh.hasGlossField;
+  const bool glossProjection3DMode =
+      glossViewMode && app->glossViewPresentation == GlossViewPresentationMode::Projection3D;
+  if (!glossField2DMode) {
+    drawGuideForPlotMode(payload, window->camera, rect.h, kViewerFovYDegrees, &renderer);
+  }
+
+  const float* activePointVerts =
+      window->derivedMesh.pointVerts.empty() ? nullptr : window->derivedMesh.pointVerts.data();
+  const float* activePointColors =
+      window->derivedMesh.pointColors.empty() ? nullptr : window->derivedMesh.pointColors.data();
+  size_t activePointCount = window->derivedMesh.pointCount;
+  std::vector<float> glossProjectionVerts;
+  std::vector<float> glossProjectionColors;
+  PointDrawBuffers sampledPointDraw;
+  if (glossField2DMode) {
+    activePointVerts = nullptr;
+    activePointColors = nullptr;
+    activePointCount = 0;
+  } else if (glossProjection3DMode) {
+    buildGlossViewProjectionCpuDrawArrays(window->derivedMesh,
+                                          payload,
+                                          app->glossViewFieldAlgorithm,
+                                          app->glossViewColorMode,
+                                          app->glossViewDebugFieldMode,
+                                          app->glossViewDiagnosticOverlay,
+                                          &glossProjectionVerts,
+                                          &glossProjectionColors);
+    if (!glossProjectionVerts.empty() &&
+        glossProjectionColors.size() / 4u >= glossProjectionVerts.size() / 3u) {
+      activePointVerts = glossProjectionVerts.data();
+      activePointColors = glossProjectionColors.data();
+      activePointCount = glossProjectionVerts.size() / 3u;
+    } else {
+      activePointVerts = nullptr;
+      activePointColors = nullptr;
+      activePointCount = 0;
+    }
+  }
+
+  const float densityForView = std::max(0.35f, payload.pointDensity);
+  if (!glossViewMode && activePointCount > 0u) {
+    const PointSelectionSpec pointSelection =
+        makePointSelectionSpec(window->derivedMesh, densityForView);
+    if (pointSelection.needsThinning &&
+        buildCpuSampledPointDrawBuffers(window->derivedMesh, pointSelection, &sampledPointDraw) &&
+        sampledPointDraw.available) {
+      activePointVerts = sampledPointDraw.cpuVerts.data();
+      activePointColors = sampledPointDraw.cpuColors.data();
+      activePointCount = sampledPointDraw.pointCount;
+    }
+  }
+  float pointSize = 2.5f;
+  if (window->derivedMesh.resolution <= 25) pointSize = 3.3f;
+  else if (window->derivedMesh.resolution <= 41) pointSize = 2.9f;
+  pointSize *= std::max(0.5f, payload.pointSize);
+  pointSize *= std::pow(densityForView, -0.12f);
+  const float zoomComp =
+      (glossViewMode && window->camera.orthographic)
+          ? 1.0f
+          : clampf(std::pow(6.0f / std::max(0.2f, window->camera.distance), 0.52f), 0.90f, 2.35f);
+  pointSize = clampf(pointSize * zoomComp, 1.0f, 24.0f);
+
+  const bool drawAsGlossProjection = glossProjection3DMode && activePointCount > 0u;
+  const bool useSquarePoints = !drawAsGlossProjection && payload.pointShape == "Square";
+  const bool plainScopeStyle = payload.plotStyle != "Space";
+  const bool occlusiveInputCloud =
+      payload.sourceMode == "input" && plainScopeStyle && !drawAsGlossProjection;
+  const float drawCoverage =
+      estimatedPointCoverage(pointSize, activePointCount, rect.w, rect.h, useSquarePoints);
+  const float denseGlowSuppress =
+      densePlotGlowSuppression(payload.pointSize, densityForView, window->derivedMesh.resolution);
+  const float denseColorPreserve =
+      denseColorPreservationForPlot(payload.colorSaturation,
+                                    payload.pointSize,
+                                    densityForView,
+                                    window->derivedMesh.resolution);
+  const float coverageWhiteSuppress = clampf((drawCoverage - 0.010f) / 0.020f, 0.0f, 1.0f);
+  const float inputCloudWhiteSuppress = occlusiveInputCloud ? 0.78f : 0.0f;
+  const float saturationWhiteSuppress = clampf((payload.colorSaturation - 1.0f) / 1.6f, 0.0f, 1.0f);
+  const float whitePassSuppress =
+      clampf(std::max(std::max(denseGlowSuppress, coverageWhiteSuppress),
+                      std::max(inputCloudWhiteSuppress, saturationWhiteSuppress)) *
+                 (1.0f + 1.35f * denseColorPreserve),
+             0.0f,
+             1.0f);
+  const float drawColorSaturation =
+      effectiveColorSaturationForPlot(payload.colorSaturation,
+                                      payload.pointSize,
+                                      densityForView,
+                                      window->derivedMesh.resolution);
+  float drawBrightnessTrim =
+      displaySaturationBrightnessTrim(drawColorSaturation,
+                                      payload.pointSize,
+                                      densityForView,
+                                      window->derivedMesh.resolution);
+  if (drawAsGlossProjection) drawBrightnessTrim = std::max(0.96f, drawBrightnessTrim * 1.08f);
+  float drawAlphaGain =
+      drawAlphaGainForPointSize(pointSize,
+                                densityForView,
+                                window->derivedMesh.resolution,
+                                activePointCount,
+                                rect.w,
+                                rect.h,
+                                useSquarePoints) *
+      (drawAsGlossProjection ? 1.0f : (plainScopeStyle ? 1.0f : 0.84f));
+  if (drawAsGlossProjection) drawAlphaGain = std::max(1.12f, drawAlphaGain * 1.24f);
+
+  if (glossViewMode && !glossField2DMode &&
+      window->derivedMesh.glossBodyGuidePointCount > 0u &&
+      !window->derivedMesh.glossBodyGuideVerts.empty() &&
+      !window->derivedMesh.glossBodyGuideColors.empty() &&
+      payload.glossBodyOpacity > 1e-4f) {
+    std::vector<float> bodyColors = window->derivedMesh.glossBodyGuideColors;
+    for (size_t i = 3u; i < bodyColors.size(); i += 4u) {
+      bodyColors[i] = clampf(bodyColors[i] * payload.glossBodyOpacity, 0.0f, 1.0f);
+    }
+    glEnableClientState(GL_VERTEX_ARRAY);
+    glEnableClientState(GL_COLOR_ARRAY);
+    glDisable(GL_POINT_SMOOTH);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glEnable(GL_DEPTH_TEST);
+    glDepthMask(GL_TRUE);
+    glPointSize(clampf(std::max(1.5f, pointSize * 0.90f), 1.5f, 9.0f));
+    glVertexPointer(3, GL_FLOAT, 0, window->derivedMesh.glossBodyGuideVerts.data());
+    glColorPointer(4, GL_FLOAT, 0, bodyColors.data());
+    glDrawArrays(GL_POINTS, 0, static_cast<GLsizei>(window->derivedMesh.glossBodyGuidePointCount));
+    glDisableClientState(GL_COLOR_ARRAY);
+    glDisableClientState(GL_VERTEX_ARRAY);
+  }
+
+  if (activePointCount > 0 && activePointVerts && activePointColors) {
+    glEnableClientState(GL_VERTEX_ARRAY);
+    glEnableClientState(GL_COLOR_ARRAY);
+    const bool usePointRenderProgram =
+        pointRenderProgramCache && ensurePointRenderProgram(pointRenderProgramCache) &&
+        (drawAsGlossProjection || plainScopeStyle);
+    if (useSquarePoints || usePointRenderProgram || drawAsGlossProjection) {
+      glDisable(GL_POINT_SMOOTH);
+    } else {
+      glEnable(GL_POINT_SMOOTH);
+      glHint(GL_POINT_SMOOTH_HINT, GL_NICEST);
+    }
+    glPointSize(pointSize);
+    glVertexPointer(3, GL_FLOAT, 0, activePointVerts);
+    glColorPointer(4, GL_FLOAT, 0, activePointColors);
+    if (usePointRenderProgram) {
+      const ViewerGlComputeApi& renderApi = viewerGlComputeApi();
+      glEnable(GL_VERTEX_PROGRAM_POINT_SIZE);
+#ifdef GL_POINT_SPRITE
+      glEnable(GL_POINT_SPRITE);
+#ifdef GL_COORD_REPLACE
+      glTexEnvi(GL_POINT_SPRITE, GL_COORD_REPLACE, GL_TRUE);
+#endif
+#endif
+      renderApi.useProgram(pointRenderProgramCache->program);
+      renderApi.uniform1f(pointRenderProgramCache->pointSizeLoc, pointSize);
+      renderApi.uniform1f(pointRenderProgramCache->colorSaturationLoc, drawColorSaturation);
+      renderApi.uniform1f(pointRenderProgramCache->brightnessTrimLoc, drawBrightnessTrim);
+      renderApi.uniform1f(pointRenderProgramCache->alphaGainLoc, drawAlphaGain);
+      renderApi.uniform1f(pointRenderProgramCache->layerAlphaScaleLoc,
+                          drawAsGlossProjection ? payload.glossHighlightOpacity : 1.0f);
+      renderApi.uniform1f(pointRenderProgramCache->pointCrispnessLoc,
+                          drawAsGlossProjection ? payload.glossPointCrispness : 0.0f);
+      renderApi.uniform1f(pointRenderProgramCache->glossModeLoc, drawAsGlossProjection ? 1.0f : 0.0f);
+      renderApi.uniform1f(pointRenderProgramCache->occlusiveModeLoc, occlusiveInputCloud ? 1.0f : 0.0f);
+    }
+    if (drawAsGlossProjection) {
+      glEnable(GL_BLEND);
+      glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+      glDepthMask(GL_TRUE);
+    } else if (plainScopeStyle) {
+      glDepthMask(occlusiveInputCloud ? GL_TRUE : GL_FALSE);
+      if (occlusiveInputCloud) {
+        glDisable(GL_BLEND);
+      } else if (usePointRenderProgram) {
+        glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+      }
+    } else {
+      glDepthMask(GL_TRUE);
+      glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    }
+    glDrawArrays(GL_POINTS, 0, static_cast<GLsizei>(activePointCount));
+    if (usePointRenderProgram) {
+      const ViewerGlComputeApi& renderApi = viewerGlComputeApi();
+      renderApi.uniform1f(pointRenderProgramCache->layerAlphaScaleLoc, 1.0f);
+      renderApi.uniform1f(pointRenderProgramCache->glossModeLoc, 0.0f);
+      renderApi.useProgram(0);
+#ifdef GL_POINT_SPRITE
+#ifdef GL_COORD_REPLACE
+      glTexEnvi(GL_POINT_SPRITE, GL_COORD_REPLACE, GL_FALSE);
+#endif
+      glDisable(GL_POINT_SPRITE);
+#endif
+      glDisable(GL_VERTEX_PROGRAM_POINT_SIZE);
+    }
+    if (occlusiveInputCloud) glEnable(GL_BLEND);
+    glDepthMask(GL_TRUE);
+    if (!drawAsGlossProjection) {
+      glDisable(GL_DEPTH_TEST);
+      glDisableClientState(GL_COLOR_ARRAY);
+      if (!plainScopeStyle) {
+        glColor4f(0.95f, 0.96f, 1.0f, clampf(0.05f / std::sqrt(densityForView), 0.014f, 0.05f));
+        glPointSize(pointSize * clampf(0.56f / std::sqrt(densityForView), 0.30f, 0.58f));
+        glDrawArrays(GL_POINTS, 0, static_cast<GLsizei>(activePointCount));
+        const float haloAlpha = clampf(0.06f / densityForView, 0.012f, 0.05f);
+        if (haloAlpha > 0.013f) {
+          glColor4f(0.95f, 0.96f, 1.0f, haloAlpha);
+          glPointSize(pointSize * clampf(0.52f / std::sqrt(densityForView), 0.28f, 0.55f));
+          glDrawArrays(GL_POINTS, 0, static_cast<GLsizei>(activePointCount));
+        }
+      } else if (!occlusiveInputCloud) {
+        const float thickeningAlpha =
+            clampf((0.04f / std::sqrt(densityForView)) * (1.0f - 0.97f * whitePassSuppress),
+                   0.0f,
+                   0.04f);
+        if (thickeningAlpha > 0.006f) {
+          glColor4f(0.90f, 0.92f, 0.96f, thickeningAlpha);
+          glPointSize(pointSize * clampf((0.52f / std::sqrt(densityForView)) *
+                                             (1.0f - 0.32f * whitePassSuppress),
+                                         0.20f,
+                                         0.52f));
+          glDrawArrays(GL_POINTS, 0, static_cast<GLsizei>(activePointCount));
+        }
+        const float haloAlpha =
+            clampf((0.045f / densityForView) * (1.0f - 0.99f * whitePassSuppress),
+                   0.0f,
+                   0.035f);
+        if (haloAlpha > 0.006f) {
+          glColor4f(0.90f, 0.92f, 0.96f, haloAlpha);
+          glPointSize(pointSize * clampf((0.46f / std::sqrt(densityForView)) *
+                                             (1.0f - 0.38f * whitePassSuppress),
+                                         0.18f,
+                                         0.46f));
+          glDrawArrays(GL_POINTS, 0, static_cast<GLsizei>(activePointCount));
+        }
+      }
+      glEnableClientState(GL_COLOR_ARRAY);
+      glEnable(GL_DEPTH_TEST);
+    }
+    glDisableClientState(GL_COLOR_ARRAY);
+    glDisableClientState(GL_VERTEX_ARRAY);
+  }
+  if (!glossViewMode &&
+      window->overlayMesh.pointCount > 0u &&
+      !window->overlayMesh.pointVerts.empty() &&
+      !window->overlayMesh.pointColors.empty()) {
+    glEnableClientState(GL_VERTEX_ARRAY);
+    glEnableClientState(GL_COLOR_ARRAY);
+    glDisable(GL_DEPTH_TEST);
+    glDepthMask(GL_FALSE);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glDisable(GL_POINT_SMOOTH);
+    glPointSize(clampf(std::max(1.0f, pointSize * 0.72f), 1.0f, 18.0f));
+    glVertexPointer(3, GL_FLOAT, 0, window->overlayMesh.pointVerts.data());
+    glColorPointer(4, GL_FLOAT, 0, window->overlayMesh.pointColors.data());
+    glDrawArrays(GL_POINTS, 0, static_cast<GLsizei>(window->overlayMesh.pointCount));
+    glDepthMask(GL_TRUE);
+    glEnable(GL_DEPTH_TEST);
+    glDisableClientState(GL_COLOR_ARRAY);
+    glDisableClientState(GL_VERTEX_ARRAY);
+  }
+  if (!glossViewMode &&
+      window->derivedMesh.lineVertexCount > 0 &&
+      window->derivedMesh.lineVerts.size() >= window->derivedMesh.lineVertexCount * 3u &&
+      window->derivedMesh.lineColors.size() >= window->derivedMesh.lineVertexCount * 4u) {
+    glEnableClientState(GL_VERTEX_ARRAY);
+    glEnableClientState(GL_COLOR_ARRAY);
+    glEnable(GL_LINE_SMOOTH);
+    glLineWidth(1.15f);
+    glVertexPointer(3, GL_FLOAT, 0, window->derivedMesh.lineVerts.data());
+    glColorPointer(4, GL_FLOAT, 0, window->derivedMesh.lineColors.data());
+    glDrawArrays(GL_LINES, 0, static_cast<GLsizei>(window->derivedMesh.lineVertexCount));
+    glLineWidth(1.0f);
+    glDisable(GL_LINE_SMOOTH);
+    glDisableClientState(GL_COLOR_ARRAY);
+    glDisableClientState(GL_VERTEX_ARRAY);
+  }
+  if (!glossViewMode && payload.showOverflow && payload.highlightOverflow &&
+      activePointCount > 0u && activePointVerts && activePointColors) {
+    std::vector<float> overflowVerts;
+    std::vector<float> overflowColors;
+    overflowVerts.reserve(activePointCount * 3u / 16u);
+    overflowColors.reserve(activePointCount * 4u / 16u);
+    for (size_t i = 0; i < activePointCount; ++i) {
+      const size_t colorBase = i * 4u;
+      if (activePointColors[colorBase + 3u] < 0.9f) continue;
+      const size_t vertBase = i * 3u;
+      overflowVerts.insert(overflowVerts.end(),
+                           {activePointVerts[vertBase], activePointVerts[vertBase + 1u], activePointVerts[vertBase + 2u]});
+      overflowColors.insert(overflowColors.end(),
+                            {activePointColors[colorBase],
+                             activePointColors[colorBase + 1u],
+                             activePointColors[colorBase + 2u],
+                             1.0f});
+    }
+    if (!overflowVerts.empty()) {
+      glEnableClientState(GL_VERTEX_ARRAY);
+      glEnableClientState(GL_COLOR_ARRAY);
+      glDisable(GL_DEPTH_TEST);
+      glPointSize(clampf(pointSize * 1.28f, 1.0f, 28.0f));
+      glVertexPointer(3, GL_FLOAT, 0, overflowVerts.data());
+      glColorPointer(4, GL_FLOAT, 0, overflowColors.data());
+      glDrawArrays(GL_POINTS, 0, static_cast<GLsizei>(overflowVerts.size() / 3u));
+      glEnable(GL_DEPTH_TEST);
+      glDisableClientState(GL_COLOR_ARRAY);
+      glDisableClientState(GL_VERTEX_ARRAY);
+    }
+  }
+  if (glossField2DMode) {
+    drawGlossViewFieldOverlay(rect.w,
+                              rect.h,
+                              payload,
+                              window->derivedMesh,
+                              app->glossViewFieldAlgorithm,
+                              app->glossViewColorMode,
+                              app->glossViewDebugFieldMode,
+                              app->glossViewDiagnosticOverlay);
+  }
+  if (payload.plotMode == "chromaticity") {
+    const double windowWidth = std::max(1.0, static_cast<double>(window->rect.w) * fbWidth);
+    const double windowHeight = std::max(1.0, static_cast<double>(window->rect.h) * fbHeight);
+    const double localX = app->hoverX - static_cast<double>(window->rect.x) * fbWidth;
+    const double localY = app->hoverY - static_cast<double>(window->rect.y) * fbHeight;
+    drawChromaticityInfoOverlay(makePlotRemapSpec(payload),
+                                rect.w,
+                                rect.h,
+                                localX * static_cast<double>(rect.w) / windowWidth,
+                                localY * static_cast<double>(rect.h) / windowHeight,
+                                renderer);
+  }
+  if (glossViewMode && !payload.glossHideText) {
+    drawGlossLiftInfoOverlay(rect.w,
+                             rect.h,
+                             payload,
+                             window->derivedMesh,
+                             renderer,
+                             app->glossViewPresentation,
+                             app->glossViewFieldAlgorithm,
+                             app->glossViewColorMode,
+                             app->glossViewDebugFieldMode,
+                             app->glossViewDiagnosticOverlay);
+  }
+  if (glossProjection3DMode && payload.glossSpatialInset) {
+    drawGlossLiftSpatialInsetOverlay(rect.w,
+                                    rect.h,
+                                    payload,
+                                    window->derivedMesh,
+                                    renderer,
+                                    app->glossViewFieldAlgorithm,
+                                    app->glossViewColorMode,
+                                    app->glossViewDebugFieldMode,
+                                    app->glossViewDiagnosticOverlay);
+  }
+  glDisable(GL_SCISSOR_TEST);
+}
+
+void drawPlotWindowFramesOverlay(const AppState& app,
+                                 int fbWidth,
+                                 int fbHeight,
+                                 int windowWidth,
+                                 int windowHeight,
+                                 const HudTextRenderer& renderer) {
+  if (fbWidth <= 0 || fbHeight <= 0 || windowWidth <= 0 || windowHeight <= 0) return;
+  const float sx = static_cast<float>(fbWidth) / static_cast<float>(windowWidth);
+  const float sy = static_cast<float>(fbHeight) / static_cast<float>(windowHeight);
+  glMatrixMode(GL_PROJECTION);
+  glPushMatrix();
+  glLoadIdentity();
+  glOrtho(0.0, static_cast<double>(fbWidth), 0.0, static_cast<double>(fbHeight), -1.0, 1.0);
+  glMatrixMode(GL_MODELVIEW);
+  glPushMatrix();
+  glLoadIdentity();
+  glDisable(GL_DEPTH_TEST);
+  glEnable(GL_BLEND);
+  glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+  for (const auto& window : app.plotWindows) {
+    const float x0w = window.rect.x * static_cast<float>(windowWidth);
+    const float y0w = window.rect.y * static_cast<float>(windowHeight);
+    const float x1w = x0w + window.rect.w * static_cast<float>(windowWidth);
+    const float y1w = y0w + window.rect.h * static_cast<float>(windowHeight);
+    const float x0 = x0w * sx;
+    const float x1 = x1w * sx;
+    const float y0 = static_cast<float>(fbHeight) - y1w * sy;
+    const float y1 = static_cast<float>(fbHeight) - y0w * sy;
+    const bool focused = window.windowId == app.focusedPlotWindowId;
+    const bool hovered = window.windowId == app.hoveredPlotWindowId;
+    const float a = focused ? 0.86f : (hovered ? 0.58f : 0.34f);
+    drawPlotMenuRect(x0, y1 - 1.5f, x1, y1, 0.62f, 0.82f, 1.0f, a);
+    drawPlotMenuRect(x0, y0, x1, y0 + 1.5f, 0.62f, 0.82f, 1.0f, a * 0.72f);
+    drawPlotMenuRect(x0, y0, x0 + 1.5f, y1, 0.62f, 0.82f, 1.0f, a * 0.72f);
+    drawPlotMenuRect(x1 - 1.5f, y0, x1, y1, 0.62f, 0.82f, 1.0f, a * 0.68f);
+    if (window.rect.w < 0.995f || window.rect.h < 0.995f) {
+      drawPlotMenuRect(x0, y1 - 22.0f, x1, y1, 0.02f, 0.03f, 0.04f, focused ? 0.52f : 0.28f);
+      const std::string label = ChromaspaceViewer::plotModelLabel(window.viewState.plotModel);
+      const std::string title = label + "  |  " + window.syncLabel;
+      drawHudTextLine(renderer,
+                      title,
+                      x0 + 8.0f,
+                      y1 - (renderer.available ? 15.0f : 14.0f),
+                      0.82f,
+                      focused ? 0.96f : 0.72f,
+                      0.88f,
+                      0.93f,
+                      0.98f);
+    }
+    if (app.plotWindows.size() > 1u) {
+      const PlotMenuRect closeWindowRect = plotWindowCloseWindowRect(window, windowWidth, windowHeight);
+      const bool closeHovered = pointInPlotMenuRect(closeWindowRect, app.hoverX, app.hoverY);
+      const float closeX0 = closeWindowRect.x0 * sx;
+      const float closeX1 = closeWindowRect.x1 * sx;
+      const float closeY0 = static_cast<float>(fbHeight) - closeWindowRect.y1 * sy;
+      const float closeY1 = static_cast<float>(fbHeight) - closeWindowRect.y0 * sy;
+      drawPlotMenuRect(closeX0, closeY0, closeX1, closeY1,
+                       closeHovered ? 0.20f : 0.05f,
+                       closeHovered ? 0.08f : 0.06f,
+                       closeHovered ? 0.09f : 0.08f,
+                       closeHovered ? 0.82f : 0.46f);
+      glLineWidth(1.25f);
+      glBegin(GL_LINES);
+      glColor4f(0.94f, 0.92f, 0.94f, closeHovered ? 0.98f : 0.66f);
+      glVertex2f(closeX0 + 5.0f * sx, closeY0 + 5.0f * sy);
+      glVertex2f(closeX1 - 5.0f * sx, closeY1 - 5.0f * sy);
+      glVertex2f(closeX1 - 5.0f * sx, closeY0 + 5.0f * sy);
+      glVertex2f(closeX0 + 5.0f * sx, closeY1 - 5.0f * sy);
+      glEnd();
+      glLineWidth(1.0f);
+    }
+  }
+  if (app.plotWindowSnapPreviewVisible) {
+    const PlotWindowRectNorm& preview = app.plotWindowSnapPreviewRect;
+    const float px0 = preview.x * static_cast<float>(fbWidth);
+    const float px1 = (preview.x + preview.w) * static_cast<float>(fbWidth);
+    const float py0 = static_cast<float>(fbHeight) -
+                      (preview.y + preview.h) * static_cast<float>(fbHeight);
+    const float py1 = static_cast<float>(fbHeight) -
+                      preview.y * static_cast<float>(fbHeight);
+    drawPlotMenuRect(px0, py0, px1, py1, 0.18f, 0.56f, 0.86f, 0.20f);
+    drawPlotMenuRect(px0, py1 - 2.0f, px1, py1, 0.48f, 0.82f, 1.0f, 0.92f);
+    drawPlotMenuRect(px0, py0, px1, py0 + 2.0f, 0.48f, 0.82f, 1.0f, 0.80f);
+    drawPlotMenuRect(px0, py0, px0 + 2.0f, py1, 0.48f, 0.82f, 1.0f, 0.82f);
+    drawPlotMenuRect(px1 - 2.0f, py0, px1, py1, 0.48f, 0.82f, 1.0f, 0.82f);
+  }
   glDisable(GL_BLEND);
   glEnable(GL_DEPTH_TEST);
   glPopMatrix();
@@ -10260,6 +19657,17 @@ void drawGlossLiftSpatialInsetOverlay(int width,
     return;
   }
 
+  glMatrixMode(GL_PROJECTION);
+  glPushMatrix();
+  glLoadIdentity();
+  glOrtho(0.0, static_cast<double>(width), 0.0, static_cast<double>(height), -1.0, 1.0);
+  glMatrixMode(GL_MODELVIEW);
+  glPushMatrix();
+  glLoadIdentity();
+  glDisable(GL_DEPTH_TEST);
+  glEnable(GL_BLEND);
+  glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+
   const float fieldAspect = static_cast<float>(mesh.glossFieldWidth) /
                             static_cast<float>(std::max(1, mesh.glossFieldHeight));
   const float maxInsetW = clampf(static_cast<float>(width) * 0.24f, 140.0f, 240.0f);
@@ -10286,16 +19694,25 @@ void drawGlossLiftSpatialInsetOverlay(int width,
   drawGlossViewFieldRect(left, bottom, right, top, mesh, payload, algorithm, colorMode, debugMode, diagnosticMode);
   drawGlossViewFieldOrientationMarkers(left, bottom, right, top, true);
 
-  const std::string label = "Linked 2D Field";
-  const float scale = renderer.available ? 0.92f : 5.6f;
-  const float labelX = left;
-  const float labelY = bottom - (renderer.available ? 7.0f : 3.0f);
-  if (renderer.available) {
-    drawHudTextLine(renderer, label, labelX, labelY, scale, 0.66f, 0.94f, 0.95f, 0.98f);
-  } else {
-    glColor4f(0.94f, 0.95f, 0.98f, 0.66f);
-    drawScreenText(label, labelX, labelY, scale);
+  if (!payload.glossHideText) {
+    const std::string label = "Linked 2D Field";
+    const float scale = renderer.available ? 0.92f : 5.6f;
+    const float labelX = left;
+    const float labelY = bottom - (renderer.available ? 7.0f : 3.0f);
+    if (renderer.available) {
+      drawHudTextLine(renderer, label, labelX, labelY, scale, 0.66f, 0.94f, 0.95f, 0.98f);
+    } else {
+      glColor4f(0.94f, 0.95f, 0.98f, 0.66f);
+      drawScreenText(label, labelX, labelY, scale);
+    }
   }
+
+  glDisable(GL_BLEND);
+  glEnable(GL_DEPTH_TEST);
+  glPopMatrix();
+  glMatrixMode(GL_PROJECTION);
+  glPopMatrix();
+  glMatrixMode(GL_MODELVIEW);
 }
 
 void drawGlossViewFieldOverlay(int width,
@@ -10445,10 +19862,6 @@ void drawGlossLiftInfoOverlay(int width,
       glColor4f(color[1], color[2], color[3], color[0]);
       drawScreenText(lines[index], leftX, lineY, scale);
     }
-  }
-
-  if (presentationMode == GlossViewPresentationMode::Projection3D && payload.glossSpatialInset) {
-    drawGlossLiftSpatialInsetOverlay(width, height, payload, mesh, renderer, algorithm, colorMode, debugMode, diagnosticMode);
   }
 
   glDisable(GL_BLEND);
@@ -10948,7 +20361,8 @@ void drawTopLeftTextIndicator(int width,
                               int height,
                               const std::string& text,
                               float alpha,
-                              const HudTextRenderer* renderer) {
+                              const HudTextRenderer* renderer,
+                              float xOffset = 16.0f) {
   if (width <= 0 || height <= 0 || text.empty() || alpha <= 0.0f) return;
 
   glMatrixMode(GL_PROJECTION);
@@ -10964,7 +20378,7 @@ void drawTopLeftTextIndicator(int width,
 
   const bool useAtlas = renderer && renderer->available;
   const float scale = useAtlas ? 0.92f : 6.0f;
-  const float x = 16.0f;
+  const float x = xOffset;
   const float y = static_cast<float>(height) - (useAtlas ? 16.0f : 22.0f);
   if (useAtlas) {
     drawHudTextLine(*renderer, text, x, y, scale, alpha, 0.92f, 0.96f, 0.98f);
@@ -11222,9 +20636,7 @@ void drawRollDirectionIndicator(int width,
   const float radius = 7.6f + 1.0f * pulse;
   const float alpha = 0.60f + 0.34f * pulse;
   const int steps = 34;
-  // Match the feedback to the intended Unicode symbols:
-  // clockwise   ↻ (U+21BB)
-  // counterclockwise ↺ (U+21BA)
+  // Match the feedback to clockwise/counterclockwise roll direction.
   const float tailAngle = 1.57079632679f;
   const float startAngle = direction > 0 ? tailAngle + 0.78f : tailAngle - 0.78f;
   const float endAngle = direction > 0 ? tailAngle - 5.05f : tailAngle + 5.05f;
@@ -11286,7 +20698,7 @@ void drawRollDirectionIndicator(int width,
   }
   glEnd();
 
-  // Short vertical tail so the overall silhouette reads more like ↻ / ↺ than a plain circular arrow.
+  // Short vertical tail so the silhouette reads more like a directional circular arrow.
   glBegin(GL_LINES);
   glVertex2f(cx, cy + radius + tailLen);
   glVertex2f(cx, cy + radius - 1.6f);
@@ -11317,41 +20729,326 @@ void mouseButtonCallback(GLFWwindow* window, int button, int action, int mods) {
   if (!app) return;
   refreshModifierState(window, app);
   applyMouseModifierBits(app, mods);
-  if (app->plotModelMenuVisible) {
-    if (action == GLFW_RELEASE) {
-      clearPointerInteractionState(app);
-      return;
-    }
-    if (action != GLFW_PRESS) return;
-    if (button == GLFW_MOUSE_BUTTON_RIGHT) {
-      app->plotModelMenuVisible = false;
+  if ((app->plotModelMenuVisible || app->quickPlotModelMenuVisible || app->addPlotMenuVisible ||
+       app->layoutMenuVisible) &&
+      button == GLFW_MOUSE_BUTTON_RIGHT &&
+      action == GLFW_PRESS) {
+    app->plotModelMenuVisible = false;
+    app->quickPlotModelMenuVisible = false;
+    app->addPlotMenuVisible = false;
+    app->layoutMenuVisible = false;
+    app->plotModelMenuHoverMain = -1;
+    app->plotModelMenuHoverSub = -1;
+    app->quickPlotModelMenuHover = -1;
+    app->addPlotMenuHover = -1;
+    app->layoutMenuHover = -1;
+    app->viewerMenuHoverTab = -1;
+    app->viewerMenuHoverChoice = -1;
+    app->viewerMenuDraggingSlider = false;
+    app->viewerMenuChoiceAction = static_cast<int>(ViewerMenuAction::None);
+    app->viewerChoiceMenuScroll = 0.0f;
+    clearPointerInteractionState(app);
+    return;
+  }
+  if (button == GLFW_MOUSE_BUTTON_LEFT && action == GLFW_PRESS && !app->plotModelMenuVisible) {
+    int windowWidth = 1, windowHeight = 1;
+    glfwGetWindowSize(window, &windowWidth, &windowHeight);
+    double cursorX = app->hoverX;
+    double cursorY = app->hoverY;
+    glfwGetCursorPos(window, &cursorX, &cursorY);
+    if (app->showWorkspaceButtons &&
+        pointInPlotMenuRect(viewerMenuIconWindowRect(windowWidth, windowHeight), cursorX, cursorY)) {
+      app->plotModelMenuVisible = true;
+      app->quickPlotModelMenuVisible = false;
+      app->addPlotMenuVisible = false;
+      app->layoutMenuVisible = false;
       app->plotModelMenuHoverMain = -1;
       app->plotModelMenuHoverSub = -1;
+      app->quickPlotModelMenuHover = -1;
+      app->addPlotMenuHover = -1;
+      app->layoutMenuHover = -1;
+      app->viewerMenuHoverTab = -1;
+      app->viewerMenuHoverChoice = -1;
+      app->viewerMenuChoiceAction = static_cast<int>(ViewerMenuAction::None);
+      app->viewerChoiceMenuScroll = 0.0f;
+      if (coercedViewerMenuSection(*app) == ViewerMenuSection::Identity) {
+        requestResolveDrawInstanceScan(app, "identity-tab-open", true);
+      }
       clearPointerInteractionState(app);
       return;
     }
-    if (button == GLFW_MOUSE_BUTTON_LEFT) {
+    if (app->showWorkspaceButtons &&
+        pointInPlotMenuRect(viewerAddPlotIconWindowRect(windowWidth, windowHeight), cursorX, cursorY)) {
+      app->addPlotMenuVisible = true;
+      app->quickPlotModelMenuVisible = false;
+      app->plotModelMenuVisible = false;
+      app->layoutMenuVisible = false;
+      app->addPlotMenuX = cursorX;
+      app->addPlotMenuY = cursorY;
+      app->addPlotMenuHover = app->viewerState.plotModel;
+      app->quickPlotModelMenuHover = -1;
+      app->layoutMenuHover = -1;
+      app->plotModelMenuHoverMain = -1;
+      app->plotModelMenuHoverSub = -1;
+      app->viewerMenuHoverTab = -1;
+      app->viewerMenuHoverChoice = -1;
+      clearPointerInteractionState(app);
+      return;
+    }
+    if (app->showWorkspaceButtons &&
+        pointInPlotMenuRect(viewerLayoutIconWindowRect(windowWidth, windowHeight), cursorX, cursorY)) {
+      app->layoutMenuVisible = true;
+      app->addPlotMenuVisible = false;
+      app->quickPlotModelMenuVisible = false;
+      app->plotModelMenuVisible = false;
+      app->layoutMenuX = cursorX;
+      app->layoutMenuY = cursorY;
+      app->layoutMenuHover = -1;
+      app->addPlotMenuHover = -1;
+      app->quickPlotModelMenuHover = -1;
+      app->plotModelMenuHoverMain = -1;
+      app->plotModelMenuHoverSub = -1;
+      app->viewerMenuHoverTab = -1;
+      app->viewerMenuHoverChoice = -1;
+      clearPointerInteractionState(app);
+      return;
+    }
+  }
+  if (app->layoutMenuVisible && button == GLFW_MOUSE_BUTTON_LEFT && action == GLFW_PRESS) {
+    int windowWidth = 1, windowHeight = 1;
+    glfwGetWindowSize(window, &windowWidth, &windowHeight);
+    double cursorX = app->hoverX;
+    double cursorY = app->hoverY;
+    glfwGetCursorPos(window, &cursorX, &cursorY);
+    const int index = layoutMenuIndexAt(*app, windowWidth, windowHeight, cursorX, cursorY);
+    if (index >= 0) {
+      applyPlotWindowLayout(app, index, windowWidth, windowHeight);
+      queueViewerStateCommand(*app, "reinterpret");
+      app->layoutMenuVisible = false;
+      app->layoutMenuHover = -1;
+      clearPointerInteractionState(app);
+      return;
+    }
+    if (!pointInPlotMenuRect(layoutMenuRect(*app, windowWidth, windowHeight), cursorX, cursorY)) {
+      app->layoutMenuVisible = false;
+      app->layoutMenuHover = -1;
+      clearPointerInteractionState(app);
+      return;
+    }
+  }
+  if (app->addPlotMenuVisible && button == GLFW_MOUSE_BUTTON_LEFT && action == GLFW_PRESS) {
+    int windowWidth = 1, windowHeight = 1;
+    glfwGetWindowSize(window, &windowWidth, &windowHeight);
+    double cursorX = app->hoverX;
+    double cursorY = app->hoverY;
+    glfwGetCursorPos(window, &cursorX, &cursorY);
+    const int index = addPlotMenuIndexAt(*app, windowWidth, windowHeight, cursorX, cursorY);
+    if (index >= 0) {
+      addPlotWindow(app, index, windowWidth, windowHeight, app->addPlotMenuX, app->addPlotMenuY);
+      queueViewerStateCommand(*app, "reinterpret");
+      app->addPlotMenuVisible = false;
+      app->addPlotMenuHover = -1;
+      clearPointerInteractionState(app);
+      return;
+    }
+    if (!pointInPlotMenuRect(addPlotMenuRect(*app, windowWidth, windowHeight), cursorX, cursorY)) {
+      app->addPlotMenuVisible = false;
+      app->addPlotMenuHover = -1;
+      clearPointerInteractionState(app);
+      return;
+    }
+  }
+  if (app->quickPlotModelMenuVisible && button == GLFW_MOUSE_BUTTON_LEFT && action == GLFW_PRESS) {
+    int windowWidth = 1, windowHeight = 1;
+    glfwGetWindowSize(window, &windowWidth, &windowHeight);
+    double cursorX = app->hoverX;
+    double cursorY = app->hoverY;
+    glfwGetCursorPos(window, &cursorX, &cursorY);
+    const int index = quickPlotModelMenuIndexAt(*app, windowWidth, windowHeight, cursorX, cursorY);
+    if (index >= 0) {
+      ViewerChoiceMenuItem item{kViewerPlotModelChoices[static_cast<std::size_t>(index)].label,
+                                index,
+                                index == app->viewerState.plotModel,
+                                ViewerMenuAction::PlotModel,
+                                "reinterpret"};
+      activateViewerChoiceMenuItem(app, item);
+      captureFocusedPlotWindowFromApp(app);
+      app->quickPlotModelMenuVisible = false;
+      app->quickPlotModelMenuHover = -1;
+      clearPointerInteractionState(app);
+      return;
+    }
+  }
+  if (app->plotModelMenuVisible) {
+    if (action == GLFW_RELEASE && app->viewerMenuDraggingSlider) {
+      app->viewerMenuDraggingSlider = false;
+      app->viewerMenuSliderAction = static_cast<int>(ViewerMenuAction::None);
+      clearPointerInteractionState(app);
+      return;
+    }
+    if (action == GLFW_PRESS && button == GLFW_MOUSE_BUTTON_LEFT) {
       int windowWidth = 1, windowHeight = 1;
       glfwGetWindowSize(window, &windowWidth, &windowHeight);
       double cursorX = app->hoverX;
       double cursorY = app->hoverY;
       glfwGetCursorPos(window, &cursorX, &cursorY);
-      const int subIndex = plotMenuSubIndexAt(*app, windowWidth, windowHeight, cursorX, cursorY);
-      const int mainIndex = plotMenuMainIndexAt(*app, windowWidth, windowHeight, cursorX, cursorY);
-      if (subIndex >= 0 && (app->plotModelMenuHoverMain == 1 || app->plotModelMenuHoverMain == 2)) {
-        const bool hsl = app->plotModelMenuHoverMain == 1;
-        queueViewerPlotModelCommand(*app, hsl ? 1 : 2, hsl, hsl, !hsl, !hsl);
-      } else if (mainIndex >= 0) {
-        const bool hsl = mainIndex == 1;
-        const bool hsv = mainIndex == 2;
-        queueViewerPlotModelCommand(*app, mainIndex, hsl, false, hsv, false);
+      if (pointInPlotMenuRect(viewerMenuCloseWindowRect(*app, windowWidth, windowHeight), cursorX, cursorY)) {
+        app->plotModelMenuVisible = false;
+        app->plotModelMenuHoverMain = -1;
+        app->plotModelMenuHoverSub = -1;
+        app->viewerMenuHoverTab = -1;
+        app->viewerMenuHoverChoice = -1;
+        app->viewerMenuDraggingSlider = false;
+        app->viewerMenuChoiceAction = static_cast<int>(ViewerMenuAction::None);
+        app->viewerChoiceMenuScroll = 0.0f;
+        clearPointerInteractionState(app);
+        return;
       }
-      app->plotModelMenuVisible = false;
-      app->plotModelMenuHoverMain = -1;
+      if (!pointerInViewerMenuUi(*app, windowWidth, windowHeight, cursorX, cursorY)) {
+        app->viewerMenuChoiceAction = static_cast<int>(ViewerMenuAction::None);
+        app->viewerMenuHoverChoice = -1;
+        app->viewerChoiceMenuScroll = 0.0f;
+      } else {
+      if (pointInIdentityLassoPopoverToggle(*app, windowWidth, windowHeight, cursorX, cursorY)) {
+        toggleViewerLassoFromIdentityPopover(app);
+        app->viewerMenuChoiceAction = static_cast<int>(ViewerMenuAction::None);
+        app->viewerMenuHoverChoice = -1;
+        clearPointerInteractionState(app);
+        return;
+      }
+      if (pointInNeutralRadiusOverflowPopoverToggle(*app, windowWidth, windowHeight, cursorX, cursorY)) {
+        toggleViewerShowOverflowFromPopover(app);
+        app->viewerMenuChoiceAction = static_cast<int>(ViewerMenuAction::None);
+        app->viewerMenuHoverChoice = -1;
+        clearPointerInteractionState(app);
+        return;
+      }
+      const int choiceIndex = viewerChoiceMenuIndexAt(*app, windowWidth, windowHeight, cursorX, cursorY);
+      if (choiceIndex >= 0) {
+        const std::vector<ViewerChoiceMenuItem> items = buildViewerChoiceMenuItems(*app);
+        if (choiceIndex < static_cast<int>(items.size())) {
+          activateViewerChoiceMenuItem(app, items[static_cast<std::size_t>(choiceIndex)]);
+        }
+        app->plotModelMenuHoverMain = -1;
+        app->plotModelMenuHoverSub = -1;
+        app->viewerMenuHoverChoice = -1;
+        clearPointerInteractionState(app);
+        return;
+      }
+      const int tabIndex = viewerMenuTabIndexAt(*app, windowWidth, windowHeight, cursorX, cursorY);
+      if (tabIndex >= 0) {
+        const std::vector<ViewerMenuTab> tabs = buildViewerMenuTabs(*app);
+        if (tabIndex < static_cast<int>(tabs.size())) {
+          app->viewerMenuSection = static_cast<int>(tabs[static_cast<std::size_t>(tabIndex)].section);
+          app->viewerMenuScroll = 0.0f;
+          app->viewerMenuChoiceAction = static_cast<int>(ViewerMenuAction::None);
+          app->viewerChoiceMenuScroll = 0.0f;
+          app->plotModelMenuHoverMain = -1;
+          app->viewerMenuHoverTab = tabIndex;
+          app->viewerSettingsHoverSubtab = -1;
+          app->viewerMenuHoverChoice = -1;
+          if (tabs[static_cast<std::size_t>(tabIndex)].section == ViewerMenuSection::Identity) {
+            requestResolveDrawInstanceScan(app, "identity-tab-selected", true);
+          }
+        }
+        clearPointerInteractionState(app);
+        return;
+      }
+      const int settingsSubtabIndex =
+          viewerSettingsSubtabIndexAt(*app, windowWidth, windowHeight, cursorX, cursorY);
+      if (settingsSubtabIndex >= 0) {
+        app->viewerSettingsSubtab = settingsSubtabIndex;
+        app->viewerSettingsHoverSubtab = settingsSubtabIndex;
+        app->viewerMenuScroll = 0.0f;
+        app->viewerMenuChoiceAction = static_cast<int>(ViewerMenuAction::None);
+        app->viewerChoiceMenuScroll = 0.0f;
+        app->plotModelMenuHoverMain = -1;
+        app->plotModelMenuHoverSub = -1;
+        app->viewerMenuHoverChoice = -1;
+        clearPointerInteractionState(app);
+        return;
+      }
+      const int mainIndex = plotMenuMainIndexAt(*app, windowWidth, windowHeight, cursorX, cursorY);
+      const std::vector<ViewerMenuRow> rows = buildViewerMenuRows(*app);
+      if (mainIndex >= 0 && mainIndex < static_cast<int>(rows.size())) {
+        const ViewerMenuRow& row = rows[static_cast<std::size_t>(mainIndex)];
+        if (row.channelSelector && row.enabled) {
+          const PlotMenuRect rowRect =
+              viewerMenuRowWindowRect(*app, windowWidth, windowHeight, mainIndex);
+          const auto channelRects = waveformChannelSelectorRects(rowRect);
+          for (int channel = 0; channel < 3; ++channel) {
+            if (pointInPlotMenuRect(channelRects[static_cast<size_t>(channel)],
+                                    cursorX,
+                                    cursorY)) {
+              toggleWaveformChannel(app, channel);
+              app->viewerMenuLastClick = -10.0;
+              app->viewerMenuLastClickRow = -1;
+              app->viewerMenuLastClickAction =
+                  static_cast<int>(ViewerMenuAction::None);
+              app->plotModelMenuHoverMain = mainIndex;
+              clearPointerInteractionState(app);
+              return;
+            }
+          }
+        }
+        const double now = glfwGetTime();
+        const bool doubleClick =
+            (now - app->viewerMenuLastClick) < 0.32 &&
+            app->viewerMenuLastClickRow == mainIndex &&
+            app->viewerMenuLastClickAction == static_cast<int>(row.action);
+        app->viewerMenuLastClick = now;
+        app->viewerMenuLastClickRow = mainIndex;
+        app->viewerMenuLastClickAction = static_cast<int>(row.action);
+        if (doubleClick && resetViewerMenuParameterFromSelectedPreset(app, row)) {
+          app->viewerMenuLastClick = -10.0;
+          app->viewerMenuLastClickRow = -1;
+          app->viewerMenuLastClickAction = static_cast<int>(ViewerMenuAction::None);
+        } else if (row.slider && row.enabled) {
+          const PlotMenuRect rowRect = viewerMenuRowWindowRect(*app, windowWidth, windowHeight, mainIndex);
+          const int value = viewerMenuSliderValueForX(row, rowRect, cursorX);
+          updateViewerMenuSlider(app, row.action, value, row.refreshPolicy);
+          app->viewerMenuDraggingSlider = true;
+          app->viewerMenuSliderAction = static_cast<int>(row.action);
+        } else if (row.enabled) {
+          activateViewerMenuRow(app, row);
+        }
+      } else {
+        app->viewerMenuChoiceAction = static_cast<int>(ViewerMenuAction::None);
+        app->viewerMenuHoverChoice = -1;
+        app->viewerChoiceMenuScroll = 0.0f;
+      }
+      app->plotModelMenuHoverMain = mainIndex;
       app->plotModelMenuHoverSub = -1;
       clearPointerInteractionState(app);
       return;
+      }
     }
+  }
+  if (button == GLFW_MOUSE_BUTTON_LEFT && app->viewerLassoDrawing && action == GLFW_RELEASE) {
+    finishViewerLassoStroke(app);
+    clearPointerInteractionState(app);
+    return;
+  }
+  if (button == GLFW_MOUSE_BUTTON_LEFT && action == GLFW_RELEASE &&
+      app->plotWindowDragMode != PlotWindowDragMode::None) {
+    int windowWidth = 1, windowHeight = 1;
+    glfwGetWindowSize(window, &windowWidth, &windowHeight);
+    double cursorX = app->hoverX;
+    double cursorY = app->hoverY;
+    glfwGetCursorPos(window, &cursorX, &cursorY);
+    commitPlotWindowSnapPreview(app, windowWidth, windowHeight);
+    app->plotWindowDragMode = PlotWindowDragMode::None;
+    app->plotWindowDragId = -1;
+    clearPointerInteractionState(app);
+    return;
+  }
+  if (button == GLFW_MOUSE_BUTTON_LEFT && action == GLFW_PRESS && viewerLassoInteractionEnabled(*app)) {
+    double cursorX = app->hoverX;
+    double cursorY = app->hoverY;
+    glfwGetCursorPos(window, &cursorX, &cursorY);
+    beginViewerLassoStroke(app, window, cursorX, cursorY);
+    clearPointerInteractionState(app);
+    return;
   }
   if (action == GLFW_RELEASE) {
     const bool anyDown =
@@ -11362,6 +21059,41 @@ void mouseButtonCallback(GLFWwindow* window, int button, int action, int mods) {
     return;
   }
   if (button != GLFW_MOUSE_BUTTON_LEFT || action != GLFW_PRESS) return;
+  {
+    int windowWidth = 1, windowHeight = 1;
+    glfwGetWindowSize(window, &windowWidth, &windowHeight);
+    double cursorX = app->hoverX;
+    double cursorY = app->hoverY;
+    glfwGetCursorPos(window, &cursorX, &cursorY);
+    const int windowId = plotWindowAt(*app, windowWidth, windowHeight, cursorX, cursorY);
+    if (windowId >= 0) {
+      if (const PlotWindowState* target = plotWindowById(*app, windowId);
+          target && app->plotWindows.size() > 1u &&
+          pointInPlotMenuRect(plotWindowCloseWindowRect(*target, windowWidth, windowHeight), cursorX, cursorY)) {
+        (void)closePlotWindow(app, windowId);
+        queueViewerStateCommand(*app, "resample");
+        clearPointerInteractionState(app);
+        return;
+      }
+      focusPlotWindow(app, windowId);
+      bringPlotWindowToFront(app, windowId);
+      if (PlotWindowState* focused = focusedPlotWindow(app)) {
+        const PlotWindowDragMode dragMode =
+            plotWindowDragModeAt(*focused, windowWidth, windowHeight, cursorX, cursorY);
+        if (dragMode != PlotWindowDragMode::None) {
+          app->plotWindowDragMode = dragMode;
+          app->plotWindowDragId = focused->windowId;
+          app->plotWindowDragStartX = cursorX;
+          app->plotWindowDragStartY = cursorY;
+          app->plotWindowDragStartRect = focused->rect;
+          app->plotWindowSnapPreviewVisible = false;
+          app->plotWindowSnapPreviewId = -1;
+          clearPointerInteractionState(app);
+          return;
+        }
+      }
+    }
+  }
   const double now = glfwGetTime();
   if ((now - app->lastClick) < 0.3) {
     const bool ctrl = app->ctrlHeld ||
@@ -11401,17 +21133,101 @@ void cursorPosCallback(GLFWwindow* window, double xpos, double ypos) {
   refreshModifierState(window, app);
   app->hoverX = xpos;
   app->hoverY = ypos;
+  const bool menuGestureActive =
+      glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS ||
+      glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_MIDDLE) == GLFW_PRESS ||
+      glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_RIGHT) == GLFW_PRESS;
+  if (app->quickPlotModelMenuVisible) {
+    int windowWidth = 1, windowHeight = 1;
+    glfwGetWindowSize(window, &windowWidth, &windowHeight);
+    app->quickPlotModelMenuHover = quickPlotModelMenuIndexAt(*app, windowWidth, windowHeight, xpos, ypos);
+    if (app->quickPlotModelMenuHover >= 0 && !menuGestureActive) {
+      clearPointerInteractionState(app);
+      return;
+    }
+  }
+  if (app->addPlotMenuVisible) {
+    int windowWidth = 1, windowHeight = 1;
+    glfwGetWindowSize(window, &windowWidth, &windowHeight);
+    app->addPlotMenuHover = addPlotMenuIndexAt(*app, windowWidth, windowHeight, xpos, ypos);
+    if (app->addPlotMenuHover >= 0 && !menuGestureActive) {
+      clearPointerInteractionState(app);
+      return;
+    }
+  }
+  if (app->layoutMenuVisible) {
+    int windowWidth = 1, windowHeight = 1;
+    glfwGetWindowSize(window, &windowWidth, &windowHeight);
+    app->layoutMenuHover = layoutMenuIndexAt(*app, windowWidth, windowHeight, xpos, ypos);
+    if (app->layoutMenuHover >= 0 && !menuGestureActive) {
+      clearPointerInteractionState(app);
+      return;
+    }
+  }
   if (app->plotModelMenuVisible) {
     int windowWidth = 1, windowHeight = 1;
     glfwGetWindowSize(window, &windowWidth, &windowHeight);
-    const int mainIndex = plotMenuMainIndexAt(*app, windowWidth, windowHeight, xpos, ypos);
-    const int subIndex = plotMenuSubIndexAt(*app, windowWidth, windowHeight, xpos, ypos);
-    if (mainIndex >= 0) {
-      app->plotModelMenuHoverMain = mainIndex;
-    } else if (subIndex < 0) {
-      app->plotModelMenuHoverMain = -1;
+    if (app->viewerMenuDraggingSlider) {
+      app->viewerMenuHoverChoice = -1;
+      const ViewerMenuAction draggingAction = viewerMenuActionFromInt(app->viewerMenuSliderAction);
+      const std::vector<ViewerMenuRow> rows = buildViewerMenuRows(*app);
+      for (int i = 0; i < static_cast<int>(rows.size()); ++i) {
+        const ViewerMenuRow& row = rows[static_cast<std::size_t>(i)];
+        if (!row.slider || row.action != draggingAction) continue;
+        const PlotMenuRect rowRect = viewerMenuRowWindowRect(*app, windowWidth, windowHeight, i);
+        const int value = viewerMenuSliderValueForX(row, rowRect, xpos);
+        updateViewerMenuSlider(app, row.action, value, row.refreshPolicy);
+        app->plotModelMenuHoverMain = i;
+        break;
+      }
+      app->plotModelMenuHoverSub = -1;
+      clearPointerInteractionState(app);
+      return;
     }
-    app->plotModelMenuHoverSub = subIndex;
+    const int choiceIndex = viewerChoiceMenuIndexAt(*app, windowWidth, windowHeight, xpos, ypos);
+    app->viewerMenuHoverChoice = choiceIndex;
+    if (choiceIndex >= 0) {
+      app->viewerMenuHoverTab = -1;
+      app->plotModelMenuHoverMain = -1;
+      app->plotModelMenuHoverSub = -1;
+      clearPointerInteractionState(app);
+      return;
+    }
+    const int tabIndex = viewerMenuTabIndexAt(*app, windowWidth, windowHeight, xpos, ypos);
+    const int settingsSubtabIndex =
+        tabIndex >= 0 ? -1 : viewerSettingsSubtabIndexAt(*app, windowWidth, windowHeight, xpos, ypos);
+    const int mainIndex =
+        (tabIndex >= 0 || settingsSubtabIndex >= 0) ? -1 : plotMenuMainIndexAt(*app, windowWidth, windowHeight, xpos, ypos);
+    app->viewerMenuHoverTab = tabIndex;
+    app->viewerSettingsHoverSubtab = settingsSubtabIndex;
+    app->plotModelMenuHoverMain = mainIndex;
+    app->plotModelMenuHoverSub = -1;
+    if (mainIndex >= 0 && coercedViewerMenuSection(*app) == ViewerMenuSection::Identity) {
+      const std::vector<ViewerMenuRow> rows = buildViewerMenuRows(*app);
+      if (mainIndex < static_cast<int>(rows.size())) {
+        const ViewerMenuAction action = rows[static_cast<std::size_t>(mainIndex)].action;
+        if (action == ViewerMenuAction::ReadGrayRamp || action == ViewerMenuAction::ReadIdentity) {
+          requestResolveDrawInstanceScan(app, "identity-read-hover");
+        }
+      }
+    }
+    if (!menuGestureActive &&
+        (choiceIndex >= 0 || tabIndex >= 0 || mainIndex >= 0 ||
+         pointInPlotMenuRect(plotMenuMainRect(*app, windowWidth, windowHeight), xpos, ypos))) {
+      clearPointerInteractionState(app);
+      return;
+    }
+  }
+
+  if (app->viewerLassoDrawing) {
+    updateViewerLassoStroke(app, window, xpos, ypos);
+    clearPointerInteractionState(app);
+    return;
+  }
+  if (app->plotWindowDragMode != PlotWindowDragMode::None) {
+    int windowWidth = 1, windowHeight = 1;
+    glfwGetWindowSize(window, &windowWidth, &windowHeight);
+    updatePlotWindowDrag(app, windowWidth, windowHeight, xpos, ypos);
     clearPointerInteractionState(app);
     return;
   }
@@ -11429,6 +21245,11 @@ void cursorPosCallback(GLFWwindow* window, double xpos, double ypos) {
                    glfwGetKey(window, GLFW_KEY_RIGHT_ALT) == GLFW_PRESS ||
                    nativeAltModifierPressed();
   const bool rollModifier = platformRollModifierPressed(*app);
+  {
+    int windowWidth = 1, windowHeight = 1;
+    glfwGetWindowSize(window, &windowWidth, &windowHeight);
+    app->hoveredPlotWindowId = plotWindowAt(*app, windowWidth, windowHeight, xpos, ypos);
+  }
 
   if (anyDown && !app->leftDown) {
     app->leftDown = true;
@@ -11437,11 +21258,29 @@ void cursorPosCallback(GLFWwindow* window, double xpos, double ypos) {
     app->rollMode = !app->zoomMode && !shiftPanFromLeft &&
                     (l == GLFW_PRESS) && (m != GLFW_PRESS) && rollModifier;
     app->panMode = !app->zoomMode && !app->rollMode && ((m == GLFW_PRESS) || shiftPanFromLeft);
+    if (plotModelIsAnalyticalScope(app->viewerState.plotModel) && !app->zoomMode &&
+        l == GLFW_PRESS && m != GLFW_PRESS) {
+      app->rollMode = false;
+      app->panMode = true;
+    }
     app->shiftPanGesture = app->panMode && shift;
     app->lastX = xpos;
     app->lastY = ypos;
-    app->orbitVirtualX = xpos;
-    app->orbitVirtualY = ypos;
+    int interactionWindowWidth = 1, interactionWindowHeight = 1;
+    int interactionFbWidth = 1, interactionFbHeight = 1;
+    glfwGetWindowSize(window, &interactionWindowWidth, &interactionWindowHeight);
+    glfwGetFramebufferSize(window, &interactionFbWidth, &interactionFbHeight);
+    if (const PlotWindowState* focused = focusedPlotWindow(*app)) {
+      const double localX = xpos - static_cast<double>(focused->rect.x) * interactionWindowWidth;
+      const double localY = ypos - static_cast<double>(focused->rect.y) * interactionWindowHeight;
+      app->orbitVirtualX = localX * static_cast<double>(interactionFbWidth) /
+                           static_cast<double>(std::max(1, interactionWindowWidth));
+      app->orbitVirtualY = localY * static_cast<double>(interactionFbHeight) /
+                           static_cast<double>(std::max(1, interactionWindowHeight));
+    } else {
+      app->orbitVirtualX = xpos;
+      app->orbitVirtualY = ypos;
+    }
     app->panVelocityX = 0.0f;
     app->panVelocityY = 0.0f;
     app->axisLockAccumDx = 0.0f;
@@ -11462,6 +21301,10 @@ void cursorPosCallback(GLFWwindow* window, double xpos, double ypos) {
 
   int width = 1, height = 1;
   glfwGetFramebufferSize(window, &width, &height);
+  if (const PlotWindowState* focused = focusedPlotWindow(*app)) {
+    width = std::max(1, static_cast<int>(std::round(focused->rect.w * static_cast<float>(width))));
+    height = std::max(1, static_cast<int>(std::round(focused->rect.h * static_cast<float>(height))));
+  }
 
   if (app->zoomMode) {
     const bool ctrl = app->ctrlHeld ||
@@ -11755,6 +21598,51 @@ void scrollCallback(GLFWwindow* window, double xoffset, double yoffset) {
     scrollDelta = xoffset;
   }
 #endif
+  if (app->plotModelMenuVisible) {
+    int windowWidth = 1, windowHeight = 1;
+    glfwGetWindowSize(window, &windowWidth, &windowHeight);
+    double cursorX = app->hoverX;
+    double cursorY = app->hoverY;
+    glfwGetCursorPos(window, &cursorX, &cursorY);
+    const PlotMenuRect choiceRect = viewerChoiceMenuWindowRect(*app, windowWidth, windowHeight);
+    const bool inChoice = choiceRect.x1 > choiceRect.x0 && choiceRect.y1 > choiceRect.y0 &&
+                          pointInPlotMenuRect(choiceRect, cursorX, cursorY);
+    const PlotMenuRect rect = plotMenuMainRect(*app, windowWidth, windowHeight);
+    const bool inDrawer = pointInPlotMenuRect(rect, cursorX, cursorY);
+    if (inChoice && !buildViewerChoiceMenuItems(*app).empty()) {
+      const float maxChoiceScroll = viewerChoiceMenuMaxScroll(*app, windowWidth, windowHeight);
+      app->viewerChoiceMenuScroll =
+          clampf(app->viewerChoiceMenuScroll - static_cast<float>(scrollDelta) * kViewerChoiceMenuRowHeight * 1.5f,
+                 0.0f,
+                 maxChoiceScroll);
+      app->viewerMenuHoverChoice = viewerChoiceMenuIndexAt(*app, windowWidth, windowHeight, cursorX, cursorY);
+      app->plotModelMenuHoverMain = -1;
+      app->plotModelMenuHoverSub = -1;
+      clearPointerInteractionState(app);
+      return;
+    }
+    if (!inDrawer) {
+      app->viewerMenuHoverChoice = -1;
+      app->plotModelMenuHoverMain = -1;
+      app->plotModelMenuHoverSub = -1;
+    } else {
+    const std::vector<ViewerMenuRow> rows = buildViewerMenuRows(*app);
+    const float rowsY0 = viewerMenuRowsY0(*app, rect);
+      const float contentHeight = viewerMenuRowsHeight(rows);
+    const float visibleHeight = std::max(1.0f, rect.y1 - rowsY0 - kViewerDrawerPad);
+    const float maxScroll = std::max(0.0f, contentHeight - visibleHeight);
+    app->viewerMenuScroll =
+        clampf(app->viewerMenuScroll - static_cast<float>(scrollDelta) * kPlotMenuRowHeight * 1.5f,
+               0.0f,
+               maxScroll);
+    app->viewerMenuHoverChoice = viewerChoiceMenuIndexAt(*app, windowWidth, windowHeight, cursorX, cursorY);
+    app->plotModelMenuHoverMain =
+        app->viewerMenuHoverChoice >= 0 ? -1 : plotMenuMainIndexAt(*app, windowWidth, windowHeight, cursorX, cursorY);
+    app->plotModelMenuHoverSub = -1;
+    clearPointerInteractionState(app);
+    return;
+    }
+  }
   const float scale = ctrl ? 0.20f : (shift ? (0.12f * shiftPrecisionFactor()) : 0.12f);
   if (ctrl) app->speedFeedbackUntil = glfwGetTime() + 0.18;
   if (!ctrl && shift) app->slowFeedbackUntil = glfwGetTime() + 0.18;
@@ -11996,37 +21884,61 @@ int main() {
     notifyExistingViewerBringToFront();
     return 0;
   }
+  logViewerEvent("Viewer singleton acquired.");
+#endif
+
+#if defined(CHROMASPACE_VIEWER_HAS_CUDA) && !defined(__APPLE__)
+  std::atomic<bool> cudaWarmupDone{false};
+  ChromaspaceCuda::StartupValidationResult cudaWarmupResult{};
+  std::thread cudaWarmupThread;
+  bool cudaWarmupStarted = false;
 #endif
 
   if (!glfwInit()) {
     logViewerEvent(std::string("Viewer startup failed at glfwInit: ") + glfwLastErrorSummary());
+#if defined(CHROMASPACE_VIEWER_HAS_CUDA) && !defined(__APPLE__)
+    if (cudaWarmupThread.joinable()) cudaWarmupThread.join();
+#endif
 #if defined(_WIN32)
     CloseHandle(singletonMutex);
 #endif
     return 1;
   }
+  logViewerEvent("GLFW initialized.");
 
 #if defined(__APPLE__)
   glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 2);
   glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 1);
+#elif defined(_WIN32)
+  // The viewer needs compute shaders plus the compatibility fixed-function
+  // guide path. Request that contract explicitly so the driver does not spend
+  // startup time negotiating an unconstrained default context.
+  glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 4);
+  glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
+  glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_COMPAT_PROFILE);
 #endif
 
   GLFWwindow* window = glfwCreateWindow(720, 600, "Chromaspace", nullptr, nullptr);
   if (!window) {
     logViewerEvent(std::string("Viewer startup failed at glfwCreateWindow: ") + glfwLastErrorSummary());
     glfwTerminate();
+#if defined(CHROMASPACE_VIEWER_HAS_CUDA) && !defined(__APPLE__)
+    if (cudaWarmupThread.joinable()) cudaWarmupThread.join();
+#endif
 #if defined(_WIN32)
     CloseHandle(singletonMutex);
 #endif
     return 1;
   }
+  logViewerEvent("Viewer window created.");
 
 #if defined(_WIN32)
   applyWindowsWindowIcon(window);
 #endif
   glfwMakeContextCurrent(window);
+  logViewerEvent("OpenGL context made current.");
   glfwSwapInterval(1);
-  ViewerGpuCapabilities gpuCaps = detectViewerGpuCapabilities();
+  ViewerGpuCapabilities gpuCaps = detectViewerGpuCapabilities(false);
   {
     const bool parityChecks = viewerParityChecksEnabled();
     std::ostringstream os;
@@ -12055,12 +21967,28 @@ int main() {
 #endif
     logViewerEvent(os.str());
   }
+  if (gpuCaps.glComputeShaders) {
+    logViewerEvent(std::string("Analytical scope compute startup validation: ") +
+                   (validateAnalyticalScopeComputeStartup() ? "ready" : "failed; using CPU reference"));
+  }
 
   AppState app{};
+  app.viewerSettingsLoadedFromDisk = loadViewerStateFromDisk(&app.viewerState);
+  applyViewerStateToApp(&app, app.viewerState);
+  if (app.viewerSettingsLoadedFromDisk) {
+    logViewerEvent(std::string("Loaded viewer-owned settings from ") + viewerSettingsFilePath().string());
+  }
   resetCamera(&app.cam);
+  if (loadViewerWorkspaceFromDisk(&app)) {
+    logViewerEvent(std::string("Loaded viewer workspace from ") + viewerWorkspaceFilePath().string());
+  } else {
+    ensureDefaultPlotWindow(&app);
+    captureFocusedPlotWindowFromApp(&app);
+  }
   app.diagTransitions = viewerDiagnosticsEnabled();
   app.parityChecks = viewerParityChecksEnabled();
   app.gpuCaps = gpuCaps;
+  (void)readResolveDrawInstanceStatus(&app, true);
   HudTextRenderer hudText{};
   HudTextRenderer hudSymbolText{};
   (void)initializeHudTextRenderer(&hudText);
@@ -12090,6 +22018,7 @@ int main() {
   glfwSetWindowUserPointer(window, &app);
   refreshModifierState(window, &app);
   glfwSetKeyCallback(window, keyCallback);
+  glfwSetCharCallback(window, charCallback);
   glfwSetCursorEnterCallback(window, cursorEnterCallback);
   glfwSetMouseButtonCallback(window, mouseButtonCallback);
   glfwSetCursorPosCallback(window, cursorPosCallback);
@@ -12131,14 +22060,61 @@ int main() {
   mesh.paramHash.clear();
   InputCloudPayload deferredCloud{};
   InputCloudPayload currentCloud{};
+  InputCloudPayload baseInputCloud{};
+  SourceCloudStore sourceCloudStore{};
   bool hasDeferredCloud = false;
   bool hasCurrentCloud = false;
+  bool hasBaseInputCloud = false;
+  uint64_t localPreviewRevisionBuilt = 0;
+  uint64_t localPreviewCloudSeqBuilt = 0;
+  std::string localPreviewBuildKeyBuilt;
+  MeshData localPreviewMeshCache{};
+  uint64_t localOverlayRevisionBuilt = 0;
   uint64_t lastCloudSeq = 0;
   uint64_t lastParamsSeq = 0;
   uint64_t lastClearSeq = 0;
+#if defined(CHROMASPACE_VIEWER_HAS_CUDA) && !defined(__APPLE__)
+  bool cudaPromotionAttempted = false;
+#endif
+  bool firstFramePresented = false;
 
   while (gRun.load() && !glfwWindowShouldClose(window)) {
     glfwPollEvents();
+#if defined(CHROMASPACE_VIEWER_HAS_CUDA) && !defined(__APPLE__)
+    if (firstFramePresented &&
+        cudaWarmupStarted &&
+        !cudaPromotionAttempted &&
+        cudaWarmupDone.load(std::memory_order_acquire)) {
+      cudaPromotionAttempted = true;
+      if (cudaWarmupThread.joinable()) cudaWarmupThread.join();
+      if (cudaWarmupResult.ready && promoteViewerCudaCapabilities(&app.gpuCaps)) {
+        gpuCaps = app.gpuCaps;
+        logViewerEvent(std::string("Promoted viewer backend after deferred CUDA warm-up: ") +
+                       app.gpuCaps.activeBackendLabel +
+                       (app.gpuCaps.cudaDeviceName.empty()
+                            ? std::string()
+                            : std::string(" device=") + app.gpuCaps.cudaDeviceName));
+      } else {
+        const std::string reason =
+            !cudaWarmupResult.ready ? cudaWarmupResult.reason
+                                    : app.gpuCaps.cudaStartupReason;
+        logViewerEvent(std::string("Deferred CUDA promotion unavailable; keeping ") +
+                       app.gpuCaps.activeBackendLabel +
+                       (reason.empty() ? std::string() : std::string(" reason=") + reason));
+      }
+    }
+#endif
+    updateResolveLiveRefreshPulse(&app);
+    (void)readResolveDrawInstanceStatus(&app);
+#if defined(_WIN32)
+    const bool identityMenuOpen =
+        app.plotModelMenuVisible && coercedViewerMenuSection(app) == ViewerMenuSection::Identity;
+    if ((app.viewerState.readGrayRamp || app.viewerState.readIdentityPlot || identityMenuOpen) &&
+        !viewerIdentityDrawInstanceDetected(app) &&
+        (!app.resolveDrawStatusKnown || !app.resolveDrawStatusAvailable)) {
+      ensureResolveBridgeRunning();
+    }
+#endif
     if (gBringToFront.exchange(false)) {
       glfwShowWindow(window);
       glfwFocusWindow(window);
@@ -12188,9 +22164,19 @@ int main() {
       } else {
         lastClearSeq = pendingClear.seq;
         hasCurrentCloud = false;
+        hasBaseInputCloud = false;
         hasDeferredCloud = false;
         currentCloud = InputCloudPayload{};
+        baseInputCloud = InputCloudPayload{};
         deferredCloud = InputCloudPayload{};
+        sourceCloudStore = SourceCloudStore{};
+        localPreviewRevisionBuilt = 0;
+        localPreviewCloudSeqBuilt = 0;
+        localPreviewBuildKeyBuilt.clear();
+        localPreviewMeshCache = MeshData{};
+        app.activeCloudSettingsKey.clear();
+        app.localPreviewSettingsKey.clear();
+        localOverlayRevisionBuilt = 0;
         mesh = MeshData{};
         mesh.quality = "Waiting";
         mesh.resolution = resolved.resolution;
@@ -12218,24 +22204,80 @@ int main() {
           logViewerEvent("Ignored stale params sequence.");
         } else {
           lastParamsSeq = next.seq;
-          const ResolvedPayload previousResolved = resolved;
-          const std::string prevSourceMode = resolved.sourceMode;
-          const std::string prevPlotMode = resolved.plotMode;
-          resolved = next;
-          app.senderId = resolved.senderId;
-          app.keepOnTop = resolved.alwaysOnTop;
-          app.plotMode = resolved.plotMode;
-          app.circularHsl = resolved.circularHsl;
-          app.circularHsv = resolved.circularHsv;
-          app.readGrayRamp = resolved.readGrayRamp;
-          app.readIdentityPlot = resolved.readIdentityPlot;
-          app.isolateIdentityData = resolved.isolateIdentityData;
-          app.identityReadResolution = resolved.identityReadResolution;
-          if (prevPlotMode != resolved.plotMode && resolved.resetViewOnPlotSwitch) {
-            applyDefaultCameraForViewerPlotSelection(&app, prevPlotMode);
-            logViewerEvent("Reset camera after plot model switch.");
-          }
-          if (app.diagTransitions && prevSourceMode != resolved.sourceMode) {
+          if (next.drawOnImageMode) {
+            rememberGeneratedIdentityResolution(&app, next);
+            logViewerEvent(std::string("Ignored draw-mode params as viewer state: sender=") +
+                           next.senderId +
+                           " plotMode=" + next.plotMode +
+                           " identityResolution=" + std::to_string(next.generatedIdentityResolution > 0
+                                                                       ? next.generatedIdentityResolution
+                                                                       : next.identityOverlayRequestedSize));
+          } else {
+            const ResolvedPayload previousResolved = resolved;
+            const std::string prevSourceMode = resolved.sourceMode;
+            const std::string prevPlotMode = resolved.plotMode;
+            resolved = next;
+            app.senderId = resolved.senderId;
+            rememberOfxImageLassoSelection(&app, resolved);
+            if (app.viewerSettingsLoadedFromDisk) {
+              if (!app.viewerSettingsSentToPlugin) {
+                app.viewerSettingsSentToPlugin = true;
+                app.viewerState.sourceSessionId = app.senderId;
+                // Image lasso is OFX-backed because the selection is drawn through the
+                // host effect overlay. Do not let a saved viewer setting override the
+                // active OFX lasso state when a viewer window starts or reconnects.
+                app.viewerState.volumeSliceLassoRegion = resolved.viewerState.volumeSliceLassoRegion;
+                app.viewerState.stateRevision = std::max<uint64_t>(app.viewerState.stateRevision,
+                                                                   resolved.stateRevision + 1);
+                app.viewerStateLocalOverride = true;
+                const char* startupPolicy =
+                    (app.viewerState.requiresHostSamples || app.viewerState.refreshPolicy == "resample")
+                        ? "resample"
+                        : "reinterpret";
+                queueViewerStateCommand(app, startupPolicy);
+                logViewerEvent("Loaded viewer-owned settings; sent them to the OFX mailbox as the active viewer state.");
+              }
+              const bool keepLocalViewerState =
+                  app.viewerStateLocalOverride && resolved.stateRevision < app.viewerState.stateRevision;
+              const bool keepWorkspaceViewerState = app.plotWindows.size() > 1u;
+              if (keepLocalViewerState || keepWorkspaceViewerState) {
+                logViewerEvent("Keeping newer viewer-local state while waiting for OFX mailbox acknowledgement.");
+                applyViewerStateToResolvedViewFields(app.viewerState, &resolved);
+                if (keepWorkspaceViewerState) app.viewerStateLocalOverride = true;
+              } else {
+                applyViewerStateToApp(&app, resolved.viewerState);
+                app.viewerStateLocalOverride = false;
+              }
+            } else {
+              const bool keepLocalViewerState =
+                  app.viewerStateLocalOverride && resolved.stateRevision < app.viewerState.stateRevision;
+              const bool keepWorkspaceViewerState = app.plotWindows.size() > 1u;
+              if (keepLocalViewerState || keepWorkspaceViewerState) {
+                logViewerEvent("Keeping newer viewer-local state while waiting for OFX mailbox acknowledgement.");
+                applyViewerStateToResolvedViewFields(app.viewerState, &resolved);
+                if (keepWorkspaceViewerState) app.viewerStateLocalOverride = true;
+              } else {
+                applyViewerStateToApp(&app, resolved.viewerState);
+                app.viewerStateLocalOverride = false;
+              }
+              if (!app.viewerSettingsImportedFromPlugin) {
+                app.viewerSettingsImportedFromPlugin = true;
+                app.viewerSettingsSentToPlugin = true;
+                saveViewerStateToDisk(app.viewerState);
+                logViewerEvent(std::string("Imported legacy plugin viewer settings into ") +
+                               viewerSettingsFilePath().string());
+              }
+            }
+            rememberGeneratedIdentityResolution(&app, resolved);
+            (void)autoMatchIdentityReadResolution(&app, &resolved);
+            applyViewerLassoStateToResolvedPayload(app, &resolved);
+            applyPendingImageLassoResetToResolvedPayload(app, &resolved);
+            applyCachedOfxImageLassoSelection(app, &resolved);
+            if (prevPlotMode != resolved.plotMode && resolved.resetViewOnPlotSwitch) {
+              applyDefaultCameraForViewerPlotSelection(&app, prevPlotMode);
+              logViewerEvent("Reset camera after plot model switch.");
+            }
+            if (app.diagTransitions && prevSourceMode != resolved.sourceMode) {
             std::ostringstream os;
             os << "Source mode transition: " << prevSourceMode << " -> " << resolved.sourceMode
                << " paramsSeq=" << resolved.seq
@@ -12255,6 +22297,9 @@ int main() {
                << " pointSize=" << resolved.pointSize
                << " density=" << resolved.pointDensity
                << " pointShape=" << resolved.pointShape
+               << " linear=" << (resolved.plotDisplayLinear ? 1 : 0)
+               << " linearTf=" << resolved.plotDisplayLinearTransfer
+               << " stateRev=" << resolved.stateRevision
                << " cloudKey=" << resolved.cloudSettingsKey
                << " overlay=" << (resolved.identityOverlayEnabled ? 1 : 0)
                << " overlayReq=" << resolved.identityOverlayRequestedSize
@@ -12308,6 +22353,16 @@ int main() {
                                     deferredCloud, &nextMesh)) {
               mesh = std::move(nextMesh);
               currentCloud = deferredCloud;
+              app.activeCloudSettingsKey = currentCloud.settingsKey;
+              app.localPreviewSettingsKey.clear();
+              if (cloudCanSeedBaseInputCache(currentCloud)) {
+                baseInputCloud = currentCloud;
+                hasBaseInputCloud = true;
+              }
+              if (payloadImageLassoModeEnabled(resolved) && hasBaseInputCloud) {
+                localPreviewRevisionBuilt = 0;
+                localPreviewCloudSeqBuilt = 0;
+              }
               hasCurrentCloud = true;
               lastCloudSeq = deferredCloud.seq;
               hasDeferredCloud = false;
@@ -12329,8 +22384,35 @@ int main() {
 #if defined(CHROMASPACE_VIEWER_HAS_CUDA) && !defined(__APPLE__)
                                     &inputCloudCudaCache,
 #endif
-                                    currentCloud, &nextMesh)) {
-              mesh = std::move(nextMesh);
+                                     currentCloud, &nextMesh)) {
+              const bool expectedEmptyLasso =
+                  payloadImageLassoModeEnabled(resolved) &&
+                  !payloadHasImageLassoSelection(resolved);
+              const bool preserveVisibleReinterpretation =
+                  !expectedEmptyLasso &&
+                  meshHasVisibleData(mesh) &&
+                  !meshHasVisibleData(nextMesh) &&
+                  currentCloud.settingsKey == previousResolved.cloudSettingsKey &&
+                  currentCloud.settingsKey == resolved.cloudSettingsKey;
+              if (preserveVisibleReinterpretation) {
+                logViewerEvent(
+                    "Rejected empty active-cloud reinterpretation after params acknowledgement; "
+                    "kept the valid viewer-local mesh.");
+              } else {
+                mesh = std::move(nextMesh);
+              }
+              app.activeCloudSettingsKey = currentCloud.settingsKey;
+              if (!preserveVisibleReinterpretation) {
+                app.localPreviewSettingsKey.clear();
+              }
+              if (cloudCanSeedBaseInputCache(currentCloud)) {
+                baseInputCloud = currentCloud;
+                hasBaseInputCloud = true;
+              }
+              if (payloadImageLassoModeEnabled(resolved) && hasBaseInputCloud) {
+                localPreviewRevisionBuilt = 0;
+                localPreviewCloudSeqBuilt = 0;
+              }
               if (viewerMultiInstanceDebugEnabled()) {
                 std::ostringstream os;
                 os << "activeCloudRebuiltAfterParams"
@@ -12339,7 +22421,9 @@ int main() {
                    << " settings=" << currentCloud.settingsKey;
                 logViewerMultiInstance(os.str());
               }
-              logViewerEvent("Rebuilt active input cloud after params update.");
+              if (!preserveVisibleReinterpretation) {
+                logViewerEvent("Rebuilt active input cloud after params update.");
+              }
             }
           } else {
             const bool keepDrawingCurrentMesh =
@@ -12355,6 +22439,8 @@ int main() {
             } else {
               hasCurrentCloud = false;
               currentCloud = InputCloudPayload{};
+              app.activeCloudSettingsKey.clear();
+              app.localPreviewSettingsKey.clear();
               mesh = MeshData{};
               mesh.quality = "Waiting";
               mesh.resolution = resolved.resolution;
@@ -12362,8 +22448,13 @@ int main() {
               logViewerEvent("Cleared stale input cloud after params changed settings.");
             }
           }
+          }
         }
       }
+    }
+
+    if (app.viewerStateLocalOverride) {
+      applyViewerStateToResolvedViewFields(app.viewerState, &resolved);
     }
 
     // Stage 2: apply cloud payloads only when they match the active sender/settings contract.
@@ -12374,9 +22465,12 @@ int main() {
           std::ostringstream os;
           os << "Input cloud received: sender=" << cp.senderId
              << " seq=" << cp.seq
+             << " contentHash=" << cp.contentHash
+             << " stabilityHash=" << cp.stabilityHash
              << " quality=" << cp.quality
              << " res=" << cp.resolution
              << " pointCount=" << cp.pointCount
+             << " primaryPointCount=" << cp.primaryPointCount
              << " stride=" << cp.pointStride
              << " transport=" << cp.transport
              << " bytes=" << cp.points.size()
@@ -12407,6 +22501,7 @@ int main() {
           }
           logViewerEvent("Ignored stale input cloud sequence.");
         } else if (resolved.sourceMode != "input") {
+          rememberSourceCloud(&sourceCloudStore, cp);
           deferredCloud = cp;
           hasDeferredCloud = true;
           if (viewerMultiInstanceDebugEnabled()) {
@@ -12419,8 +22514,22 @@ int main() {
           }
           logViewerEvent("Deferred input cloud until params switch viewer to input mode.");
         } else if (!cloudMatchesResolved(resolved, cp)) {
+          rememberSourceCloud(&sourceCloudStore, cp, false);
           deferredCloud = cp;
           hasDeferredCloud = true;
+          if (cloudCanSeedBaseInputCache(cp)) {
+            const bool hasCurrentSenderProvisional =
+                hasBaseInputCloud &&
+                senderMatchesCurrent(cp.senderId, baseInputCloud.senderId);
+            if (!hasCurrentSenderProvisional) {
+              baseInputCloud = cp;
+              hasBaseInputCloud = true;
+              localPreviewRevisionBuilt = 0;
+              localPreviewCloudSeqBuilt = 0;
+              localPreviewBuildKeyBuilt.clear();
+              logViewerEvent("Updated provisional viewer-local preview from changed ordinary input cloud.");
+            }
+          }
           if (viewerMultiInstanceDebugEnabled()) {
             std::ostringstream os;
             os << "cloudDeferred/settingsMismatch"
@@ -12431,15 +22540,42 @@ int main() {
             logViewerMultiInstance(os.str());
           }
           logViewerEvent("Deferred input cloud until params match cloud settings.");
+        } else if (hasCurrentCloud &&
+                   currentCloud.settingsKey == cp.settingsKey &&
+                   inputCloudHasSameContent(currentCloud, cp)) {
+          rememberSourceCloud(&sourceCloudStore, cp);
+          currentCloud.seq = cp.seq;
+          lastCloudSeq = cp.seq;
+          app.activeCloudSettingsKey = currentCloud.settingsKey;
+          logViewerEvent("Accepted identical input-cloud refresh without rebuilding meshes.");
         } else {
+          rememberSourceCloud(&sourceCloudStore, cp);
           MeshData nextMesh{};
-            if (buildInputCloudMesh(resolved, app.gpuCaps, &app.computeSession, &inputCloudComputeCache,
+          if (buildInputCloudMesh(resolved, app.gpuCaps, &app.computeSession, &inputCloudComputeCache,
 #if defined(CHROMASPACE_VIEWER_HAS_CUDA) && !defined(__APPLE__)
-                                    &inputCloudCudaCache,
+                                  &inputCloudCudaCache,
 #endif
-                                    cp, &nextMesh)) {
+                                  cp, &nextMesh)) {
+            const bool preserveVisiblePlot =
+                !payloadAllowsIntentionalEmptyPlot(resolved) &&
+                meshHasVisibleData(mesh) &&
+                !meshHasVisibleData(nextMesh);
+            if (preserveVisiblePlot) {
+              logViewerEvent("Kept visible plot instead of applying an unexpected empty cloud refinement.");
+            } else {
               mesh = std::move(nextMesh);
-              currentCloud = cp;
+            }
+            currentCloud = cp;
+            app.activeCloudSettingsKey = currentCloud.settingsKey;
+            app.localPreviewSettingsKey.clear();
+            if (cloudCanSeedBaseInputCache(currentCloud)) {
+              baseInputCloud = currentCloud;
+              hasBaseInputCloud = true;
+            }
+            if (payloadImageLassoModeEnabled(resolved) && hasBaseInputCloud) {
+              localPreviewRevisionBuilt = 0;
+              localPreviewCloudSeqBuilt = 0;
+            }
             hasCurrentCloud = true;
             lastCloudSeq = cp.seq;
             hasDeferredCloud = false;
@@ -12449,7 +22585,8 @@ int main() {
                  << " sender=" << cp.senderId
                  << " cloudSeq=" << cp.seq
                  << " settings=" << cp.settingsKey
-                 << " points=" << (nextMesh.pointCount > 0 ? nextMesh.pointCount : (nextMesh.pointVerts.size() / 3u));
+                 << " points=" << (mesh.pointCount > 0 ? mesh.pointCount : (mesh.pointVerts.size() / 3u))
+                 << " preservedVisible=" << (preserveVisiblePlot ? 1 : 0);
               logViewerMultiInstance(os.str());
             }
             std::ostringstream os;
@@ -12466,22 +22603,206 @@ int main() {
     }
 
     // Stage 3: render the current guide, overlay reference, and active point cloud.
+    if (app.viewerStateLocalOverride) {
+      applyViewerStateToResolvedViewFields(app.viewerState, &resolved);
+      if (resolved.identityOverlayEnabled) {
+        if (localOverlayRevisionBuilt != resolved.stateRevision) {
+          MeshData nextOverlay{};
+          if ((app.gpuCaps.overlayComputeEnabled && buildIdentityOverlayMeshOnGpu(resolved, app.gpuCaps, &app.computeSession, &overlayComputeCache, &nextOverlay
+#if defined(CHROMASPACE_VIEWER_HAS_CUDA) && !defined(__APPLE__)
+                                                                                   , &overlayCudaCache
+#endif
+                                                                                   )) ||
+              buildIdentityOverlayMesh(resolved, &nextOverlay)) {
+            overlayMesh = std::move(nextOverlay);
+            localOverlayRevisionBuilt = resolved.stateRevision;
+          }
+        }
+      } else {
+        overlayMesh = MeshData{};
+        overlayComputeCache.builtSerial = 0;
+        overlayComputeCache.pointCount = 0;
+#if defined(CHROMASPACE_VIEWER_HAS_CUDA) && !defined(__APPLE__)
+        overlayCudaCache.builtSerial = 0;
+        overlayCudaCache.pointCount = 0;
+#endif
+        localOverlayRevisionBuilt = resolved.stateRevision;
+      }
+    } else {
+      localOverlayRevisionBuilt = 0;
+    }
+    applyViewerLassoStateToResolvedPayload(app, &resolved);
+    applyPendingImageLassoResetToResolvedPayload(app, &resolved);
+    applyCachedOfxImageLassoSelection(app, &resolved);
+    const InputCloudPayload* localPreviewCloud = nullptr;
+    InputCloudPayload syntheticIdentityPreviewCloud{};
+    if (resolved.sourceMode == "input") {
+      const PlotWindowState* focusedSourceWindow = focusedPlotWindow(app);
+      const InputCloudPayload* focusedVariantCloud =
+          focusedSourceWindow
+              ? sourceCloudForPlotWindow(sourceCloudStore, *focusedSourceWindow, app.senderId, nullptr)
+              : nullptr;
+      const bool wantsImageLassoCachePreview =
+          payloadImageLassoModeEnabled(resolved) && hasBaseInputCloud;
+      const bool focusedVariantMatches =
+          focusedVariantCloud && cloudMatchesResolved(resolved, *focusedVariantCloud);
+      const bool focusedVariantIsOrdinary =
+          focusedVariantCloud && cloudCanSeedBaseInputCache(*focusedVariantCloud);
+      if (focusedVariantCloud &&
+          (focusedVariantMatches ||
+           (app.viewerStateLocalOverride && focusedVariantIsOrdinary))) {
+        localPreviewCloud = focusedVariantCloud;
+      } else if (hasCurrentCloud && cloudMatchesResolved(resolved, currentCloud)) {
+        localPreviewCloud = &currentCloud;
+      } else if (wantsImageLassoCachePreview) {
+        localPreviewCloud = &baseInputCloud;
+      } else if (app.viewerStateLocalOverride) {
+        if (hasCurrentCloud && cloudMatchesResolved(resolved, currentCloud)) {
+          localPreviewCloud = &currentCloud;
+        } else {
+          localPreviewCloud = hasBaseInputCloud ? &baseInputCloud
+                                                : (hasCurrentCloud && cloudCanSeedBaseInputCache(currentCloud)
+                                                       ? &currentCloud
+                                                       : nullptr);
+        }
+      } else if (payloadWantsIdentityReadPreview(resolved) && hasBaseInputCloud &&
+                 (!hasCurrentCloud || !cloudLooksIdentityRead(currentCloud))) {
+        localPreviewCloud = &baseInputCloud;
+      }
+      if (!localPreviewCloud && payloadWantsIdentityReadPreview(resolved)) {
+        syntheticIdentityPreviewCloud = makeSyntheticIdentityReadPreviewCloud(resolved);
+        if (!syntheticIdentityPreviewCloud.packedPoints.empty()) {
+          localPreviewCloud = &syntheticIdentityPreviewCloud;
+        }
+      }
+    }
+    if (localPreviewCloud) {
+      const uint64_t localRevision = resolved.stateRevision;
+      const std::string localPreviewBuildKey = viewerLocalPreviewBuildKey(resolved, *localPreviewCloud);
+      const bool cachedPreviewResident =
+          localPreviewMeshCache.serial != 0 &&
+          meshHasResidentInputPointStorage(
+              localPreviewMeshCache,
+              inputCloudComputeCache
+#if defined(CHROMASPACE_VIEWER_HAS_CUDA) && !defined(__APPLE__)
+              , inputCloudCudaCache
+#endif
+              );
+      if (localPreviewBuildKeyBuilt == localPreviewBuildKey && cachedPreviewResident) {
+        if (mesh.serial != localPreviewMeshCache.serial) {
+          mesh = localPreviewMeshCache;
+          app.localPreviewSettingsKey = resolved.cloudSettingsKey;
+        }
+      } else {
+        if (localPreviewBuildKeyBuilt == localPreviewBuildKey &&
+            localPreviewMeshCache.serial != 0 &&
+            !cachedPreviewResident) {
+          logViewerEvent(
+              "Discarded stale viewer-local GPU preview handle after its shared input buffer was rebuilt.");
+        }
+        MeshData previewMesh{};
+        const bool emptyImageLassoPreview =
+            payloadImageLassoModeEnabled(resolved) && !payloadHasImageLassoSelection(resolved);
+        if (emptyImageLassoPreview) {
+          previewMesh.resolution = localPreviewCloud->resolution <= 25 ? 25 : (localPreviewCloud->resolution <= 41 ? 41 : 57);
+          previewMesh.quality = localPreviewCloud->quality.empty() ? resolved.quality : localPreviewCloud->quality;
+          previewMesh.paramHash = resolved.cloudSettingsKey.empty() ? localPreviewCloud->paramHash : resolved.cloudSettingsKey;
+          previewMesh.serial = nextMeshSerial();
+          mesh = previewMesh;
+          localPreviewMeshCache = mesh;
+          localPreviewRevisionBuilt = localRevision;
+          localPreviewCloudSeqBuilt = localPreviewCloud->seq;
+          localPreviewBuildKeyBuilt = localPreviewBuildKey;
+          app.localPreviewSettingsKey = resolved.cloudSettingsKey;
+        } else if (buildInputCloudMesh(resolved, app.gpuCaps, &app.computeSession, &inputCloudComputeCache,
+#if defined(CHROMASPACE_VIEWER_HAS_CUDA) && !defined(__APPLE__)
+                                &inputCloudCudaCache,
+#endif
+                                *localPreviewCloud, &previewMesh)) {
+          const bool preserveVisiblePlot =
+              !payloadAllowsIntentionalEmptyPlot(resolved) &&
+              meshHasVisibleData(mesh) &&
+              !meshHasVisibleData(previewMesh);
+          if (preserveVisiblePlot) {
+            localPreviewMeshCache = mesh;
+            logViewerEvent("Kept visible plot instead of applying an unexpected empty cached preview.");
+          } else {
+            mesh = std::move(previewMesh);
+            localPreviewMeshCache = mesh;
+          }
+          localPreviewRevisionBuilt = localRevision;
+          localPreviewCloudSeqBuilt = localPreviewCloud->seq;
+          localPreviewBuildKeyBuilt = localPreviewBuildKey;
+          app.localPreviewSettingsKey = resolved.cloudSettingsKey;
+          logViewerEvent("Rebuilt viewer-local preview from cached source cloud.");
+        }
+      }
+    } else {
+      localPreviewRevisionBuilt = 0;
+      localPreviewCloudSeqBuilt = 0;
+      localPreviewBuildKeyBuilt.clear();
+      localPreviewMeshCache = MeshData{};
+      app.localPreviewSettingsKey.clear();
+      if (payloadImageLassoModeEnabled(resolved) && !payloadHasImageLassoSelection(resolved) &&
+          (mesh.pointCount > 0 || !mesh.pointVerts.empty())) {
+        MeshData emptyLassoMesh{};
+        emptyLassoMesh.resolution = resolved.resolution <= 25 ? 25 : (resolved.resolution <= 41 ? 41 : 57);
+        emptyLassoMesh.quality = resolved.quality;
+        emptyLassoMesh.paramHash = resolved.cloudSettingsKey;
+        emptyLassoMesh.serial = nextMeshSerial();
+        mesh = std::move(emptyLassoMesh);
+      }
+    }
     if (app.keepOnTop != app.appliedTopmost) {
       glfwSetWindowAttrib(window, GLFW_FLOATING, app.keepOnTop ? GLFW_TRUE : GLFW_FALSE);
       app.appliedTopmost = app.keepOnTop;
     }
 
+    int width = 1, height = 1;
+    glfwGetFramebufferSize(window, &width, &height);
+    int windowWidth = 1, windowHeight = 1;
+    glfwGetWindowSize(window, &windowWidth, &windowHeight);
+    ensureDefaultPlotWindow(&app);
+    reflowPlotWindowsForWorkspaceResize(&app, windowWidth, windowHeight);
+    for (auto& plotWindow : app.plotWindows) {
+      plotWindow.rect = clampedPlotWindowRect(plotWindow.rect, windowWidth, windowHeight);
+    }
+    captureFocusedPlotWindowFromApp(&app);
+    const PlotWindowState* focusedWindowForRender = focusedPlotWindow(app);
+    const auto titleState =
+        focusedWindowForRender
+            ? viewerStateWithModelCapabilities(focusedWindowForRender->viewState)
+            : viewerStateWithModelCapabilities(app.viewerState);
+    const MeshData& titleMesh =
+        focusedWindowForRender && focusedWindowForRender->derivedMeshValid
+            ? focusedWindowForRender->derivedMesh
+            : mesh;
+    const bool analyticalScopeForTitle =
+        plotModelIsAnalyticalScope(titleState.plotModel);
+    const std::string titlePlotMode =
+        ChromaspaceViewer::plotModeForModel(titleState.plotModel);
+    CameraState titleCamera =
+        focusedWindowForRender ? focusedWindowForRender->camera : app.cam;
+
     std::ostringstream title;
     title << "Chromaspace | " << (gConnected.load() ? "Connected" : "Waiting")
-          << " | " << plotModeLabel(resolved)
-          << " | " << mesh.quality
-          << ' ' << mesh.resolution << "^3";
+          << " | " << ChromaspaceViewer::plotModelLabel(titleState.plotModel);
+    if (analyticalScopeForTitle) {
+      if (titleState.plotModel == ChromaspaceViewer::kPlotModelWaveform) {
+        title << " | " << (titleState.waveformHighDetail ? "High Detail" : "Standard");
+      } else {
+        title << " | " << titleMesh.quality;
+      }
+    } else {
+      title << " | " << titleMesh.quality
+            << ' ' << titleMesh.resolution << "^3";
+    }
     title << " | viewer:" << app.gpuCaps.activeBackendLabel;
     if (resolved.identityOverlayEnabled) {
       title << " | Overlay " << resolved.identityOverlaySize << "^3";
       if (resolved.identityOverlayRamp) title << " + Ramp";
     }
-    const bool glossViewModeForTitle = isGlossViewPlotModeString(resolved.plotMode);
+    const bool glossViewModeForTitle = isGlossViewPlotModeString(titlePlotMode);
     const bool glossProjection3DForTitle =
         glossViewModeForTitle && app.glossViewPresentation == GlossViewPresentationMode::Projection3D;
     if (glossViewModeForTitle) {
@@ -12496,27 +22817,39 @@ int main() {
         title << " | diag " << glossViewDiagnosticOverlayLabel(app.glossViewDiagnosticOverlay);
       }
     }
-    if (app.cam.orthographic && (!glossViewModeForTitle || glossProjection3DForTitle)) {
-      syncOrthographicStateForPlotMode(resolved.plotMode, &app.cam);
+    if (!analyticalScopeForTitle &&
+        titleCamera.orthographic &&
+        (!glossViewModeForTitle || glossProjection3DForTitle)) {
+      syncOrthographicStateForPlotMode(titlePlotMode, &titleCamera);
     }
     const char* orthoLabel =
-        (glossViewModeForTitle && !glossProjection3DForTitle)
+        analyticalScopeForTitle || (glossViewModeForTitle && !glossProjection3DForTitle)
             ? nullptr
-            : (glossViewModeForTitle ? glossViewOrthographicViewLabel(app.cam) : orthographicViewLabel(app.cam));
+            : (glossViewModeForTitle ? glossViewOrthographicViewLabel(titleCamera)
+                                     : orthographicViewLabel(titleCamera));
     if (orthoLabel != nullptr) {
       title << " | " << orthoLabel;
     }
-    if (!mesh.paramHash.empty()) title << " | hash " << mesh.paramHash;
+    if (!titleMesh.paramHash.empty()) title << " | hash " << titleMesh.paramHash;
     glfwSetWindowTitle(window, title.str().c_str());
 
-    int width = 1, height = 1;
-    glfwGetFramebufferSize(window, &width, &height);
-    int windowWidth = 1, windowHeight = 1;
-    glfwGetWindowSize(window, &windowWidth, &windowHeight);
+    const PlotWindowFramebufferRect primaryRenderRect =
+        focusedWindowForRender ? plotWindowFramebufferRect(*focusedWindowForRender, width, height)
+                               : PlotWindowFramebufferRect{0, 0, width, height};
+    const int renderWidth = primaryRenderRect.w;
+    const int renderHeight = primaryRenderRect.h;
+    glDisable(GL_SCISSOR_TEST);
     glViewport(0, 0, width, height);
+    glClearColor(0.008f, 0.010f, 0.013f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    glEnable(GL_SCISSOR_TEST);
+    glScissor(primaryRenderRect.x, primaryRenderRect.y, primaryRenderRect.w, primaryRenderRect.h);
+    glViewport(primaryRenderRect.x, primaryRenderRect.y, primaryRenderRect.w, primaryRenderRect.h);
     glMatrixMode(GL_PROJECTION);
     glLoadIdentity();
-    const float aspect = height > 0 ? static_cast<float>(width) / static_cast<float>(height) : 1.0f;
+    const float aspect = primaryRenderRect.h > 0
+                             ? static_cast<float>(primaryRenderRect.w) / static_cast<float>(primaryRenderRect.h)
+                             : 1.0f;
     const float fovy = kViewerFovYDegrees;
     // Let the near plane relax as the user pushes into very close inspection
     // so points near the camera do not disappear just because the orbit distance
@@ -12571,14 +22904,15 @@ int main() {
     float backgroundR = resolved.backgroundColorR;
     float backgroundG = resolved.backgroundColorG;
     float backgroundB = resolved.backgroundColorB;
-    if (resolved.volumeSlicingEnabled &&
-        resolved.volumeSlicingMode == "lasso" &&
-        resolved.lassoRegionEmpty) {
+    const bool waitingForImageLassoShape =
+        payloadImageLassoModeEnabled(resolved) && !payloadHasImageLassoSelection(resolved);
+    const bool emptyImageLassoMode = waitingForImageLassoShape;
+    if (emptyImageLassoMode) {
       backgroundR = clamp01(backgroundR * 0.82f + 0.05f);
       backgroundG = clamp01(backgroundG * 0.86f + 0.09f);
       backgroundB = clamp01(backgroundB * 1.10f + 0.20f);
     }
-    if (resolved.neutralRadiusEnabled) {
+    if (resolved.neutralRadiusEnabled && !emptyImageLassoMode) {
       backgroundR = 0.118f;
       backgroundG = 0.110f;
       backgroundB = 0.102f;
@@ -12594,7 +22928,7 @@ int main() {
         glossViewMode && app.glossViewPresentation == GlossViewPresentationMode::Projection3D;
     const bool drawIdentityOverlay = !glossViewMode && overlayMesh.pointCount > 0;
     if (!glossField2DMode) {
-      drawGuideForPlotMode(resolved, app.cam, height, fovy, overlayTextRenderer);
+      drawGuideForPlotMode(resolved, app.cam, renderHeight, fovy, overlayTextRenderer);
     }
 
     // Viewer-side draw tuning intentionally stays separate from OFX sampling quality:
@@ -12667,6 +23001,34 @@ int main() {
     } else if (!glossViewMode) {
       prepareNormalPointCloudDraw();
     }
+    std::vector<float> viewerLassoFilteredVerts;
+    std::vector<float> viewerLassoFilteredColors;
+    bool useViewerScreenLassoBuffers = false;
+    if (false &&
+        drawingNormalPointCloud &&
+        resolved.volumeSlicingEnabled &&
+        resolved.volumeSlicingMode == "lasso" &&
+        !resolved.lassoRegionEmpty &&
+        !mesh.pointVerts.empty() &&
+        !mesh.pointColors.empty() &&
+        mesh.pointCount > 0) {
+      activePointVerts = mesh.pointVerts.data();
+      activePointColors = mesh.pointColors.data();
+      activePointCount = mesh.pointCount;
+      sampledDrawReady = false;
+      useSampledCpuArrays = false;
+      if (buildViewerScreenLassoPointBuffers(resolved,
+                                             activePointVerts,
+                                             activePointColors,
+                                             activePointCount,
+                                             &viewerLassoFilteredVerts,
+                                             &viewerLassoFilteredColors)) {
+        activePointVerts = viewerLassoFilteredVerts.empty() ? nullptr : viewerLassoFilteredVerts.data();
+        activePointColors = viewerLassoFilteredColors.empty() ? nullptr : viewerLassoFilteredColors.data();
+        activePointCount = viewerLassoFilteredVerts.size() / 3u;
+        useViewerScreenLassoBuffers = true;
+      }
+    }
     const bool drawAsGlossProjection = glossProjection3DMode && drawingGlossProjectionPoints;
     float pointSize = 2.5f;
     if (mesh.resolution <= 25) pointSize = 3.3f;
@@ -12682,7 +23044,7 @@ int main() {
     const bool useSquarePoints = !drawAsGlossProjection && resolved.pointShape == "Square";
     const bool plainScopeStyle = resolved.plotStyle != "Space";
     const float drawCoverage =
-        estimatedPointCoverage(pointSize, activePointCount, width, height, useSquarePoints);
+        estimatedPointCoverage(pointSize, activePointCount, renderWidth, renderHeight, useSquarePoints);
     const float denseGlowSuppress =
         densePlotGlowSuppression(resolved.pointSize, densityForView, mesh.resolution);
     const float denseColorPreserve =
@@ -12722,6 +23084,7 @@ int main() {
 #if defined(CHROMASPACE_VIEWER_HAS_CUDA) && !defined(__APPLE__)
     const bool useInputCudaBuffers =
         drawingNormalPointCloud &&
+        !useViewerScreenLassoBuffers &&
         !pointSelection.needsThinning &&
         activePointCount == mesh.pointCount && app.gpuCaps.cudaComputeEnabled &&
         inputCloudCudaCache.available &&
@@ -12730,6 +23093,7 @@ int main() {
         inputCloudCudaCache.pointCount > 0;
     const bool useInputSampledCudaBuffers =
         drawingNormalPointCloud &&
+        !useViewerScreenLassoBuffers &&
         pointSelection.needsThinning && sampledDrawReady && sampledPointDraw.available &&
         app.gpuCaps.cudaComputeEnabled &&
         sampledPointDraw.verts != 0 && sampledPointDraw.colors != 0 &&
@@ -12740,6 +23104,7 @@ int main() {
 #endif
     const bool useInputComputeBuffers =
         drawingNormalPointCloud &&
+        !useViewerScreenLassoBuffers &&
         !useInputCudaBuffers &&
         !useInputSampledCudaBuffers &&
         !pointSelection.needsThinning &&
@@ -12751,6 +23116,7 @@ int main() {
         inputCloudComputeCache.pointCount > 0;
     const bool useInputSampledComputeBuffers =
         drawingNormalPointCloud &&
+        !useViewerScreenLassoBuffers &&
         !useInputSampledCudaBuffers &&
         pointSelection.needsThinning && sampledDrawReady && sampledPointDraw.available &&
         sampledPointDraw.verts != 0 && sampledPointDraw.colors != 0 &&
@@ -12773,7 +23139,7 @@ int main() {
         displaySaturationBrightnessTrim(drawColorSaturation, resolved.pointSize, densityForView, mesh.resolution);
     if (drawAsGlossProjection) drawBrightnessTrim = std::max(0.96f, drawBrightnessTrim * 1.08f);
     float drawAlphaGain =
-        drawAlphaGainForPointSize(pointSize, densityForView, mesh.resolution, activePointCount, width, height, useSquarePoints) *
+        drawAlphaGainForPointSize(pointSize, densityForView, mesh.resolution, activePointCount, renderWidth, renderHeight, useSquarePoints) *
         (drawAsGlossProjection ? 1.0f : (plainScopeStyle ? 1.0f : 0.84f));
     if (drawAsGlossProjection) drawAlphaGain = std::max(1.12f, drawAlphaGain * 1.24f);
     const bool usePointRenderProgram =
@@ -12789,15 +23155,15 @@ int main() {
     auto applyCurrentCameraFit = [&]() -> bool {
       bool fitApplied = false;
       if (drawAsGlossProjection && activePointVerts != nullptr && activePointCount > 0) {
-        fitCameraToPoints(&app.cam, app.modelOrientation, activePointVerts, activePointCount, width, height);
+        fitCameraToPoints(&app.cam, app.modelOrientation, activePointVerts, activePointCount, renderWidth, renderHeight);
         fitApplied = true;
       } else if (mesh.hasFitBounds) {
-        fitApplied = fitCameraToBounds(&app.cam, app.modelOrientation, mesh.fitMin, mesh.fitMax, width, height);
+        fitApplied = fitCameraToBounds(&app.cam, app.modelOrientation, mesh.fitMin, mesh.fitMax, renderWidth, renderHeight);
       }
       const float* fitVerts = mesh.pointVerts.empty() ? activePointVerts : mesh.pointVerts.data();
       size_t fitCount = mesh.pointVerts.empty() ? activePointCount : mesh.pointCount;
       if (!fitApplied && fitVerts != nullptr && fitCount > 0) {
-        fitCameraToPoints(&app.cam, app.modelOrientation, fitVerts, fitCount, width, height);
+        fitCameraToPoints(&app.cam, app.modelOrientation, fitVerts, fitCount, renderWidth, renderHeight);
         fitApplied = true;
       }
       MeshData fitMesh{};
@@ -12807,7 +23173,7 @@ int main() {
           cloudMatchesResolved(resolved, currentCloud) &&
           buildInputCloudFitMeshCpu(resolved, currentCloud, &fitMesh) &&
           fitMesh.hasFitBounds) {
-        fitApplied = fitCameraToBounds(&app.cam, app.modelOrientation, fitMesh.fitMin, fitMesh.fitMax, width, height);
+        fitApplied = fitCameraToBounds(&app.cam, app.modelOrientation, fitMesh.fitMin, fitMesh.fitMax, renderWidth, renderHeight);
       }
       return fitApplied;
     };
@@ -13110,8 +23476,8 @@ int main() {
     glDisableClientState(GL_VERTEX_ARRAY);
 
     if (glossField2DMode) {
-      drawGlossViewFieldOverlay(width,
-                                height,
+      drawGlossViewFieldOverlay(renderWidth,
+                                renderHeight,
                                 resolved,
                                 mesh,
                                 app.glossViewFieldAlgorithm,
@@ -13121,18 +23487,26 @@ int main() {
     }
 
     if (resolved.plotMode == "chromaticity") {
-      const double hoverScaleX = static_cast<double>(width) / static_cast<double>(std::max(1, windowWidth));
-      const double hoverScaleY = static_cast<double>(height) / static_cast<double>(std::max(1, windowHeight));
+      const double focusedWindowX =
+          focusedWindowForRender ? static_cast<double>(focusedWindowForRender->rect.x) * windowWidth : 0.0;
+      const double focusedWindowY =
+          focusedWindowForRender ? static_cast<double>(focusedWindowForRender->rect.y) * windowHeight : 0.0;
+      const double focusedWindowWidth =
+          focusedWindowForRender ? static_cast<double>(focusedWindowForRender->rect.w) * windowWidth : windowWidth;
+      const double focusedWindowHeight =
+          focusedWindowForRender ? static_cast<double>(focusedWindowForRender->rect.h) * windowHeight : windowHeight;
+      const double hoverScaleX = static_cast<double>(renderWidth) / std::max(1.0, focusedWindowWidth);
+      const double hoverScaleY = static_cast<double>(renderHeight) / std::max(1.0, focusedWindowHeight);
       drawChromaticityInfoOverlay(makePlotRemapSpec(resolved),
-                                  width,
-                                  height,
-                                  app.hoverX * hoverScaleX,
-                                  app.hoverY * hoverScaleY,
+                                  renderWidth,
+                                  renderHeight,
+                                  (app.hoverX - focusedWindowX) * hoverScaleX,
+                                  (app.hoverY - focusedWindowY) * hoverScaleY,
                                   overlayTextRenderer ? *overlayTextRenderer : hudText);
     }
     if (isGlossViewPlotModeString(resolved.plotMode) && !resolved.glossHideText) {
-      drawGlossLiftInfoOverlay(width,
-                               height,
+      drawGlossLiftInfoOverlay(renderWidth,
+                               renderHeight,
                                resolved,
                                mesh,
                                overlayTextRenderer ? *overlayTextRenderer : hudText,
@@ -13142,6 +23516,55 @@ int main() {
                                app.glossViewDebugFieldMode,
                                app.glossViewDiagnosticOverlay);
     }
+    if (glossProjection3DMode && resolved.glossSpatialInset) {
+      drawGlossLiftSpatialInsetOverlay(renderWidth,
+                                      renderHeight,
+                                      resolved,
+                                      mesh,
+                                      overlayTextRenderer ? *overlayTextRenderer : hudText,
+                                      app.glossViewFieldAlgorithm,
+                                      app.glossViewColorMode,
+                                      app.glossViewDebugFieldMode,
+                                      app.glossViewDiagnosticOverlay);
+    }
+    captureFocusedPlotWindowFromApp(&app);
+    if (PlotWindowState* focusedStatusWindow = focusedPlotWindow(&app)) {
+      if (!plotModelIsAnalyticalScope(focusedStatusWindow->viewState.plotModel)) {
+        const bool hasVisibleMesh = mesh.serial != 0 && (mesh.pointCount > 0 || mesh.hasGlossField);
+        focusedStatusWindow->syncLabel =
+            !hasVisibleMesh
+                ? "Waiting for Resolve"
+                : (app.activeCloudSettingsKey == resolved.cloudSettingsKey ? "Live" : "Using cache");
+      }
+    }
+    const InputCloudPayload* sharedPlotCloud = hasCurrentCloud ? &currentCloud
+                                             : (hasBaseInputCloud ? &baseInputCloud : nullptr);
+    glDisable(GL_SCISSOR_TEST);
+    for (auto& plotWindow : app.plotWindows) {
+      const InputCloudPayload* plotCloud =
+          sourceCloudForPlotWindow(sourceCloudStore, plotWindow, app.senderId, sharedPlotCloud);
+      drawSecondaryPlotWindow(&app,
+                              &plotWindow,
+                              resolved,
+                              plotCloud,
+                              width,
+                              height,
+                              overlayTextRenderer ? *overlayTextRenderer : hudText,
+                              &pointRenderProgramCache);
+    }
+    glViewport(0, 0, width, height);
+    drawPlotWindowFramesOverlay(app,
+                                width,
+                                height,
+                                windowWidth,
+                                windowHeight,
+                                overlayTextRenderer ? *overlayTextRenderer : hudText);
+    drawViewerLassoOverlay(app, width, height);
+    if (waitingForImageLassoShape) {
+      drawImageLassoWaitingOverlay(width,
+                                   height,
+                                   overlayTextRenderer ? *overlayTextRenderer : hudText);
+    }
     drawPlotModelMenuOverlay(app,
                              resolved,
                              width,
@@ -13149,6 +23572,11 @@ int main() {
                              windowWidth,
                              windowHeight,
                              overlayTextRenderer ? *overlayTextRenderer : hudText);
+    glEnable(GL_SCISSOR_TEST);
+    glScissor(primaryRenderRect.x, primaryRenderRect.y, primaryRenderRect.w, primaryRenderRect.h);
+    glViewport(primaryRenderRect.x, primaryRenderRect.y, primaryRenderRect.w, primaryRenderRect.h);
+    const int indicatorWidth = primaryRenderRect.w;
+    const int indicatorHeight = primaryRenderRect.h;
     int indicatorSlot = 0;
     auto indicatorYOffset = [&](int slot) {
       return 30.0f + static_cast<float>(slot) * 26.0f;
@@ -13159,20 +23587,20 @@ int main() {
     const float slowIndicatorStrength =
         std::max(slowPulse, combinedSlowModifierHeld ? 0.55f : 0.0f);
     if (slowIndicatorStrength > 0.0f) {
-      drawSlowModifierIndicator(width,
-                                height,
+      drawSlowModifierIndicator(indicatorWidth,
+                                indicatorHeight,
                                 34.0f,
                                 indicatorYOffset(indicatorSlot++),
                                 0.50f + 0.50f * slowIndicatorStrength,
                                 overlayTextRenderer);
     }
     if (app.panMode) {
-      drawModifierSymbolIndicator(width, height, 'P', 34.0f, indicatorYOffset(indicatorSlot++), 1.0f);
+      drawModifierSymbolIndicator(indicatorWidth, indicatorHeight, 'P', 34.0f, indicatorYOffset(indicatorSlot++), 1.0f);
     }
     if (app.rollMode) {
       const float feedback = clampf(static_cast<float>((app.rollFeedbackUntil - glfwGetTime()) / 0.18), 0.0f, 1.0f);
       const float breathe = 0.5f + 0.5f * std::sin(static_cast<float>(glfwGetTime()) * 8.0f);
-      drawRollDirectionIndicator(width, height, app.rollDirection,
+      drawRollDirectionIndicator(indicatorWidth, indicatorHeight, app.rollDirection,
                                  0.30f + 0.70f * std::max(feedback, breathe * 0.6f),
                                  indicatorYOffset(indicatorSlot++),
                                  &hudSymbolText,
@@ -13180,27 +23608,28 @@ int main() {
     }
     if (app.orientAxisLock != 0) {
       const float pulse = clampf(static_cast<float>((app.orientAxisFeedbackUntil - glfwGetTime()) / 0.18), 0.0f, 1.0f);
-      drawOrientationLockIndicator(width, height, app.orientAxisLock, pulse, indicatorYOffset(indicatorSlot++));
+      drawOrientationLockIndicator(indicatorWidth, indicatorHeight, app.orientAxisLock, pulse, indicatorYOffset(indicatorSlot++));
     }
     if (app.orthographicSnapEnabled) {
-      drawTopLeftTextIndicator(width,
-                               height,
+      drawTopLeftTextIndicator(indicatorWidth,
+                               indicatorHeight,
                                "S",
                                0.72f,
-                               overlayTextRenderer ? overlayTextRenderer : &hudText);
+                               overlayTextRenderer ? overlayTextRenderer : &hudText,
+                               48.0f);
     }
     const float speedPulse = clampf(static_cast<float>((app.speedFeedbackUntil - glfwGetTime()) / 0.18), 0.0f, 1.0f);
     if (speedPulse > 0.0f) {
-      drawModifierSymbolIndicator(width,
-                                  height,
+      drawModifierSymbolIndicator(indicatorWidth,
+                                  indicatorHeight,
                                   'S',
                                   34.0f,
                                   indicatorYOffset(indicatorSlot++),
                                   0.55f + 0.45f * speedPulse);
     }
     if (resolved.neutralRadiusEnabled) {
-      drawNeutralRadiusIndicator(width,
-                                 height,
+      drawNeutralRadiusIndicator(indicatorWidth,
+                                 indicatorHeight,
                                  42.0f,
                                  28.0f,
                                  0.82f,
@@ -13208,17 +23637,36 @@ int main() {
     }
     const float fitPulse = clampf(static_cast<float>((app.fitFeedbackUntil - glfwGetTime()) / 0.55), 0.0f, 1.0f);
     if (fitPulse > 0.0f) {
-      drawFitIndicator(width,
-                       height,
+      drawFitIndicator(indicatorWidth,
+                       indicatorHeight,
                        34.0f,
                        28.0f,
                        0.58f + 0.42f * fitPulse,
                        overlayTextRenderer);
     }
+    glDisable(GL_SCISSOR_TEST);
+    glViewport(0, 0, width, height);
 
+    const double workspaceNow = glfwGetTime();
+    if ((workspaceNow - app.lastWorkspaceSave) >= 1.5) {
+      app.lastWorkspaceSave = workspaceNow;
+      saveViewerWorkspaceToDisk(&app);
+    }
     glfwSwapBuffers(window);
+    if (!firstFramePresented) {
+      firstFramePresented = true;
+      logViewerEvent("First viewer frame presented.");
+#if defined(CHROMASPACE_VIEWER_HAS_CUDA) && !defined(__APPLE__)
+      cudaWarmupStarted = true;
+      cudaWarmupThread = std::thread([&]() {
+        cudaWarmupResult = ChromaspaceCuda::warmupRuntime();
+        cudaWarmupDone.store(true, std::memory_order_release);
+      });
+#endif
+    }
   }
 
+  saveViewerWorkspaceToDisk(&app);
   gRun.store(false);
   wakeIpcServer();
 #if defined(_WIN32)
@@ -13227,6 +23675,9 @@ int main() {
   CloseHandle(singletonMutex);
 #else
   if (ipcThread.joinable()) ipcThread.join();
+#endif
+#if defined(CHROMASPACE_VIEWER_HAS_CUDA) && !defined(__APPLE__)
+  if (cudaWarmupThread.joinable()) cudaWarmupThread.join();
 #endif
   releasePointBufferCache(&meshPointBufferCache);
   releasePointBufferCache(&overlayPointBufferCache);

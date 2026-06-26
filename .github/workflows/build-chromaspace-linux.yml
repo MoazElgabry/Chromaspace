@@ -30,7 +30,10 @@ jobs:
       - name: Resolve package version
         id: version
         run: |
-          version="$(grep -Eo 'set\(CUBE_DISPLAY_VERSION "[^"]+"\)' CMakeLists.txt | sed -E 's/.*"([^"]+)".*/\1/' | head -n1)"
+          version="$(grep -Eo 'set\(CHROMASPACE_PACKAGE_VERSION "[^"]+"\)' CMakeLists.txt | sed -E 's/.*"([^"]+)".*/\1/' | head -n1)"
+          if [ -z "${version}" ]; then
+            version="$(grep -Eo 'set\(CUBE_DISPLAY_VERSION "[^"]+"\)' CMakeLists.txt | sed -E 's/.*"([^"]+)".*/\1/' | head -n1)"
+          fi
           if [ -z "${version}" ]; then
             version="$(grep -Eo 'project\([^)]*VERSION [0-9A-Za-z.\-]+' CMakeLists.txt | sed -E 's/.*VERSION ([0-9A-Za-z.\-]+)/\1/' | head -n1)"
           fi
@@ -102,6 +105,8 @@ jobs:
           test -f bundle/Chromaspace.ofx.bundle/Contents/Linux-x86-64/Chromaspace.ofx
           test -f bundle/Chromaspace.ofx.bundle/Contents/Linux-x86-64/Chromaspace_CubeViewer
           test -f bundle/Chromaspace.ofx.bundle/Contents/Linux-x86-64/OpenSans-Regular.ttf
+          test -f bundle/Chromaspace.ofx.bundle/Contents/Resources/chromaspace_resolve_bridge.py
+          test -f bundle/Chromaspace.ofx.bundle/Contents/Resources/com.moazelgabry.chromaspace.png
           chmod +x bundle/Chromaspace.ofx.bundle/Contents/Linux-x86-64/Chromaspace_CubeViewer
 
       - name: Verify Linux viewer runtime deps and launch

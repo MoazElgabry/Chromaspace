@@ -47,6 +47,12 @@ struct OverlayKernelUniforms {
   int circularHsl;
   int circularHsv;
   int normConeNormalized;
+  int chromaticityInputTransfer;
+  int chromaticityReferenceBasis;
+  float chromaticityWhiteX;
+  float chromaticityWhiteY;
+  float chromaticityRgbToXyz[9];
+  float chromaticityXyzToRgb[9];
 };
 
 struct InputKernelUniforms {
@@ -61,6 +67,12 @@ struct InputKernelUniforms {
   int circularHsl;
   int circularHsv;
   int normConeNormalized;
+  int chromaticityInputTransfer;
+  int chromaticityReferenceBasis;
+  float chromaticityWhiteX;
+  float chromaticityWhiteY;
+  float chromaticityRgbToXyz[9];
+  float chromaticityXyzToRgb[9];
   float pointAlphaScale;
   float denseAlphaBias;
   float colorSaturation;
@@ -354,6 +366,162 @@ inline __device__ float rawRgbHue01(float r, float g, float b, float cMax, float
     h = ((r - g) / delta) + 4.0f;
   }
   return wrapHue01(h / 6.0f);
+}
+
+inline __device__ float safeDiv(float num, float den) {
+  return fabsf(den) < 1e-6f ? 0.0f : num / den;
+}
+
+inline __device__ float safeExp2Clamped(float value) {
+  return exp2f(fminf(fmaxf(value, -126.0f), 126.0f));
+}
+
+inline __device__ float safePowPos(float value, float exponent) {
+  return value <= 0.0f ? 0.0f : powf(value, exponent);
+}
+
+inline __device__ float signPreservingPow(float value, float exponent) {
+  return value == 0.0f ? 0.0f : copysignf(safePowPos(fabsf(value), exponent), value);
+}
+
+inline __device__ float exp10Compat(float value) {
+  return safeExp2Clamped(value * 3.3219280948873626f);
+}
+
+inline __device__ float decodeTransferChannel(float x, int tf) {
+  switch (tf) {
+    case 0: return x;
+    case 1: {
+      const float a = fabsf(x);
+      const float decoded = (a <= 0.04045f) ? safeDiv(a, 12.92f) : safePowPos(safeDiv(a + 0.055f, 1.055f), 2.4f);
+      return copysignf(decoded, x);
+    }
+    case 2: return signPreservingPow(x, 2.4f);
+    case 3: return x <= 0.02740668f ? safeDiv(x, 10.44426855f) : safeExp2Clamped(safeDiv(x, 0.07329248f) - 7.0f) - 0.0075f;
+    case 4: return x <= 0.155251141552511f ? safeDiv(x - 0.0729055341958355f, 10.5402377416545f) : safeExp2Clamped(x * 17.52f - 9.72f);
+    case 5: return x < 5.367655f * 0.010591f + 0.092809f ? safeDiv(x - 0.092809f, 5.367655f) : safeDiv(exp10Compat(safeDiv(x - 0.385537f, 0.247190f)) - 0.052272f, 5.555556f);
+    case 6: return x < -0.7774983977293537f ? x * 0.3033266726886969f - 0.7774983977293537f : safeDiv(safeExp2Clamped(14.0f * safeDiv(x - 0.09286412512218964f, 0.9071358748778103f) + 6.0f) - 64.0f, 2231.8263090676883f);
+    case 7: {
+      constexpr float kCut = 0.092864125f;
+      constexpr float kScale = 0.24136077f;
+      constexpr float kGain = 87.099375f;
+      const float decoded = x < kCut ? -safeDiv(exp10Compat(safeDiv(kCut - x, kScale)) - 1.0f, kGain)
+                                     : safeDiv(exp10Compat(safeDiv(x - kCut, kScale)) - 1.0f, kGain);
+      return decoded * 0.9f;
+    }
+    case 8: return x < 171.2102946929f / 1023.0f ? safeDiv((x * 1023.0f - 95.0f) * 0.01125f, 171.2102946929f - 95.0f) : (exp10Compat(safeDiv(x * 1023.0f - 420.0f, 261.5f)) * 0.19f - 0.01f);
+    case 9:
+      if (x < 0.04076162f) return -safeDiv(exp10Compat(safeDiv(0.069886632f - x, 0.42889912f)) - 1.0f, 14.98325f);
+      if (x <= 0.105357102f) return safeDiv(x - 0.073059361f, 2.3069815f);
+      return safeDiv(exp10Compat(safeDiv(x - 0.073059361f, 0.36726845f)) - 1.0f, 14.98325f);
+    case 10: return x < 0.0f ? safeDiv(x, 15.1927f) - 0.01f : safeDiv(exp10Compat(safeDiv(x, 0.224282f)) - 1.0f, 155.975327f) - 0.01f;
+    case 11: {
+      constexpr float kA = 8.283605932402494f;
+      constexpr float kB = 0.09246575342465753f;
+      constexpr float kC = 0.5300133392291939f;
+      constexpr float kD = 0.08692876065491224f;
+      constexpr float kE = 0.005494072432257808f;
+      constexpr float kCut = kA * 0.005f + kB;
+      return x < kCut ? safeDiv(x - kB, kA) : expf(safeDiv(x - kC, kD)) - kE;
+    }
+    case 12: return x <= 0.14f ? safeDiv(x - 0.0929f, 6.025f) : safeDiv(exp10Compat(3.89616f * x - 2.27752f) - 0.0108f, 0.9892f);
+    case 13: {
+      constexpr float kA = 0.555556f;
+      constexpr float kB = 0.009468f;
+      constexpr float kC = 0.344676f;
+      constexpr float kD = 0.790453f;
+      constexpr float kE = 8.735631f;
+      constexpr float kF = 0.092864f;
+      constexpr float kCut = 0.100537775223865f;
+      return x >= kCut ? safeDiv(exp10Compat(safeDiv(x - kD, kC)), kA) - safeDiv(kB, kA) : safeDiv(x - kF, kE);
+    }
+    case 14: {
+      constexpr float kA = 5.555556f;
+      constexpr float kB = 0.064829f;
+      constexpr float kC = 0.245281f;
+      constexpr float kD = 0.384316f;
+      constexpr float kE = 8.799461f;
+      constexpr float kF = 0.092864f;
+      constexpr float kCut = 0.100686685370811f;
+      return x >= kCut ? safeDiv(exp10Compat(safeDiv(x - kD, kC)), kA) - safeDiv(kB, kA) : safeDiv(x - kF, kE);
+    }
+    case 15: return x < 0.181f ? safeDiv(x - 0.125f, 5.6f) : exp10Compat(safeDiv(x - 0.598206f, 0.241514f)) - 0.00873f;
+    case 16: return signPreservingPow(x, 2.2f);
+    case 17: return signPreservingPow(x, 2.6f);
+    default: return x;
+  }
+}
+
+inline __device__ void mulRows(const float* m, float x, float y, float z, float* outX, float* outY, float* outZ) {
+  *outX = m[0] * x + m[1] * y + m[2] * z;
+  *outY = m[3] * x + m[4] * y + m[5] * z;
+  *outZ = m[6] * x + m[7] * y + m[8] * z;
+}
+
+inline __device__ void xyToXyz(float x, float y, float Y, float* outX, float* outY, float* outZ) {
+  if (fabsf(y) <= 1e-8f) {
+    *outX = x;
+    *outY = Y;
+    *outZ = 1.0f - x;
+    return;
+  }
+  *outX = x * Y / y;
+  *outY = Y;
+  *outZ = (1.0f - x - y) * Y / y;
+}
+
+inline __device__ void xyzToXyY(float x, float y, float z, float fallbackX, float fallbackY, float* outX, float* outY, float* outYValue) {
+  if (fabsf(y) <= 1e-8f) {
+    *outX = fallbackX;
+    *outY = fallbackY;
+    *outYValue = 0.0f;
+    return;
+  }
+  const float sum = x + y + z;
+  if (fabsf(sum) <= 1e-8f) {
+    *outX = fallbackX;
+    *outY = fallbackY;
+    *outYValue = y;
+    return;
+  }
+  *outX = x / sum;
+  *outY = y / sum;
+  *outYValue = y;
+}
+
+inline __device__ void mapChromaticityPosition(float r, float g, float b, const InputKernelUniforms& u,
+                                               float* outX, float* outY, float* outZ) {
+  float linearR = decodeTransferChannel(r, u.chromaticityInputTransfer);
+  float linearG = decodeTransferChannel(g, u.chromaticityInputTransfer);
+  float linearB = decodeTransferChannel(b, u.chromaticityInputTransfer);
+  if (u.showOverflow == 0) {
+    linearR = clamp01(linearR);
+    linearG = clamp01(linearG);
+    linearB = clamp01(linearB);
+  }
+  float xyzX = 0.0f;
+  float xyzY = 0.0f;
+  float xyzZ = 0.0f;
+  mulRows(u.chromaticityRgbToXyz, linearR, linearG, linearB, &xyzX, &xyzY, &xyzZ);
+  float xyX = u.chromaticityWhiteX;
+  float xyY = u.chromaticityWhiteY;
+  float Y = 0.0f;
+  xyzToXyY(xyzX, xyzY, xyzZ, u.chromaticityWhiteX, u.chromaticityWhiteY, &xyX, &xyY, &Y);
+  if (u.chromaticityReferenceBasis != 0) {
+    float basisXyzX = 0.0f;
+    float basisXyzY = 0.0f;
+    float basisXyzZ = 0.0f;
+    xyToXyz(xyX, xyY, 1.0f, &basisXyzX, &basisXyzY, &basisXyzZ);
+    float rgbX = 0.0f;
+    float rgbY = 0.0f;
+    float rgbZ = 0.0f;
+    mulRows(u.chromaticityXyzToRgb, basisXyzX, basisXyzY, basisXyzZ, &rgbX, &rgbY, &rgbZ);
+    xyzToXyY(rgbX, rgbY, rgbZ, 1.0f / 3.0f, 1.0f / 3.0f, &xyX, &xyY, &basisXyzY);
+  }
+  const float viewerHeight = (u.showOverflow != 0 ? Y : clamp01(Y)) * 2.0f - 1.0f;
+  *outX = (xyX - (1.0f / 3.0f)) * 3.0f;
+  *outY = (xyY - (1.0f / 3.0f)) * 3.0f;
+  *outZ = viewerHeight;
 }
 
 inline __device__ void mapPlotPosition(float r, float g, float b, int plotMode, int circularHsl, int circularHsv, int normConeNormalized, int showOverflow,
@@ -715,7 +883,11 @@ __global__ void inputKernel(float* verts, float* colors, const float* input, Inp
   const float plotG = u.showOverflow != 0 ? g : clamp01(g);
   const float plotB = u.showOverflow != 0 ? b : clamp01(b);
   float x, y, z;
-  mapPlotPosition(plotR, plotG, plotB, u.plotMode, u.circularHsl, u.circularHsv, u.normConeNormalized, u.showOverflow, &x, &y, &z);
+  if (u.plotMode == 8) {
+    mapChromaticityPosition(r, g, b, u, &x, &y, &z);
+  } else {
+    mapPlotPosition(plotR, plotG, plotB, u.plotMode, u.circularHsl, u.circularHsv, u.normConeNormalized, u.showOverflow, &x, &y, &z);
+  }
   if (u.glossView != 0) {
     const float aspect = fminf(fmaxf(u.sourceAspect, 0.25f), 4.0f);
     const float halfWidth = aspect >= 1.0f ? 1.22f : (1.22f * aspect);
@@ -1332,6 +1504,31 @@ ProbeResult probe() {
   return result;
 }
 
+StartupValidationResult warmupRuntime() {
+  StartupValidationResult result{};
+  int deviceCount = 0;
+  cudaError_t err = cudaGetDeviceCount(&deviceCount);
+  if (err != cudaSuccess || deviceCount <= 0) {
+    result.reason = err != cudaSuccess
+                        ? std::string("CUDA runtime warm-up failed: ") + errorString(err)
+                        : std::string("No CUDA devices found.");
+    return result;
+  }
+  err = cudaSetDevice(0);
+  if (err != cudaSuccess) {
+    result.reason = std::string("CUDA runtime device selection failed: ") + errorString(err);
+    return result;
+  }
+  err = cudaFree(0);
+  if (err != cudaSuccess) {
+    result.reason = std::string("CUDA runtime warm-up failed: ") + errorString(err);
+    return result;
+  }
+  result.ready = true;
+  result.reason = "runtime-warmed";
+  return result;
+}
+
 StartupValidationResult validateStartup() {
   StartupValidationResult result{};
   std::string error;
@@ -1408,6 +1605,14 @@ bool buildInputMesh(InputCache* cache,
   uniforms.circularHsl = request.remap.circularHsl;
   uniforms.circularHsv = request.remap.circularHsv;
   uniforms.normConeNormalized = request.remap.normConeNormalized;
+  uniforms.chromaticityInputTransfer = request.remap.chromaticityInputTransfer;
+  uniforms.chromaticityReferenceBasis = request.remap.chromaticityReferenceBasis;
+  uniforms.chromaticityWhiteX = request.remap.chromaticityWhiteX;
+  uniforms.chromaticityWhiteY = request.remap.chromaticityWhiteY;
+  for (int i = 0; i < 9; ++i) {
+    uniforms.chromaticityRgbToXyz[i] = request.remap.chromaticityRgbToXyz[i];
+    uniforms.chromaticityXyzToRgb[i] = request.remap.chromaticityXyzToRgb[i];
+  }
   uniforms.pointAlphaScale = request.pointAlphaScale;
   uniforms.denseAlphaBias = request.denseAlphaBias;
   uniforms.colorSaturation = request.colorSaturation;

@@ -1,8 +1,8 @@
 [Setup]
 AppId={{A8CBEA7B-8D55-4A2E-8C23-5B8DCCF9D5A1}
 AppName=Chromaspace
-AppVersion=1.0.12
-AppVerName=Chromaspace OFX v1.0.12
+AppVersion=2.0.0
+AppVerName=Chromaspace OFX v2.0 Beta
 AppPublisher=Moaz ELgabry
 AppPublisherURL=https://moazelgabry.com
 AppSupportURL=https://github.com/MoazElgabry/ME_OFX/issues
@@ -13,7 +13,7 @@ ArchitecturesInstallIn64BitMode=x64compatible
 DisableDirPage=yes
 DisableProgramGroupPage=yes
 OutputDir=.
-OutputBaseFilename=Chromaspace_v1.0.12_Windows_Installer
+OutputBaseFilename=Chromaspace_v2.0_Beta_Windows_Installer
 Compression=lzma
 SolidCompression=yes
 PrivilegesRequired=admin

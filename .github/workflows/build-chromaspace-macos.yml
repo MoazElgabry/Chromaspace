@@ -25,7 +25,10 @@ jobs:
       - name: Resolve package version
         id: version
         run: |
-          version="$(grep -Eo 'set\(CUBE_DISPLAY_VERSION "[^"]+"\)' CMakeLists.txt | sed -E 's/.*"([^"]+)".*/\1/' | head -n1)"
+          version="$(grep -Eo 'set\(CHROMASPACE_PACKAGE_VERSION "[^"]+"\)' CMakeLists.txt | sed -E 's/.*"([^"]+)".*/\1/' | head -n1)"
+          if [ -z "${version}" ]; then
+            version="$(grep -Eo 'set\(CUBE_DISPLAY_VERSION "[^"]+"\)' CMakeLists.txt | sed -E 's/.*"([^"]+)".*/\1/' | head -n1)"
+          fi
           if [ -z "${version}" ]; then
             version="$(grep -Eo 'project\([^)]*VERSION [0-9A-Za-z.\-]+' CMakeLists.txt | sed -E 's/.*VERSION ([0-9A-Za-z.\-]+)/\1/' | head -n1)"
           fi
@@ -81,6 +84,7 @@ jobs:
           test -f bundle/Chromaspace.ofx.bundle/Contents/MacOS/Chromaspace_CubeViewer
           test -f bundle/Chromaspace.ofx.bundle/Contents/MacOS/OpenSans-Regular.ttf
           test -f bundle/Chromaspace.ofx.bundle/Contents/Resources/com.moazelgabry.chromaspace.png
+          test -f bundle/Chromaspace.ofx.bundle/Contents/Resources/chromaspace_resolve_bridge.py
           lipo -archs bundle/Chromaspace.ofx.bundle/Contents/MacOS/Chromaspace.ofx | grep -q "x86_64 arm64"
           lipo -archs bundle/Chromaspace.ofx.bundle/Contents/MacOS/Chromaspace_CubeViewer | grep -q "x86_64 arm64"
           otool -l bundle/Chromaspace.ofx.bundle/Contents/MacOS/Chromaspace.ofx | grep -A3 LC_BUILD_VERSION | grep -q "minos 13.0"

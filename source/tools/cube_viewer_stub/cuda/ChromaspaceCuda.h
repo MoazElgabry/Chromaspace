@@ -24,6 +24,18 @@ struct RemapUniforms {
   int normConeNormalized = 1;
   int showOverflow = 0;
   int highlightOverflow = 1;
+  int chromaticityInputTransfer = 0;
+  int chromaticityReferenceBasis = 0;
+  float chromaticityWhiteX = 1.0f / 3.0f;
+  float chromaticityWhiteY = 1.0f / 3.0f;
+  float chromaticityRgbToXyz[9] = {
+      1.0f, 0.0f, 0.0f,
+      0.0f, 1.0f, 0.0f,
+      0.0f, 0.0f, 1.0f};
+  float chromaticityXyzToRgb[9] = {
+      1.0f, 0.0f, 0.0f,
+      0.0f, 1.0f, 0.0f,
+      0.0f, 0.0f, 1.0f};
 };
 
 struct OverlayRequest {
@@ -108,6 +120,7 @@ struct InputSampleCache {
 };
 
 ProbeResult probe();
+StartupValidationResult warmupRuntime();
 StartupValidationResult validateStartup();
 void releaseOverlayCache(OverlayCache* cache);
 void releaseInputCache(InputCache* cache);

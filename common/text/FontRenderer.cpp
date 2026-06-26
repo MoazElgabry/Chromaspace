@@ -207,10 +207,10 @@ bool loadFontAtlas(const std::string& fontPath, int pixelSize, FontAtlas* out, s
         const unsigned char* src = info.pixels.data() + row * info.width;
         std::memcpy(dst, src, static_cast<std::size_t>(info.width));
       }
-      metrics.u0 = (static_cast<float>(penX) + 0.5f) / static_cast<float>(atlas.width);
-      metrics.u1 = (static_cast<float>(penX + info.width) - 0.5f) / static_cast<float>(atlas.width);
-      metrics.v0 = (static_cast<float>(texY + info.height) - 0.5f) / static_cast<float>(atlas.height);
-      metrics.v1 = (static_cast<float>(texY) + 0.5f) / static_cast<float>(atlas.height);
+      metrics.u0 = static_cast<float>(penX) / static_cast<float>(atlas.width);
+      metrics.u1 = static_cast<float>(penX + info.width) / static_cast<float>(atlas.width);
+      metrics.v0 = static_cast<float>(texY + info.height) / static_cast<float>(atlas.height);
+      metrics.v1 = static_cast<float>(texY) / static_cast<float>(atlas.height);
     }
     atlas.glyphs[c] = metrics;
     atlas.glyphIndexForChar[c] = info.glyphIndex;
@@ -246,10 +246,10 @@ bool loadFontAtlas(const std::string& fontPath, int pixelSize, FontAtlas* out, s
         const unsigned char* src = info.pixels.data() + row * info.width;
         std::memcpy(dst, src, static_cast<std::size_t>(info.width));
       }
-      metrics.u0 = (static_cast<float>(penX) + 0.5f) / static_cast<float>(atlas.width);
-      metrics.u1 = (static_cast<float>(penX + info.width) - 0.5f) / static_cast<float>(atlas.width);
-      metrics.v0 = (static_cast<float>(texY + info.height) - 0.5f) / static_cast<float>(atlas.height);
-      metrics.v1 = (static_cast<float>(texY) + 0.5f) / static_cast<float>(atlas.height);
+      metrics.u0 = static_cast<float>(penX) / static_cast<float>(atlas.width);
+      metrics.u1 = static_cast<float>(penX + info.width) / static_cast<float>(atlas.width);
+      metrics.v0 = static_cast<float>(texY + info.height) / static_cast<float>(atlas.height);
+      metrics.v1 = static_cast<float>(texY) / static_cast<float>(atlas.height);
     }
     atlas.glyphsByIndex[info.glyphIndex] = metrics;
     penX += info.width + kPadding;
