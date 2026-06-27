@@ -69,6 +69,7 @@ struct ViewerRuntimeState {
   bool readGrayRamp = false;
   bool readIdentityPlot = false;
   bool isolateIdentityData = false;
+  bool excludeIdentityData = false;
   int identityReadResolution = 29;
 
   bool volumeSliceLassoRegion = false;
@@ -101,10 +102,10 @@ struct ViewerRuntimeState {
   bool waveformHighDetailRequested = false;
   int waveformSampleColumns = 768;
   int waveformSamplesPerColumn = 96;
-  double waveformPointBrightness = 1.0;
+  double waveformPointBrightness = 1.5;
   double waveformGridBrightness = 1.0;
-  double waveformSaturation = 1.0;
-  double waveformDotSize = 1.0;
+  double waveformSaturation = 0.75;
+  double waveformDotSize = 0.25;
   bool waveformChannelRed = true;
   bool waveformChannelGreen = true;
   bool waveformChannelBlue = true;
@@ -168,8 +169,8 @@ inline ViewerRuntimeState clampedViewerRuntimeState(ViewerRuntimeState s) {
   s.waveformSamplesPerColumn = std::max(0, std::min(192, s.waveformSamplesPerColumn));
   s.waveformPointBrightness = clampDouble(s.waveformPointBrightness, 0.1, 2.0);
   s.waveformGridBrightness = clampDouble(s.waveformGridBrightness, 0.0, 2.0);
-  s.waveformSaturation = clampDouble(s.waveformSaturation, 0.0, 2.0);
-  s.waveformDotSize = clampDouble(s.waveformDotSize, 0.25, 3.0);
+  s.waveformSaturation = clampDouble(s.waveformSaturation, 0.0, 1.5);
+  s.waveformDotSize = clampDouble(s.waveformDotSize, 0.05, 1.5);
   s.waveformLumaMethod = clampChoice(s.waveformLumaMethod, 3, 0);
   s.histogramMode = clampChoice(s.histogramMode, 1, 0);
   s.scopeRangeMode = clampChoice(s.scopeRangeMode, 2, 0);
@@ -179,6 +180,7 @@ inline ViewerRuntimeState clampedViewerRuntimeState(ViewerRuntimeState s) {
     s.readGrayRamp = false;
     s.readIdentityPlot = false;
     s.isolateIdentityData = false;
+    s.excludeIdentityData = false;
     s.volumeSliceLassoRegion = false;
   }
   if (s.plotModel == kPlotModelWaveform || s.plotModel == kPlotModelHistogram) {
@@ -187,9 +189,15 @@ inline ViewerRuntimeState clampedViewerRuntimeState(ViewerRuntimeState s) {
     s.readGrayRamp = false;
     s.readIdentityPlot = false;
     s.isolateIdentityData = false;
+    s.excludeIdentityData = false;
     s.occupancyGuidedFill = false;
     s.showOverflow = false;
     s.highlightOverflow = false;
+  }
+  if (s.excludeIdentityData) {
+    s.readGrayRamp = false;
+    s.readIdentityPlot = false;
+    s.isolateIdentityData = false;
   }
   if (!s.readGrayRamp && !s.readIdentityPlot) s.isolateIdentityData = false;
   return s;
@@ -349,7 +357,8 @@ inline bool showOverflowSupported(const ViewerRuntimeState& state, bool drawOnIm
 }
 
 inline bool readStripData(const ViewerRuntimeState& state, bool drawOnImage) {
-  return !drawOnImage && !isGlossView(state) && (state.readIdentityPlot || state.readGrayRamp);
+  return !drawOnImage && !isGlossView(state) && !state.excludeIdentityData &&
+         (state.readIdentityPlot || state.readGrayRamp);
 }
 
 inline bool volumeSlicingSupported(const ViewerRuntimeState& state, bool drawOnImage) {

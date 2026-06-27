@@ -2566,6 +2566,8 @@ struct ResolvedPayload {
   bool readGrayRamp = false;
   bool readIdentityPlot = false;
   bool isolateIdentityData = false;
+  bool excludeIdentityData = false;
+  bool hasExcludeIdentityData = false;
   int identityReadResolution = 29;
   int generatedIdentityResolution = 0;
   bool generatedIdentityDrawCube = false;
@@ -4944,6 +4946,7 @@ std::string viewerLocalPreviewBuildKey(const ResolvedPayload& payload,
      << "|readRamp=" << (payload.readGrayRamp ? 1 : 0)
      << "|readIdentity=" << (payload.readIdentityPlot ? 1 : 0)
      << "|isolateIdentity=" << (payload.isolateIdentityData ? 1 : 0)
+     << "|excludeIdentity=" << (payload.excludeIdentityData ? 1 : 0)
      << "|overflow=" << (payload.showOverflow ? 1 : 0)
      << "|highlight=" << (payload.highlightOverflow ? 1 : 0)
      << "|slice=" << (payload.cubeSlicingEnabled ? 1 : 0)
@@ -4969,6 +4972,81 @@ std::string viewerLocalPreviewBuildKey(const ResolvedPayload& payload,
 bool payloadWantsIdentityReadPreview(const ResolvedPayload& payload) {
   return payload.sourceMode == "input" && !isGlossViewPlotModeString(payload.plotMode) &&
          (payload.readIdentityPlot || payload.readGrayRamp);
+}
+
+struct ViewerIdentityStripBands {
+  bool hasCube = false;
+  bool hasRamp = false;
+  float cubeY0 = 0.0f;
+  float cubeY1 = 0.0f;
+  float rampY0 = 0.0f;
+  float rampY1 = 0.0f;
+};
+
+bool viewerGeneratedIdentityStripBands(const ResolvedPayload& payload,
+                                       ViewerIdentityStripBands* bands) {
+  if (!bands) return false;
+  *bands = {};
+  if (!payload.generatedIdentityDrawCube && !payload.generatedIdentityDrawRamp) return false;
+  const int resolution = std::clamp(payload.generatedIdentityResolution > 0
+                                        ? payload.generatedIdentityResolution
+                                        : payload.identityReadResolution,
+                                    4,
+                                    65);
+  const float stripNorm = clampf(payload.sourceAspect / static_cast<float>(std::max(1, resolution)),
+                                 1.0f / 4096.0f,
+                                 1.0f);
+  float cursor = 0.0f;
+  if (payload.generatedIdentityDrawCube) {
+    bands->hasCube = true;
+    bands->cubeY0 = cursor;
+    bands->cubeY1 = std::min(1.0f, cursor + stripNorm);
+    cursor = bands->cubeY1;
+  }
+  if (payload.generatedIdentityDrawRamp) {
+    bands->hasRamp = true;
+    bands->rampY0 = cursor;
+    bands->rampY1 = std::min(1.0f, cursor + stripNorm);
+  }
+  return (bands->hasCube && bands->cubeY1 > bands->cubeY0) ||
+         (bands->hasRamp && bands->rampY1 > bands->rampY0);
+}
+
+bool sampleInsideGeneratedIdentityStrip(const ViewerIdentityStripBands& bands,
+                                        const InputCloudSample& sample) {
+  const float y = clampf(sample.yNorm, 0.0f, 1.0f);
+  const bool inCube = bands.hasCube && y >= bands.cubeY0 && y <= bands.cubeY1;
+  const bool inRamp = bands.hasRamp && y >= bands.rampY0 && y <= bands.rampY1;
+  return inCube || inRamp;
+}
+
+void applyViewerExcludeIdentityData(const ResolvedPayload& payload,
+                                    const InputCloudPayload& cloud,
+                                    std::vector<InputCloudSample>* samples) {
+  if (!samples || !payload.excludeIdentityData || samples->empty()) return;
+
+  if (cloudLooksIdentityRead(cloud)) {
+    std::size_t cubeCount = 0;
+    std::size_t rampCount = 0;
+    const bool hasCubeCount = cloudParamHashCount(cloud, "instance1CubePoints", &cubeCount);
+    const bool hasRampCount = cloudParamHashCount(cloud, "instance1RampPoints", &rampCount);
+    if (hasCubeCount || hasRampCount) {
+      cubeCount = std::min(cubeCount, samples->size());
+      rampCount = std::min(rampCount, samples->size() - cubeCount);
+      const std::size_t identityCount = cubeCount + rampCount;
+      samples->erase(samples->begin(), samples->begin() + static_cast<std::ptrdiff_t>(identityCount));
+      return;
+    }
+  }
+
+  ViewerIdentityStripBands bands{};
+  if (!viewerGeneratedIdentityStripBands(payload, &bands)) return;
+  std::vector<InputCloudSample> filtered;
+  filtered.reserve(samples->size());
+  for (const auto& sample : *samples) {
+    if (!sampleInsideGeneratedIdentityStrip(bands, sample)) filtered.push_back(sample);
+  }
+  samples->swap(filtered);
 }
 
 bool payloadAllowsIntentionalEmptyPlot(const ResolvedPayload& payload) {
@@ -5505,6 +5583,7 @@ void appendViewerStateCommandFields(std::ostringstream& os,
      << ",\"readGrayRamp\":" << (s.readGrayRamp ? 1 : 0)
      << ",\"readIdentityPlot\":" << (s.readIdentityPlot ? 1 : 0)
      << ",\"isolateIdentityData\":" << (s.isolateIdentityData ? 1 : 0)
+     << ",\"excludeIdentityData\":" << (s.excludeIdentityData ? 1 : 0)
      << ",\"identityReadResolution\":" << s.identityReadResolution
      << ",\"volumeSliceLassoRegion\":" << (s.volumeSliceLassoRegion ? 1 : 0)
      << ",\"cubeSliceRed\":" << (s.volumeSliceRed ? 1 : 0)
@@ -5752,10 +5831,10 @@ bool parseParamsMessage(const std::string& line, ResolvedPayload* out) {
   int waveformHighDetailRequested = 0;
   int waveformSampleColumns = 768;
   int waveformSamplesPerColumn = 96;
-  float waveformPointBrightness = 1.0f;
+  float waveformPointBrightness = 1.5f;
   float waveformGridBrightness = 1.0f;
-  float waveformSaturation = 1.0f;
-  float waveformDotSize = 1.0f;
+  float waveformSaturation = 0.75f;
+  float waveformDotSize = 0.25f;
   int waveformChannelRed = 1;
   int waveformChannelGreen = 1;
   int waveformChannelBlue = 1;
@@ -5806,6 +5885,9 @@ bool parseParamsMessage(const std::string& line, ResolvedPayload* out) {
   int isolateIdentityData = 0;
   extractInt(line, "isolateIdentityData", &isolateIdentityData);
   p.isolateIdentityData = (isolateIdentityData != 0);
+  int excludeIdentityData = 0;
+  p.hasExcludeIdentityData = extractInt(line, "excludeIdentityData", &excludeIdentityData);
+  p.excludeIdentityData = (excludeIdentityData != 0);
   extractInt(line, "identityReadResolution", &p.identityReadResolution);
   extractInt(line, "generatedIdentityResolution", &p.generatedIdentityResolution);
   int generatedIdentityDrawCube = 0;
@@ -5864,6 +5946,7 @@ bool parseParamsMessage(const std::string& line, ResolvedPayload* out) {
     p.readGrayRamp = false;
     p.readIdentityPlot = false;
     p.isolateIdentityData = false;
+    p.excludeIdentityData = false;
     p.volumeSlicingEnabled = false;
     p.cubeSlicingEnabled = false;
     p.neutralRadiusEnabled = false;
@@ -5921,6 +6004,7 @@ bool parseParamsMessage(const std::string& line, ResolvedPayload* out) {
   p.viewerState.readGrayRamp = p.readGrayRamp;
   p.viewerState.readIdentityPlot = p.readIdentityPlot;
   p.viewerState.isolateIdentityData = p.isolateIdentityData;
+  p.viewerState.excludeIdentityData = p.excludeIdentityData;
   p.viewerState.identityReadResolution = p.identityReadResolution;
   int volumeSliceLassoRegion = (p.volumeSlicingMode == "lasso") ? 1 : 0;
   extractInt(line, "volumeSliceLassoRegion", &volumeSliceLassoRegion);
@@ -8765,6 +8849,7 @@ bool buildInputCloudMeshCpu(const ResolvedPayload& payload,
   if (classifyPlotMode(payload) == PlotModeKind::GlossLift) {
     std::vector<InputCloudSample> samples;
     if (!parseInputCloudSamples(cloud, &samples)) return false;
+    applyViewerExcludeIdentityData(payload, cloud, &samples);
     applyViewerIdentityReadPreview(payload, cloud, &samples);
     filterInputCloudSamples(payload, &samples);
     std::vector<float> baseRawPoints;
@@ -8849,6 +8934,7 @@ bool buildInputCloudFitMeshCpu(const ResolvedPayload& payload,
   if (!out) return false;
   std::vector<InputCloudSample> samples;
   if (!parseInputCloudSamples(cloud, &samples)) return false;
+  applyViewerExcludeIdentityData(payload, cloud, &samples);
   applyViewerIdentityReadPreview(payload, cloud, &samples);
   filterInputCloudSamples(payload, &samples);
   if (classifyPlotMode(payload) == PlotModeKind::GlossLift) {
@@ -9188,6 +9274,7 @@ bool buildAnalyticalScopeMeshCpu(const ResolvedPayload& payload,
   const bool useHighWaveformLayer =
       payload.plotMode == "waveform" &&
       payload.viewerState.waveformHighDetail &&
+      !payload.viewerState.excludeIdentityData &&
       !payload.viewerState.readGrayRamp &&
       !payload.viewerState.readIdentityPlot &&
       !payload.viewerState.isolateIdentityData &&
@@ -9209,6 +9296,7 @@ bool buildAnalyticalScopeMeshCpu(const ResolvedPayload& payload,
   } else {
     keepPrimaryInputCloudSamples(cloud, &samples);
   }
+  applyViewerExcludeIdentityData(payload, cloud, &samples);
   applyViewerIdentityReadPreview(payload, cloud, &samples);
   filterInputCloudSamples(payload, &samples);
   if (payload.plotMode == "waveform" && !samples.empty()) {
@@ -9367,6 +9455,12 @@ bool buildAnalyticalScopeMeshCpu(const ResolvedPayload& payload,
         static_cast<float>(payload.viewerState.waveformPointBrightness);
     const float waveformSaturation =
         static_cast<float>(payload.viewerState.waveformSaturation);
+    const float waveformDotSize =
+        clampf(static_cast<float>(payload.viewerState.waveformDotSize), 0.05f, 1.5f);
+    const float waveformCoverageAlpha =
+        waveformDotSize < 0.5f
+            ? clampf(std::pow(waveformDotSize / 0.5f, 0.72f), 0.16f, 1.0f)
+            : 1.0f;
     auto scopeIntensity = [&](float density) {
       if (density <= 0.0f) return 0.0f;
       const float normalized =
@@ -9409,7 +9503,7 @@ bool buildAnalyticalScopeMeshCpu(const ResolvedPayload& payload,
                         0.88f * intensity,
                         0.92f * intensity,
                         0.96f * intensity,
-                        1.0f);
+                        waveformCoverageAlpha);
         } else if (mesh.scopeMode == 1) {
           for (int channel = 0; channel < 3; ++channel) {
             if (!waveformChannelEnabled(channel)) continue;
@@ -9429,7 +9523,7 @@ bool buildAnalyticalScopeMeshCpu(const ResolvedPayload& payload,
                           color.x,
                           color.y,
                           color.z,
-                          1.0f);
+                          waveformCoverageAlpha);
           }
         } else {
           const float red =
@@ -9443,7 +9537,7 @@ bool buildAnalyticalScopeMeshCpu(const ResolvedPayload& payload,
               kScopePlotLeft + kScopePlotWidth * (static_cast<float>(x) + 0.5f) /
                                        kPositionBins;
           const Vec3 color = saturatedWaveformColor(red, green, blue);
-          addScopePoint(plotX, plotY, color.x, color.y, color.z, 1.0f);
+          addScopePoint(plotX, plotY, color.x, color.y, color.z, waveformCoverageAlpha);
         }
       }
     }
@@ -9480,7 +9574,7 @@ bool buildAnalyticalScopeMeshCpu(const ResolvedPayload& payload,
                         color.x * overflowIntensity,
                         color.y * overflowIntensity,
                         color.z * overflowIntensity,
-                        1.0f);
+                        waveformCoverageAlpha);
           continue;
         }
         const float values[3] = {sample.r, sample.g, sample.b};
@@ -9496,7 +9590,7 @@ bool buildAnalyticalScopeMeshCpu(const ResolvedPayload& payload,
                         color.x * overflowIntensity,
                         color.y * overflowIntensity,
                         color.z * overflowIntensity,
-                        1.0f);
+                        waveformCoverageAlpha);
         }
       }
     }
@@ -9731,6 +9825,7 @@ bool buildInputCloudMesh(const ResolvedPayload& payload,
   if (classifyPlotMode(payload) == PlotModeKind::GlossLift) {
     std::vector<InputCloudSample> samples;
     if (!parseInputCloudSamples(cloud, &samples)) return false;
+    applyViewerExcludeIdentityData(payload, cloud, &samples);
     applyViewerIdentityReadPreview(payload, cloud, &samples);
     filterInputCloudSamples(payload, &samples);
     std::vector<float> rawPoints;
@@ -9810,6 +9905,7 @@ bool buildInputCloudMesh(const ResolvedPayload& payload,
   std::vector<InputCloudSample> samples;
   std::vector<float> rawPoints;
   if (!parseInputCloudSamples(cloud, &samples)) return false;
+  applyViewerExcludeIdentityData(payload, cloud, &samples);
   applyViewerIdentityReadPreview(payload, cloud, &samples);
   filterInputCloudSamples(payload, &samples);
   if (samples.empty()) {
@@ -10433,6 +10529,7 @@ const InputCloudPayload* sourceCloudForPlotWindow(const SourceCloudStore& store,
   const auto state = viewerStateWithModelCapabilities(window.viewState);
   if (state.plotModel == ChromaspaceViewer::kPlotModelWaveform &&
       state.waveformHighDetail &&
+      !state.excludeIdentityData &&
       !state.readGrayRamp &&
       !state.readIdentityPlot &&
       !state.isolateIdentityData &&
@@ -10445,7 +10542,7 @@ const InputCloudPayload* sourceCloudForPlotWindow(const SourceCloudStore& store,
       !cloudLooksEmptyImageLassoVariant(store.imageLasso)) {
     return &store.imageLasso;
   }
-  if ((state.readGrayRamp || state.readIdentityPlot) && store.hasIdentity &&
+  if (!state.excludeIdentityData && (state.readGrayRamp || state.readIdentityPlot) && store.hasIdentity &&
       senderMatchesCurrent(senderId, store.identity.senderId)) {
     return &store.identity;
   }
@@ -10467,6 +10564,48 @@ enum class PlotWindowDragMode {
   ResizeBottomLeft,
   ResizeBottomRight
 };
+
+bool plotWindowDragModeIsResize(PlotWindowDragMode mode) {
+  switch (mode) {
+    case PlotWindowDragMode::ResizeLeft:
+    case PlotWindowDragMode::ResizeRight:
+    case PlotWindowDragMode::ResizeTop:
+    case PlotWindowDragMode::ResizeBottom:
+    case PlotWindowDragMode::ResizeTopLeft:
+    case PlotWindowDragMode::ResizeTopRight:
+    case PlotWindowDragMode::ResizeBottomLeft:
+    case PlotWindowDragMode::ResizeBottomRight:
+      return true;
+    case PlotWindowDragMode::None:
+    case PlotWindowDragMode::Move:
+      return false;
+  }
+  return false;
+}
+
+bool plotWindowDragModeTouchesLeft(PlotWindowDragMode mode) {
+  return mode == PlotWindowDragMode::ResizeLeft ||
+         mode == PlotWindowDragMode::ResizeTopLeft ||
+         mode == PlotWindowDragMode::ResizeBottomLeft;
+}
+
+bool plotWindowDragModeTouchesRight(PlotWindowDragMode mode) {
+  return mode == PlotWindowDragMode::ResizeRight ||
+         mode == PlotWindowDragMode::ResizeTopRight ||
+         mode == PlotWindowDragMode::ResizeBottomRight;
+}
+
+bool plotWindowDragModeTouchesTop(PlotWindowDragMode mode) {
+  return mode == PlotWindowDragMode::ResizeTop ||
+         mode == PlotWindowDragMode::ResizeTopLeft ||
+         mode == PlotWindowDragMode::ResizeTopRight;
+}
+
+bool plotWindowDragModeTouchesBottom(PlotWindowDragMode mode) {
+  return mode == PlotWindowDragMode::ResizeBottom ||
+         mode == PlotWindowDragMode::ResizeBottomLeft ||
+         mode == PlotWindowDragMode::ResizeBottomRight;
+}
 
 struct AppState {
   CameraState cam;
@@ -10541,6 +10680,7 @@ struct AppState {
   bool viewerMenuDraggingSlider = false;
   int viewerMenuSliderAction = 0;
   int viewerMenuChoiceAction = 0;
+  bool viewerPresetChoiceAnchorCompact = false;
   float viewerMenuScroll = 0.0f;
   float viewerChoiceMenuScroll = 0.0f;
   double viewerMenuLastClick = -10.0;
@@ -10555,6 +10695,8 @@ struct AppState {
   bool viewerLassoDrawing = false;
   std::string viewerLassoData;
   std::string cachedOfxImageLassoData;
+  uint64_t lastObservedOfxImageLassoRevision = 0;
+  uint64_t clearImageLassoBaselineRevision = 0;
   bool plotModelMenuVisible = false;
   bool quickPlotModelMenuVisible = false;
   int quickPlotModelMenuHover = -1;
@@ -10573,6 +10715,7 @@ struct AppState {
   int focusedPlotWindowId = 1;
   int hoveredPlotWindowId = -1;
   int nextPlotWindowId = 2;
+  PlotWindowDragMode hoveredPlotWindowDragMode = PlotWindowDragMode::None;
   PlotWindowDragMode plotWindowDragMode = PlotWindowDragMode::None;
   int plotWindowDragId = -1;
   double plotWindowDragStartX = 0.0;
@@ -10593,6 +10736,7 @@ struct AppState {
   bool readGrayRamp = false;
   bool readIdentityPlot = false;
   bool isolateIdentityData = false;
+  bool excludeIdentityData = false;
   int identityReadResolution = 29;
   bool resolveDrawStatusKnown = false;
   bool resolveDrawStatusAvailable = false;
@@ -10673,6 +10817,7 @@ void applyPlotWindowToApp(AppState* app, const PlotWindowState& window) {
   app->readGrayRamp = app->viewerState.readGrayRamp;
   app->readIdentityPlot = app->viewerState.readIdentityPlot;
   app->isolateIdentityData = app->viewerState.isolateIdentityData;
+  app->excludeIdentityData = app->viewerState.excludeIdentityData;
   app->identityReadResolution = app->viewerState.identityReadResolution;
   app->cam = window.camera;
   for (auto& other : app->plotWindows) other.selected = other.windowId == window.windowId;
@@ -10982,25 +11127,45 @@ void applyPlotWindowLayout(AppState* app, int layoutIndex, int windowWidth, int 
 
 void rememberOfxImageLassoSelection(AppState* app, const ResolvedPayload& payload) {
   if (!app || !payloadImageLassoModeEnabled(payload)) return;
+  const LassoRegionState state = parseViewerLassoRegionState(payload.lassoData);
+  if (state.revision > 0) {
+    app->lastObservedOfxImageLassoRevision =
+        std::max(app->lastObservedOfxImageLassoRevision, state.revision);
+  }
   if (payloadHasImageLassoSelection(payload)) {
-    app->cachedOfxImageLassoData = payload.lassoData;
-    const LassoRegionState state = parseViewerLassoRegionState(payload.lassoData);
     if (app->clearImageLassoRequestedRevision > 0 &&
-        state.revision >= app->clearImageLassoRequestedRevision) {
+        state.revision <= app->clearImageLassoBaselineRevision) {
+      return;
+    }
+    app->cachedOfxImageLassoData = payload.lassoData;
+    if (app->clearImageLassoRequestedRevision > 0) {
       app->clearImageLassoRequestedRevision = 0;
+      app->clearImageLassoBaselineRevision = 0;
     }
     return;
   }
   // A serialized empty lasso carries an explicit reset revision. Do not restore
   // the previous selection over it while the matching empty cloud is arriving.
-  const LassoRegionState emptyState = parseViewerLassoRegionState(payload.lassoData);
-  if (payload.lassoRegionEmpty && emptyState.revision > 0) {
+  if (payload.lassoRegionEmpty && state.revision > 0) {
     app->cachedOfxImageLassoData.clear();
     if (app->clearImageLassoRequestedRevision > 0 &&
-        emptyState.revision >= app->clearImageLassoRequestedRevision) {
+        state.revision > app->clearImageLassoBaselineRevision) {
       app->clearImageLassoRequestedRevision = 0;
+      app->clearImageLassoBaselineRevision = 0;
     }
   }
+}
+
+uint64_t currentKnownOfxImageLassoRevision(const AppState& app) {
+  const LassoRegionState cached = parseViewerLassoRegionState(app.cachedOfxImageLassoData);
+  return std::max(app.lastObservedOfxImageLassoRevision, cached.revision);
+}
+
+void beginPendingImageLassoClear(AppState* app, uint64_t requestRevision) {
+  if (!app) return;
+  app->clearImageLassoBaselineRevision = currentKnownOfxImageLassoRevision(*app);
+  app->clearImageLassoRequestedRevision = requestRevision;
+  app->cachedOfxImageLassoData.clear();
 }
 
 void applyCachedOfxImageLassoSelection(const AppState& app, ResolvedPayload* payload) {
@@ -11025,7 +11190,7 @@ void applyPendingImageLassoResetToResolvedPayload(const AppState& app, ResolvedP
     return;
   }
   payload->lassoData =
-      serializeViewerLassoRegionState(app.clearImageLassoRequestedRevision, {});
+      serializeViewerLassoRegionState(std::max<uint64_t>(1, app.clearImageLassoBaselineRevision + 1), {});
   payload->lassoRegionEmpty = true;
   payload->cloudSettingsKey = cloudSettingsKeyWithoutImageLasso(payload->cloudSettingsKey) +
                               imageLassoSettingsSuffixForData(payload->lassoData);
@@ -11154,6 +11319,52 @@ constexpr PlotModelDescriptor kViewerPlotModelChoices[] = {
 constexpr int kViewerPlotModelChoiceCount =
     static_cast<int>(sizeof(kViewerPlotModelChoices) / sizeof(kViewerPlotModelChoices[0]));
 
+struct PlotModelMenuEntry {
+  const char* label;
+  int plotModel;
+  bool submenu;
+};
+
+constexpr PlotModelMenuEntry kPlotModelTopMenuEntries[] = {
+    {"Cube", 0, false},
+    {"Color Models", -1, true},
+    {"Chromaticity", 7, false},
+    {"Gloss View (beta)", 8, false},
+    {"Waveform", 9, false},
+    {"Histogram", 10, false},
+};
+
+constexpr int kPlotModelTopMenuEntryCount =
+    static_cast<int>(sizeof(kPlotModelTopMenuEntries) / sizeof(kPlotModelTopMenuEntries[0]));
+
+constexpr PlotModelMenuEntry kPlotModelColorSubmenuEntries[] = {
+    {"HSL", 1, false},
+    {"HSV", 2, false},
+    {"Chen", 3, false},
+    {"Norm-Cone", 4, false},
+    {"JP-Conical", 5, false},
+    {"Reuleaux", 6, false},
+};
+
+constexpr int kPlotModelColorSubmenuEntryCount =
+    static_cast<int>(sizeof(kPlotModelColorSubmenuEntries) / sizeof(kPlotModelColorSubmenuEntries[0]));
+constexpr int kPlotModelColorSubmenuTopIndex = 1;
+
+bool plotModelIsColorModel(int plotModel) {
+  return plotModel >= 1 && plotModel <= 6;
+}
+
+int plotModelMenuEntryIndexForModel(int plotModel) {
+  if (plotModelIsColorModel(plotModel)) return kPlotModelColorSubmenuTopIndex;
+  for (int i = 0; i < kPlotModelTopMenuEntryCount; ++i) {
+    if (!kPlotModelTopMenuEntries[i].submenu &&
+        kPlotModelTopMenuEntries[i].plotModel == plotModel) {
+      return i;
+    }
+  }
+  return 0;
+}
+
 const PlotModelDescriptor& plotModelDescriptor(int plotModel) {
   return kViewerPlotModelChoices[static_cast<std::size_t>(
       std::clamp(plotModel, 0, kViewerPlotModelChoiceCount - 1))];
@@ -11174,6 +11385,7 @@ ChromaspaceViewer::ViewerRuntimeState viewerStateForPlotModel(
     state.readGrayRamp = false;
     state.readIdentityPlot = false;
     state.isolateIdentityData = false;
+    state.excludeIdentityData = false;
   }
   if (!descriptor.supportsVolumeSlicing) {
     state.volumeSliceLassoRegion = false;
@@ -11264,6 +11476,7 @@ enum class ViewerMenuAction {
   ReadGrayRamp,
   ReadIdentity,
   IsolateIdentity,
+  ExcludeIdentityData,
   ReadResolution,
   ChromaticityInputPrimaries,
   ChromaticityInputTransfer,
@@ -11337,6 +11550,8 @@ struct ViewerMenuRow {
   bool choiceItem = false;
   bool note = false;
   bool channelSelector = false;
+  bool presetActionButtons = false;
+  bool spacer = false;
   int choiceValue = 0;
   int sliderMin = 0;
   int sliderMax = 0;
@@ -11350,6 +11565,7 @@ struct ViewerChoiceMenuItem {
   ViewerMenuAction action = ViewerMenuAction::None;
   const char* refreshPolicy = "reinterpret";
   bool displayReferred = false;
+  bool groupHeader = false;
 };
 
 std::vector<std::string> viewerUserPresetNames();
@@ -11510,6 +11726,26 @@ void appendNoteRow(std::vector<ViewerMenuRow>* rows,
   rows->push_back(row);
 }
 
+void appendPresetActionButtonsRow(std::vector<ViewerMenuRow>* rows) {
+  ViewerMenuRow row{};
+  row.action = ViewerMenuAction::None;
+  row.enabled = true;
+  row.refreshPolicy = "none";
+  row.presetActionButtons = true;
+  rows->push_back(row);
+}
+
+void appendSpacerRow(std::vector<ViewerMenuRow>* rows, const char* label = "") {
+  ViewerMenuRow row{};
+  row.section = true;
+  row.label = label ? label : "";
+  row.action = ViewerMenuAction::None;
+  row.enabled = false;
+  row.refreshPolicy = "none";
+  row.spacer = true;
+  rows->push_back(row);
+}
+
 void appendChoiceRow(std::vector<ViewerMenuRow>* rows,
                      const char* label,
                      int value,
@@ -11611,6 +11847,7 @@ bool viewerMenuActionCanPreviewFromCachedCloud(ViewerMenuAction action) {
          action == ViewerMenuAction::ReadGrayRamp ||
          action == ViewerMenuAction::ReadIdentity ||
          action == ViewerMenuAction::IsolateIdentity ||
+         action == ViewerMenuAction::ExcludeIdentityData ||
          action == ViewerMenuAction::ReadResolution ||
          action == ViewerMenuAction::ViewerLasso ||
          action == ViewerMenuAction::NeutralRadius ||
@@ -11700,6 +11937,7 @@ bool viewerMenuActionIsCheckbox(ViewerMenuAction action) {
     case ViewerMenuAction::ReadGrayRamp:
     case ViewerMenuAction::ReadIdentity:
     case ViewerMenuAction::IsolateIdentity:
+    case ViewerMenuAction::ExcludeIdentityData:
     case ViewerMenuAction::KeepOnTop:
     case ViewerMenuAction::ResetOnSwitch:
     case ViewerMenuAction::ShowWorkspaceButtons:
@@ -11821,26 +12059,26 @@ std::vector<ViewerMenuRow> buildViewerMenuRows(const AppState& app) {
                                  200,
                                  ViewerMenuAction::WaveformPointBrightness);
         appendSliderRowWithValue(&rows,
+                                 "Saturation",
+                                 fixedValue(state.waveformSaturation),
+                                 static_cast<int>(std::round(state.waveformSaturation * 100.0)),
+                                 0,
+                                 150,
+                                 ViewerMenuAction::WaveformSaturation);
+        appendSliderRowWithValue(&rows,
+                                 "Dot Size",
+                                 fixedValue(state.waveformDotSize),
+                                 static_cast<int>(std::round(state.waveformDotSize * 100.0)),
+                                 5,
+                                 150,
+                                 ViewerMenuAction::WaveformDotSize);
+        appendSliderRowWithValue(&rows,
                                  "Grid Brightness",
                                  fixedValue(state.waveformGridBrightness),
                                  static_cast<int>(std::round(state.waveformGridBrightness * 100.0)),
                                  0,
                                  200,
                                  ViewerMenuAction::WaveformGridBrightness);
-        appendSliderRowWithValue(&rows,
-                                 "Saturation",
-                                 fixedValue(state.waveformSaturation),
-                                 static_cast<int>(std::round(state.waveformSaturation * 100.0)),
-                                 0,
-                                 200,
-                                 ViewerMenuAction::WaveformSaturation);
-        appendSliderRowWithValue(&rows,
-                                 "Dot Size",
-                                 fixedValue(state.waveformDotSize),
-                                 static_cast<int>(std::round(state.waveformDotSize * 100.0)),
-                                 25,
-                                 300,
-                                 ViewerMenuAction::WaveformDotSize);
         appendRow(&rows,
                   "Detail",
                   state.waveformHighDetail ? "High" : "Standard",
@@ -12010,13 +12248,26 @@ std::vector<ViewerMenuRow> buildViewerMenuRows(const AppState& app) {
     }
     case ViewerMenuSection::Identity:
       if (plotModelDescriptor(state.plotModel).supportsFillVolume) {
+        const bool identityStripDataAvailable =
+            viewerGeneratedIdentityBandAvailable(app, false) ||
+            viewerGeneratedIdentityBandAvailable(app, true);
+        const bool excludeIdentityEnabled =
+            !state.volumeSliceLassoRegion && (identityStripDataAvailable || state.excludeIdentityData);
         const bool grayRampReadEnabled =
-            !state.volumeSliceLassoRegion && viewerGeneratedIdentityBandAvailable(app, false);
+            !state.volumeSliceLassoRegion && !state.excludeIdentityData &&
+            viewerGeneratedIdentityBandAvailable(app, false);
         const bool identityDataReadEnabled =
-            !state.volumeSliceLassoRegion && viewerGeneratedIdentityBandAvailable(app, true);
+            !state.volumeSliceLassoRegion && !state.excludeIdentityData &&
+            viewerGeneratedIdentityBandAvailable(app, true);
         const bool activeIdentityReadsEnabled =
             (state.readGrayRamp && grayRampReadEnabled) ||
             (state.readIdentityPlot && identityDataReadEnabled);
+        appendRow(&rows,
+                  "Exclude Identity Data",
+                  onOffLabel(state.excludeIdentityData),
+                  ViewerMenuAction::ExcludeIdentityData,
+                  excludeIdentityEnabled,
+                  "reinterpret");
         appendRow(&rows,
                   "Read Gray Ramp",
                   onOffLabel(state.readGrayRamp),
@@ -12093,9 +12344,6 @@ std::vector<ViewerMenuRow> buildViewerMenuRows(const AppState& app) {
       break;
     case ViewerMenuSection::Presets: {
       const bool hasPresets = viewerUserPresetExists();
-      const bool selectedPreset = viewerUserPresetExists(app.viewerPresetSelection);
-      const std::string requestedName = sanitizeViewerPresetName(app.viewerPresetNameInput);
-      const bool canSaveNew = !requestedName.empty();
       std::string nameValue = app.viewerPresetNameInput.empty() ? std::string("Click to name") : app.viewerPresetNameInput;
       if (app.viewerPresetNameEditing) nameValue += "|";
       const std::string presetValue = !app.viewerPresetSelection.empty()
@@ -12108,11 +12356,8 @@ std::vector<ViewerMenuRow> buildViewerMenuRows(const AppState& app) {
                 hasPresets,
                 "resample");
       appendRow(&rows, "Preset Name", nameValue, ViewerMenuAction::EditPresetName, true, "none");
-      appendRow(&rows, "Save New", "Save", ViewerMenuAction::SaveUserPreset, canSaveNew, "none");
-      appendRow(&rows, "Update Selected", "Update", ViewerMenuAction::UpdateUserPreset,
-                selectedPreset && viewerPresetNameEditableTarget(app.viewerPresetSelection), "none");
-      appendRow(&rows, "Delete Selected", "Delete", ViewerMenuAction::DeleteUserPreset,
-                selectedPreset && viewerPresetNameEditableTarget(app.viewerPresetSelection), "none");
+      appendPresetActionButtonsRow(&rows);
+      appendSpacerRow(&rows);
       appendRow(&rows, "Save Defaults", "Save", ViewerMenuAction::SaveDefaults, true, "none");
       appendRow(&rows, "Restore Defaults", "Load", ViewerMenuAction::RestoreDefaults, true, "resample");
       break;
@@ -12126,13 +12371,19 @@ std::vector<ViewerChoiceMenuItem> buildViewerChoiceMenuItems(const AppState& app
   const auto state = viewerStateWithModelCapabilities(app.viewerState);
   std::vector<ViewerChoiceMenuItem> items;
   if (action == ViewerMenuAction::PlotModel) {
-    items.reserve(kViewerPlotModelChoiceCount);
-    for (int i = 0; i < kViewerPlotModelChoiceCount; ++i) {
-      items.push_back({kViewerPlotModelChoices[i].label,
-                       i,
-                       i == state.plotModel,
+    items.reserve(kPlotModelTopMenuEntryCount);
+    for (int i = 0; i < kPlotModelTopMenuEntryCount; ++i) {
+      const PlotModelMenuEntry& entry = kPlotModelTopMenuEntries[i];
+      const bool selected =
+          entry.submenu ? plotModelIsColorModel(state.plotModel)
+                        : entry.plotModel == state.plotModel;
+      items.push_back({entry.label,
+                       entry.plotModel,
+                       selected,
                        ViewerMenuAction::PlotModel,
-                       "reinterpret"});
+                       "reinterpret",
+                       false,
+                       entry.submenu});
     }
   } else if (action == ViewerMenuAction::PlotLinearTransfer) {
     const std::vector<int> ordered = orderedTransferChoiceIndices();
@@ -12577,6 +12828,7 @@ bool parseViewerStateJson(const std::string& json, ChromaspaceViewer::ViewerRunt
   readBool("readGrayRamp", &s.readGrayRamp);
   readBool("readIdentityPlot", &s.readIdentityPlot);
   readBool("isolateIdentityData", &s.isolateIdentityData);
+  readBool("excludeIdentityData", &s.excludeIdentityData);
   readInt("identityReadResolution", &s.identityReadResolution);
   readBool("volumeSliceLassoRegion", &s.volumeSliceLassoRegion);
   readBool("cubeSliceRed", &s.volumeSliceRed);
@@ -13195,6 +13447,7 @@ ChromaspaceViewer::ViewerRuntimeState viewerStateFromSharedPresetValuesJson(
   readBool("readGrayRamp", &state.readGrayRamp);
   readBool("readIdentityPlot", &state.readIdentityPlot);
   readBool("isolateIdentityData", &state.isolateIdentityData);
+  readBool("excludeIdentityData", &state.excludeIdentityData);
   readBool("liveUpdate", &state.liveUpdate);
   readBool("keepOnTop", &state.keepOnTop);
   readBool("resetViewOnPlotSwitch", &state.resetViewOnPlotSwitch);
@@ -13274,6 +13527,7 @@ std::string viewerSharedPresetValuesJsonFromState(
   os << "\"readGrayRamp\":" << (s.readGrayRamp ? "true" : "false") << ",";
   os << "\"readIdentityPlot\":" << (s.readIdentityPlot ? "true" : "false") << ",";
   os << "\"isolateIdentityData\":" << (s.isolateIdentityData ? "true" : "false") << ",";
+  os << "\"excludeIdentityData\":" << (s.excludeIdentityData ? "true" : "false") << ",";
   os << "\"liveUpdate\":" << (s.liveUpdate ? "true" : "false") << ",";
   os << "\"keepOnTop\":" << (s.keepOnTop ? "true" : "false") << ",";
   os << "\"resetViewOnPlotSwitch\":" << (s.resetViewOnPlotSwitch ? "true" : "false") << ",";
@@ -13707,6 +13961,7 @@ ChromaspaceViewer::ViewerRuntimeState aggregateHostStateForWorkspace(const AppSt
   // isolation, and model-specific filtering remain owned by each plot window.
   aggregate.plotModel = 0;
   aggregate.isolateIdentityData = false;
+  aggregate.excludeIdentityData = false;
   aggregate.quality = 0;
   aggregate.scale = 0;
   aggregate.occupancyGuidedFill = false;
@@ -13764,6 +14019,7 @@ ChromaspaceViewer::ViewerRuntimeState aggregateHostStateForWorkspace(const AppSt
 
   aggregate = ChromaspaceViewer::clampedViewerRuntimeState(aggregate);
   aggregate.isolateIdentityData = false;
+  aggregate.excludeIdentityData = false;
   aggregate.sampleSettingsKey = ChromaspaceViewer::sampleSettingsKey(aggregate, false);
   return aggregate;
 }
@@ -13962,6 +14218,7 @@ void applyViewerStateToApp(AppState* app, const ChromaspaceViewer::ViewerRuntime
   app->readGrayRamp = app->viewerState.readGrayRamp;
   app->readIdentityPlot = app->viewerState.readIdentityPlot;
   app->isolateIdentityData = app->viewerState.isolateIdentityData;
+  app->excludeIdentityData = app->viewerState.excludeIdentityData;
   app->identityReadResolution = app->viewerState.identityReadResolution;
   if (auto* window = focusedPlotWindow(app)) {
     window->viewState = app->viewerState;
@@ -14040,9 +14297,10 @@ void applyViewerStateToResolvedViewFields(const ChromaspaceViewer::ViewerRuntime
   payload->identityOverlayRequestedSize = s.fillResolution;
   payload->identityOverlaySize = s.fillResolution;
   payload->identityOverlayAuto = false;
-  payload->readGrayRamp = !imageLassoActive && s.readGrayRamp;
-  payload->readIdentityPlot = !imageLassoActive && s.readIdentityPlot;
-  payload->isolateIdentityData = !imageLassoActive && s.isolateIdentityData;
+  payload->excludeIdentityData = !imageLassoActive && s.excludeIdentityData;
+  payload->readGrayRamp = !imageLassoActive && !s.excludeIdentityData && s.readGrayRamp;
+  payload->readIdentityPlot = !imageLassoActive && !s.excludeIdentityData && s.readIdentityPlot;
+  payload->isolateIdentityData = !imageLassoActive && !s.excludeIdentityData && s.isolateIdentityData;
   payload->identityReadResolution = s.identityReadResolution;
   payload->chromaticityInputPrimaries = s.chromaticityInputPrimaries;
   payload->chromaticityInputTransfer = s.chromaticityInputTransfer;
@@ -14176,6 +14434,51 @@ std::array<PlotMenuRect, 3> waveformChannelSelectorRects(const PlotMenuRect& row
   return rects;
 }
 
+std::array<PlotMenuRect, 3> presetActionButtonRects(const PlotMenuRect& rowRect) {
+  constexpr float kGap = 8.0f;
+  const float available = std::max(120.0f, rowRect.x1 - rowRect.x0 - 20.0f);
+  const float buttonW = std::min(94.0f, std::max(54.0f, (available - kGap * 2.0f) / 3.0f));
+  const float totalW = buttonW * 3.0f + kGap * 2.0f;
+  const float x0 = rowRect.x1 - 10.0f - totalW;
+  const float y0 = rowRect.y0 + 5.0f;
+  std::array<PlotMenuRect, 3> rects{};
+  for (int i = 0; i < 3; ++i) {
+    const float bx0 = x0 + static_cast<float>(i) * (buttonW + kGap);
+    rects[static_cast<size_t>(i)] = {bx0, y0, bx0 + buttonW, rowRect.y1 - 5.0f};
+  }
+  return rects;
+}
+
+bool presetActionAvailable(const AppState& app, ViewerMenuAction action) {
+  const bool selectedPreset = viewerUserPresetExists(app.viewerPresetSelection);
+  switch (action) {
+    case ViewerMenuAction::SaveUserPreset:
+      return !sanitizeViewerPresetName(app.viewerPresetNameInput).empty();
+    case ViewerMenuAction::UpdateUserPreset:
+    case ViewerMenuAction::DeleteUserPreset:
+      return selectedPreset && viewerPresetNameEditableTarget(app.viewerPresetSelection);
+    default:
+      return false;
+  }
+}
+
+ViewerMenuAction presetActionAtPoint(const AppState& app, const PlotMenuRect& rowRect, double x, double y) {
+  constexpr ViewerMenuAction actions[3] = {
+      ViewerMenuAction::SaveUserPreset,
+      ViewerMenuAction::UpdateUserPreset,
+      ViewerMenuAction::DeleteUserPreset};
+  const auto rects = presetActionButtonRects(rowRect);
+  for (int i = 0; i < 3; ++i) {
+    const ViewerMenuAction action = actions[i];
+    const PlotMenuRect& rect = rects[static_cast<size_t>(i)];
+    if (presetActionAvailable(app, action) &&
+        x >= rect.x0 && x <= rect.x1 && y >= rect.y0 && y <= rect.y1) {
+      return action;
+    }
+  }
+  return ViewerMenuAction::None;
+}
+
 void toggleWaveformChannel(AppState* app, int channel) {
   if (!app || channel < 0 || channel > 2) return;
   auto state = viewerStateWithModelCapabilities(app->viewerState);
@@ -14199,6 +14502,7 @@ PlotMenuRect plotWindowCloseWindowRect(const PlotWindowState& window,
 
 bool pointInPlotMenuRect(const PlotMenuRect& rect, double x, double y);
 PlotMenuRect viewerChoiceMenuWindowRect(const AppState& app, int width, int height);
+PlotMenuRect viewerChoicePlotModelColorSubmenuRect(const AppState& app, int width, int height);
 
 void applyDefaultCameraForViewerPlotSelection(AppState* app, const std::string& prevPlotMode);
 
@@ -14241,6 +14545,7 @@ bool copyViewerPresetParameter(ViewerMenuAction action,
     case ViewerMenuAction::ReadGrayRamp: state->readGrayRamp = preset.readGrayRamp; return true;
     case ViewerMenuAction::ReadIdentity: state->readIdentityPlot = preset.readIdentityPlot; return true;
     case ViewerMenuAction::IsolateIdentity: state->isolateIdentityData = preset.isolateIdentityData; return true;
+    case ViewerMenuAction::ExcludeIdentityData: state->excludeIdentityData = preset.excludeIdentityData; return true;
     case ViewerMenuAction::ReadResolution: state->identityReadResolution = preset.identityReadResolution; return true;
     case ViewerMenuAction::ChromaticityInputPrimaries: state->chromaticityInputPrimaries = preset.chromaticityInputPrimaries; return true;
     case ViewerMenuAction::ChromaticityInputTransfer: state->chromaticityInputTransfer = preset.chromaticityInputTransfer; return true;
@@ -14370,6 +14675,7 @@ void activateViewerMenuRow(AppState* app, const ViewerMenuRow& row) {
         state.readGrayRamp = false;
         state.readIdentityPlot = false;
         state.isolateIdentityData = false;
+        state.excludeIdentityData = false;
       }
       state = viewerStateForPlotModel(state, state.plotModel);
       bump();
@@ -14440,8 +14746,7 @@ void activateViewerMenuRow(AppState* app, const ViewerMenuRow& row) {
         bump();
         if (enablingLasso) {
           app->focusPlotNodeRequestedRevision = state.stateRevision;
-          app->clearImageLassoRequestedRevision = state.stateRevision;
-          app->cachedOfxImageLassoData.clear();
+          beginPendingImageLassoClear(app, state.stateRevision);
         }
       }
       break;
@@ -14449,8 +14754,7 @@ void activateViewerMenuRow(AppState* app, const ViewerMenuRow& row) {
       clearViewerLassoState(app);
       state = viewerStateWithModelCapabilities(app->viewerState);
       bump();
-      app->clearImageLassoRequestedRevision = state.stateRevision;
-      app->cachedOfxImageLassoData.clear();
+      beginPendingImageLassoClear(app, state.stateRevision);
       break;
     case ViewerMenuAction::FillVolume: state.fillVolume = !state.fillVolume; bump(); break;
     case ViewerMenuAction::FillResolution:
@@ -14460,13 +14764,24 @@ void activateViewerMenuRow(AppState* app, const ViewerMenuRow& row) {
     case ViewerMenuAction::FillRamp: state.fillGrayRamp = !state.fillGrayRamp; bump(); break;
     case ViewerMenuAction::ReadGrayRamp:
       state.readGrayRamp = !state.readGrayRamp;
+      if (state.readGrayRamp) state.excludeIdentityData = false;
       bump();
       break;
     case ViewerMenuAction::ReadIdentity:
       state.readIdentityPlot = !state.readIdentityPlot;
+      if (state.readIdentityPlot) state.excludeIdentityData = false;
       bump();
       break;
     case ViewerMenuAction::IsolateIdentity: state.isolateIdentityData = !state.isolateIdentityData; bump(); break;
+    case ViewerMenuAction::ExcludeIdentityData:
+      state.excludeIdentityData = !state.excludeIdentityData;
+      if (state.excludeIdentityData) {
+        state.readGrayRamp = false;
+        state.readIdentityPlot = false;
+        state.isolateIdentityData = false;
+      }
+      bump();
+      break;
     case ViewerMenuAction::ReadResolution:
       state.identityReadResolution =
           state.identityReadResolution >= 65 ? 4 : ChromaspaceViewer::clampOverlaySize(state.identityReadResolution + 4);
@@ -14646,7 +14961,7 @@ void activateViewerMenuRow(AppState* app, const ViewerMenuRow& row) {
 }
 
 void activateViewerChoiceMenuItem(AppState* app, const ViewerChoiceMenuItem& item) {
-  if (!app || item.action == ViewerMenuAction::None) return;
+  if (!app || item.action == ViewerMenuAction::None || item.groupHeader) return;
   ViewerMenuRow row{};
   row.label = item.label;
   row.action = item.action;
@@ -14737,14 +15052,14 @@ void updateViewerMenuSlider(AppState* app, ViewerMenuAction action, int value, c
     }
     case ViewerMenuAction::WaveformSaturation: {
       const double next =
-          ChromaspaceViewer::clampDouble(static_cast<double>(value) / 100.0, 0.0, 2.0);
+          ChromaspaceViewer::clampDouble(static_cast<double>(value) / 100.0, 0.0, 1.5);
       changed = std::abs(state.waveformSaturation - next) > 1e-6;
       state.waveformSaturation = next;
       break;
     }
     case ViewerMenuAction::WaveformDotSize: {
       const double next =
-          ChromaspaceViewer::clampDouble(static_cast<double>(value) / 100.0, 0.25, 3.0);
+          ChromaspaceViewer::clampDouble(static_cast<double>(value) / 100.0, 0.05, 1.5);
       changed = std::abs(state.waveformDotSize - next) > 1e-6;
       state.waveformDotSize = next;
       break;
@@ -14789,8 +15104,7 @@ void toggleViewerLassoFromIdentityPopover(AppState* app) {
   state.stateRevision = std::max<uint64_t>(state.stateRevision + 1, 1);
   if (enablingLasso) {
     app->focusPlotNodeRequestedRevision = state.stateRevision;
-    app->clearImageLassoRequestedRevision = state.stateRevision;
-    app->cachedOfxImageLassoData.clear();
+    beginPendingImageLassoClear(app, state.stateRevision);
   }
   applyViewerStateToApp(app, state);
   app->viewerStateLocalOverride =
@@ -14852,7 +15166,7 @@ PlotMenuRect quickPlotModelMenuRect(const AppState& app, int width, int height) 
   const float menuWidth = std::min(std::max(210.0f, w * 0.28f), std::max(210.0f, w - 16.0f));
   const float headerHeight = 24.0f;
   const float menuHeight = kPlotMenuPad * 2.0f + headerHeight +
-                           kViewerChoiceMenuRowHeight * static_cast<float>(kViewerPlotModelChoiceCount);
+                           kViewerChoiceMenuRowHeight * static_cast<float>(kPlotModelTopMenuEntryCount);
   const float x0 = clampf(static_cast<float>(app.quickPlotModelMenuX),
                           8.0f,
                           std::max(8.0f, w - menuWidth - 8.0f));
@@ -14868,7 +15182,7 @@ PlotMenuRect addPlotMenuRect(const AppState& app, int width, int height) {
   const float menuWidth = std::min(std::max(220.0f, w * 0.28f), std::max(220.0f, w - 16.0f));
   const float headerHeight = 24.0f;
   const float menuHeight = kPlotMenuPad * 2.0f + headerHeight +
-                           kViewerChoiceMenuRowHeight * static_cast<float>(kViewerPlotModelChoiceCount);
+                           kViewerChoiceMenuRowHeight * static_cast<float>(kPlotModelTopMenuEntryCount);
   const float x0 = clampf(static_cast<float>(app.addPlotMenuX),
                           8.0f,
                           std::max(8.0f, w - menuWidth - 8.0f));
@@ -14895,7 +15209,7 @@ int quickPlotModelMenuIndexAt(const AppState& app, int width, int height, double
   const float localY = static_cast<float>(y) - rect.y0 - kPlotMenuPad - 24.0f;
   if (localY < 0.0f) return -1;
   const int index = static_cast<int>(localY / kViewerChoiceMenuRowHeight);
-  return (index >= 0 && index < kViewerPlotModelChoiceCount) ? index : -1;
+  return (index >= 0 && index < kPlotModelTopMenuEntryCount) ? index : -1;
 }
 
 int addPlotMenuIndexAt(const AppState& app, int width, int height, double x, double y) {
@@ -14904,7 +15218,50 @@ int addPlotMenuIndexAt(const AppState& app, int width, int height, double x, dou
   const float localY = static_cast<float>(y) - rect.y0 - kPlotMenuPad - 24.0f;
   if (localY < 0.0f) return -1;
   const int index = static_cast<int>(localY / kViewerChoiceMenuRowHeight);
-  return (index >= 0 && index < kViewerPlotModelChoiceCount) ? index : -1;
+  return (index >= 0 && index < kPlotModelTopMenuEntryCount) ? index : -1;
+}
+
+PlotMenuRect plotModelColorSubmenuRect(const PlotMenuRect& parentRect,
+                                       int width,
+                                       int height,
+                                       float rowsOffset) {
+  const float submenuWidth = std::min(190.0f, std::max(150.0f, static_cast<float>(width) - 16.0f));
+  const float submenuHeight = kPlotMenuPad * 2.0f +
+                              kViewerChoiceMenuRowHeight *
+                                  static_cast<float>(kPlotModelColorSubmenuEntryCount);
+  float x0 = parentRect.x1 + kPlotMenuGap;
+  if (x0 + submenuWidth > static_cast<float>(width) - 8.0f) {
+    x0 = parentRect.x0 - kPlotMenuGap - submenuWidth;
+  }
+  float y0 = parentRect.y0 + rowsOffset +
+             static_cast<float>(kPlotModelColorSubmenuTopIndex) * kViewerChoiceMenuRowHeight;
+  y0 = clampf(y0, 8.0f, std::max(8.0f, static_cast<float>(height) - submenuHeight - 8.0f));
+  return {x0, y0, x0 + submenuWidth, y0 + submenuHeight};
+}
+
+int plotModelColorSubmenuModelAt(const PlotMenuRect& submenuRect, double x, double y) {
+  if (!pointInPlotMenuRect(submenuRect, x, y)) return -1;
+  const float localY = static_cast<float>(y) - submenuRect.y0 - kPlotMenuPad;
+  if (localY < 0.0f) return -1;
+  const int index = static_cast<int>(localY / kViewerChoiceMenuRowHeight);
+  if (index < 0 || index >= kPlotModelColorSubmenuEntryCount) return -1;
+  return kPlotModelColorSubmenuEntries[index].plotModel;
+}
+
+PlotMenuRect quickPlotModelColorSubmenuRect(const AppState& app, int width, int height) {
+  return plotModelColorSubmenuRect(quickPlotModelMenuRect(app, width, height), width, height, kPlotMenuPad + 24.0f);
+}
+
+PlotMenuRect addPlotModelColorSubmenuRect(const AppState& app, int width, int height) {
+  return plotModelColorSubmenuRect(addPlotMenuRect(app, width, height), width, height, kPlotMenuPad + 24.0f);
+}
+
+int quickPlotModelColorSubmenuModelAt(const AppState& app, int width, int height, double x, double y) {
+  return plotModelColorSubmenuModelAt(quickPlotModelColorSubmenuRect(app, width, height), x, y);
+}
+
+int addPlotModelColorSubmenuModelAt(const AppState& app, int width, int height, double x, double y) {
+  return plotModelColorSubmenuModelAt(addPlotModelColorSubmenuRect(app, width, height), x, y);
 }
 
 int layoutMenuIndexAt(const AppState& app, int width, int height, double x, double y) {
@@ -14921,8 +15278,20 @@ bool pointerInViewerMenuUi(const AppState& app, int width, int height, double x,
       pointInPlotMenuRect(quickPlotModelMenuRect(app, width, height), x, y)) {
     return true;
   }
+  if (app.quickPlotModelMenuVisible &&
+      (app.quickPlotModelMenuHover == kPlotModelColorSubmenuTopIndex ||
+       plotModelColorSubmenuModelAt(quickPlotModelColorSubmenuRect(app, width, height), x, y) >= 0) &&
+      pointInPlotMenuRect(quickPlotModelColorSubmenuRect(app, width, height), x, y)) {
+    return true;
+  }
   if (app.addPlotMenuVisible &&
       pointInPlotMenuRect(addPlotMenuRect(app, width, height), x, y)) {
+    return true;
+  }
+  if (app.addPlotMenuVisible &&
+      (app.addPlotMenuHover == kPlotModelColorSubmenuTopIndex ||
+       plotModelColorSubmenuModelAt(addPlotModelColorSubmenuRect(app, width, height), x, y) >= 0) &&
+      pointInPlotMenuRect(addPlotModelColorSubmenuRect(app, width, height), x, y)) {
     return true;
   }
   if (app.layoutMenuVisible &&
@@ -14932,7 +15301,11 @@ bool pointerInViewerMenuUi(const AppState& app, int width, int height, double x,
   if (!app.plotModelMenuVisible) return false;
   if (pointInPlotMenuRect(plotMenuMainRect(app, width, height), x, y)) return true;
   const PlotMenuRect choice = viewerChoiceMenuWindowRect(app, width, height);
-  return choice.x1 > choice.x0 && choice.y1 > choice.y0 && pointInPlotMenuRect(choice, x, y);
+  if (choice.x1 > choice.x0 && choice.y1 > choice.y0 && pointInPlotMenuRect(choice, x, y)) return true;
+  const PlotMenuRect colorChoice = viewerChoicePlotModelColorSubmenuRect(app, width, height);
+  return viewerMenuActionFromInt(app.viewerMenuChoiceAction) == ViewerMenuAction::PlotModel &&
+         colorChoice.x1 > colorChoice.x0 && colorChoice.y1 > colorChoice.y0 &&
+         pointInPlotMenuRect(colorChoice, x, y);
 }
 
 PlotMenuRect plotMenuSubRect(const PlotMenuRect& mainRect, int hoverMain, int width, int height) {
@@ -14951,6 +15324,8 @@ bool pointInPlotMenuRect(const PlotMenuRect& rect, double x, double y) {
 }
 
 float viewerMenuRowHeight(const ViewerMenuRow& row) {
+  if (row.spacer) return 18.0f;
+  if (row.presetActionButtons) return 38.0f;
   return row.note ? (kPlotMenuRowHeight * 2.25f) : kPlotMenuRowHeight;
 }
 
@@ -14975,6 +15350,40 @@ bool viewerSettingsSubtabsVisible(const AppState& app) {
 
 float viewerMenuRowsX0(const PlotMenuRect& rect) {
   return rect.x0 + kViewerDrawerPad + kViewerDrawerTabRailWidth + kViewerDrawerPad;
+}
+
+std::string currentViewerPresetLabel(const AppState& app) {
+  if (!app.viewerPresetSelection.empty()) return app.viewerPresetSelection;
+  return viewerUserPresetExists() ? std::string("Default") : std::string("No presets");
+}
+
+PlotMenuRect viewerMenuCompactPresetWindowRect(const AppState& app, int width, int height) {
+  if (!app.plotModelMenuVisible) return {};
+  const PlotMenuRect rect = plotMenuMainRect(app, width, height);
+  const std::vector<ViewerMenuTab> tabs = buildViewerMenuTabs(app);
+  const float x0 = rect.x0 + kViewerDrawerPad;
+  const float tabsY0 = rect.y0 + kViewerDrawerHeaderHeight + kViewerDrawerPad;
+  const float naturalY0 =
+      tabsY0 + static_cast<float>(tabs.size()) * kViewerDrawerTabHeight + 8.0f;
+  const float selectorHeight = 24.0f;
+  const float y0 = clampf(naturalY0,
+                          rect.y0 + kViewerDrawerHeaderHeight + kViewerDrawerPad,
+                          std::max(rect.y0 + kViewerDrawerHeaderHeight + kViewerDrawerPad,
+                                   rect.y1 - kViewerDrawerPad - selectorHeight));
+  return {x0,
+          y0,
+          x0 + kViewerDrawerTabRailWidth,
+          y0 + selectorHeight};
+}
+
+bool pointInViewerMenuCompactPresetSelector(const AppState& app,
+                                            int width,
+                                            int height,
+                                            double x,
+                                            double y) {
+  const PlotMenuRect rect = viewerMenuCompactPresetWindowRect(app, width, height);
+  return rect.x1 > rect.x0 && rect.y1 > rect.y0 &&
+         x >= rect.x0 && x <= rect.x1 && y >= rect.y0 && y <= rect.y1;
 }
 
 float viewerMenuRowsY0(const AppState& app, const PlotMenuRect& rect) {
@@ -15120,7 +15529,9 @@ bool neutralRadiusOverflowPopoverVisible(const AppState& app, int width, int hei
 }
 
 bool viewerMenuIdentityLassoLockedAction(ViewerMenuAction action) {
-  return action == ViewerMenuAction::ReadGrayRamp || action == ViewerMenuAction::ReadIdentity;
+  return action == ViewerMenuAction::ReadGrayRamp ||
+         action == ViewerMenuAction::ReadIdentity ||
+         action == ViewerMenuAction::ExcludeIdentityData;
 }
 
 int identityLassoPopoverRowIndexForPoint(const AppState& app,
@@ -15343,9 +15754,19 @@ PlotMenuRect viewerChoiceMenuWindowRect(const AppState& app, int width, int heig
   if (items.empty()) return {};
   const ViewerMenuAction action = viewerMenuActionFromInt(app.viewerMenuChoiceAction);
   const int rowIndex = viewerMenuRowIndexForAction(app, action);
-  if (rowIndex < 0) return {};
   const PlotMenuRect drawer = plotMenuMainRect(app, width, height);
-  const PlotMenuRect rowRect = viewerMenuRowWindowRect(app, width, height, rowIndex);
+  PlotMenuRect rowRect{};
+  const bool anchoredToCompactPreset =
+      action == ViewerMenuAction::LoadUserPreset &&
+      app.plotModelMenuVisible &&
+      (app.viewerPresetChoiceAnchorCompact || rowIndex < 0);
+  if (anchoredToCompactPreset) {
+    rowRect = viewerMenuCompactPresetWindowRect(app, width, height);
+  } else if (rowIndex >= 0) {
+    rowRect = viewerMenuRowWindowRect(app, width, height, rowIndex);
+  } else {
+    return {};
+  }
   const float rowsX0 = drawer.x0 + kViewerDrawerPad + kViewerDrawerTabRailWidth + kViewerDrawerPad;
   const float rowsX1 = drawer.x1 - kViewerDrawerPad;
   const float availableWidth = std::max(1.0f, rowsX1 - rowsX0);
@@ -15359,10 +15780,27 @@ PlotMenuRect viewerChoiceMenuWindowRect(const AppState& app, int width, int heig
   const float availableHeight = std::max(kViewerChoiceMenuPad * 2.0f + kViewerChoiceMenuRowHeight,
                                          maxY - minY);
   const float menuHeight = std::min(naturalHeight, availableHeight);
-  float y0 = rowRect.y1 + 4.0f;
+  float y0 = anchoredToCompactPreset ? rowRect.y1 + 6.0f : rowRect.y1 + 4.0f;
   if (y0 + menuHeight > maxY) y0 = rowRect.y0 - 4.0f - menuHeight;
   y0 = clampf(y0, minY, std::max(minY, maxY - menuHeight));
+  if (anchoredToCompactPreset) {
+    const float compactX0 = drawer.x0 + kViewerDrawerPad;
+    const float compactX1 = std::min(drawer.x1 - kViewerDrawerPad, compactX0 + menuWidth);
+    return {compactX0, y0, compactX1, y0 + menuHeight};
+  }
   return {x0, y0, x1, y0 + menuHeight};
+}
+
+PlotMenuRect viewerChoicePlotModelColorSubmenuRect(const AppState& app, int width, int height) {
+  return plotModelColorSubmenuRect(viewerChoiceMenuWindowRect(app, width, height),
+                                   width,
+                                   height,
+                                   kViewerChoiceMenuPad);
+}
+
+int viewerChoicePlotModelColorSubmenuModelAt(const AppState& app, int width, int height, double x, double y) {
+  if (viewerMenuActionFromInt(app.viewerMenuChoiceAction) != ViewerMenuAction::PlotModel) return -1;
+  return plotModelColorSubmenuModelAt(viewerChoicePlotModelColorSubmenuRect(app, width, height), x, y);
 }
 
 float viewerChoiceMenuMaxScroll(const AppState& app, int width, int height) {
@@ -15625,8 +16063,18 @@ void updatePlotWindowSnapPreview(AppState* app,
   auto workspaceCandidate = [&](float x, float y, float width, float height) {
     return plotWorkspaceRect(x, y, width, height, windowHeight);
   };
+  const bool singleWindowWorkspace = app->plotWindows.size() <= 1u;
+  const bool nearWorkspaceEdge = nx <= edgeX || nx >= 1.0f - edgeX ||
+                                 workspaceNy <= edgeY || workspaceNy >= 1.0f - edgeY;
+  const bool nearlyFullWidth = candidate.w >= 0.92f;
+  const bool nearlyFullHeight = candidate.h >= workspaceHeight * 0.86f;
 
-  if (nx <= cornerX && workspaceNy <= cornerY) {
+  if (singleWindowWorkspace &&
+      (nearWorkspaceEdge || (nearlyFullWidth && (workspaceNy <= cornerY || workspaceNy >= 1.0f - cornerY)) ||
+       (nearlyFullHeight && (nx <= cornerX || nx >= 1.0f - cornerX)))) {
+    candidate = workspaceCandidate(0.0f, 0.0f, 1.0f, 1.0f);
+    haveCandidate = true;
+  } else if (nx <= cornerX && workspaceNy <= cornerY) {
     candidate = workspaceCandidate(0.0f, 0.0f, 0.5f, 0.5f);
     haveCandidate = true;
   } else if (nx >= 1.0f - cornerX && workspaceNy <= cornerY) {
@@ -15945,7 +16393,8 @@ void keyCallback(GLFWwindow* window, int key, int, int action, int) {
     app->viewerChoiceMenuScroll = 0.0f;
     app->plotModelMenuHoverMain = -1;
     app->plotModelMenuHoverSub = -1;
-    app->quickPlotModelMenuHover = app->quickPlotModelMenuVisible ? app->viewerState.plotModel : -1;
+    app->quickPlotModelMenuHover =
+        app->quickPlotModelMenuVisible ? plotModelMenuEntryIndexForModel(app->viewerState.plotModel) : -1;
     app->addPlotMenuHover = -1;
     app->layoutMenuHover = -1;
     app->viewerMenuHoverTab = -1;
@@ -15963,7 +16412,8 @@ void keyCallback(GLFWwindow* window, int key, int, int action, int) {
     app->layoutMenuVisible = false;
     app->addPlotMenuX = cursorX;
     app->addPlotMenuY = cursorY;
-    app->addPlotMenuHover = app->addPlotMenuVisible ? app->viewerState.plotModel : -1;
+    app->addPlotMenuHover =
+        app->addPlotMenuVisible ? plotModelMenuEntryIndexForModel(app->viewerState.plotModel) : -1;
     app->quickPlotModelMenuHover = -1;
     app->layoutMenuHover = -1;
     app->viewerMenuChoiceAction = static_cast<int>(ViewerMenuAction::None);
@@ -17137,14 +17587,16 @@ void drawQuickPlotModelMenuOverlay(const AppState& app,
                        0.86f,
                        0.94f);
 
-  for (int i = 0; i < kViewerPlotModelChoiceCount; ++i) {
+  for (int i = 0; i < kPlotModelTopMenuEntryCount; ++i) {
+    const PlotModelMenuEntry& entry = kPlotModelTopMenuEntries[i];
     const float itemY0 = menuWindowRect.y0 + kPlotMenuPad +
                          static_cast<float>(i) * kViewerChoiceMenuRowHeight + 24.0f;
     const PlotMenuRect itemRect = scaleRect({menuWindowRect.x0 + kPlotMenuPad,
                                              itemY0,
                                              menuWindowRect.x1 - kPlotMenuPad,
                                              itemY0 + kViewerChoiceMenuRowHeight});
-    const bool selected = i == app.viewerState.plotModel;
+    const bool selected = entry.submenu ? plotModelIsColorModel(app.viewerState.plotModel)
+                                        : entry.plotModel == app.viewerState.plotModel;
     const bool hovered = i == app.quickPlotModelMenuHover;
     if (hovered) {
       drawPlotMenuRect(itemRect.x0, itemRect.y0, itemRect.x1, itemRect.y1,
@@ -17161,7 +17613,7 @@ void drawQuickPlotModelMenuOverlay(const AppState& app,
                        0.86f);
     }
     drawHudTextLine(renderer,
-                    kViewerPlotModelChoices[i].label,
+                    entry.label,
                     itemRect.x0 + (selected ? 14.0f : 10.0f),
                     itemRect.y0 + (renderer.available ? 8.0f : 9.0f),
                     textScale,
@@ -17169,6 +17621,63 @@ void drawQuickPlotModelMenuOverlay(const AppState& app,
                     0.88f,
                     0.93f,
                     0.98f);
+    if (entry.submenu) {
+      drawHudTextLineRight(renderer,
+                           ">",
+                           itemRect.x1 - 10.0f,
+                           itemRect.y0 + (renderer.available ? 8.0f : 9.0f),
+                           textScale,
+                           hovered ? 0.96f : 0.70f,
+                           0.88f,
+                           0.93f,
+                           0.98f);
+    }
+  }
+
+  const PlotMenuRect colorSubmenuWindowRect = quickPlotModelColorSubmenuRect(app, windowWidth, windowHeight);
+  const bool showColorSubmenu =
+      app.quickPlotModelMenuHover == kPlotModelColorSubmenuTopIndex ||
+      pointInPlotMenuRect(colorSubmenuWindowRect, app.hoverX, app.hoverY);
+  if (showColorSubmenu) {
+    const PlotMenuRect subRect = scaleRect(colorSubmenuWindowRect);
+    drawPlotMenuRect(subRect.x0, subRect.y0, subRect.x1, subRect.y1, 0.012f, 0.014f, 0.019f, 0.96f);
+    drawPlotMenuRect(subRect.x0, subRect.y1 - 1.0f, subRect.x1, subRect.y1, 0.75f, 0.82f, 0.92f, 0.20f);
+    drawPlotMenuRect(subRect.x0, subRect.y0, subRect.x1, subRect.y0 + 1.0f, 0.75f, 0.82f, 0.92f, 0.12f);
+    const int hoveredModel = quickPlotModelColorSubmenuModelAt(app, windowWidth, windowHeight, app.hoverX, app.hoverY);
+    for (int i = 0; i < kPlotModelColorSubmenuEntryCount; ++i) {
+      const PlotModelMenuEntry& entry = kPlotModelColorSubmenuEntries[i];
+      const float itemY0 = colorSubmenuWindowRect.y0 + kPlotMenuPad +
+                           static_cast<float>(i) * kViewerChoiceMenuRowHeight;
+      const PlotMenuRect itemRect = scaleRect({colorSubmenuWindowRect.x0 + kPlotMenuPad,
+                                               itemY0,
+                                               colorSubmenuWindowRect.x1 - kPlotMenuPad,
+                                               itemY0 + kViewerChoiceMenuRowHeight});
+      const bool hovered = hoveredModel == entry.plotModel;
+      const bool selected = app.viewerState.plotModel == entry.plotModel;
+      if (hovered) {
+        drawPlotMenuRect(itemRect.x0, itemRect.y0, itemRect.x1, itemRect.y1,
+                         0.18f, 0.30f, 0.42f, 0.62f);
+      }
+      if (selected) {
+        drawPlotMenuRect(itemRect.x0 + 4.0f,
+                         itemRect.y0 + 5.0f,
+                         itemRect.x0 + 7.0f,
+                         itemRect.y1 - 5.0f,
+                         0.48f,
+                         0.78f,
+                         1.0f,
+                         0.86f);
+      }
+      drawHudTextLine(renderer,
+                      entry.label,
+                      itemRect.x0 + (selected ? 14.0f : 10.0f),
+                      itemRect.y0 + (renderer.available ? 8.0f : 9.0f),
+                      textScale,
+                      selected ? 0.98f : 0.82f,
+                      0.88f,
+                      0.93f,
+                      0.98f);
+    }
   }
 
   glDisable(GL_BLEND);
@@ -17237,7 +17746,8 @@ void drawAddPlotMenuOverlay(const AppState& app,
                        0.86f,
                        0.94f);
 
-  for (int i = 0; i < kViewerPlotModelChoiceCount; ++i) {
+  for (int i = 0; i < kPlotModelTopMenuEntryCount; ++i) {
+    const PlotModelMenuEntry& entry = kPlotModelTopMenuEntries[i];
     const float itemY0 = menuWindowRect.y0 + kPlotMenuPad +
                          static_cast<float>(i) * kViewerChoiceMenuRowHeight + 24.0f;
     const PlotMenuRect itemRect = scaleRect({menuWindowRect.x0 + kPlotMenuPad,
@@ -17250,7 +17760,7 @@ void drawAddPlotMenuOverlay(const AppState& app,
                        0.18f, 0.30f, 0.42f, 0.62f);
     }
     drawHudTextLine(renderer,
-                    kViewerPlotModelChoices[i].label,
+                    entry.label,
                     itemRect.x0 + 10.0f,
                     itemRect.y0 + (renderer.available ? 8.0f : 9.0f),
                     textScale,
@@ -17258,6 +17768,52 @@ void drawAddPlotMenuOverlay(const AppState& app,
                     0.88f,
                     0.93f,
                     0.98f);
+    if (entry.submenu) {
+      drawHudTextLineRight(renderer,
+                           ">",
+                           itemRect.x1 - 10.0f,
+                           itemRect.y0 + (renderer.available ? 8.0f : 9.0f),
+                           textScale,
+                           hovered ? 0.96f : 0.70f,
+                           0.88f,
+                           0.93f,
+                           0.98f);
+    }
+  }
+
+  const PlotMenuRect colorSubmenuWindowRect = addPlotModelColorSubmenuRect(app, windowWidth, windowHeight);
+  const bool showColorSubmenu =
+      app.addPlotMenuHover == kPlotModelColorSubmenuTopIndex ||
+      pointInPlotMenuRect(colorSubmenuWindowRect, app.hoverX, app.hoverY);
+  if (showColorSubmenu) {
+    const PlotMenuRect subRect = scaleRect(colorSubmenuWindowRect);
+    drawPlotMenuRect(subRect.x0, subRect.y0, subRect.x1, subRect.y1, 0.012f, 0.014f, 0.019f, 0.96f);
+    drawPlotMenuRect(subRect.x0, subRect.y1 - 1.0f, subRect.x1, subRect.y1, 0.75f, 0.82f, 0.92f, 0.20f);
+    drawPlotMenuRect(subRect.x0, subRect.y0, subRect.x1, subRect.y0 + 1.0f, 0.75f, 0.82f, 0.92f, 0.12f);
+    const int hoveredModel = addPlotModelColorSubmenuModelAt(app, windowWidth, windowHeight, app.hoverX, app.hoverY);
+    for (int i = 0; i < kPlotModelColorSubmenuEntryCount; ++i) {
+      const PlotModelMenuEntry& entry = kPlotModelColorSubmenuEntries[i];
+      const float itemY0 = colorSubmenuWindowRect.y0 + kPlotMenuPad +
+                           static_cast<float>(i) * kViewerChoiceMenuRowHeight;
+      const PlotMenuRect itemRect = scaleRect({colorSubmenuWindowRect.x0 + kPlotMenuPad,
+                                               itemY0,
+                                               colorSubmenuWindowRect.x1 - kPlotMenuPad,
+                                               itemY0 + kViewerChoiceMenuRowHeight});
+      const bool hovered = hoveredModel == entry.plotModel;
+      if (hovered) {
+        drawPlotMenuRect(itemRect.x0, itemRect.y0, itemRect.x1, itemRect.y1,
+                         0.18f, 0.30f, 0.42f, 0.62f);
+      }
+      drawHudTextLine(renderer,
+                      entry.label,
+                      itemRect.x0 + 10.0f,
+                      itemRect.y0 + (renderer.available ? 8.0f : 9.0f),
+                      textScale,
+                      hovered ? 0.98f : 0.82f,
+                      0.88f,
+                      0.93f,
+                      0.98f);
+    }
   }
 
   glDisable(GL_BLEND);
@@ -17386,6 +17942,53 @@ void drawPlotModelMenuOverlay(const AppState& app,
                   0.96f,
                   1.0f);
   drawViewerMenuCloseButton(closeRect, closeHovered);
+  {
+    const PlotMenuRect compactPresetWindowRect =
+        viewerMenuCompactPresetWindowRect(app, windowWidth, windowHeight);
+    const PlotMenuRect compactPresetRect = scaleRect(compactPresetWindowRect);
+    if (compactPresetWindowRect.x1 > compactPresetWindowRect.x0 &&
+        compactPresetWindowRect.y1 > compactPresetWindowRect.y0) {
+      const bool hasPresets = viewerUserPresetExists();
+      const bool hovered = hasPresets && pointInViewerMenuCompactPresetSelector(
+                                           app, windowWidth, windowHeight, app.hoverX, app.hoverY);
+      drawPlotMenuRect(compactPresetRect.x0,
+                       compactPresetRect.y0,
+                       compactPresetRect.x1,
+                       compactPresetRect.y1,
+                       hovered ? 0.30f : 0.20f,
+                       hovered ? 0.23f : 0.16f,
+                       hovered ? 0.06f : 0.04f,
+                       hasPresets ? (hovered ? 0.86f : 0.70f) : 0.30f);
+      drawPlotMenuRect(compactPresetRect.x0,
+                       compactPresetRect.y1 - 1.0f,
+                       compactPresetRect.x1,
+                       compactPresetRect.y1,
+                       1.0f,
+                       0.78f,
+                       0.28f,
+                       hasPresets ? 0.42f : 0.14f);
+      drawHudTextLine(renderer,
+                      fitHudText(renderer,
+                                 currentViewerPresetLabel(app),
+                                 std::max(24.0f, compactPresetRect.x1 - compactPresetRect.x0 - 34.0f),
+                                 0.82f),
+                      compactPresetRect.x0 + 8.0f,
+                      compactPresetRect.y0 + (renderer.available ? 6.0f : 7.0f),
+                      0.82f,
+                      hasPresets ? 0.92f : 0.44f,
+                      0.96f,
+                      0.84f,
+                      0.56f);
+      const float triCx = compactPresetRect.x1 - 12.0f;
+      const float triCy = compactPresetRect.y0 + (compactPresetRect.y1 - compactPresetRect.y0) * 0.52f;
+      glBegin(GL_TRIANGLES);
+      glColor4f(0.98f, 0.82f, 0.48f, hasPresets ? (hovered ? 0.95f : 0.78f) : 0.30f);
+      glVertex2f(triCx - 4.5f, triCy + 2.5f);
+      glVertex2f(triCx + 4.5f, triCy + 2.5f);
+      glVertex2f(triCx, triCy - 3.0f);
+      glEnd();
+    }
+  }
   const std::string desiredKey = payload.cloudSettingsKey.empty()
                                      ? ChromaspaceViewer::sampleSettingsKey(app.viewerState, false)
                                      : payload.cloudSettingsKey;
@@ -17486,7 +18089,8 @@ void drawPlotModelMenuOverlay(const AppState& app,
     const PlotMenuRect rr = scaleRect(viewerMenuRowWindowRect(app, windowWidth, windowHeight, i));
     if (rr.y1 < mainRect.y0 + 8.0f || rr.y0 > mainRect.y1 - kViewerDrawerHeaderHeight) continue;
     const ViewerMenuRow& row = rows[static_cast<std::size_t>(i)];
-    const bool hovered = app.plotModelMenuHoverMain == i && row.enabled;
+    const bool hovered =
+        app.plotModelMenuHoverMain == i && row.enabled && !row.presetActionButtons && !row.spacer;
     if (hovered) drawPlotMenuRect(rr.x0, rr.y0, rr.x1, rr.y1, 0.18f, 0.30f, 0.42f, 0.58f);
     const float alpha = row.enabled ? 0.90f : 0.36f;
     const float rowWidth = rr.x1 - rr.x0;
@@ -17509,6 +18113,104 @@ void drawPlotModelMenuOverlay(const AppState& app,
     const float swatchX = labelX;
     const float swatchY = rr.y0 + (kPlotMenuRowHeight - swatchSize) * 0.5f;
     const float textLabelX = hasVectorSwatch ? (labelX + swatchSize + 8.0f) : labelX;
+    if (row.spacer) {
+      drawPlotMenuRect(rr.x0 + 14.0f,
+                       rr.y0 + (rr.y1 - rr.y0) * 0.5f,
+                       rr.x1 - 14.0f,
+                       rr.y0 + (rr.y1 - rr.y0) * 0.5f + 1.0f,
+                       0.72f,
+                       0.78f,
+                       0.86f,
+                       0.14f);
+      continue;
+    }
+    if (row.presetActionButtons) {
+      const PlotMenuRect rowWindowRect = viewerMenuRowWindowRect(app, windowWidth, windowHeight, i);
+      const auto buttonWindowRects = presetActionButtonRects(rowWindowRect);
+      constexpr ViewerMenuAction actions[3] = {
+          ViewerMenuAction::SaveUserPreset,
+          ViewerMenuAction::UpdateUserPreset,
+          ViewerMenuAction::DeleteUserPreset};
+      constexpr const char* labels[3] = {"Save", "Update", "Delete"};
+      const ViewerMenuAction hoverAction = presetActionAtPoint(app, rowWindowRect, app.hoverX, app.hoverY);
+      for (int button = 0; button < 3; ++button) {
+        const ViewerMenuAction buttonAction = actions[button];
+        const bool available = presetActionAvailable(app, buttonAction);
+        const bool buttonHovered = available && hoverAction == buttonAction;
+        const bool danger = buttonAction == ViewerMenuAction::DeleteUserPreset;
+        const PlotMenuRect buttonRect = scaleRect(buttonWindowRects[static_cast<size_t>(button)]);
+        drawPlotMenuRect(buttonRect.x0,
+                         buttonRect.y0,
+                         buttonRect.x1,
+                         buttonRect.y1,
+                         danger ? (buttonHovered ? 0.42f : 0.26f) : (buttonHovered ? 0.22f : 0.12f),
+                         danger ? (buttonHovered ? 0.12f : 0.07f) : (buttonHovered ? 0.36f : 0.22f),
+                         danger ? (buttonHovered ? 0.12f : 0.08f) : (buttonHovered ? 0.48f : 0.30f),
+                         available ? (buttonHovered ? 0.88f : 0.70f) : 0.28f);
+        drawPlotMenuRect(buttonRect.x0,
+                         buttonRect.y1 - 1.0f,
+                         buttonRect.x1,
+                         buttonRect.y1,
+                         danger ? 1.0f : 0.80f,
+                         danger ? 0.42f : 0.88f,
+                         danger ? 0.38f : 0.98f,
+                         available ? 0.22f : 0.08f);
+        const std::string fittedButtonLabel =
+            fitHudText(renderer, labels[button], std::max(20.0f, buttonRect.x1 - buttonRect.x0 - 12.0f), textScale);
+        const float labelWidth = hudTextWidth(renderer, fittedButtonLabel, textScale);
+        drawHudTextLine(renderer,
+                        fittedButtonLabel,
+                        buttonRect.x0 + std::max(5.0f, (buttonRect.x1 - buttonRect.x0 - labelWidth) * 0.5f),
+                        buttonRect.y0 + (renderer.available ? 9.0f : 10.0f),
+                        textScale,
+                        available ? 0.92f : 0.40f,
+                        danger ? 0.98f : 0.92f,
+                        danger ? 0.74f : 0.96f,
+                        danger ? 0.70f : 0.98f);
+      }
+      continue;
+    }
+    if (row.action == ViewerMenuAction::LoadUserPreset) {
+      drawPlotMenuRect(rr.x0,
+                       rr.y0 + 4.0f,
+                       rr.x1,
+                       rr.y1 - 4.0f,
+                       hovered ? 0.32f : 0.20f,
+                       hovered ? 0.24f : 0.16f,
+                       hovered ? 0.06f : 0.04f,
+                       row.enabled ? (hovered ? 0.78f : 0.62f) : 0.25f);
+      drawPlotMenuRect(rr.x0,
+                       rr.y1 - 5.0f,
+                       rr.x1,
+                       rr.y1 - 4.0f,
+                       1.0f,
+                       0.78f,
+                       0.28f,
+                       row.enabled ? 0.38f : 0.10f);
+      const float valueWidthLimit = std::max(40.0f, rowWidth * 0.48f);
+      const std::string fittedLabel =
+          fitHudText(renderer, row.label, std::max(24.0f, rowWidth - valueWidthLimit - 32.0f), textScale);
+      const std::string fittedValue = fitHudText(renderer, row.value, valueWidthLimit, textScale);
+      drawHudTextLine(renderer,
+                      fittedLabel,
+                      textLabelX,
+                      singleBaseline,
+                      textScale,
+                      row.enabled ? 0.94f : 0.42f,
+                      0.96f,
+                      0.86f,
+                      0.58f);
+      drawHudTextLineRight(renderer,
+                           fittedValue,
+                           valueRightX,
+                           singleBaseline,
+                           textScale,
+                           row.enabled ? 0.92f : 0.38f,
+                           0.98f,
+                           0.82f,
+                           0.48f);
+      continue;
+    }
     if (hasVectorSwatch) {
       drawPlotMenuRect(swatchX, swatchY, swatchX + swatchSize, swatchY + swatchSize,
                        vectorR, vectorG, vectorB, row.enabled ? 0.92f : 0.34f);
@@ -17951,6 +18653,7 @@ void drawPlotModelMenuOverlay(const AppState& app,
                                                  itemY0,
                                                  choiceWindowRect.x1 - kViewerChoiceMenuPad,
                                                  itemY0 + kViewerChoiceMenuRowHeight});
+        const bool groupHeader = choiceItems[static_cast<std::size_t>(i)].groupHeader;
         const bool hovered = app.viewerMenuHoverChoice == i;
         const bool selected = choiceItems[static_cast<std::size_t>(i)].selected;
         if (hovered) {
@@ -17964,7 +18667,7 @@ void drawPlotModelMenuOverlay(const AppState& app,
         }
         const float labelX = itemRect.x0 + (selected ? 14.0f : 10.0f);
         const bool displayReferred = choiceItems[static_cast<std::size_t>(i)].displayReferred;
-        const float glyphReserve = displayReferred ? 24.0f : 0.0f;
+        const float glyphReserve = displayReferred || groupHeader ? 24.0f : 0.0f;
         const std::string fittedLabel =
             fitHudText(renderer,
                        choiceItems[static_cast<std::size_t>(i)].label,
@@ -17985,6 +18688,66 @@ void drawPlotModelMenuOverlay(const AppState& app,
           drawViewerDisplayGlyph(glyphX,
                                  itemRect.y0 + (kViewerChoiceMenuRowHeight - 12.0f) * 0.5f,
                                  selected);
+        }
+        if (groupHeader) {
+          drawHudTextLineRight(renderer,
+                               ">",
+                               itemRect.x1 - 10.0f,
+                               itemRect.y0 + (renderer.available ? 9.0f : 10.0f),
+                               textScale,
+                               hovered ? 0.96f : 0.70f,
+                               0.88f,
+                               0.93f,
+                               0.98f);
+        }
+      }
+      if (viewerMenuActionFromInt(app.viewerMenuChoiceAction) == ViewerMenuAction::PlotModel) {
+        const PlotMenuRect colorSubmenuWindowRect =
+            viewerChoicePlotModelColorSubmenuRect(app, windowWidth, windowHeight);
+        const bool showColorSubmenu =
+            app.viewerMenuHoverChoice == kPlotModelColorSubmenuTopIndex ||
+            pointInPlotMenuRect(colorSubmenuWindowRect, app.hoverX, app.hoverY);
+        if (showColorSubmenu) {
+          const PlotMenuRect subRect = scaleRect(colorSubmenuWindowRect);
+          drawPlotMenuRect(subRect.x0, subRect.y0, subRect.x1, subRect.y1, 0.012f, 0.014f, 0.019f, 0.96f);
+          drawPlotMenuRect(subRect.x0, subRect.y1 - 1.0f, subRect.x1, subRect.y1, 0.75f, 0.82f, 0.92f, 0.20f);
+          drawPlotMenuRect(subRect.x0, subRect.y0, subRect.x1, subRect.y0 + 1.0f, 0.75f, 0.82f, 0.92f, 0.12f);
+          const int hoveredModel =
+              viewerChoicePlotModelColorSubmenuModelAt(app, windowWidth, windowHeight, app.hoverX, app.hoverY);
+          for (int submenuIndex = 0; submenuIndex < kPlotModelColorSubmenuEntryCount; ++submenuIndex) {
+            const PlotModelMenuEntry& entry = kPlotModelColorSubmenuEntries[submenuIndex];
+            const float itemY0 = colorSubmenuWindowRect.y0 + kPlotMenuPad +
+                                 static_cast<float>(submenuIndex) * kViewerChoiceMenuRowHeight;
+            const PlotMenuRect itemRect = scaleRect({colorSubmenuWindowRect.x0 + kViewerChoiceMenuPad,
+                                                     itemY0,
+                                                     colorSubmenuWindowRect.x1 - kViewerChoiceMenuPad,
+                                                     itemY0 + kViewerChoiceMenuRowHeight});
+            const bool hovered = hoveredModel == entry.plotModel;
+            const bool selected = app.viewerState.plotModel == entry.plotModel;
+            if (hovered) {
+              drawPlotMenuRect(itemRect.x0, itemRect.y0, itemRect.x1, itemRect.y1,
+                               0.18f, 0.30f, 0.42f, 0.62f);
+            }
+            if (selected) {
+              drawPlotMenuRect(itemRect.x0 + 4.0f,
+                               itemRect.y0 + 5.0f,
+                               itemRect.x0 + 7.0f,
+                               itemRect.y1 - 5.0f,
+                               0.42f,
+                               0.78f,
+                               1.0f,
+                               0.86f);
+            }
+            drawHudTextLine(renderer,
+                            entry.label,
+                            itemRect.x0 + (selected ? 14.0f : 10.0f),
+                            itemRect.y0 + (renderer.available ? 9.0f : 10.0f),
+                            textScale,
+                            selected ? 0.98f : 0.88f,
+                            0.90f,
+                            0.94f,
+                            0.98f);
+          }
         }
       }
       const float maxChoiceScroll = viewerChoiceMenuMaxScroll(app, windowWidth, windowHeight);
@@ -18068,6 +18831,7 @@ std::string plotWindowDerivedBuildKey(const PlotWindowState& window,
      << "|readRamp=" << (state.readGrayRamp ? 1 : 0)
      << "|readIdentity=" << (state.readIdentityPlot ? 1 : 0)
      << "|isolateIdentity=" << (state.isolateIdentityData ? 1 : 0)
+     << "|excludeIdentity=" << (state.excludeIdentityData ? 1 : 0)
      << "|imageLasso=" << (state.volumeSliceLassoRegion ? 1 : 0)
      << "|slices=" << (state.volumeSliceRed ? 1 : 0)
      << (state.volumeSliceYellow ? 1 : 0)
@@ -18423,9 +19187,9 @@ void drawAnalyticalScopePlot(const PlotWindowState& window,
             : 1.45f;
     const float waveformDotSize =
         mesh.waveformScope
-            ? clampf(static_cast<float>(window.viewState.waveformDotSize), 0.25f, 3.0f)
+            ? clampf(static_cast<float>(window.viewState.waveformDotSize), 0.05f, 1.5f)
             : 1.0f;
-    glPointSize(clampf(scopePointSize * waveformDotSize, 0.75f, 7.0f));
+    glPointSize(clampf(scopePointSize * waveformDotSize, 0.05f, 7.0f));
     glVertexPointer(3, GL_FLOAT, 0, mesh.pointVerts.data());
     glColorPointer(4, GL_FLOAT, 0, mesh.pointColors.data());
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
@@ -19073,6 +19837,51 @@ void drawPlotWindowFramesOverlay(const AppState& app,
                       0.88f,
                       0.93f,
                       0.98f);
+    }
+    PlotWindowDragMode interactionMode = PlotWindowDragMode::None;
+    if (app.plotWindowDragId == window.windowId &&
+        app.plotWindowDragMode != PlotWindowDragMode::None) {
+      interactionMode = app.plotWindowDragMode;
+    } else if (hovered) {
+      interactionMode = app.hoveredPlotWindowDragMode;
+    }
+    const bool activeDrag = app.plotWindowDragId == window.windowId &&
+                            app.plotWindowDragMode != PlotWindowDragMode::None;
+    if (interactionMode == PlotWindowDragMode::Move) {
+      const float moveAlpha = activeDrag ? 0.36f : 0.20f;
+      drawPlotMenuRect(x0, y1 - 22.0f, x1, y1 - 18.0f, 0.20f, 0.42f, 0.58f, moveAlpha);
+      const float gripX = x0 + 10.0f;
+      const float gripY = y1 - 11.0f;
+      glLineWidth(activeDrag ? 1.7f : 1.2f);
+      glBegin(GL_LINES);
+      glColor4f(0.72f, 0.90f, 1.0f, activeDrag ? 0.88f : 0.58f);
+      for (int i = 0; i < 3; ++i) {
+        const float gy = gripY + static_cast<float>(i - 1) * 4.0f;
+        glVertex2f(gripX, gy);
+        glVertex2f(gripX + 18.0f, gy);
+      }
+      glEnd();
+      glLineWidth(1.0f);
+    } else if (plotWindowDragModeIsResize(interactionMode)) {
+      const float edgeAlpha = activeDrag ? 0.94f : 0.72f;
+      const float glowAlpha = activeDrag ? 0.22f : 0.13f;
+      const float thickness = activeDrag ? 5.0f : 4.0f;
+      if (plotWindowDragModeTouchesTop(interactionMode)) {
+        drawPlotMenuRect(x0, y1 - thickness, x1, y1, 0.36f, 0.78f, 1.0f, edgeAlpha);
+        drawPlotMenuRect(x0, y1 - 12.0f, x1, y1, 0.18f, 0.56f, 0.86f, glowAlpha);
+      }
+      if (plotWindowDragModeTouchesBottom(interactionMode)) {
+        drawPlotMenuRect(x0, y0, x1, y0 + thickness, 0.36f, 0.78f, 1.0f, edgeAlpha);
+        drawPlotMenuRect(x0, y0, x1, y0 + 12.0f, 0.18f, 0.56f, 0.86f, glowAlpha);
+      }
+      if (plotWindowDragModeTouchesLeft(interactionMode)) {
+        drawPlotMenuRect(x0, y0, x0 + thickness, y1, 0.36f, 0.78f, 1.0f, edgeAlpha);
+        drawPlotMenuRect(x0, y0, x0 + 12.0f, y1, 0.18f, 0.56f, 0.86f, glowAlpha);
+      }
+      if (plotWindowDragModeTouchesRight(interactionMode)) {
+        drawPlotMenuRect(x1 - thickness, y0, x1, y1, 0.36f, 0.78f, 1.0f, edgeAlpha);
+        drawPlotMenuRect(x1 - 12.0f, y0, x1, y1, 0.18f, 0.56f, 0.86f, glowAlpha);
+      }
     }
     if (app.plotWindows.size() > 1u) {
       const PlotMenuRect closeWindowRect = plotWindowCloseWindowRect(window, windowWidth, windowHeight);
@@ -20362,7 +21171,8 @@ void drawTopLeftTextIndicator(int width,
                               const std::string& text,
                               float alpha,
                               const HudTextRenderer* renderer,
-                              float xOffset = 16.0f) {
+                              float xOffset = 16.0f,
+                              float yOffsetFromTop = -1.0f) {
   if (width <= 0 || height <= 0 || text.empty() || alpha <= 0.0f) return;
 
   glMatrixMode(GL_PROJECTION);
@@ -20379,7 +21189,8 @@ void drawTopLeftTextIndicator(int width,
   const bool useAtlas = renderer && renderer->available;
   const float scale = useAtlas ? 0.92f : 6.0f;
   const float x = xOffset;
-  const float y = static_cast<float>(height) - (useAtlas ? 16.0f : 22.0f);
+  const float yFromTop = yOffsetFromTop >= 0.0f ? yOffsetFromTop : (useAtlas ? 16.0f : 22.0f);
+  const float y = static_cast<float>(height) - yFromTop;
   if (useAtlas) {
     drawHudTextLine(*renderer, text, x, y, scale, alpha, 0.92f, 0.96f, 0.98f);
   } else {
@@ -20785,7 +21596,7 @@ void mouseButtonCallback(GLFWwindow* window, int button, int action, int mods) {
       app->layoutMenuVisible = false;
       app->addPlotMenuX = cursorX;
       app->addPlotMenuY = cursorY;
-      app->addPlotMenuHover = app->viewerState.plotModel;
+      app->addPlotMenuHover = plotModelMenuEntryIndexForModel(app->viewerState.plotModel);
       app->quickPlotModelMenuHover = -1;
       app->layoutMenuHover = -1;
       app->plotModelMenuHoverMain = -1;
@@ -20842,12 +21653,33 @@ void mouseButtonCallback(GLFWwindow* window, int button, int action, int mods) {
     double cursorX = app->hoverX;
     double cursorY = app->hoverY;
     glfwGetCursorPos(window, &cursorX, &cursorY);
-    const int index = addPlotMenuIndexAt(*app, windowWidth, windowHeight, cursorX, cursorY);
-    if (index >= 0) {
-      addPlotWindow(app, index, windowWidth, windowHeight, app->addPlotMenuX, app->addPlotMenuY);
+    const int submenuModel = addPlotModelColorSubmenuModelAt(*app, windowWidth, windowHeight, cursorX, cursorY);
+    if (submenuModel >= 0) {
+      addPlotWindow(app,
+                    submenuModel,
+                    windowWidth,
+                    windowHeight,
+                    app->addPlotMenuX,
+                    app->addPlotMenuY);
       queueViewerStateCommand(*app, "reinterpret");
       app->addPlotMenuVisible = false;
       app->addPlotMenuHover = -1;
+      clearPointerInteractionState(app);
+      return;
+    }
+    const int index = addPlotMenuIndexAt(*app, windowWidth, windowHeight, cursorX, cursorY);
+    if (index >= 0 && index < kPlotModelTopMenuEntryCount) {
+      if (!kPlotModelTopMenuEntries[index].submenu) {
+        addPlotWindow(app,
+                      kPlotModelTopMenuEntries[index].plotModel,
+                      windowWidth,
+                      windowHeight,
+                      app->addPlotMenuX,
+                      app->addPlotMenuY);
+        queueViewerStateCommand(*app, "reinterpret");
+        app->addPlotMenuVisible = false;
+        app->addPlotMenuHover = -1;
+      }
       clearPointerInteractionState(app);
       return;
     }
@@ -20864,17 +21696,33 @@ void mouseButtonCallback(GLFWwindow* window, int button, int action, int mods) {
     double cursorX = app->hoverX;
     double cursorY = app->hoverY;
     glfwGetCursorPos(window, &cursorX, &cursorY);
-    const int index = quickPlotModelMenuIndexAt(*app, windowWidth, windowHeight, cursorX, cursorY);
-    if (index >= 0) {
-      ViewerChoiceMenuItem item{kViewerPlotModelChoices[static_cast<std::size_t>(index)].label,
-                                index,
-                                index == app->viewerState.plotModel,
+    const int submenuModel = quickPlotModelColorSubmenuModelAt(*app, windowWidth, windowHeight, cursorX, cursorY);
+    if (submenuModel >= 0) {
+      ViewerChoiceMenuItem item{ChromaspaceViewer::plotModelLabel(submenuModel),
+                                submenuModel,
+                                submenuModel == app->viewerState.plotModel,
                                 ViewerMenuAction::PlotModel,
                                 "reinterpret"};
       activateViewerChoiceMenuItem(app, item);
       captureFocusedPlotWindowFromApp(app);
       app->quickPlotModelMenuVisible = false;
       app->quickPlotModelMenuHover = -1;
+      clearPointerInteractionState(app);
+      return;
+    }
+    const int index = quickPlotModelMenuIndexAt(*app, windowWidth, windowHeight, cursorX, cursorY);
+    if (index >= 0 && index < kPlotModelTopMenuEntryCount) {
+      if (!kPlotModelTopMenuEntries[index].submenu) {
+        ViewerChoiceMenuItem item{kPlotModelTopMenuEntries[index].label,
+                                  kPlotModelTopMenuEntries[index].plotModel,
+                                  kPlotModelTopMenuEntries[index].plotModel == app->viewerState.plotModel,
+                                  ViewerMenuAction::PlotModel,
+                                  "reinterpret"};
+        activateViewerChoiceMenuItem(app, item);
+        captureFocusedPlotWindowFromApp(app);
+        app->quickPlotModelMenuVisible = false;
+        app->quickPlotModelMenuHover = -1;
+      }
       clearPointerInteractionState(app);
       return;
     }
@@ -20923,6 +21771,21 @@ void mouseButtonCallback(GLFWwindow* window, int button, int action, int mods) {
         clearPointerInteractionState(app);
         return;
       }
+      const int choiceSubmenuModel =
+          viewerChoicePlotModelColorSubmenuModelAt(*app, windowWidth, windowHeight, cursorX, cursorY);
+      if (choiceSubmenuModel >= 0) {
+        ViewerChoiceMenuItem item{ChromaspaceViewer::plotModelLabel(choiceSubmenuModel),
+                                  choiceSubmenuModel,
+                                  choiceSubmenuModel == app->viewerState.plotModel,
+                                  ViewerMenuAction::PlotModel,
+                                  "reinterpret"};
+        activateViewerChoiceMenuItem(app, item);
+        app->plotModelMenuHoverMain = -1;
+        app->plotModelMenuHoverSub = -1;
+        app->viewerMenuHoverChoice = -1;
+        clearPointerInteractionState(app);
+        return;
+      }
       const int choiceIndex = viewerChoiceMenuIndexAt(*app, windowWidth, windowHeight, cursorX, cursorY);
       if (choiceIndex >= 0) {
         const std::vector<ViewerChoiceMenuItem> items = buildViewerChoiceMenuItems(*app);
@@ -20932,6 +21795,21 @@ void mouseButtonCallback(GLFWwindow* window, int button, int action, int mods) {
         app->plotModelMenuHoverMain = -1;
         app->plotModelMenuHoverSub = -1;
         app->viewerMenuHoverChoice = -1;
+        clearPointerInteractionState(app);
+        return;
+      }
+      if (pointInViewerMenuCompactPresetSelector(*app, windowWidth, windowHeight, cursorX, cursorY) &&
+          viewerUserPresetExists()) {
+        const bool alreadyOpen =
+            viewerMenuActionFromInt(app->viewerMenuChoiceAction) == ViewerMenuAction::LoadUserPreset;
+        app->viewerMenuChoiceAction =
+            alreadyOpen ? static_cast<int>(ViewerMenuAction::None)
+                        : static_cast<int>(ViewerMenuAction::LoadUserPreset);
+        app->viewerPresetChoiceAnchorCompact = !alreadyOpen;
+        app->viewerChoiceMenuScroll = 0.0f;
+        app->viewerMenuHoverChoice = -1;
+        app->plotModelMenuHoverMain = -1;
+        app->plotModelMenuHoverSub = -1;
         clearPointerInteractionState(app);
         return;
       }
@@ -20972,6 +21850,27 @@ void mouseButtonCallback(GLFWwindow* window, int button, int action, int mods) {
       const std::vector<ViewerMenuRow> rows = buildViewerMenuRows(*app);
       if (mainIndex >= 0 && mainIndex < static_cast<int>(rows.size())) {
         const ViewerMenuRow& row = rows[static_cast<std::size_t>(mainIndex)];
+        if (row.presetActionButtons) {
+          const PlotMenuRect rowRect =
+              viewerMenuRowWindowRect(*app, windowWidth, windowHeight, mainIndex);
+          const ViewerMenuAction presetAction =
+              presetActionAtPoint(*app, rowRect, cursorX, cursorY);
+          if (presetAction != ViewerMenuAction::None) {
+            ViewerMenuRow buttonRow{};
+            buttonRow.action = presetAction;
+            buttonRow.enabled = true;
+            buttonRow.refreshPolicy =
+                presetAction == ViewerMenuAction::RestoreDefaults ? "resample" : "none";
+            activateViewerMenuRow(app, buttonRow);
+          }
+          app->viewerMenuLastClick = -10.0;
+          app->viewerMenuLastClickRow = -1;
+          app->viewerMenuLastClickAction =
+              static_cast<int>(ViewerMenuAction::None);
+          app->plotModelMenuHoverMain = mainIndex;
+          clearPointerInteractionState(app);
+          return;
+        }
         if (row.channelSelector && row.enabled) {
           const PlotMenuRect rowRect =
               viewerMenuRowWindowRect(*app, windowWidth, windowHeight, mainIndex);
@@ -20992,6 +21891,9 @@ void mouseButtonCallback(GLFWwindow* window, int button, int action, int mods) {
           }
         }
         const double now = glfwGetTime();
+        if (row.action == ViewerMenuAction::LoadUserPreset) {
+          app->viewerPresetChoiceAnchorCompact = false;
+        }
         const bool doubleClick =
             (now - app->viewerMenuLastClick) < 0.32 &&
             app->viewerMenuLastClickRow == mainIndex &&
@@ -21140,7 +22042,10 @@ void cursorPosCallback(GLFWwindow* window, double xpos, double ypos) {
   if (app->quickPlotModelMenuVisible) {
     int windowWidth = 1, windowHeight = 1;
     glfwGetWindowSize(window, &windowWidth, &windowHeight);
-    app->quickPlotModelMenuHover = quickPlotModelMenuIndexAt(*app, windowWidth, windowHeight, xpos, ypos);
+    const int submenuModel = quickPlotModelColorSubmenuModelAt(*app, windowWidth, windowHeight, xpos, ypos);
+    app->quickPlotModelMenuHover = submenuModel >= 0
+                                       ? kPlotModelColorSubmenuTopIndex
+                                       : quickPlotModelMenuIndexAt(*app, windowWidth, windowHeight, xpos, ypos);
     if (app->quickPlotModelMenuHover >= 0 && !menuGestureActive) {
       clearPointerInteractionState(app);
       return;
@@ -21149,7 +22054,10 @@ void cursorPosCallback(GLFWwindow* window, double xpos, double ypos) {
   if (app->addPlotMenuVisible) {
     int windowWidth = 1, windowHeight = 1;
     glfwGetWindowSize(window, &windowWidth, &windowHeight);
-    app->addPlotMenuHover = addPlotMenuIndexAt(*app, windowWidth, windowHeight, xpos, ypos);
+    const int submenuModel = addPlotModelColorSubmenuModelAt(*app, windowWidth, windowHeight, xpos, ypos);
+    app->addPlotMenuHover = submenuModel >= 0
+                                ? kPlotModelColorSubmenuTopIndex
+                                : addPlotMenuIndexAt(*app, windowWidth, windowHeight, xpos, ypos);
     if (app->addPlotMenuHover >= 0 && !menuGestureActive) {
       clearPointerInteractionState(app);
       return;
@@ -21184,9 +22092,19 @@ void cursorPosCallback(GLFWwindow* window, double xpos, double ypos) {
       clearPointerInteractionState(app);
       return;
     }
+    const int choiceSubmenuModel =
+        viewerChoicePlotModelColorSubmenuModelAt(*app, windowWidth, windowHeight, xpos, ypos);
     const int choiceIndex = viewerChoiceMenuIndexAt(*app, windowWidth, windowHeight, xpos, ypos);
-    app->viewerMenuHoverChoice = choiceIndex;
-    if (choiceIndex >= 0) {
+    app->viewerMenuHoverChoice =
+        choiceSubmenuModel >= 0 ? kPlotModelColorSubmenuTopIndex : choiceIndex;
+    if (choiceSubmenuModel >= 0 || choiceIndex >= 0) {
+      app->viewerMenuHoverTab = -1;
+      app->plotModelMenuHoverMain = -1;
+      app->plotModelMenuHoverSub = -1;
+      clearPointerInteractionState(app);
+      return;
+    }
+    if (pointInViewerMenuCompactPresetSelector(*app, windowWidth, windowHeight, xpos, ypos)) {
       app->viewerMenuHoverTab = -1;
       app->plotModelMenuHoverMain = -1;
       app->plotModelMenuHoverSub = -1;
@@ -21249,6 +22167,14 @@ void cursorPosCallback(GLFWwindow* window, double xpos, double ypos) {
     int windowWidth = 1, windowHeight = 1;
     glfwGetWindowSize(window, &windowWidth, &windowHeight);
     app->hoveredPlotWindowId = plotWindowAt(*app, windowWidth, windowHeight, xpos, ypos);
+    app->hoveredPlotWindowDragMode = PlotWindowDragMode::None;
+    if (app->plotWindowDragMode == PlotWindowDragMode::None) {
+      if (const PlotWindowState* hoveredWindow =
+              plotWindowById(*app, app->hoveredPlotWindowId)) {
+        app->hoveredPlotWindowDragMode =
+            plotWindowDragModeAt(*hoveredWindow, windowWidth, windowHeight, xpos, ypos);
+      }
+    }
   }
 
   if (anyDown && !app->leftDown) {
@@ -22109,7 +23035,8 @@ int main() {
 #if defined(_WIN32)
     const bool identityMenuOpen =
         app.plotModelMenuVisible && coercedViewerMenuSection(app) == ViewerMenuSection::Identity;
-    if ((app.viewerState.readGrayRamp || app.viewerState.readIdentityPlot || identityMenuOpen) &&
+    if ((app.viewerState.readGrayRamp || app.viewerState.readIdentityPlot ||
+         app.viewerState.excludeIdentityData || identityMenuOpen) &&
         !viewerIdentityDrawInstanceDetected(app) &&
         (!app.resolveDrawStatusKnown || !app.resolveDrawStatusAvailable)) {
       ensureResolveBridgeRunning();
@@ -22216,6 +23143,11 @@ int main() {
             const ResolvedPayload previousResolved = resolved;
             const std::string prevSourceMode = resolved.sourceMode;
             const std::string prevPlotMode = resolved.plotMode;
+            if (!next.hasExcludeIdentityData) {
+              next.viewerState.excludeIdentityData = app.viewerState.excludeIdentityData;
+              next.viewerState = viewerStateWithModelCapabilities(next.viewerState);
+              next.excludeIdentityData = next.viewerState.excludeIdentityData;
+            }
             resolved = next;
             app.senderId = resolved.senderId;
             rememberOfxImageLassoSelection(&app, resolved);
@@ -23616,7 +24548,8 @@ int main() {
                                "S",
                                0.72f,
                                overlayTextRenderer ? overlayTextRenderer : &hudText,
-                               48.0f);
+                               12.0f,
+                               55.0f);
     }
     const float speedPulse = clampf(static_cast<float>((app.speedFeedbackUntil - glfwGetTime()) / 0.18), 0.0f, 1.0f);
     if (speedPulse > 0.0f) {
