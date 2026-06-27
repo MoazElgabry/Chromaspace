@@ -194,11 +194,6 @@ inline ViewerRuntimeState clampedViewerRuntimeState(ViewerRuntimeState s) {
     s.showOverflow = false;
     s.highlightOverflow = false;
   }
-  if (s.excludeIdentityData) {
-    s.readGrayRamp = false;
-    s.readIdentityPlot = false;
-    s.isolateIdentityData = false;
-  }
   if (!s.readGrayRamp && !s.readIdentityPlot) s.isolateIdentityData = false;
   return s;
 }

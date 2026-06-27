@@ -4971,7 +4971,7 @@ std::string viewerLocalPreviewBuildKey(const ResolvedPayload& payload,
 
 bool payloadWantsIdentityReadPreview(const ResolvedPayload& payload) {
   return payload.sourceMode == "input" && !isGlossViewPlotModeString(payload.plotMode) &&
-         (payload.readIdentityPlot || payload.readGrayRamp);
+         !payload.excludeIdentityData && (payload.readIdentityPlot || payload.readGrayRamp);
 }
 
 struct ViewerIdentityStripBands {
@@ -13953,6 +13953,11 @@ ChromaspaceViewer::ViewerRuntimeState aggregateHostStateForWorkspace(const AppSt
         aggregate.waveformSamplesPerColumn = grid.rowsPerColumn;
       }
     }
+    if (aggregate.excludeIdentityData) {
+      aggregate.readGrayRamp = false;
+      aggregate.readIdentityPlot = false;
+      aggregate.isolateIdentityData = false;
+    }
     aggregate.sampleSettingsKey = ChromaspaceViewer::sampleSettingsKey(aggregate, false);
     return aggregate;
   }
@@ -13995,8 +14000,12 @@ ChromaspaceViewer::ViewerRuntimeState aggregateHostStateForWorkspace(const AppSt
     }
     aggregate.scale = std::max(aggregate.scale, state.scale);
     aggregate.occupancyGuidedFill = aggregate.occupancyGuidedFill || state.occupancyGuidedFill;
-    aggregate.readGrayRamp = aggregate.readGrayRamp || state.readGrayRamp;
-    aggregate.readIdentityPlot = aggregate.readIdentityPlot || state.readIdentityPlot;
+    const bool stateIdentityReadActive =
+        !state.excludeIdentityData && !state.volumeSliceLassoRegion;
+    aggregate.readGrayRamp =
+        aggregate.readGrayRamp || (stateIdentityReadActive && state.readGrayRamp);
+    aggregate.readIdentityPlot =
+        aggregate.readIdentityPlot || (stateIdentityReadActive && state.readIdentityPlot);
     aggregate.volumeSliceLassoRegion =
         aggregate.volumeSliceLassoRegion || state.volumeSliceLassoRegion;
     aggregate.liveUpdate = aggregate.liveUpdate || state.liveUpdate;
@@ -14775,11 +14784,6 @@ void activateViewerMenuRow(AppState* app, const ViewerMenuRow& row) {
     case ViewerMenuAction::IsolateIdentity: state.isolateIdentityData = !state.isolateIdentityData; bump(); break;
     case ViewerMenuAction::ExcludeIdentityData:
       state.excludeIdentityData = !state.excludeIdentityData;
-      if (state.excludeIdentityData) {
-        state.readGrayRamp = false;
-        state.readIdentityPlot = false;
-        state.isolateIdentityData = false;
-      }
       bump();
       break;
     case ViewerMenuAction::ReadResolution:
@@ -15160,10 +15164,66 @@ PlotMenuRect viewerMenuCloseWindowRect(const AppState& app, int width, int heigh
           12.0f + kViewerMenuCloseSize};
 }
 
+float approximateMenuTextWidth(const std::string& text, float scale = 1.0f) {
+  float width = 0.0f;
+  for (const unsigned char ch : text) {
+    if (ch == ' ') {
+      width += 4.5f;
+    } else if (ch == 'i' || ch == 'l' || ch == 'I' || ch == '|' || ch == '.' || ch == ':' || ch == '\'' || ch == ',') {
+      width += 3.6f;
+    } else if (ch == 'm' || ch == 'w' || ch == 'M' || ch == 'W' || ch == '@') {
+      width += 10.0f;
+    } else if (ch >= 'A' && ch <= 'Z') {
+      width += 7.8f;
+    } else {
+      width += 7.0f;
+    }
+  }
+  return width * scale;
+}
+
+float clampFloatingMenuWidth(float naturalWidth,
+                             float minWidth,
+                             float maxWidth,
+                             int windowWidth) {
+  const float available = std::max(minWidth, static_cast<float>(windowWidth) - 16.0f);
+  return std::min(std::max(minWidth, naturalWidth), std::min(maxWidth, available));
+}
+
+float plotModelTopMenuNaturalWidth(const char* headerLabel) {
+  float contentWidth = approximateMenuTextWidth(headerLabel ? headerLabel : "", 1.0f) + 34.0f;
+  for (const auto& entry : kPlotModelTopMenuEntries) {
+    const float rowExtra = entry.submenu ? 42.0f : 28.0f;
+    contentWidth = std::max(contentWidth, approximateMenuTextWidth(entry.label, 1.0f) + rowExtra);
+  }
+  return contentWidth + kPlotMenuPad * 2.0f + 18.0f;
+}
+
+float plotModelColorSubmenuNaturalWidth() {
+  float contentWidth = 0.0f;
+  for (const auto& entry : kPlotModelColorSubmenuEntries) {
+    contentWidth = std::max(contentWidth, approximateMenuTextWidth(entry.label, 1.0f) + 30.0f);
+  }
+  return contentWidth + kPlotMenuPad * 2.0f + 18.0f;
+}
+
+float viewerChoiceMenuNaturalWidth(const std::vector<ViewerChoiceMenuItem>& items) {
+  float contentWidth = 0.0f;
+  for (const ViewerChoiceMenuItem& item : items) {
+    float rowWidth = approximateMenuTextWidth(item.label, 1.0f) + 28.0f;
+    if (item.selected) rowWidth += 10.0f;
+    if (item.groupHeader) rowWidth += 28.0f;
+    if (item.displayReferred) rowWidth += 28.0f;
+    contentWidth = std::max(contentWidth, rowWidth);
+  }
+  return contentWidth + kViewerChoiceMenuPad * 2.0f + 18.0f;
+}
+
 PlotMenuRect quickPlotModelMenuRect(const AppState& app, int width, int height) {
   const float w = static_cast<float>(width);
   const float h = static_cast<float>(height);
-  const float menuWidth = std::min(std::max(210.0f, w * 0.28f), std::max(210.0f, w - 16.0f));
+  const float menuWidth =
+      clampFloatingMenuWidth(plotModelTopMenuNaturalWidth("Plot Model"), 168.0f, 300.0f, width);
   const float headerHeight = 24.0f;
   const float menuHeight = kPlotMenuPad * 2.0f + headerHeight +
                            kViewerChoiceMenuRowHeight * static_cast<float>(kPlotModelTopMenuEntryCount);
@@ -15179,7 +15239,8 @@ PlotMenuRect quickPlotModelMenuRect(const AppState& app, int width, int height) 
 PlotMenuRect addPlotMenuRect(const AppState& app, int width, int height) {
   const float w = static_cast<float>(width);
   const float h = static_cast<float>(height);
-  const float menuWidth = std::min(std::max(220.0f, w * 0.28f), std::max(220.0f, w - 16.0f));
+  const float menuWidth =
+      clampFloatingMenuWidth(plotModelTopMenuNaturalWidth("Add Plot"), 168.0f, 300.0f, width);
   const float headerHeight = 24.0f;
   const float menuHeight = kPlotMenuPad * 2.0f + headerHeight +
                            kViewerChoiceMenuRowHeight * static_cast<float>(kPlotModelTopMenuEntryCount);
@@ -15225,7 +15286,8 @@ PlotMenuRect plotModelColorSubmenuRect(const PlotMenuRect& parentRect,
                                        int width,
                                        int height,
                                        float rowsOffset) {
-  const float submenuWidth = std::min(190.0f, std::max(150.0f, static_cast<float>(width) - 16.0f));
+  const float submenuWidth =
+      clampFloatingMenuWidth(plotModelColorSubmenuNaturalWidth(), 132.0f, 220.0f, width);
   const float submenuHeight = kPlotMenuPad * 2.0f +
                               kViewerChoiceMenuRowHeight *
                                   static_cast<float>(kPlotModelColorSubmenuEntryCount);
@@ -15770,7 +15832,9 @@ PlotMenuRect viewerChoiceMenuWindowRect(const AppState& app, int width, int heig
   const float rowsX0 = drawer.x0 + kViewerDrawerPad + kViewerDrawerTabRailWidth + kViewerDrawerPad;
   const float rowsX1 = drawer.x1 - kViewerDrawerPad;
   const float availableWidth = std::max(1.0f, rowsX1 - rowsX0);
-  const float menuWidth = std::min(availableWidth, std::max(220.0f, std::min(360.0f, availableWidth)));
+  const float menuWidth =
+      std::min(availableWidth,
+               clampFloatingMenuWidth(viewerChoiceMenuNaturalWidth(items), 128.0f, 360.0f, width));
   const float naturalHeight =
       kViewerChoiceMenuPad * 2.0f + kViewerChoiceMenuRowHeight * static_cast<float>(items.size());
   const float x1 = rowsX1;
@@ -17577,15 +17641,17 @@ void drawQuickPlotModelMenuOverlay(const AppState& app,
                   0.92f,
                   0.96f,
                   1.0f);
-  drawHudTextLineRight(renderer,
-                       "Ctrl+S closes",
-                       menuRect.x1 - 12.0f,
-                       menuRect.y1 - 20.0f,
-                       0.82f,
-                       0.56f,
-                       0.80f,
-                       0.86f,
-                       0.94f);
+  if (menuRect.x1 - menuRect.x0 >= 238.0f) {
+    drawHudTextLineRight(renderer,
+                         "Ctrl+S closes",
+                         menuRect.x1 - 12.0f,
+                         menuRect.y1 - 20.0f,
+                         0.82f,
+                         0.56f,
+                         0.80f,
+                         0.86f,
+                         0.94f);
+  }
 
   for (int i = 0; i < kPlotModelTopMenuEntryCount; ++i) {
     const PlotModelMenuEntry& entry = kPlotModelTopMenuEntries[i];
@@ -17736,15 +17802,17 @@ void drawAddPlotMenuOverlay(const AppState& app,
                   0.92f,
                   0.96f,
                   1.0f);
-  drawHudTextLineRight(renderer,
-                       "Shift+A closes",
-                       menuRect.x1 - 12.0f,
-                       menuRect.y1 - 20.0f,
-                       0.82f,
-                       0.56f,
-                       0.80f,
-                       0.86f,
-                       0.94f);
+  if (menuRect.x1 - menuRect.x0 >= 238.0f) {
+    drawHudTextLineRight(renderer,
+                         "Shift+A closes",
+                         menuRect.x1 - 12.0f,
+                         menuRect.y1 - 20.0f,
+                         0.82f,
+                         0.56f,
+                         0.80f,
+                         0.86f,
+                         0.94f);
+  }
 
   for (int i = 0; i < kPlotModelTopMenuEntryCount; ++i) {
     const PlotModelMenuEntry& entry = kPlotModelTopMenuEntries[i];
@@ -23145,6 +23213,11 @@ int main() {
             const std::string prevPlotMode = resolved.plotMode;
             if (!next.hasExcludeIdentityData) {
               next.viewerState.excludeIdentityData = app.viewerState.excludeIdentityData;
+              if (app.viewerState.excludeIdentityData) {
+                next.viewerState.readGrayRamp = app.viewerState.readGrayRamp;
+                next.viewerState.readIdentityPlot = app.viewerState.readIdentityPlot;
+                next.viewerState.isolateIdentityData = app.viewerState.isolateIdentityData;
+              }
               next.viewerState = viewerStateWithModelCapabilities(next.viewerState);
               next.excludeIdentityData = next.viewerState.excludeIdentityData;
             }
