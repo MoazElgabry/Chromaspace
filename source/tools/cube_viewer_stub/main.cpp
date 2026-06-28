@@ -106,6 +106,12 @@
 #ifndef GL_CLAMP_TO_EDGE
 #define GL_CLAMP_TO_EDGE 0x812F
 #endif
+#ifndef GL_RGBA16F
+#define GL_RGBA16F 0x881A
+#endif
+#ifndef GL_HALF_FLOAT
+#define GL_HALF_FLOAT 0x140B
+#endif
 
 namespace {
 
@@ -2606,6 +2612,35 @@ struct InputCloudPayload {
   uint64_t shmSize = 0;
   std::string points;
   std::vector<float> packedPoints;
+};
+
+struct SourceSignalPayload {
+  uint64_t seq = 0;
+  uint64_t contentHash = 0;
+  std::string senderId;
+  int sourceWidth = 0;
+  int sourceHeight = 0;
+  int proxyWidth = 0;
+  int proxyHeight = 0;
+  std::string pixelFormat = "rgba16f";
+  std::string transport = "json";
+  std::string shmName;
+  uint64_t shmSize = 0;
+  std::string coverage = "full";
+  std::string tierLabel = "Proxy";
+  std::vector<uint16_t> rgba16f;
+};
+
+struct SourceSignalStore {
+  SourceSignalPayload authoritative{};
+  SourceSignalPayload preview{};
+  bool hasAuthoritative = false;
+  bool hasPreview = false;
+  uint64_t lastSeq = 0;
+  GLuint texture = 0;
+  uint64_t textureContentHash = 0;
+  int textureWidth = 0;
+  int textureHeight = 0;
 };
 
 float effectiveColorSaturationForPlot(float colorSaturation, float pointSize, float pointDensity, int resolution);
@@ -5491,9 +5526,11 @@ bool mayKeepDrawingCurrentMeshDuringParamHandoff(const ResolvedPayload& previous
 std::mutex gMsgMutex;
 PendingMessage gPendingParamsMsg;
 PendingMessage gPendingCloudMsg;
+PendingMessage gPendingSourceSignalMsg;
 PendingMessage gPendingClearMsg;
 bool gHasPendingParamsMsg = false;
 bool gHasPendingCloudMsg = false;
+bool gHasPendingSourceSignalMsg = false;
 bool gHasPendingClearMsg = false;
 
 struct PendingViewerCommand {
@@ -5559,6 +5596,10 @@ void appendViewerStateCommandFields(std::ostringstream& os,
      << ",\"plotDisplayLinearTransfer\":" << s.plotDisplayLinearTransfer
      << ",\"liveUpdate\":" << (s.liveUpdate ? 1 : 0)
      << ",\"updateMode\":" << s.updateMode
+     << ",\"sourceDetailMode\":" << s.sourceDetailMode
+     << ",\"sourceMaxProxyLongEdge\":" << s.sourceMaxProxyLongEdge
+     << ",\"sourceUseNativeWhenAvailable\":" << (s.sourceUseNativeWhenAvailable ? 1 : 0)
+     << ",\"sourceSyncSelections\":" << (s.sourceSyncSelections ? 1 : 0)
      << ",\"quality\":" << s.quality
      << ",\"scale\":" << s.scale
      << ",\"sampling\":" << s.sampling
@@ -5845,6 +5886,10 @@ bool parseParamsMessage(const std::string& line, ResolvedPayload* out) {
   int histogramShowOverflow = 1;
   int histogramHighlightOverflow = 1;
   int scopeRangeMode = 0;
+  int sourceDetailMode = 0;
+  int sourceMaxProxyLongEdge = 2048;
+  int sourceUseNativeWhenAvailable = 1;
+  int sourceSyncSelections = 0;
   extractInt(line, "waveformMode", &waveformMode);
   extractInt(line, "waveformHighDetail", &waveformHighDetail);
   extractInt(line, "waveformContinuousHighDetail", &waveformContinuousHighDetail);
@@ -5865,6 +5910,10 @@ bool parseParamsMessage(const std::string& line, ResolvedPayload* out) {
   extractInt(line, "histogramShowOverflow", &histogramShowOverflow);
   extractInt(line, "histogramHighlightOverflow", &histogramHighlightOverflow);
   extractInt(line, "scopeRangeMode", &scopeRangeMode);
+  extractInt(line, "sourceDetailMode", &sourceDetailMode);
+  extractInt(line, "sourceMaxProxyLongEdge", &sourceMaxProxyLongEdge);
+  extractInt(line, "sourceUseNativeWhenAvailable", &sourceUseNativeWhenAvailable);
+  extractInt(line, "sourceSyncSelections", &sourceSyncSelections);
   int identityOverlayEnabled = 0;
   extractInt(line, "identityOverlayEnabled", &identityOverlayEnabled);
   p.identityOverlayEnabled = (identityOverlayEnabled != 0);
@@ -5988,6 +6037,10 @@ bool parseParamsMessage(const std::string& line, ResolvedPayload* out) {
   p.viewerState.histogramShowOverflow = histogramShowOverflow != 0;
   p.viewerState.histogramHighlightOverflow = histogramHighlightOverflow != 0;
   p.viewerState.scopeRangeMode = scopeRangeMode;
+  p.viewerState.sourceDetailMode = sourceDetailMode;
+  p.viewerState.sourceMaxProxyLongEdge = sourceMaxProxyLongEdge;
+  p.viewerState.sourceUseNativeWhenAvailable = sourceUseNativeWhenAvailable != 0;
+  p.viewerState.sourceSyncSelections = sourceSyncSelections != 0;
   p.viewerState.keepOnTop = p.alwaysOnTop;
   p.viewerState.resetViewOnPlotSwitch = p.resetViewOnPlotSwitch;
   p.viewerState.showOverflow = p.showOverflow;
@@ -6075,6 +6128,80 @@ uint64_t inputCloudPrimaryStabilityHash(const InputCloudPayload& cloud) {
     addQuantized(sample[5]);
   }
   return hash;
+}
+
+bool loadSourceSignalSharedMemory(SourceSignalPayload* payload) {
+  if (!payload) return false;
+  payload->rgba16f.clear();
+  if (payload->transport != "shm" || payload->shmName.empty() ||
+      payload->proxyWidth <= 0 || payload->proxyHeight <= 0 ||
+      payload->pixelFormat != "rgba16f") {
+    return false;
+  }
+  const uint64_t expectedBytes =
+      static_cast<uint64_t>(payload->proxyWidth) *
+      static_cast<uint64_t>(payload->proxyHeight) * 4u * sizeof(uint16_t);
+  if (expectedBytes == 0 || (payload->shmSize != 0 && expectedBytes > payload->shmSize)) {
+    return false;
+  }
+  payload->rgba16f.assign(static_cast<size_t>(expectedBytes / sizeof(uint16_t)), 0);
+#if defined(_WIN32)
+  HANDLE mapping = OpenFileMappingA(FILE_MAP_READ, FALSE, payload->shmName.c_str());
+  if (mapping == nullptr) return false;
+  const void* mapped = MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, static_cast<SIZE_T>(expectedBytes));
+  if (!mapped) {
+    CloseHandle(mapping);
+    return false;
+  }
+  std::memcpy(payload->rgba16f.data(), mapped, static_cast<size_t>(expectedBytes));
+  UnmapViewOfFile(mapped);
+  CloseHandle(mapping);
+  return true;
+#else
+  const int fd = shm_open(payload->shmName.c_str(), O_RDONLY, 0);
+  if (fd < 0) return false;
+  void* mapped = mmap(nullptr, static_cast<size_t>(expectedBytes), PROT_READ, MAP_SHARED, fd, 0);
+  if (mapped == MAP_FAILED) {
+    ::close(fd);
+    return false;
+  }
+  std::memcpy(payload->rgba16f.data(), mapped, static_cast<size_t>(expectedBytes));
+  munmap(mapped, static_cast<size_t>(expectedBytes));
+  ::close(fd);
+  return true;
+#endif
+}
+
+bool parseSourceSignalMessage(const std::string& line, SourceSignalPayload* out) {
+  if (line.find("\"type\":\"source_signal\"") == std::string::npos || !out) return false;
+  SourceSignalPayload p{};
+  extractUInt64(line, "seq", &p.seq);
+  extractUInt64(line, "contentHash", &p.contentHash);
+  extractQuoted(line, "senderId", &p.senderId);
+  extractQuoted(line, "pixelFormat", &p.pixelFormat);
+  extractQuoted(line, "transport", &p.transport);
+  extractQuoted(line, "shmName", &p.shmName);
+  extractQuoted(line, "coverage", &p.coverage);
+  extractQuoted(line, "tier", &p.tierLabel);
+  extractInt(line, "sourceWidth", &p.sourceWidth);
+  extractInt(line, "sourceHeight", &p.sourceHeight);
+  extractInt(line, "proxyWidth", &p.proxyWidth);
+  extractInt(line, "proxyHeight", &p.proxyHeight);
+  extractUInt64(line, "shmSize", &p.shmSize);
+  if (p.transport == "shm" && !loadSourceSignalSharedMemory(&p)) {
+    logViewerEvent(std::string("Failed to load shared-memory source signal: ") + p.shmName);
+    return false;
+  }
+  if (p.contentHash == 0 && !p.rgba16f.empty()) {
+    p.contentHash = inputCloudContentHashBytes(p.rgba16f.data(), p.rgba16f.size() * sizeof(uint16_t));
+  }
+  if (p.sourceWidth <= 0 || p.sourceHeight <= 0) {
+    p.sourceWidth = p.proxyWidth;
+    p.sourceHeight = p.proxyHeight;
+  }
+  if (p.tierLabel.empty()) p.tierLabel = p.coverage == "partial-preview" ? "Preview" : "Proxy";
+  *out = std::move(p);
+  return out->proxyWidth > 0 && out->proxyHeight > 0 && !out->rgba16f.empty();
 }
 
 // Stage: parse the plot cloud payload exactly as shipped by the OFX instance.
@@ -10506,6 +10633,9 @@ struct PlotWindowState {
   PlotWindowRectNorm rect{};
   ChromaspaceViewer::ViewerRuntimeState viewState{};
   CameraState camera{};
+  std::vector<LassoStroke> viewerLassoStrokes;
+  uint64_t viewerLassoRevision = 0;
+  std::string viewerLassoData;
   MeshData derivedMesh{};
   MeshData overlayMesh{};
   std::string derivedBuildKey;
@@ -10525,7 +10655,8 @@ ChromaspaceViewer::ViewerRuntimeState viewerStateWithModelCapabilities(
 const InputCloudPayload* sourceCloudForPlotWindow(const SourceCloudStore& store,
                                                   const PlotWindowState& window,
                                                   const std::string& senderId,
-                                                  const InputCloudPayload* fallback) {
+                                                  const InputCloudPayload* fallback,
+                                                  bool allowImageLasso = true) {
   const auto state = viewerStateWithModelCapabilities(window.viewState);
   if (state.plotModel == ChromaspaceViewer::kPlotModelWaveform &&
       state.waveformHighDetail &&
@@ -10537,7 +10668,7 @@ const InputCloudPayload* sourceCloudForPlotWindow(const SourceCloudStore& store,
       senderMatchesCurrent(senderId, store.waveformHigh.senderId)) {
     return &store.waveformHigh;
   }
-  if (state.volumeSliceLassoRegion && store.hasImageLasso &&
+  if (allowImageLasso && state.volumeSliceLassoRegion && store.hasImageLasso &&
       senderMatchesCurrent(senderId, store.imageLasso.senderId) &&
       !cloudLooksEmptyImageLassoVariant(store.imageLasso)) {
     return &store.imageLasso;
@@ -10672,6 +10803,10 @@ struct AppState {
   std::string generatedIdentityResolutionSender;
   std::string activeCloudSettingsKey;
   std::string localPreviewSettingsKey;
+  int sourceSignalSourceWidth = 0;
+  int sourceSignalSourceHeight = 0;
+  int sourceSignalProxyWidth = 0;
+  int sourceSignalProxyHeight = 0;
   int viewerMenuSection = 0;
   int viewerMenuHoverTab = -1;
   int viewerSettingsSubtab = 0;
@@ -10694,6 +10829,8 @@ struct AppState {
   uint64_t viewerLassoRevision = 0;
   bool viewerLassoDrawing = false;
   std::string viewerLassoData;
+  int viewerLassoTargetWindowId = -1;
+  bool viewerLassoSubtractMode = false;
   std::string cachedOfxImageLassoData;
   uint64_t lastObservedOfxImageLassoRevision = 0;
   uint64_t clearImageLassoBaselineRevision = 0;
@@ -11048,6 +11185,229 @@ void addPlotWindow(AppState* app, int plotModel, int windowWidth, int windowHeig
                  " model=" + ChromaspaceViewer::plotModelLabel(window.viewState.plotModel));
 }
 
+bool plotWindowIsSourceSignal(const PlotWindowState& window) {
+  return window.viewState.plotModel == ChromaspaceViewer::kPlotModelSourceSignal;
+}
+
+bool plotWindowCanOwnViewerLassoSelection(const PlotWindowState& window) {
+  const auto state = viewerStateWithModelCapabilities(window.viewState);
+  return !plotWindowIsSourceSignal(window) &&
+         ChromaspaceViewer::volumeSlicingSupported(state, false);
+}
+
+bool viewerSourceSelectionsSynced(const AppState& app) {
+  return app.viewerState.sourceSyncSelections;
+}
+
+PlotWindowState* sourceSignalPlotWindow(AppState* app) {
+  if (!app) return nullptr;
+  for (auto& window : app->plotWindows) {
+    if (plotWindowIsSourceSignal(window)) return &window;
+  }
+  return nullptr;
+}
+
+const PlotWindowState* sourceSignalPlotWindow(const AppState& app) {
+  for (const auto& window : app.plotWindows) {
+    if (plotWindowIsSourceSignal(window)) return &window;
+  }
+  return nullptr;
+}
+
+PlotWindowState* sourceSignalPlotWindowAt(AppState* app,
+                                          int windowWidth,
+                                          int windowHeight,
+                                          double x,
+                                          double y) {
+  if (!app) return nullptr;
+  for (auto it = app->plotWindows.rbegin(); it != app->plotWindows.rend(); ++it) {
+    if (plotWindowIsSourceSignal(*it) &&
+        pointInPlotWindowRect(*it, windowWidth, windowHeight, x, y)) {
+      return &(*it);
+    }
+  }
+  return nullptr;
+}
+
+PlotWindowState* activeViewerLassoTargetWindow(AppState* app) {
+  if (!app || viewerSourceSelectionsSynced(*app)) return nullptr;
+  if (PlotWindowState* target = plotWindowById(app, app->viewerLassoTargetWindowId);
+      target && plotWindowCanOwnViewerLassoSelection(*target)) {
+    return target;
+  }
+  if (PlotWindowState* focused = focusedPlotWindow(app);
+      focused && plotWindowCanOwnViewerLassoSelection(*focused)) {
+    app->viewerLassoTargetWindowId = focused->windowId;
+    return focused;
+  }
+  for (auto it = app->plotWindows.rbegin(); it != app->plotWindows.rend(); ++it) {
+    if (plotWindowCanOwnViewerLassoSelection(*it)) {
+      app->viewerLassoTargetWindowId = it->windowId;
+      return &(*it);
+    }
+  }
+  app->viewerLassoTargetWindowId = -1;
+  return nullptr;
+}
+
+const PlotWindowState* activeViewerLassoTargetWindow(const AppState& app) {
+  if (viewerSourceSelectionsSynced(app)) return nullptr;
+  if (const PlotWindowState* target = plotWindowById(app, app.viewerLassoTargetWindowId);
+      target && plotWindowCanOwnViewerLassoSelection(*target)) {
+    return target;
+  }
+  if (const PlotWindowState* focused = focusedPlotWindow(app);
+      focused && plotWindowCanOwnViewerLassoSelection(*focused)) {
+    return focused;
+  }
+  for (auto it = app.plotWindows.rbegin(); it != app.plotWindows.rend(); ++it) {
+    if (plotWindowCanOwnViewerLassoSelection(*it)) return &(*it);
+  }
+  return nullptr;
+}
+
+void rememberViewerLassoTargetFromCurrentFocus(AppState* app) {
+  if (!app || viewerSourceSelectionsSynced(*app)) return;
+  if (PlotWindowState* focused = focusedPlotWindow(app);
+      focused && plotWindowCanOwnViewerLassoSelection(*focused)) {
+    app->viewerLassoTargetWindowId = focused->windowId;
+  }
+}
+
+const PlotWindowState* activeSourceSignalLassoWindow(const AppState& app) {
+  if (const PlotWindowState* focused = focusedPlotWindow(app);
+      focused && plotWindowIsSourceSignal(*focused)) {
+    return focused;
+  }
+  return sourceSignalPlotWindow(app);
+}
+
+void ensureSourceSignalWindowForLasso(AppState* app,
+                                      int windowWidth,
+                                      int windowHeight,
+                                      bool focusExisting) {
+  if (!app || !app->viewerState.volumeSliceLassoRegion) return;
+  if (focusExisting) rememberViewerLassoTargetFromCurrentFocus(app);
+  if (PlotWindowState* existing = sourceSignalPlotWindow(app)) {
+    if (focusExisting) focusPlotWindow(app, existing->windowId);
+    return;
+  }
+  const double cursorX = (app->hoverX > 0.0) ? app->hoverX : static_cast<double>(windowWidth) * 0.5;
+  const double cursorY = (app->hoverY > 0.0) ? app->hoverY : static_cast<double>(windowHeight) * 0.5;
+  addPlotWindow(app,
+                ChromaspaceViewer::kPlotModelSourceSignal,
+                windowWidth,
+                windowHeight,
+                cursorX,
+                cursorY);
+  logViewerEvent("Opened Source Signal window for viewer lasso drawing.");
+}
+
+void propagateViewerLassoEnabledToPlotWindows(AppState* app) {
+  if (!app) return;
+  const bool enabled = app->viewerState.volumeSliceLassoRegion;
+  for (auto& window : app->plotWindows) {
+    auto state = viewerStateWithModelCapabilities(window.viewState);
+    if (!enabled && !state.volumeSliceLassoRegion) continue;
+    if (enabled && !ChromaspaceViewer::volumeSlicingSupported(state, false)) continue;
+    if (state.volumeSliceLassoRegion == enabled) continue;
+    state.volumeSliceLassoRegion = enabled;
+    state.stateRevision = std::max<uint64_t>(state.stateRevision + 1, 1);
+    window.viewState = viewerStateWithModelCapabilities(state);
+  }
+}
+
+void propagateSourceSelectionSyncToPlotWindows(AppState* app) {
+  if (!app) return;
+  const bool synced = app->viewerState.sourceSyncSelections;
+  PlotWindowState* unsyncedInitialTarget = nullptr;
+  if (!synced) {
+    unsyncedInitialTarget = activeViewerLassoTargetWindow(app);
+  } else {
+    PlotWindowState* syncSource = plotWindowById(app, app->viewerLassoTargetWindowId);
+    if (!syncSource || !plotWindowCanOwnViewerLassoSelection(*syncSource)) {
+      syncSource = focusedPlotWindow(app);
+    }
+    if (syncSource && plotWindowCanOwnViewerLassoSelection(*syncSource) &&
+        !syncSource->viewerLassoData.empty()) {
+      app->viewerLassoStrokes = syncSource->viewerLassoStrokes;
+      app->viewerLassoRevision = std::max<uint64_t>(syncSource->viewerLassoRevision, 1);
+      app->viewerLassoData = syncSource->viewerLassoData;
+    }
+  }
+  for (auto& window : app->plotWindows) {
+    window.viewState.sourceSyncSelections = synced;
+    window.viewState.stateRevision = std::max<uint64_t>(window.viewState.stateRevision + 1, 1);
+    if (!synced && (&window == unsyncedInitialTarget) &&
+        window.viewerLassoData.empty() && !app->viewerLassoData.empty() &&
+        plotWindowCanOwnViewerLassoSelection(window)) {
+      window.viewerLassoStrokes = app->viewerLassoStrokes;
+      window.viewerLassoRevision = app->viewerLassoRevision;
+      window.viewerLassoData = app->viewerLassoData;
+    }
+  }
+}
+
+bool sourceSignalImageRectForCanvas(const AppState& app,
+                                    const PlotWindowState& window,
+                                    int canvasWidth,
+                                    int canvasHeight,
+                                    bool topLeftY,
+                                    float* outX0,
+                                    float* outY0,
+                                    float* outX1,
+                                    float* outY1) {
+  if (!outX0 || !outY0 || !outX1 || !outY1 || canvasWidth <= 0 || canvasHeight <= 0) {
+    return false;
+  }
+  const float plotX = window.rect.x * static_cast<float>(canvasWidth);
+  const float plotTop = window.rect.y * static_cast<float>(canvasHeight);
+  const float plotW = std::max(1.0f, window.rect.w * static_cast<float>(canvasWidth));
+  const float plotH = std::max(1.0f, window.rect.h * static_cast<float>(canvasHeight));
+  const int proxyW = app.sourceSignalProxyWidth > 0 ? app.sourceSignalProxyWidth : app.sourceSignalSourceWidth;
+  const int proxyH = app.sourceSignalProxyHeight > 0 ? app.sourceSignalProxyHeight : app.sourceSignalSourceHeight;
+  if (proxyW <= 0 || proxyH <= 0) {
+    if (topLeftY) {
+      *outX0 = plotX;
+      *outY0 = plotTop;
+      *outX1 = plotX + plotW;
+      *outY1 = plotTop + plotH;
+    } else {
+      *outX0 = plotX;
+      *outY0 = static_cast<float>(canvasHeight) - plotTop - plotH;
+      *outX1 = plotX + plotW;
+      *outY1 = *outY0 + plotH;
+    }
+    return true;
+  }
+
+  const float pad = std::max(10.0f, std::min(plotW, plotH) * 0.025f);
+  const float availableW = std::max(1.0f, plotW - pad * 2.0f);
+  const float availableH = std::max(1.0f, plotH - pad * 2.0f - 26.0f);
+  const float sourceAspect =
+      static_cast<float>(std::max(1, proxyW)) / static_cast<float>(std::max(1, proxyH));
+  float drawW = availableW;
+  float drawH = drawW / sourceAspect;
+  if (drawH > availableH) {
+    drawH = availableH;
+    drawW = drawH * sourceAspect;
+  }
+
+  const float localX0 = (plotW - drawW) * 0.5f;
+  const float localY0Bottom = (plotH - drawH) * 0.5f - 4.0f;
+  *outX0 = plotX + localX0;
+  *outX1 = *outX0 + drawW;
+  if (topLeftY) {
+    *outY0 = plotTop + plotH - (localY0Bottom + drawH);
+    *outY1 = plotTop + plotH - localY0Bottom;
+  } else {
+    const float plotBottom = static_cast<float>(canvasHeight) - plotTop - plotH;
+    *outY0 = plotBottom + localY0Bottom;
+    *outY1 = *outY0 + drawH;
+  }
+  return *outX1 > *outX0 && *outY1 > *outY0;
+}
+
 void ensurePlotWindowCount(AppState* app, int count, int windowWidth, int windowHeight) {
   if (!app) return;
   ensureDefaultPlotWindow(app);
@@ -11195,15 +11555,54 @@ void applyPendingImageLassoResetToResolvedPayload(const AppState& app, ResolvedP
   payload->cloudSettingsKey = cloudSettingsKeyWithoutImageLasso(payload->cloudSettingsKey) +
                               imageLassoSettingsSuffixForData(payload->lassoData);
 }
-bool viewerLassoInteractionEnabled(const AppState& app) {
-  (void)app;
-  return false;
-}
-
-LassoPointNorm viewerLassoPointFromCursor(GLFWwindow* window, double xpos, double ypos) {
+bool viewerLassoInteractionEnabled(const AppState& app,
+                                   GLFWwindow* window,
+                                   double xpos,
+                                   double ypos) {
+  if (!window || !app.viewerState.volumeSliceLassoRegion) return false;
   int windowWidth = 1;
   int windowHeight = 1;
   glfwGetWindowSize(window, &windowWidth, &windowHeight);
+  const PlotWindowState* sourceWindow = nullptr;
+  for (auto it = app.plotWindows.rbegin(); it != app.plotWindows.rend(); ++it) {
+    if (plotWindowIsSourceSignal(*it) &&
+        pointInPlotWindowRect(*it, windowWidth, windowHeight, xpos, ypos)) {
+      sourceWindow = &(*it);
+      break;
+    }
+  }
+  if (!sourceWindow) return false;
+
+  float x0 = 0.0f;
+  float y0 = 0.0f;
+  float x1 = 0.0f;
+  float y1 = 0.0f;
+  if (!sourceSignalImageRectForCanvas(app, *sourceWindow, windowWidth, windowHeight, true,
+                                      &x0, &y0, &x1, &y1)) {
+    return false;
+  }
+  return xpos >= x0 && xpos <= x1 && ypos >= y0 && ypos <= y1;
+}
+
+LassoPointNorm viewerLassoPointFromCursor(const AppState& app,
+                                          GLFWwindow* window,
+                                          double xpos,
+                                          double ypos) {
+  int windowWidth = 1;
+  int windowHeight = 1;
+  glfwGetWindowSize(window, &windowWidth, &windowHeight);
+  if (const PlotWindowState* sourceWindow = activeSourceSignalLassoWindow(app)) {
+    float x0 = 0.0f;
+    float y0 = 0.0f;
+    float x1 = 0.0f;
+    float y1 = 0.0f;
+    if (sourceSignalImageRectForCanvas(app, *sourceWindow, windowWidth, windowHeight, true,
+                                       &x0, &y0, &x1, &y1) &&
+        x1 > x0 && y1 > y0) {
+      return {clampf((static_cast<float>(xpos) - x0) / (x1 - x0), 0.0f, 1.0f),
+              clampf((y1 - static_cast<float>(ypos)) / (y1 - y0), 0.0f, 1.0f)};
+    }
+  }
   const float xNorm = clampf(static_cast<float>(xpos) / static_cast<float>(std::max(1, windowWidth)),
                              0.0f,
                              1.0f);
@@ -11217,6 +11616,60 @@ void rebuildViewerLassoData(AppState* app) {
   if (!app) return;
   app->viewerLassoData =
       serializeViewerLassoRegionState(app->viewerLassoRevision, app->viewerLassoStrokes);
+}
+
+void rebuildViewerLassoData(PlotWindowState* window) {
+  if (!window) return;
+  window->viewerLassoData =
+      serializeViewerLassoRegionState(window->viewerLassoRevision, window->viewerLassoStrokes);
+}
+
+const std::vector<LassoStroke>* viewerLassoStrokesForActiveSelection(const AppState& app) {
+  if (!viewerSourceSelectionsSynced(app)) {
+    if (const PlotWindowState* target = activeViewerLassoTargetWindow(app)) {
+      return &target->viewerLassoStrokes;
+    }
+  }
+  return &app.viewerLassoStrokes;
+}
+
+std::string viewerLassoDataForPlotWindow(const AppState& app, const PlotWindowState* window) {
+  if (!viewerSourceSelectionsSynced(app) && window) {
+    if (const PlotWindowState* target = activeViewerLassoTargetWindow(app);
+        target && target->windowId != window->windowId) {
+      return {};
+    }
+  }
+  if (!viewerSourceSelectionsSynced(app) && window) {
+    return window->viewerLassoData.empty()
+               ? serializeViewerLassoRegionState(std::max<uint64_t>(1, window->viewerLassoRevision), {})
+               : window->viewerLassoData;
+  }
+  return app.viewerLassoData.empty()
+             ? serializeViewerLassoRegionState(std::max<uint64_t>(1, app.viewerLassoRevision), {})
+             : app.viewerLassoData;
+}
+
+bool activeViewerLassoSelectionHasData(const AppState& app) {
+  if (!viewerSourceSelectionsSynced(app)) {
+    if (const PlotWindowState* target = activeViewerLassoTargetWindow(app)) {
+      return !parseViewerLassoRegionState(target->viewerLassoData).strokes.empty();
+    }
+    return false;
+  }
+  return !parseViewerLassoRegionState(app.viewerLassoData).strokes.empty();
+}
+
+bool plotWindowShouldShowImageLassoStandby(const AppState& app, const PlotWindowState* window) {
+  if (!window || app.viewerLassoDrawing || !app.viewerState.volumeSliceLassoRegion) return false;
+  const auto state = viewerStateWithModelCapabilities(window->viewState);
+  if (!state.volumeSliceLassoRegion || !plotWindowCanOwnViewerLassoSelection(*window)) return false;
+  if (viewerSourceSelectionsSynced(app)) {
+    return parseViewerLassoRegionState(app.viewerLassoData).strokes.empty();
+  }
+  const PlotWindowState* target = activeViewerLassoTargetWindow(app);
+  if (!target || target->windowId != window->windowId) return false;
+  return parseViewerLassoRegionState(target->viewerLassoData).strokes.empty();
 }
 
 void bumpViewerLocalStateRevision(AppState* app) {
@@ -11239,11 +11692,12 @@ bool appendPointToViewerLassoStroke(LassoStroke* stroke, LassoPointNorm point) {
 
 void beginViewerLassoStroke(AppState* app, GLFWwindow* window, double xpos, double ypos) {
   if (!app || !window) return;
+  if (!viewerSourceSelectionsSynced(*app)) activeViewerLassoTargetWindow(app);
   app->viewerLassoDrawing = true;
   app->viewerLassoActiveStroke = LassoStroke{};
-  app->viewerLassoActiveStroke.subtract = app->altHeld || app->ctrlHeld;
+  app->viewerLassoActiveStroke.subtract = app->viewerLassoSubtractMode || app->altHeld || app->ctrlHeld;
   appendPointToViewerLassoStroke(&app->viewerLassoActiveStroke,
-                                 viewerLassoPointFromCursor(window, xpos, ypos));
+                                 viewerLassoPointFromCursor(*app, window, xpos, ypos));
   app->leftDown = false;
   app->panMode = false;
   app->rollMode = false;
@@ -11253,7 +11707,7 @@ void beginViewerLassoStroke(AppState* app, GLFWwindow* window, double xpos, doub
 void updateViewerLassoStroke(AppState* app, GLFWwindow* window, double xpos, double ypos) {
   if (!app || !window || !app->viewerLassoDrawing) return;
   if (appendPointToViewerLassoStroke(&app->viewerLassoActiveStroke,
-                                     viewerLassoPointFromCursor(window, xpos, ypos))) {
+                                     viewerLassoPointFromCursor(*app, window, xpos, ypos))) {
     bumpViewerLocalStateRevision(app);
   }
 }
@@ -11262,22 +11716,65 @@ void finishViewerLassoStroke(AppState* app) {
   if (!app || !app->viewerLassoDrawing) return;
   app->viewerLassoDrawing = false;
   if (app->viewerLassoActiveStroke.points.size() >= 3) {
-    app->viewerLassoStrokes.push_back(std::move(app->viewerLassoActiveStroke));
-    app->viewerLassoRevision = std::max<uint64_t>(app->viewerLassoRevision + 1, 1);
-    rebuildViewerLassoData(app);
+    if (!viewerSourceSelectionsSynced(*app)) {
+      if (PlotWindowState* target = activeViewerLassoTargetWindow(app)) {
+        target->viewerLassoStrokes.push_back(std::move(app->viewerLassoActiveStroke));
+        target->viewerLassoRevision = std::max<uint64_t>(target->viewerLassoRevision + 1, 1);
+        target->viewState.stateRevision = std::max<uint64_t>(target->viewState.stateRevision + 1, 1);
+        rebuildViewerLassoData(target);
+      } else {
+        app->viewerLassoStrokes.push_back(std::move(app->viewerLassoActiveStroke));
+        app->viewerLassoRevision = std::max<uint64_t>(app->viewerLassoRevision + 1, 1);
+        rebuildViewerLassoData(app);
+      }
+    } else {
+      app->viewerLassoStrokes.push_back(std::move(app->viewerLassoActiveStroke));
+      app->viewerLassoRevision = std::max<uint64_t>(app->viewerLassoRevision + 1, 1);
+      rebuildViewerLassoData(app);
+    }
     bumpViewerLocalStateRevision(app);
   }
   app->viewerLassoActiveStroke = LassoStroke{};
 }
 
-void clearViewerLassoState(AppState* app) {
+void clearAllViewerLassoState(AppState* app) {
   if (!app) return;
   app->viewerLassoDrawing = false;
   app->viewerLassoActiveStroke = LassoStroke{};
   app->viewerLassoStrokes.clear();
   app->viewerLassoRevision = std::max<uint64_t>(app->viewerLassoRevision + 1, 1);
   app->viewerLassoData.clear();
+  for (auto& window : app->plotWindows) {
+    window.viewerLassoStrokes.clear();
+    window.viewerLassoRevision = std::max<uint64_t>(window.viewerLassoRevision + 1, 1);
+    window.viewerLassoData.clear();
+    window.viewState.stateRevision = std::max<uint64_t>(window.viewState.stateRevision + 1, 1);
+  }
   bumpViewerLocalStateRevision(app);
+}
+
+void clearActiveViewerLassoSelection(AppState* app) {
+  if (!app) return;
+  app->viewerLassoDrawing = false;
+  app->viewerLassoActiveStroke = LassoStroke{};
+  if (!viewerSourceSelectionsSynced(*app)) {
+    if (PlotWindowState* target = activeViewerLassoTargetWindow(app)) {
+      target->viewerLassoStrokes.clear();
+      target->viewerLassoRevision = std::max<uint64_t>(target->viewerLassoRevision + 1, 1);
+      target->viewerLassoData.clear();
+      target->viewState.stateRevision = std::max<uint64_t>(target->viewState.stateRevision + 1, 1);
+      bumpViewerLocalStateRevision(app);
+      return;
+    }
+  }
+  app->viewerLassoStrokes.clear();
+  app->viewerLassoRevision = std::max<uint64_t>(app->viewerLassoRevision + 1, 1);
+  app->viewerLassoData.clear();
+  bumpViewerLocalStateRevision(app);
+}
+
+void clearViewerLassoState(AppState* app) {
+  clearAllViewerLassoState(app);
 }
 
 enum class PlotRenderFamily {
@@ -11286,6 +11783,7 @@ enum class PlotRenderFamily {
   Gloss,
   Waveform2D,
   Histogram2D,
+  SourceSignal2D,
 };
 
 struct PlotModelDescriptor {
@@ -11314,6 +11812,7 @@ constexpr PlotModelDescriptor kViewerPlotModelChoices[] = {
     {"gloss_view", "Gloss View (beta)", "gloss_view", 8, PlotRenderFamily::Gloss, false, false, true, false, true, true},
     {"waveform", "Waveform", "waveform", 9, PlotRenderFamily::Waveform2D, false, true, false, false, false, false},
     {"histogram", "Histogram", "histogram", 10, PlotRenderFamily::Histogram2D, false, true, false, false, false, false},
+    {"source_signal", "Source Signal", "source_signal", 11, PlotRenderFamily::SourceSignal2D, false, true, false, false, false, false},
 };
 
 constexpr int kViewerPlotModelChoiceCount =
@@ -11332,6 +11831,7 @@ constexpr PlotModelMenuEntry kPlotModelTopMenuEntries[] = {
     {"Gloss View (beta)", 8, false},
     {"Waveform", 9, false},
     {"Histogram", 10, false},
+    {"Source Signal", 11, false},
 };
 
 constexpr int kPlotModelTopMenuEntryCount =
@@ -11373,6 +11873,10 @@ const PlotModelDescriptor& plotModelDescriptor(int plotModel) {
 bool plotModelIsAnalyticalScope(int plotModel) {
   const PlotRenderFamily family = plotModelDescriptor(plotModel).renderFamily;
   return family == PlotRenderFamily::Waveform2D || family == PlotRenderFamily::Histogram2D;
+}
+
+bool plotModelIsSourceSignal(int plotModel) {
+  return plotModelDescriptor(plotModel).renderFamily == PlotRenderFamily::SourceSignal2D;
 }
 
 ChromaspaceViewer::ViewerRuntimeState viewerStateForPlotModel(
@@ -11506,6 +12010,10 @@ enum class ViewerMenuAction {
   HistogramShowOverflow,
   HistogramHighlightOverflow,
   ScopeRangeMode,
+  SourceDetail,
+  SourceMaxProxyResolution,
+  SourceNativeWhenAvailable,
+  SourceSyncSelections,
   ResetDefaults,
   SaveUserPreset,
   LoadUserPreset,
@@ -11825,7 +12333,8 @@ bool viewerMenuActionUsesChoiceList(ViewerMenuAction action) {
          action == ViewerMenuAction::WaveformDetail ||
          action == ViewerMenuAction::WaveformLumaMethod ||
          action == ViewerMenuAction::HistogramMode ||
-         action == ViewerMenuAction::ScopeRangeMode;
+         action == ViewerMenuAction::ScopeRangeMode ||
+         action == ViewerMenuAction::SourceDetail;
 }
 
 bool viewerMenuActionCanPreviewFromCachedCloud(ViewerMenuAction action) {
@@ -11891,6 +12400,10 @@ bool viewerMenuActionCanPreviewFromCachedCloud(ViewerMenuAction action) {
          action == ViewerMenuAction::HistogramShowOverflow ||
          action == ViewerMenuAction::HistogramHighlightOverflow ||
          action == ViewerMenuAction::ScopeRangeMode ||
+         action == ViewerMenuAction::SourceDetail ||
+         action == ViewerMenuAction::SourceMaxProxyResolution ||
+         action == ViewerMenuAction::SourceNativeWhenAvailable ||
+         action == ViewerMenuAction::SourceSyncSelections ||
          action == ViewerMenuAction::ResetDefaults;
 }
 
@@ -11945,6 +12458,8 @@ bool viewerMenuActionIsCheckbox(ViewerMenuAction action) {
     case ViewerMenuAction::WaveformHighlightOverflow:
     case ViewerMenuAction::HistogramShowOverflow:
     case ViewerMenuAction::HistogramHighlightOverflow:
+    case ViewerMenuAction::SourceNativeWhenAvailable:
+    case ViewerMenuAction::SourceSyncSelections:
       return true;
     default:
       return false;
@@ -12107,7 +12622,7 @@ std::vector<ViewerMenuRow> buildViewerMenuRows(const AppState& app) {
                   ViewerMenuAction::HistogramHighlightOverflow);
         }
       }
-      if (state.plotModel != 7) {
+      if (state.plotModel != 7 && !plotModelIsSourceSignal(state.plotModel)) {
         appendRow(&rows, "Plot in Linear", onOffLabel(state.plotDisplayLinear), ViewerMenuAction::PlotLinear);
         if (state.plotDisplayLinear) {
           appendRow(&rows, "Input Transfer", transferFunctionLabelForIndex(state.plotDisplayLinearTransfer),
@@ -12173,11 +12688,47 @@ std::vector<ViewerMenuRow> buildViewerMenuRows(const AppState& app) {
       if (app.viewerSettingsSubtab == static_cast<int>(ViewerSettingsSubtab::Performance)) {
         appendRow(&rows, "Live Update", onOffLabel(state.liveUpdate), ViewerMenuAction::LiveUpdate, true, "resample");
         appendRow(&rows, "Update Mode", ChromaspaceViewer::updateModeLabel(state.updateMode), ViewerMenuAction::UpdateMode, true, "resample");
-        if (state.plotModel != ChromaspaceViewer::kPlotModelWaveform) {
+        appendSection(&rows, "Source Signal");
+        appendRow(&rows,
+                  "Source Detail",
+                  ChromaspaceViewer::sourceDetailLabel(state.sourceDetailMode),
+                  ViewerMenuAction::SourceDetail,
+                  true,
+                  "resample");
+        if (state.sourceDetailMode != 4) {
+          appendSliderRowWithValue(&rows,
+                                   "Max Proxy Resolution",
+                                   std::to_string(state.sourceMaxProxyLongEdge),
+                                   state.sourceMaxProxyLongEdge,
+                                   768,
+                                   4096,
+                                   ViewerMenuAction::SourceMaxProxyResolution,
+                                   true,
+                                   "resample");
+        }
+        if (state.sourceDetailMode == 0 || state.sourceDetailMode == 3) {
+          appendRow(&rows,
+                    "Use Native When Available",
+                    onOffLabel(state.sourceUseNativeWhenAvailable),
+                    ViewerMenuAction::SourceNativeWhenAvailable,
+                    true,
+                    "resample");
+        }
+        appendRow(&rows,
+                  "Sync Source Selections",
+                  onOffLabel(state.sourceSyncSelections),
+                  ViewerMenuAction::SourceSyncSelections,
+                  true,
+                  "none");
+        appendSection(&rows, "Cloud Sampling");
+        if (state.plotModel != ChromaspaceViewer::kPlotModelWaveform &&
+            !plotModelIsSourceSignal(state.plotModel)) {
           appendRow(&rows, "Quality", ChromaspaceViewer::qualityLabel(state.quality), ViewerMenuAction::Quality, true, "resample");
         }
-        appendRow(&rows, "Scale", ChromaspaceViewer::scaleLabel(state.scale), ViewerMenuAction::Scale, true, "resample");
-        appendRow(&rows, "Sampling", ChromaspaceViewer::samplingLabel(state.sampling), ViewerMenuAction::Sampling, true, "resample");
+        if (!plotModelIsSourceSignal(state.plotModel)) {
+          appendRow(&rows, "Scale", ChromaspaceViewer::scaleLabel(state.scale), ViewerMenuAction::Scale, true, "resample");
+          appendRow(&rows, "Sampling", ChromaspaceViewer::samplingLabel(state.sampling), ViewerMenuAction::Sampling, true, "resample");
+        }
         if (plotModelDescriptor(state.plotModel).supportsOccupancyFill) {
           appendRow(&rows, "Occupancy Fill", onOffLabel(state.occupancyGuidedFill), ViewerMenuAction::Occupancy, true, "resample");
         }
@@ -12230,7 +12781,8 @@ std::vector<ViewerMenuRow> buildViewerMenuRows(const AppState& app) {
       }
       if (ChromaspaceViewer::volumeSlicingSupported(state, false)) {
         appendRow(&rows, "Image Lasso", onOffLabel(state.volumeSliceLassoRegion), ViewerMenuAction::ViewerLasso, true, "resample");
-        if (state.volumeSliceLassoRegion) {
+        const bool sourceSignalLassoPath = sourceSignalPlotWindow(app) != nullptr;
+        if (state.volumeSliceLassoRegion && !sourceSignalLassoPath) {
           const bool focusFresh =
               app.focusPlotNodeRequestedRevision > 0 &&
               app.resolvePlotNodeFocusRevision >= app.focusPlotNodeRequestedRevision;
@@ -12240,7 +12792,7 @@ std::vector<ViewerMenuRow> buildViewerMenuRows(const AppState& app) {
                             ? "Chromaspace plot node focused for drawing"
                             : "Select the Chromaspace plot node to draw selections");
         }
-        if (state.volumeSliceLassoRegion && !app.viewerLassoData.empty()) {
+        if (state.volumeSliceLassoRegion && activeViewerLassoSelectionHasData(app)) {
           appendRow(&rows, "Clear Viewer Lasso", "Clear", ViewerMenuAction::ClearViewerLasso, true, "resample");
         }
       }
@@ -12490,6 +13042,15 @@ std::vector<ViewerChoiceMenuItem> buildViewerChoiceMenuItems(const AppState& app
                        i == state.scopeRangeMode,
                        ViewerMenuAction::ScopeRangeMode,
                        "reinterpret"});
+    }
+  } else if (action == ViewerMenuAction::SourceDetail) {
+    items.reserve(5);
+    for (int i = 0; i < 5; ++i) {
+      items.push_back({ChromaspaceViewer::sourceDetailLabel(i),
+                       i,
+                       i == state.sourceDetailMode,
+                       ViewerMenuAction::SourceDetail,
+                       "resample"});
     }
   } else if (action == ViewerMenuAction::ChromaticityInputPrimaries) {
     const std::vector<int> ordered = orderedPrimariesChoiceIndices();
@@ -12804,6 +13365,10 @@ bool parseViewerStateJson(const std::string& json, ChromaspaceViewer::ViewerRunt
   readInt("plotDisplayLinearTransfer", &s.plotDisplayLinearTransfer);
   readBool("liveUpdate", &s.liveUpdate);
   readInt("updateMode", &s.updateMode);
+  readInt("sourceDetailMode", &s.sourceDetailMode);
+  readInt("sourceMaxProxyLongEdge", &s.sourceMaxProxyLongEdge);
+  readBool("sourceUseNativeWhenAvailable", &s.sourceUseNativeWhenAvailable);
+  readBool("sourceSyncSelections", &s.sourceSyncSelections);
   readInt("quality", &s.quality);
   readInt("scale", &s.scale);
   readInt("sampling", &s.sampling);
@@ -13452,6 +14017,10 @@ ChromaspaceViewer::ViewerRuntimeState viewerStateFromSharedPresetValuesJson(
   readBool("keepOnTop", &state.keepOnTop);
   readBool("resetViewOnPlotSwitch", &state.resetViewOnPlotSwitch);
   readInt("updateMode", &state.updateMode);
+  readInt("sourceDetailMode", &state.sourceDetailMode);
+  readInt("sourceMaxProxyLongEdge", &state.sourceMaxProxyLongEdge);
+  readBool("sourceUseNativeWhenAvailable", &state.sourceUseNativeWhenAvailable);
+  readBool("sourceSyncSelections", &state.sourceSyncSelections);
   readInt("quality", &state.quality);
   readInt("scale", &state.scale);
   readInt("plotStyle", &state.plotStyle);
@@ -13532,6 +14101,10 @@ std::string viewerSharedPresetValuesJsonFromState(
   os << "\"keepOnTop\":" << (s.keepOnTop ? "true" : "false") << ",";
   os << "\"resetViewOnPlotSwitch\":" << (s.resetViewOnPlotSwitch ? "true" : "false") << ",";
   os << "\"updateMode\":" << s.updateMode << ",";
+  os << "\"sourceDetailMode\":" << s.sourceDetailMode << ",";
+  os << "\"sourceMaxProxyLongEdge\":" << s.sourceMaxProxyLongEdge << ",";
+  os << "\"sourceUseNativeWhenAvailable\":" << (s.sourceUseNativeWhenAvailable ? "true" : "false") << ",";
+  os << "\"sourceSyncSelections\":" << (s.sourceSyncSelections ? "true" : "false") << ",";
   os << "\"quality\":" << s.quality << ",";
   os << "\"scale\":" << s.scale << ",";
   os << "\"plotStyle\":" << s.plotStyle << ",";
@@ -14416,11 +14989,46 @@ bool autoMatchIdentityReadResolution(AppState* app, ResolvedPayload* payload) {
   return true;
 }
 
-void applyViewerLassoStateToResolvedPayload(const AppState& app, ResolvedPayload* payload) {
-  if (!payload || !app.viewerState.volumeSliceLassoRegion) return;
+bool applyViewerLassoStateToResolvedPayloadForWindow(const AppState& app,
+                                                     const PlotWindowState* window,
+                                                     ResolvedPayload* payload) {
+  const bool lassoEnabled =
+      window ? viewerStateWithModelCapabilities(window->viewState).volumeSliceLassoRegion
+             : app.viewerState.volumeSliceLassoRegion;
+  if (!payload || !lassoEnabled) return false;
+  if (!viewerSourceSelectionsSynced(app) && window) {
+    const PlotWindowState* target = activeViewerLassoTargetWindow(app);
+    if (target && target->windowId != window->windowId) {
+      payload->volumeSlicingEnabled = false;
+      payload->volumeSlicingMode.clear();
+      payload->lassoData.clear();
+      payload->lassoRegionEmpty = false;
+      payload->cloudSettingsKey = cloudSettingsKeyWithoutImageLasso(payload->cloudSettingsKey);
+      return true;
+    }
+  }
   payload->volumeSlicingEnabled = true;
   payload->volumeSlicingMode = "lasso";
-  payload->lassoRegionEmpty = payload->lassoData.empty();
+  const bool sourceSignalLassoArmed =
+      activeSourceSignalLassoWindow(app) != nullptr ||
+      app.viewerLassoDrawing ||
+      app.viewerLassoRevision > 0 ||
+      (window && window->viewerLassoRevision > 0);
+  if (sourceSignalLassoArmed) {
+    payload->lassoData = viewerLassoDataForPlotWindow(app, window);
+    payload->cloudSettingsKey = cloudSettingsKeyWithoutImageLasso(payload->cloudSettingsKey) +
+                                imageLassoSettingsSuffixForData(payload->lassoData);
+    payload->lassoRegionEmpty = !payloadHasImageLassoSelection(*payload);
+    return true;
+  }
+  payload->lassoRegionEmpty = !payloadHasImageLassoSelection(*payload);
+  return false;
+}
+
+void applyViewerLassoStateToResolvedPayload(const AppState& app, ResolvedPayload* payload) {
+  const PlotWindowState* target =
+      viewerSourceSelectionsSynced(app) ? focusedPlotWindow(app) : activeViewerLassoTargetWindow(app);
+  (void)applyViewerLassoStateToResolvedPayloadForWindow(app, target, payload);
 }
 
 struct PlotMenuRect {
@@ -14608,6 +15216,18 @@ bool copyViewerPresetParameter(ViewerMenuAction action,
       state->histogramHighlightOverflow = preset.histogramHighlightOverflow;
       return true;
     case ViewerMenuAction::ScopeRangeMode: state->scopeRangeMode = preset.scopeRangeMode; return true;
+    case ViewerMenuAction::SourceDetail:
+      state->sourceDetailMode = preset.sourceDetailMode;
+      return true;
+    case ViewerMenuAction::SourceMaxProxyResolution:
+      state->sourceMaxProxyLongEdge = preset.sourceMaxProxyLongEdge;
+      return true;
+    case ViewerMenuAction::SourceNativeWhenAvailable:
+      state->sourceUseNativeWhenAvailable = preset.sourceUseNativeWhenAvailable;
+      return true;
+    case ViewerMenuAction::SourceSyncSelections:
+      state->sourceSyncSelections = preset.sourceSyncSelections;
+      return true;
     default: break;
   }
   return false;
@@ -14671,6 +15291,7 @@ void activateViewerMenuRow(AppState* app, const ViewerMenuRow& row) {
   const std::string previousSampleKey = ChromaspaceViewer::sampleSettingsKey(state, false);
   const std::string previousPlotMode = app->plotMode;
   const int previousPlotModel = state.plotModel;
+  bool ensureSourceSignalLassoWindow = false;
   auto bump = [&]() {
     state.stateRevision = std::max<uint64_t>(state.stateRevision + 1, 1);
   };
@@ -14756,11 +15377,12 @@ void activateViewerMenuRow(AppState* app, const ViewerMenuRow& row) {
         if (enablingLasso) {
           app->focusPlotNodeRequestedRevision = state.stateRevision;
           beginPendingImageLassoClear(app, state.stateRevision);
+          ensureSourceSignalLassoWindow = true;
         }
       }
       break;
     case ViewerMenuAction::ClearViewerLasso:
-      clearViewerLassoState(app);
+      clearActiveViewerLassoSelection(app);
       state = viewerStateWithModelCapabilities(app->viewerState);
       bump();
       beginPendingImageLassoClear(app, state.stateRevision);
@@ -14881,6 +15503,18 @@ void activateViewerMenuRow(AppState* app, const ViewerMenuRow& row) {
       state.scopeRangeMode = row.choiceItem ? std::clamp(row.choiceValue, 0, 2) : state.scopeRangeMode;
       bump();
       break;
+    case ViewerMenuAction::SourceDetail:
+      state.sourceDetailMode = row.choiceItem ? std::clamp(row.choiceValue, 0, 4) : state.sourceDetailMode;
+      bump();
+      break;
+    case ViewerMenuAction::SourceNativeWhenAvailable:
+      state.sourceUseNativeWhenAvailable = !state.sourceUseNativeWhenAvailable;
+      bump();
+      break;
+    case ViewerMenuAction::SourceSyncSelections:
+      state.sourceSyncSelections = !state.sourceSyncSelections;
+      bump();
+      break;
     case ViewerMenuAction::ResetDefaults:
       clearViewerLassoState(app);
       state = ChromaspaceViewer::ViewerRuntimeState{};
@@ -14942,6 +15576,18 @@ void activateViewerMenuRow(AppState* app, const ViewerMenuRow& row) {
       return;
   }
   applyViewerStateToApp(app, state);
+  if (row.action == ViewerMenuAction::ViewerLasso) {
+    propagateViewerLassoEnabledToPlotWindows(app);
+  }
+  if (row.action == ViewerMenuAction::SourceSyncSelections) {
+    propagateSourceSelectionSyncToPlotWindows(app);
+  }
+  if (ensureSourceSignalLassoWindow) {
+    ensureSourceSignalWindowForLasso(app,
+                                     std::max(1, app->workspaceLayoutWindowWidth),
+                                     std::max(1, app->workspaceLayoutWindowHeight),
+                                     true);
+  }
   if (previousPlotModel != app->viewerState.plotModel && app->viewerState.resetViewOnPlotSwitch) {
     applyDefaultCameraForViewerPlotSelection(app, previousPlotMode);
   }
@@ -15072,6 +15718,11 @@ void updateViewerMenuSlider(AppState* app, ViewerMenuAction action, int value, c
       value = ChromaspaceViewer::clampOverlaySize(value);
       changed = state.identityReadResolution != value;
       state.identityReadResolution = value;
+      break;
+    case ViewerMenuAction::SourceMaxProxyResolution:
+      value = std::clamp(value, 768, 4096);
+      changed = state.sourceMaxProxyLongEdge != value;
+      state.sourceMaxProxyLongEdge = value;
       break;
     default:
       return;
@@ -16467,6 +17118,16 @@ void keyCallback(GLFWwindow* window, int key, int, int action, int) {
     return;
   }
   if (action == GLFW_PRESS && key == GLFW_KEY_A && app->shiftHeld) {
+    if (app->viewerState.volumeSliceLassoRegion) {
+      clearActiveViewerLassoSelection(app);
+      auto state = viewerStateWithModelCapabilities(app->viewerState);
+      state.stateRevision = std::max<uint64_t>(state.stateRevision + 1, 1);
+      applyViewerStateToApp(app, state);
+      app->viewerStateLocalOverride = true;
+      queueViewerStateCommand(*app, "reinterpret");
+      clearPointerInteractionState(app);
+      return;
+    }
     double cursorX = app->hoverX;
     double cursorY = app->hoverY;
     glfwGetCursorPos(window, &cursorX, &cursorY);
@@ -17522,10 +18183,26 @@ void drawViewerMenuCheckbox(float x0,
 }
 
 void drawViewerLassoOverlay(const AppState& app, int width, int height) {
+  const std::vector<LassoStroke>* lassoStrokes = viewerLassoStrokesForActiveSelection(app);
   if ((!app.viewerState.volumeSliceLassoRegion && !app.viewerLassoDrawing) ||
-      (app.viewerLassoStrokes.empty() && !app.viewerLassoDrawing) ||
+      ((!lassoStrokes || lassoStrokes->empty()) && !app.viewerLassoDrawing) ||
       width <= 0 || height <= 0) {
     return;
+  }
+  float drawX0 = 0.0f;
+  float drawY0 = 0.0f;
+  float drawX1 = static_cast<float>(width);
+  float drawY1 = static_cast<float>(height);
+  if (const PlotWindowState* sourceWindow = activeSourceSignalLassoWindow(app)) {
+    (void)sourceSignalImageRectForCanvas(app,
+                                         *sourceWindow,
+                                         width,
+                                         height,
+                                         false,
+                                         &drawX0,
+                                         &drawY0,
+                                         &drawX1,
+                                         &drawY1);
   }
   glMatrixMode(GL_PROJECTION);
   glPushMatrix();
@@ -17548,12 +18225,14 @@ void drawViewerLassoOverlay(const AppState& app, int width, int height) {
               alpha);
     glBegin(closed ? GL_LINE_LOOP : GL_LINE_STRIP);
     for (const auto& point : stroke.points) {
-      glVertex2f(point.xNorm * static_cast<float>(width),
-                 point.yNorm * static_cast<float>(height));
+      glVertex2f(drawX0 + point.xNorm * (drawX1 - drawX0),
+                 drawY0 + point.yNorm * (drawY1 - drawY0));
     }
     glEnd();
   };
-  for (const auto& stroke : app.viewerLassoStrokes) drawStroke(stroke, 0.78f, true);
+  if (lassoStrokes) {
+    for (const auto& stroke : *lassoStrokes) drawStroke(stroke, 0.78f, true);
+  }
   if (app.viewerLassoDrawing) drawStroke(app.viewerLassoActiveStroke, 0.94f, false);
   glDisable(GL_LINE_SMOOTH);
   glDisable(GL_BLEND);
@@ -18901,6 +19580,8 @@ std::string plotWindowDerivedBuildKey(const PlotWindowState& window,
      << "|isolateIdentity=" << (state.isolateIdentityData ? 1 : 0)
      << "|excludeIdentity=" << (state.excludeIdentityData ? 1 : 0)
      << "|imageLasso=" << (state.volumeSliceLassoRegion ? 1 : 0)
+     << "|lassoEmpty=" << (payloadHasImageLassoSelection(payload) ? 0 : 1)
+     << "|lassoData=" << payload.lassoData
      << "|slices=" << (state.volumeSliceRed ? 1 : 0)
      << (state.volumeSliceYellow ? 1 : 0)
      << (state.volumeSliceGreen ? 1 : 0)
@@ -18952,7 +19633,11 @@ bool rebuildPlotWindowDerivedMeshIfNeeded(PlotWindowState* window,
   const bool analyticalScope = plotModelIsAnalyticalScope(window->viewState.plotModel);
   ResolvedPayload payload = resolved;
   applyViewerStateToResolvedViewFields(window->viewState, &payload);
-  applyCachedOfxImageLassoSelection(app, &payload);
+  const bool viewerSourceLassoApplied =
+      applyViewerLassoStateToResolvedPayloadForWindow(app, window, &payload);
+  if (!viewerSourceLassoApplied) {
+    applyCachedOfxImageLassoSelection(app, &payload);
+  }
   rebuildPlotWindowOverlayMeshIfNeeded(window, payload);
   const auto aggregateState = aggregateHostStateForWorkspace(app);
   const std::string aggregateKey = ChromaspaceViewer::sampleSettingsKey(aggregateState, false);
@@ -19150,6 +19835,315 @@ void drawGlossLiftSpatialInsetOverlay(int width,
                                       GlossViewColorMode colorMode,
                                       GlossViewDebugFieldMode debugMode,
                                       GlossViewDiagnosticOverlay diagnosticMode);
+
+const SourceSignalPayload* activeSourceSignalPayload(const SourceSignalStore& store) {
+  if (store.hasAuthoritative) return &store.authoritative;
+  if (store.hasPreview) return &store.preview;
+  return nullptr;
+}
+
+void drawCircularArrowGlyph(float cx,
+                            float cy,
+                            float radius,
+                            int direction,
+                            float alpha,
+                            float lineWidth);
+
+enum class SourceSignalLassoButton {
+  None,
+  Add,
+  Subtract,
+  Clear,
+};
+
+PlotMenuRect sourceSignalLassoButtonLocalRect(int index) {
+  constexpr float kButtonSize = 26.0f;
+  constexpr float kGap = 6.0f;
+  constexpr float kLeft = 10.0f;
+  constexpr float kTop = 34.0f;
+  const float x0 = kLeft + static_cast<float>(index) * (kButtonSize + kGap);
+  return {x0, kTop, x0 + kButtonSize, kTop + kButtonSize};
+}
+
+SourceSignalLassoButton sourceSignalLassoButtonAtPoint(const AppState& app,
+                                                       int windowWidth,
+                                                       int windowHeight,
+                                                       double x,
+                                                       double y,
+                                                       int* outWindowId = nullptr) {
+  if (outWindowId) *outWindowId = -1;
+  if (!app.viewerState.volumeSliceLassoRegion || windowWidth <= 0 || windowHeight <= 0) {
+    return SourceSignalLassoButton::None;
+  }
+  for (auto it = app.plotWindows.rbegin(); it != app.plotWindows.rend(); ++it) {
+    if (!plotWindowIsSourceSignal(*it) ||
+        !pointInPlotWindowRect(*it, windowWidth, windowHeight, x, y)) {
+      continue;
+    }
+    const double localX = x - static_cast<double>(it->rect.x) * windowWidth;
+    const double localY = y - static_cast<double>(it->rect.y) * windowHeight;
+    const SourceSignalLassoButton actions[] = {
+        SourceSignalLassoButton::Add,
+        SourceSignalLassoButton::Subtract,
+        SourceSignalLassoButton::Clear,
+    };
+    for (int i = 0; i < 3; ++i) {
+      if (pointInPlotMenuRect(sourceSignalLassoButtonLocalRect(i), localX, localY)) {
+        if (outWindowId) *outWindowId = it->windowId;
+        return actions[i];
+      }
+    }
+    return SourceSignalLassoButton::None;
+  }
+  return SourceSignalLassoButton::None;
+}
+
+bool ensureSourceSignalTexture(SourceSignalStore* store, const SourceSignalPayload& source) {
+  if (!store || source.rgba16f.empty() || source.proxyWidth <= 0 || source.proxyHeight <= 0) {
+    return false;
+  }
+  if (store->texture == 0) {
+    glGenTextures(1, &store->texture);
+  }
+  if (store->texture == 0) return false;
+  if (store->textureContentHash == source.contentHash &&
+      store->textureWidth == source.proxyWidth &&
+      store->textureHeight == source.proxyHeight) {
+    return true;
+  }
+  glBindTexture(GL_TEXTURE_2D, store->texture);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+  glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+  glTexImage2D(GL_TEXTURE_2D,
+               0,
+               GL_RGBA16F,
+               source.proxyWidth,
+               source.proxyHeight,
+               0,
+               GL_RGBA,
+               GL_HALF_FLOAT,
+               source.rgba16f.data());
+  glBindTexture(GL_TEXTURE_2D, 0);
+  store->textureContentHash = source.contentHash;
+  store->textureWidth = source.proxyWidth;
+  store->textureHeight = source.proxyHeight;
+  return true;
+}
+
+void drawSourceSignalLassoButtons(const AppState& app,
+                                  const PlotWindowState& window,
+                                  int width,
+                                  int height,
+                                  int windowWidth,
+                                  int windowHeight,
+                                  const HudTextRenderer& renderer,
+                                  const HudTextRenderer* symbolRenderer) {
+  if (!app.viewerState.volumeSliceLassoRegion || width <= 0 || height <= 0 ||
+      windowWidth <= 0 || windowHeight <= 0) {
+    return;
+  }
+  const float localWindowW =
+      std::max(1.0f, window.rect.w * static_cast<float>(windowWidth));
+  const float localWindowH =
+      std::max(1.0f, window.rect.h * static_cast<float>(windowHeight));
+  const float sx = static_cast<float>(width) / localWindowW;
+  const float sy = static_cast<float>(height) / localWindowH;
+  const double localHoverX = app.hoverX - static_cast<double>(window.rect.x) * windowWidth;
+  const double localHoverY = app.hoverY - static_cast<double>(window.rect.y) * windowHeight;
+  const bool hasSelection = activeViewerLassoSelectionHasData(app);
+
+  auto drawButton = [&](int index,
+                        SourceSignalLassoButton action,
+                        const std::string& label,
+                        bool active,
+                        bool enabled) {
+    const PlotMenuRect local = sourceSignalLassoButtonLocalRect(index);
+    const PlotMenuRect rect{
+        local.x0 * sx,
+        static_cast<float>(height) - local.y1 * sy,
+        local.x1 * sx,
+        static_cast<float>(height) - local.y0 * sy};
+    const bool hovered = pointInPlotMenuRect(local, localHoverX, localHoverY);
+    const float alpha = enabled ? (hovered ? 0.90f : 0.70f) : 0.30f;
+    const float bgGain = active ? 1.0f : 0.62f;
+    drawPlotMenuRect(rect.x0,
+                     rect.y0,
+                     rect.x1,
+                     rect.y1,
+                     action == SourceSignalLassoButton::Clear ? 0.18f * bgGain : 0.07f * bgGain,
+                     action == SourceSignalLassoButton::Clear ? 0.13f * bgGain : 0.16f * bgGain,
+                     action == SourceSignalLassoButton::Clear ? 0.15f * bgGain : 0.22f * bgGain,
+                     alpha * 0.42f);
+    drawPlotMenuRect(rect.x0,
+                     rect.y1 - 1.0f,
+                     rect.x1,
+                     rect.y1,
+                     active ? 0.70f : 0.58f,
+                     active ? 0.90f : 0.72f,
+                     active ? 1.0f : 0.86f,
+                     alpha * (active ? 0.62f : 0.28f));
+    if (action == SourceSignalLassoButton::Clear) {
+      const HudTextRenderer& iconRenderer =
+          (symbolRenderer && symbolRenderer->available) ? *symbolRenderer : renderer;
+      const std::string resetGlyph = u8"\u21BA";
+      const float scale = iconRenderer.available ? 1.22f : 10.0f;
+      const float textWidth = hudTextWidth(iconRenderer, resetGlyph, scale);
+      drawHudTextLine(iconRenderer,
+                      resetGlyph,
+                      (rect.x0 + rect.x1 - textWidth) * 0.5f,
+                      rect.y0 + (iconRenderer.available ? 6.0f : 7.5f),
+                      scale,
+                      enabled ? 0.92f : 0.40f,
+                      enabled ? 0.98f : 0.48f,
+                      enabled ? 1.0f : 0.54f,
+                      alpha);
+      return;
+    }
+    const float scale = renderer.available ? 1.16f : 9.5f;
+    const float textWidth = hudTextWidth(renderer, label, scale);
+    drawHudTextLine(renderer,
+                    label,
+                    (rect.x0 + rect.x1 - textWidth) * 0.5f,
+                    rect.y0 + (renderer.available ? 5.8f : 7.0f),
+                    scale,
+                    enabled ? 0.92f : 0.40f,
+                    enabled ? 0.98f : 0.48f,
+                    enabled ? 1.0f : 0.54f,
+                    alpha);
+  };
+
+  drawButton(0,
+             SourceSignalLassoButton::Add,
+             std::string("+"),
+             !app.viewerLassoSubtractMode,
+             true);
+  drawButton(1,
+             SourceSignalLassoButton::Subtract,
+             std::string("-"),
+             app.viewerLassoSubtractMode,
+             true);
+  drawButton(2,
+             SourceSignalLassoButton::Clear,
+             std::string(),
+             hasSelection,
+             hasSelection);
+}
+
+void drawSourceSignalPlot(const AppState& app,
+                          const PlotWindowState& window,
+                          SourceSignalStore* store,
+                          int width,
+                          int height,
+                          int windowWidth,
+                          int windowHeight,
+                          const HudTextRenderer& renderer,
+                          const HudTextRenderer* symbolRenderer) {
+  glMatrixMode(GL_PROJECTION);
+  glPushMatrix();
+  glLoadIdentity();
+  glOrtho(0.0, static_cast<double>(width), 0.0, static_cast<double>(height), -1.0, 1.0);
+  glMatrixMode(GL_MODELVIEW);
+  glPushMatrix();
+  glLoadIdentity();
+  glDisable(GL_DEPTH_TEST);
+  glEnable(GL_BLEND);
+  glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+
+  const SourceSignalPayload* source = store ? activeSourceSignalPayload(*store) : nullptr;
+  drawPlotMenuRect(0.0f, 0.0f, static_cast<float>(width), static_cast<float>(height),
+                   0.018f, 0.019f, 0.022f, 1.0f);
+
+  if (source && ensureSourceSignalTexture(store, *source)) {
+    const float pad = std::max(10.0f, std::min(width, height) * 0.025f);
+    const float availableW = std::max(1.0f, static_cast<float>(width) - pad * 2.0f);
+    const float availableH = std::max(1.0f, static_cast<float>(height) - pad * 2.0f - 26.0f);
+    const float sourceAspect =
+        static_cast<float>(std::max(1, source->proxyWidth)) /
+        static_cast<float>(std::max(1, source->proxyHeight));
+    float drawW = availableW;
+    float drawH = drawW / sourceAspect;
+    if (drawH > availableH) {
+      drawH = availableH;
+      drawW = drawH * sourceAspect;
+    }
+    const float x0 = (static_cast<float>(width) - drawW) * 0.5f;
+    const float y0 = (static_cast<float>(height) - drawH) * 0.5f - 4.0f;
+    const float x1 = x0 + drawW;
+    const float y1 = y0 + drawH;
+
+    glEnable(GL_TEXTURE_2D);
+    glBindTexture(GL_TEXTURE_2D, store->texture);
+    glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
+    glBegin(GL_QUADS);
+    glTexCoord2f(0.0f, 0.0f); glVertex2f(x0, y0);
+    glTexCoord2f(1.0f, 0.0f); glVertex2f(x1, y0);
+    glTexCoord2f(1.0f, 1.0f); glVertex2f(x1, y1);
+    glTexCoord2f(0.0f, 1.0f); glVertex2f(x0, y1);
+    glEnd();
+    glBindTexture(GL_TEXTURE_2D, 0);
+    glDisable(GL_TEXTURE_2D);
+
+    glColor4f(0.70f, 0.80f, 0.92f, 0.38f);
+    glLineWidth(1.0f);
+    glBegin(GL_LINE_LOOP);
+    glVertex2f(x0, y0);
+    glVertex2f(x1, y0);
+    glVertex2f(x1, y1);
+    glVertex2f(x0, y1);
+    glEnd();
+  } else {
+    const std::string waiting = "Waiting for Resolve";
+    const float scale = renderer.available ? 0.92f : 1.0f;
+    drawHudTextLine(renderer,
+                    waiting,
+                    std::max(10.0f,
+                             (static_cast<float>(width) - hudTextWidth(renderer, waiting, scale)) * 0.5f),
+                    static_cast<float>(height) * 0.5f,
+                    scale,
+                    0.80f,
+                    0.68f,
+                    0.80f,
+                    0.90f);
+  }
+
+  const std::string status =
+      source
+          ? (source->tierLabel + " | " + std::to_string(source->sourceWidth) + "x" +
+             std::to_string(source->sourceHeight) + " -> " +
+             std::to_string(source->proxyWidth) + "x" + std::to_string(source->proxyHeight))
+          : std::string("No source packet");
+  drawHudTextLine(renderer,
+                  status,
+                  10.0f,
+                  static_cast<float>(height) - 18.0f,
+                  renderer.available ? 0.82f : 1.0f,
+                  0.76f,
+                  0.82f,
+                  0.90f,
+                  0.88f);
+  if (window.viewState.sourceSyncSelections) {
+    drawHudTextLineRight(renderer,
+                         "Selections synced",
+                         static_cast<float>(width) - 10.0f,
+                         static_cast<float>(height) - 18.0f,
+                         renderer.available ? 0.76f : 1.0f,
+                         0.75f,
+                         0.86f,
+                         0.96f,
+                         0.72f);
+  }
+  drawSourceSignalLassoButtons(app, window, width, height, windowWidth, windowHeight, renderer, symbolRenderer);
+
+  glDisable(GL_BLEND);
+  glEnable(GL_DEPTH_TEST);
+  glPopMatrix();
+  glMatrixMode(GL_PROJECTION);
+  glPopMatrix();
+  glMatrixMode(GL_MODELVIEW);
+}
 
 void drawAnalyticalScopePlot(const PlotWindowState& window,
                              const MeshData& mesh,
@@ -19452,19 +20446,27 @@ void drawSecondaryPlotWindow(AppState* app,
                              PlotWindowState* window,
                              const ResolvedPayload& resolved,
                              const InputCloudPayload* cloud,
+                             SourceSignalStore* sourceSignalStore,
                              int fbWidth,
                              int fbHeight,
+                             int windowWidth,
+                             int windowHeight,
                              const HudTextRenderer& renderer,
+                             const HudTextRenderer* symbolRenderer,
                              PointRenderProgramCache* pointRenderProgramCache) {
   if (!app || !window) return;
   // In a multi-window workspace every plot must use the same per-window draw
   // path. Otherwise moving focus switches that plot between the primary GPU
   // path and the secondary CPU path, visibly changing its density/shape.
   if (window->windowId == app->focusedPlotWindowId && app->plotWindows.size() <= 1u &&
-      !plotModelIsAnalyticalScope(window->viewState.plotModel)) return;
-  if (!rebuildPlotWindowDerivedMeshIfNeeded(window, *app, resolved, cloud)) return;
+      !plotModelIsAnalyticalScope(window->viewState.plotModel) &&
+      !plotModelIsSourceSignal(window->viewState.plotModel)) return;
   ResolvedPayload payload = resolved;
   applyViewerStateToResolvedViewFields(window->viewState, &payload);
+  const bool sourceSignalPlot = plotModelIsSourceSignal(window->viewState.plotModel);
+  if (!sourceSignalPlot && !rebuildPlotWindowDerivedMeshIfNeeded(window, *app, resolved, cloud)) {
+    return;
+  }
   const PlotWindowFramebufferRect rect = plotWindowFramebufferRect(*window, fbWidth, fbHeight);
   glEnable(GL_SCISSOR_TEST);
   glScissor(rect.x, rect.y, rect.w, rect.h);
@@ -19472,7 +20474,11 @@ void drawSecondaryPlotWindow(AppState* app,
   float backgroundR = payload.backgroundColorR;
   float backgroundG = payload.backgroundColorG;
   float backgroundB = payload.backgroundColorB;
-  if (payloadImageLassoModeEnabled(payload) && !payloadHasImageLassoSelection(payload)) {
+  const bool windowWaitingForImageLasso =
+      plotWindowShouldShowImageLassoStandby(*app, window) ||
+      (sourceSignalPlotWindow(*app) == nullptr &&
+       payloadImageLassoModeEnabled(payload) && !payloadHasImageLassoSelection(payload));
+  if (windowWaitingForImageLasso) {
     backgroundR = clamp01(backgroundR * 0.82f + 0.05f);
     backgroundG = clamp01(backgroundG * 0.86f + 0.09f);
     backgroundB = clamp01(backgroundB * 1.10f + 0.20f);
@@ -19483,8 +20489,29 @@ void drawSecondaryPlotWindow(AppState* app,
   }
   glClearColor(backgroundR, backgroundG, backgroundB, 1.0f);
   glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+  if (sourceSignalPlot) {
+    const SourceSignalPayload* source =
+        sourceSignalStore ? activeSourceSignalPayload(*sourceSignalStore) : nullptr;
+    window->syncLabel =
+        source ? (source->coverage == "partial-preview" ? "Proxy" : "Live")
+               : "Waiting for Resolve";
+    drawSourceSignalPlot(*app,
+                         *window,
+                         sourceSignalStore,
+                         rect.w,
+                         rect.h,
+                         windowWidth,
+                         windowHeight,
+                         renderer,
+                         symbolRenderer);
+    glDisable(GL_SCISSOR_TEST);
+    return;
+  }
   if (window->derivedMesh.analyticalScope) {
     drawAnalyticalScopePlot(*window, window->derivedMesh, rect.w, rect.h, renderer);
+    if (windowWaitingForImageLasso) {
+      drawImageLassoWaitingOverlay(rect.w, rect.h, renderer);
+    }
     glDisable(GL_SCISSOR_TEST);
     return;
   }
@@ -19820,15 +20847,15 @@ void drawSecondaryPlotWindow(AppState* app,
                               app->glossViewDiagnosticOverlay);
   }
   if (payload.plotMode == "chromaticity") {
-    const double windowWidth = std::max(1.0, static_cast<double>(window->rect.w) * fbWidth);
-    const double windowHeight = std::max(1.0, static_cast<double>(window->rect.h) * fbHeight);
+    const double localWindowWidth = std::max(1.0, static_cast<double>(window->rect.w) * fbWidth);
+    const double localWindowHeight = std::max(1.0, static_cast<double>(window->rect.h) * fbHeight);
     const double localX = app->hoverX - static_cast<double>(window->rect.x) * fbWidth;
     const double localY = app->hoverY - static_cast<double>(window->rect.y) * fbHeight;
     drawChromaticityInfoOverlay(makePlotRemapSpec(payload),
                                 rect.w,
                                 rect.h,
-                                localX * static_cast<double>(rect.w) / windowWidth,
-                                localY * static_cast<double>(rect.h) / windowHeight,
+                                localX * static_cast<double>(rect.w) / localWindowWidth,
+                                localY * static_cast<double>(rect.h) / localWindowHeight,
                                 renderer);
   }
   if (glossViewMode && !payload.glossHideText) {
@@ -19853,6 +20880,9 @@ void drawSecondaryPlotWindow(AppState* app,
                                     app->glossViewColorMode,
                                     app->glossViewDebugFieldMode,
                                     app->glossViewDiagnosticOverlay);
+  }
+  if (windowWaitingForImageLasso) {
+    drawImageLassoWaitingOverlay(rect.w, rect.h, renderer);
   }
   glDisable(GL_SCISSOR_TEST);
 }
@@ -21502,6 +22532,50 @@ void drawFitIndicator(int width,
   glMatrixMode(GL_MODELVIEW);
 }
 
+void drawCircularArrowGlyph(float cx,
+                            float cy,
+                            float radius,
+                            int direction,
+                            float alpha,
+                            float lineWidth) {
+  if (direction == 0 || alpha <= 0.0f) return;
+  const int steps = 34;
+  const float tailAngle = 1.57079632679f;
+  const float startAngle = direction > 0 ? tailAngle + 0.78f : tailAngle - 0.78f;
+  const float endAngle = direction > 0 ? tailAngle - 5.05f : tailAngle + 5.05f;
+  const float headAngle = endAngle;
+  const float headLen = radius * 0.58f;
+  const float tailLen = radius * 0.50f;
+
+  glLineWidth(lineWidth);
+  glColor4f(0.96f, 0.98f, 1.0f, alpha);
+  glBegin(GL_LINE_STRIP);
+  for (int i = 0; i <= steps; ++i) {
+    const float t = static_cast<float>(i) / static_cast<float>(steps);
+    const float a = startAngle + (endAngle - startAngle) * t;
+    glVertex2f(cx + std::cos(a) * radius, cy + std::sin(a) * radius);
+  }
+  glEnd();
+
+  glBegin(GL_LINES);
+  glVertex2f(cx, cy + radius + tailLen);
+  glVertex2f(cx, cy + radius - radius * 0.21f);
+  glEnd();
+
+  const float hx = cx + std::cos(headAngle) * radius;
+  const float hy = cy + std::sin(headAngle) * radius;
+  const float tangentX = direction > 0 ? -std::sin(headAngle) : std::sin(headAngle);
+  const float tangentY = direction > 0 ?  std::cos(headAngle) : -std::cos(headAngle);
+  glBegin(GL_LINES);
+  glVertex2f(hx, hy);
+  glVertex2f(hx - tangentX * headLen - std::cos(headAngle) * radius * 0.29f,
+             hy - tangentY * headLen - std::sin(headAngle) * radius * 0.29f);
+  glVertex2f(hx, hy);
+  glVertex2f(hx + tangentX * headLen - std::cos(headAngle) * radius * 0.29f,
+             hy + tangentY * headLen - std::sin(headAngle) * radius * 0.29f);
+  glEnd();
+}
+
 void drawRollDirectionIndicator(int width,
                                 int height,
                                 int direction,
@@ -21514,14 +22588,6 @@ void drawRollDirectionIndicator(int width,
   const float cy = yOffset;
   const float radius = 7.6f + 1.0f * pulse;
   const float alpha = 0.60f + 0.34f * pulse;
-  const int steps = 34;
-  // Match the feedback to clockwise/counterclockwise roll direction.
-  const float tailAngle = 1.57079632679f;
-  const float startAngle = direction > 0 ? tailAngle + 0.78f : tailAngle - 0.78f;
-  const float endAngle = direction > 0 ? tailAngle - 5.05f : tailAngle + 5.05f;
-  const float headAngle = endAngle;
-  const float headLen = 4.4f + 0.6f * pulse;
-  const float tailLen = 3.8f + 0.4f * pulse;
 
   glMatrixMode(GL_PROJECTION);
   glPushMatrix();
@@ -21567,34 +22633,7 @@ void drawRollDirectionIndicator(int width,
     }
   }
 
-  glLineWidth(1.7f + 0.4f * pulse);
-  glColor4f(0.96f, 0.98f, 1.0f, alpha);
-  glBegin(GL_LINE_STRIP);
-  for (int i = 0; i <= steps; ++i) {
-    const float t = static_cast<float>(i) / static_cast<float>(steps);
-    const float a = startAngle + (endAngle - startAngle) * t;
-    glVertex2f(cx + std::cos(a) * radius, cy + std::sin(a) * radius);
-  }
-  glEnd();
-
-  // Short vertical tail so the silhouette reads more like a directional circular arrow.
-  glBegin(GL_LINES);
-  glVertex2f(cx, cy + radius + tailLen);
-  glVertex2f(cx, cy + radius - 1.6f);
-  glEnd();
-
-  const float hx = cx + std::cos(headAngle) * radius;
-  const float hy = cy + std::sin(headAngle) * radius;
-  const float tangentX = direction > 0 ? -std::sin(headAngle) : std::sin(headAngle);
-  const float tangentY = direction > 0 ?  std::cos(headAngle) : -std::cos(headAngle);
-  glBegin(GL_LINES);
-  glVertex2f(hx, hy);
-  glVertex2f(hx - tangentX * headLen - std::cos(headAngle) * 2.2f,
-             hy - tangentY * headLen - std::sin(headAngle) * 2.2f);
-  glVertex2f(hx, hy);
-  glVertex2f(hx + tangentX * headLen - std::cos(headAngle) * 2.2f,
-             hy + tangentY * headLen - std::sin(headAngle) * 2.2f);
-  glEnd();
+  drawCircularArrowGlyph(cx, cy, radius, direction, alpha, 1.7f + 0.4f * pulse);
 
   glEnable(GL_DEPTH_TEST);
   glPopMatrix();
@@ -21689,6 +22728,31 @@ void mouseButtonCallback(GLFWwindow* window, int button, int action, int mods) {
       app->plotModelMenuHoverSub = -1;
       app->viewerMenuHoverTab = -1;
       app->viewerMenuHoverChoice = -1;
+      clearPointerInteractionState(app);
+      return;
+    }
+  }
+  if (button == GLFW_MOUSE_BUTTON_LEFT && action == GLFW_PRESS &&
+      !app->plotModelMenuVisible && !app->quickPlotModelMenuVisible &&
+      !app->addPlotMenuVisible && !app->layoutMenuVisible) {
+    int windowWidth = 1, windowHeight = 1;
+    glfwGetWindowSize(window, &windowWidth, &windowHeight);
+    double cursorX = app->hoverX;
+    double cursorY = app->hoverY;
+    glfwGetCursorPos(window, &cursorX, &cursorY);
+    int sourceWindowId = -1;
+    const SourceSignalLassoButton lassoButton =
+        sourceSignalLassoButtonAtPoint(*app, windowWidth, windowHeight, cursorX, cursorY, &sourceWindowId);
+    if (lassoButton != SourceSignalLassoButton::None) {
+      (void)sourceWindowId;
+      if (lassoButton == SourceSignalLassoButton::Add) {
+        app->viewerLassoSubtractMode = false;
+      } else if (lassoButton == SourceSignalLassoButton::Subtract) {
+        app->viewerLassoSubtractMode = true;
+      } else if (lassoButton == SourceSignalLassoButton::Clear) {
+        clearActiveViewerLassoSelection(app);
+        queueViewerStateCommand(*app, "reinterpret");
+      }
       clearPointerInteractionState(app);
       return;
     }
@@ -22012,13 +23076,15 @@ void mouseButtonCallback(GLFWwindow* window, int button, int action, int mods) {
     clearPointerInteractionState(app);
     return;
   }
-  if (button == GLFW_MOUSE_BUTTON_LEFT && action == GLFW_PRESS && viewerLassoInteractionEnabled(*app)) {
+  if (button == GLFW_MOUSE_BUTTON_LEFT && action == GLFW_PRESS) {
     double cursorX = app->hoverX;
     double cursorY = app->hoverY;
     glfwGetCursorPos(window, &cursorX, &cursorY);
-    beginViewerLassoStroke(app, window, cursorX, cursorY);
-    clearPointerInteractionState(app);
-    return;
+    if (viewerLassoInteractionEnabled(*app, window, cursorX, cursorY)) {
+      beginViewerLassoStroke(app, window, cursorX, cursorY);
+      clearPointerInteractionState(app);
+      return;
+    }
   }
   if (action == GLFW_RELEASE) {
     const bool anyDown =
@@ -22047,6 +23113,12 @@ void mouseButtonCallback(GLFWwindow* window, int button, int action, int mods) {
       }
       focusPlotWindow(app, windowId);
       bringPlotWindowToFront(app, windowId);
+      if (!viewerSourceSelectionsSynced(*app)) {
+        if (PlotWindowState* target = plotWindowById(app, windowId);
+            target && plotWindowCanOwnViewerLassoSelection(*target)) {
+          app->viewerLassoTargetWindowId = windowId;
+        }
+      }
       if (PlotWindowState* focused = focusedPlotWindow(app)) {
         const PlotWindowDragMode dragMode =
             plotWindowDragModeAt(*focused, windowWidth, windowHeight, cursorX, cursorY);
@@ -22758,6 +23830,17 @@ std::string handleIncomingLine(const std::string& line) {
       gPendingCloudMsg.seq = payload.seq;
       gHasPendingCloudMsg = true;
     }
+    return std::string();
+  }
+  if (line.find("\"type\":\"source_signal\"") != std::string::npos) {
+    SourceSignalPayload payload{};
+    if (parseSourceSignalMessage(line, &payload)) {
+      std::lock_guard<std::mutex> lock(gMsgMutex);
+      gPendingSourceSignalMsg.line = line;
+      gPendingSourceSignalMsg.seq = payload.seq;
+      gHasPendingSourceSignalMsg = true;
+    }
+    return std::string();
   }
   return std::string();
 }
@@ -23056,6 +24139,7 @@ int main() {
   InputCloudPayload currentCloud{};
   InputCloudPayload baseInputCloud{};
   SourceCloudStore sourceCloudStore{};
+  SourceSignalStore sourceSignalStore{};
   bool hasDeferredCloud = false;
   bool hasCurrentCloud = false;
   bool hasBaseInputCloud = false;
@@ -23065,6 +24149,7 @@ int main() {
   MeshData localPreviewMeshCache{};
   uint64_t localOverlayRevisionBuilt = 0;
   uint64_t lastCloudSeq = 0;
+  uint64_t lastSourceSignalSeq = 0;
   uint64_t lastParamsSeq = 0;
   uint64_t lastClearSeq = 0;
 #if defined(CHROMASPACE_VIEWER_HAS_CUDA) && !defined(__APPLE__)
@@ -23117,9 +24202,11 @@ int main() {
 
     PendingMessage pendingParams;
     PendingMessage pendingCloud;
+    PendingMessage pendingSourceSignal;
     PendingMessage pendingClear;
     bool haveParams = false;
     bool haveCloud = false;
+    bool haveSourceSignal = false;
     bool haveClear = false;
     {
       std::lock_guard<std::mutex> lock(gMsgMutex);
@@ -23137,6 +24224,11 @@ int main() {
         pendingCloud = gPendingCloudMsg;
         gHasPendingCloudMsg = false;
         haveCloud = true;
+      }
+      if (gHasPendingSourceSignalMsg) {
+        pendingSourceSignal = gPendingSourceSignalMsg;
+        gHasPendingSourceSignalMsg = false;
+        haveSourceSignal = true;
       }
     }
 
@@ -23165,6 +24257,15 @@ int main() {
         baseInputCloud = InputCloudPayload{};
         deferredCloud = InputCloudPayload{};
         sourceCloudStore = SourceCloudStore{};
+        if (sourceSignalStore.texture != 0) {
+          glDeleteTextures(1, &sourceSignalStore.texture);
+        }
+        sourceSignalStore = SourceSignalStore{};
+        app.sourceSignalSourceWidth = 0;
+        app.sourceSignalSourceHeight = 0;
+        app.sourceSignalProxyWidth = 0;
+        app.sourceSignalProxyHeight = 0;
+        lastSourceSignalSeq = 0;
         localPreviewRevisionBuilt = 0;
         localPreviewCloudSeqBuilt = 0;
         localPreviewBuildKeyBuilt.clear();
@@ -23462,7 +24563,46 @@ int main() {
       applyViewerStateToResolvedViewFields(app.viewerState, &resolved);
     }
 
-    // Stage 2: apply cloud payloads only when they match the active sender/settings contract.
+    // Stage 2: accept source-signal raster packets independently from plot clouds.
+    if (haveSourceSignal) {
+      SourceSignalPayload sp{};
+      if (parseSourceSignalMessage(pendingSourceSignal.line, &sp)) {
+        std::ostringstream os;
+        os << "Source signal received: sender=" << sp.senderId
+           << " seq=" << sp.seq
+           << " hash=" << sp.contentHash
+           << " source=" << sp.sourceWidth << "x" << sp.sourceHeight
+           << " proxy=" << sp.proxyWidth << "x" << sp.proxyHeight
+           << " coverage=" << sp.coverage
+           << " tier=" << sp.tierLabel
+           << " transport=" << sp.transport;
+        logViewerEvent(os.str());
+        if (!senderMatchesCurrent(resolved.senderId, sp.senderId)) {
+          logViewerEvent("Ignored source signal from non-active sender.");
+        } else if (sp.seq <= lastSourceSignalSeq) {
+          logViewerEvent("Ignored stale source signal sequence.");
+        } else if (sp.coverage == "partial-preview") {
+          app.sourceSignalSourceWidth = sp.sourceWidth;
+          app.sourceSignalSourceHeight = sp.sourceHeight;
+          app.sourceSignalProxyWidth = sp.proxyWidth;
+          app.sourceSignalProxyHeight = sp.proxyHeight;
+          sourceSignalStore.preview = std::move(sp);
+          sourceSignalStore.hasPreview = true;
+          lastSourceSignalSeq = pendingSourceSignal.seq;
+        } else {
+          app.sourceSignalSourceWidth = sp.sourceWidth;
+          app.sourceSignalSourceHeight = sp.sourceHeight;
+          app.sourceSignalProxyWidth = sp.proxyWidth;
+          app.sourceSignalProxyHeight = sp.proxyHeight;
+          sourceSignalStore.authoritative = std::move(sp);
+          sourceSignalStore.hasAuthoritative = true;
+          sourceSignalStore.lastSeq = sourceSignalStore.authoritative.seq;
+          lastSourceSignalSeq = sourceSignalStore.authoritative.seq;
+        }
+      }
+    }
+
+    // Stage 3: apply cloud payloads only when they match the active sender/settings contract.
     if (haveCloud) {
       InputCloudPayload cp{};
       if (parseInputCloudMessage(pendingCloud.line, &cp)) {
@@ -23772,6 +24912,7 @@ int main() {
     for (auto& plotWindow : app.plotWindows) {
       plotWindow.rect = clampedPlotWindowRect(plotWindow.rect, windowWidth, windowHeight);
     }
+    ensureSourceSignalWindowForLasso(&app, windowWidth, windowHeight, false);
     captureFocusedPlotWindowFromApp(&app);
     const PlotWindowState* focusedWindowForRender = focusedPlotWindow(app);
     const auto titleState =
@@ -23784,6 +24925,8 @@ int main() {
             : mesh;
     const bool analyticalScopeForTitle =
         plotModelIsAnalyticalScope(titleState.plotModel);
+    const bool sourceSignalForTitle =
+        plotModelIsSourceSignal(titleState.plotModel);
     const std::string titlePlotMode =
         ChromaspaceViewer::plotModeForModel(titleState.plotModel);
     CameraState titleCamera =
@@ -23792,7 +24935,9 @@ int main() {
     std::ostringstream title;
     title << "Chromaspace | " << (gConnected.load() ? "Connected" : "Waiting")
           << " | " << ChromaspaceViewer::plotModelLabel(titleState.plotModel);
-    if (analyticalScopeForTitle) {
+    if (sourceSignalForTitle) {
+      title << " | " << ChromaspaceViewer::sourceDetailLabel(titleState.sourceDetailMode);
+    } else if (analyticalScopeForTitle) {
       if (titleState.plotModel == ChromaspaceViewer::kPlotModelWaveform) {
         title << " | " << (titleState.waveformHighDetail ? "High Detail" : "Standard");
       } else {
@@ -23828,7 +24973,7 @@ int main() {
       syncOrthographicStateForPlotMode(titlePlotMode, &titleCamera);
     }
     const char* orthoLabel =
-        analyticalScopeForTitle || (glossViewModeForTitle && !glossProjection3DForTitle)
+        analyticalScopeForTitle || sourceSignalForTitle || (glossViewModeForTitle && !glossProjection3DForTitle)
             ? nullptr
             : (glossViewModeForTitle ? glossViewOrthographicViewLabel(titleCamera)
                                      : orthographicViewLabel(titleCamera));
@@ -23910,7 +25055,9 @@ int main() {
     float backgroundG = resolved.backgroundColorG;
     float backgroundB = resolved.backgroundColorB;
     const bool waitingForImageLassoShape =
-        payloadImageLassoModeEnabled(resolved) && !payloadHasImageLassoSelection(resolved);
+        plotWindowShouldShowImageLassoStandby(app, focusedWindowForRender) ||
+        (sourceSignalPlotWindow(app) == nullptr &&
+         payloadImageLassoModeEnabled(resolved) && !payloadHasImageLassoSelection(resolved));
     const bool emptyImageLassoMode = waitingForImageLassoShape;
     if (emptyImageLassoMode) {
       backgroundR = clamp01(backgroundR * 0.82f + 0.05f);
@@ -24545,16 +25692,32 @@ int main() {
     const InputCloudPayload* sharedPlotCloud = hasCurrentCloud ? &currentCloud
                                              : (hasBaseInputCloud ? &baseInputCloud : nullptr);
     glDisable(GL_SCISSOR_TEST);
+    const PlotWindowState* activeUnsyncedLassoTarget =
+        viewerSourceSelectionsSynced(app) ? nullptr : activeViewerLassoTargetWindow(app);
     for (auto& plotWindow : app.plotWindows) {
+      const bool allowImageLassoCloud =
+          viewerSourceSelectionsSynced(app) ||
+          !sourceSignalPlotWindow(app) ||
+          !plotWindowCanOwnViewerLassoSelection(plotWindow) ||
+          (activeUnsyncedLassoTarget &&
+           activeUnsyncedLassoTarget->windowId == plotWindow.windowId);
       const InputCloudPayload* plotCloud =
-          sourceCloudForPlotWindow(sourceCloudStore, plotWindow, app.senderId, sharedPlotCloud);
+          sourceCloudForPlotWindow(sourceCloudStore,
+                                   plotWindow,
+                                   app.senderId,
+                                   sharedPlotCloud,
+                                   allowImageLassoCloud);
       drawSecondaryPlotWindow(&app,
                               &plotWindow,
                               resolved,
                               plotCloud,
+                              &sourceSignalStore,
                               width,
                               height,
+                              windowWidth,
+                              windowHeight,
                               overlayTextRenderer ? *overlayTextRenderer : hudText,
+                              &hudSymbolText,
                               &pointRenderProgramCache);
     }
     glViewport(0, 0, width, height);
@@ -24565,7 +25728,7 @@ int main() {
                                 windowHeight,
                                 overlayTextRenderer ? *overlayTextRenderer : hudText);
     drawViewerLassoOverlay(app, width, height);
-    if (waitingForImageLassoShape) {
+    if (waitingForImageLassoShape && app.plotWindows.size() <= 1u) {
       drawImageLassoWaitingOverlay(width,
                                    height,
                                    overlayTextRenderer ? *overlayTextRenderer : hudText);

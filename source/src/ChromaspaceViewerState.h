@@ -22,7 +22,8 @@ enum PlotModelId {
   kPlotModelGlossView = 8,
   kPlotModelWaveform = 9,
   kPlotModelHistogram = 10,
-  kPlotModelCount = 11,
+  kPlotModelSourceSignal = 11,
+  kPlotModelCount = 12,
 };
 
 struct ViewerRuntimeState {
@@ -116,6 +117,11 @@ struct ViewerRuntimeState {
   bool histogramShowOverflow = true;
   bool histogramHighlightOverflow = true;
   int scopeRangeMode = 0;
+
+  int sourceDetailMode = 0;
+  int sourceMaxProxyLongEdge = 2048;
+  bool sourceUseNativeWhenAvailable = true;
+  bool sourceSyncSelections = false;
 };
 
 inline int clampChoice(int value, int hi, int fallback = 0) {
@@ -174,6 +180,8 @@ inline ViewerRuntimeState clampedViewerRuntimeState(ViewerRuntimeState s) {
   s.waveformLumaMethod = clampChoice(s.waveformLumaMethod, 3, 0);
   s.histogramMode = clampChoice(s.histogramMode, 1, 0);
   s.scopeRangeMode = clampChoice(s.scopeRangeMode, 2, 0);
+  s.sourceDetailMode = clampChoice(s.sourceDetailMode, 4, 0);
+  s.sourceMaxProxyLongEdge = std::max(768, std::min(4096, s.sourceMaxProxyLongEdge));
   if (s.plotModel == kPlotModelGlossView) {
     s.fillVolume = false;
     s.fillGrayRamp = false;
@@ -194,6 +202,24 @@ inline ViewerRuntimeState clampedViewerRuntimeState(ViewerRuntimeState s) {
     s.showOverflow = false;
     s.highlightOverflow = false;
   }
+  if (s.plotModel == kPlotModelSourceSignal) {
+    s.fillVolume = false;
+    s.fillGrayRamp = false;
+    s.readGrayRamp = false;
+    s.readIdentityPlot = false;
+    s.isolateIdentityData = false;
+    s.excludeIdentityData = false;
+    s.occupancyGuidedFill = false;
+    s.showOverflow = false;
+    s.highlightOverflow = false;
+    s.volumeSliceRed = false;
+    s.volumeSliceYellow = false;
+    s.volumeSliceGreen = false;
+    s.volumeSliceCyan = false;
+    s.volumeSliceBlue = false;
+    s.volumeSliceMagenta = false;
+    s.neutralRadius = 1.0;
+  }
   if (!s.readGrayRamp && !s.readIdentityPlot) s.isolateIdentityData = false;
   return s;
 }
@@ -210,6 +236,7 @@ inline const char* plotModeForModel(int plotModel) {
     case 8: return "gloss_view";
     case 9: return "waveform";
     case 10: return "histogram";
+    case 11: return "source_signal";
     default: return "rgb";
   }
 }
@@ -225,6 +252,7 @@ inline int plotModelForMode(const std::string& plotMode) {
   if (plotMode == "gloss_view" || plotMode == "gloss_lift") return 8;
   if (plotMode == "waveform") return 9;
   if (plotMode == "histogram") return 10;
+  if (plotMode == "source_signal") return 11;
   return 0;
 }
 
@@ -240,6 +268,7 @@ inline const char* plotModelLabel(int plotModel) {
     case 8: return "Gloss View";
     case 9: return "Waveform";
     case 10: return "Histogram";
+    case 11: return "Source Signal";
     default: return "Cube";
   }
 }
@@ -266,6 +295,16 @@ inline const char* scaleLabel(int scale) {
     case 1: return "50%";
     case 2: return "75%";
     default: return "100%";
+  }
+}
+
+inline const char* sourceDetailLabel(int mode) {
+  switch (clampChoice(mode, 4, 0)) {
+    case 1: return "Performance";
+    case 2: return "Balanced";
+    case 3: return "Quality";
+    case 4: return "Native";
+    default: return "Auto";
   }
 }
 
@@ -344,6 +383,10 @@ inline bool isAnalyticalScope(const ViewerRuntimeState& state) {
   return model == kPlotModelWaveform || model == kPlotModelHistogram;
 }
 
+inline bool isSourceSignal(const ViewerRuntimeState& state) {
+  return clampChoice(state.plotModel, kPlotModelCount - 1, kPlotModelCube) == kPlotModelSourceSignal;
+}
+
 inline bool showOverflowSupported(const ViewerRuntimeState& state, bool drawOnImage) {
   if (drawOnImage) return false;
   const int model = clampChoice(state.plotModel, kPlotModelCount - 1, kPlotModelCube);
@@ -361,11 +404,11 @@ inline bool volumeSlicingSupported(const ViewerRuntimeState& state, bool drawOnI
 }
 
 inline bool hueSlicingAllowed(const ViewerRuntimeState& state, bool drawOnImage) {
-  return volumeSlicingSupported(state, drawOnImage) && !isChromaticity(state);
+  return volumeSlicingSupported(state, drawOnImage) && !isChromaticity(state) && !isSourceSignal(state);
 }
 
 inline bool neutralRadiusAllowed(const ViewerRuntimeState& state, bool drawOnImage) {
-  return volumeSlicingSupported(state, drawOnImage) && !isChromaticity(state);
+  return volumeSlicingSupported(state, drawOnImage) && !isChromaticity(state) && !isSourceSignal(state);
 }
 
 inline bool anyHueSliceSelected(const ViewerRuntimeState& state) {
