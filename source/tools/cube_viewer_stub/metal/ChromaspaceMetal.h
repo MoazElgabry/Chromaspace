@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -54,6 +55,65 @@ struct InputRequest {
   RemapUniforms remap;
 };
 
+struct RasterSourceRequest {
+  int pointCount = 0;
+  int basePointCount = 0;
+  int sourceWidth = 0;
+  int sourceHeight = 0;
+  int sampleStride = 1;
+  int sampleCountX = 0;
+  int pixelFormat = 0;  // 0=RGBA16F, 1=RGBA32F.
+  float sourceAspect = 16.0f / 9.0f;
+  float glossLiftScale = 1.0f;
+  float pointAlphaScale = 1.0f;
+  float denseAlphaBias = 0.0f;
+  float colorSaturation = 1.18f;
+  int plotLinear = 0;
+  int plotLinearTransfer = 0;
+  int excludeIdentityData = 0;
+  int isolateIdentityData = 0;
+  int readIdentityPlot = 0;
+  int readGrayRamp = 0;
+  int identityCubeY1 = -1;
+  int identityCubeY2 = -1;
+  int identityRampY1 = -1;
+  int identityRampY2 = -1;
+  int identityCubeAppendOffset = 0;
+  int identityCubeAppendCount = 0;
+  int identityCubeAppendY1 = -1;
+  int identityCubeAppendY2 = -1;
+  int identityCubeAppendRowStep = 1;
+  int identityCubeAppendXStep = 1;
+  int identityRampAppendOffset = 0;
+  int identityRampAppendCount = 0;
+  int identityRampAppendY1 = -1;
+  int identityRampAppendY2 = -1;
+  int identityRampAppendRowStep = 1;
+  int identityRampAppendXStep = 1;
+  int occupancyFill = 0;
+  int occupancyAppendOffset = 0;
+  int occupancyAppendCount = 0;
+  int occupancyCandidateCount = 0;
+  int lassoEnabled = 0;
+  int lassoStrokeCount = 0;
+  int lassoPointCount = 0;
+  int lassoStrokeFirst[16] = {};
+  int lassoStrokeCountPerStroke[16] = {};
+  int lassoStrokeSubtract[16] = {};
+  float lassoX[256] = {};
+  float lassoY[256] = {};
+  int cubeSlicingEnabled = 0;
+  int neutralRadiusEnabled = 0;
+  float neutralRadius = 1.0f;
+  int cubeSliceRed = 0;
+  int cubeSliceYellow = 0;
+  int cubeSliceGreen = 0;
+  int cubeSliceCyan = 0;
+  int cubeSliceBlue = 0;
+  int cubeSliceMagenta = 0;
+  RemapUniforms remap;
+};
+
 struct InputSampleRequest {
   int fullPointCount = 0;
   int visiblePointCount = 0;
@@ -84,6 +144,17 @@ struct GlossFieldResult {
   std::vector<float> confidence;
 };
 
+struct ScopeDensityRequest {
+  int pointCount = 0;
+  int waveform = 1;
+  int scopeMode = 0;
+  int width = 768;
+  int height = 512;
+  float rangeMin = 0.0f;
+  float invRange = 1.0f;
+  int excludeOverflow = 1;
+};
+
 enum ModifierFlags : uint32_t {
   ModifierFlagShift = 1u << 0,
   ModifierFlagControl = 1u << 1,
@@ -104,6 +175,12 @@ bool buildInputMesh(const InputRequest& request,
                     std::vector<float>* outVerts,
                     std::vector<float>* outColors,
                     std::string* error);
+bool buildRasterSourceMesh(const RasterSourceRequest& request,
+                           const void* sourceBytes,
+                           size_t sourceByteCount,
+                           std::vector<float>* outVerts,
+                           std::vector<float>* outColors,
+                           std::string* error);
 bool buildInputSampledMesh(const InputSampleRequest& request,
                            const std::vector<float>& fullVerts,
                            const std::vector<float>& fullColors,
@@ -114,5 +191,9 @@ bool buildGlossField(const GlossFieldRequest& request,
                      const std::vector<float>& packedPoints,
                      GlossFieldResult* out,
                      std::string* error);
+bool buildScopeDensity(const ScopeDensityRequest& request,
+                       const std::vector<float>& packedSamples,
+                       std::vector<float>* outDensity,
+                       std::string* error);
 
 }  // namespace ChromaspaceMetal

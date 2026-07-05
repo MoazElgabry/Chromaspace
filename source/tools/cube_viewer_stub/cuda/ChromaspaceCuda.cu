@@ -83,6 +83,60 @@ struct InputSampleKernelUniforms {
   int visiblePointCount;
 };
 
+struct RasterSourceKernelUniforms {
+  InputKernelUniforms input;
+  int basePointCount;
+  int sourceWidth;
+  int sourceHeight;
+  int sampleStride;
+  int sampleCountX;
+  int pixelFormat;
+  int plotLinear;
+  int plotLinearTransfer;
+  int excludeIdentityData;
+  int isolateIdentityData;
+  int readIdentityPlot;
+  int readGrayRamp;
+  int identityCubeY1;
+  int identityCubeY2;
+  int identityRampY1;
+  int identityRampY2;
+  int identityCubeAppendOffset;
+  int identityCubeAppendCount;
+  int identityCubeAppendY1;
+  int identityCubeAppendY2;
+  int identityCubeAppendRowStep;
+  int identityCubeAppendXStep;
+  int identityRampAppendOffset;
+  int identityRampAppendCount;
+  int identityRampAppendY1;
+  int identityRampAppendY2;
+  int identityRampAppendRowStep;
+  int identityRampAppendXStep;
+  int occupancyFill;
+  int occupancyAppendOffset;
+  int occupancyAppendCount;
+  int occupancyCandidateCount;
+  int occupancyTargetThreshold;
+  int lassoEnabled;
+  int lassoStrokeCount;
+  int lassoPointCount;
+  int lassoStrokeFirst[16];
+  int lassoStrokeCountPerStroke[16];
+  int lassoStrokeSubtract[16];
+  float lassoX[256];
+  float lassoY[256];
+  int cubeSlicingEnabled;
+  int neutralRadiusEnabled;
+  float neutralRadius;
+  int cubeSliceRed;
+  int cubeSliceYellow;
+  int cubeSliceGreen;
+  int cubeSliceCyan;
+  int cubeSliceBlue;
+  int cubeSliceMagenta;
+};
+
 struct CacheImpl {
   cudaGraphicsResource* vertsResource = nullptr;
   cudaGraphicsResource* colorsResource = nullptr;
@@ -91,6 +145,8 @@ struct CacheImpl {
   size_t pointCapacity = 0;
   float* deviceInput = nullptr;
   size_t inputCapacityFloats = 0;
+  unsigned char* deviceSource = nullptr;
+  size_t sourceCapacityBytes = 0;
   unsigned int* deviceBounds = nullptr;
   float* deviceFieldWorkspace = nullptr;
   size_t fieldWorkspaceFloats = 0;
@@ -184,6 +240,7 @@ void releaseImpl(CacheImpl* impl) {
   if (impl->vertsResource) cudaGraphicsUnregisterResource(impl->vertsResource);
   if (impl->colorsResource) cudaGraphicsUnregisterResource(impl->colorsResource);
   if (impl->deviceInput) cudaFree(impl->deviceInput);
+  if (impl->deviceSource) cudaFree(impl->deviceSource);
   if (impl->deviceBounds) cudaFree(impl->deviceBounds);
   if (impl->deviceFieldWorkspace) cudaFree(impl->deviceFieldWorkspace);
   delete impl;
@@ -309,6 +366,23 @@ bool ensureInputCapacity(CacheImpl* impl, size_t floatCount, std::string* error)
     return false;
   }
   impl->inputCapacityFloats = floatCount;
+  return true;
+}
+
+bool ensureSourceCapacity(CacheImpl* impl, size_t byteCount, std::string* error) {
+  if (!impl) return false;
+  if (byteCount <= impl->sourceCapacityBytes && impl->deviceSource != nullptr) return true;
+  if (impl->deviceSource) {
+    cudaFree(impl->deviceSource);
+    impl->deviceSource = nullptr;
+    impl->sourceCapacityBytes = 0;
+  }
+  cudaError_t err = cudaMalloc(&impl->deviceSource, byteCount);
+  if (err != cudaSuccess) {
+    if (error) *error = std::string("Failed to allocate CUDA source buffer: ") + errorString(err);
+    return false;
+  }
+  impl->sourceCapacityBytes = byteCount;
   return true;
 }
 
@@ -860,24 +934,15 @@ __global__ void overlayKernel(float* verts, float* colors, const float* input, O
   colors[cbase + 3u] = alpha;
 }
 
-__global__ void inputKernel(float* verts, float* colors, const float* input, InputKernelUniforms u) {
-  const unsigned int index = blockIdx.x * blockDim.x + threadIdx.x;
-  const unsigned int total = static_cast<unsigned int>(max(u.pointCount, 0));
-  if (index >= total) return;
-  const unsigned int stride = static_cast<unsigned int>(max(u.inputStride, 3));
-  const unsigned int ibase = index * stride;
-  float xNorm = 0.5f;
-  float yNorm = 0.5f;
-  float r = input[ibase + 0u];
-  float g = input[ibase + 1u];
-  float b = input[ibase + 2u];
-  if (u.glossView != 0 && stride >= 6u) {
-    xNorm = fminf(fmaxf(input[ibase + 0u], 0.0f), 1.0f);
-    yNorm = fminf(fmaxf(input[ibase + 1u], 0.0f), 1.0f);
-    r = input[ibase + 3u];
-    g = input[ibase + 4u];
-    b = input[ibase + 5u];
-  }
+__device__ void writeMappedInputPoint(float* verts,
+                                      float* colors,
+                                      unsigned int index,
+                                      float xNorm,
+                                      float yNorm,
+                                      float r,
+                                      float g,
+                                      float b,
+                                      InputKernelUniforms u) {
   const bool overflow = outOfBounds(r, g, b);
   const float plotR = u.showOverflow != 0 ? r : clamp01(r);
   const float plotG = u.showOverflow != 0 ? g : clamp01(g);
@@ -951,9 +1016,428 @@ __global__ void inputKernel(float* verts, float* colors, const float* input, Inp
   colors[cbase + 3u] = alpha;
 }
 
-__global__ void boundsKernel(const float* verts, unsigned int* boundsVals, int pointCount) {
+__device__ void writeHiddenInputPoint(float* verts, float* colors, unsigned int index) {
+  const unsigned int vbase = index * 3u;
+  verts[vbase + 0u] = 0.0f;
+  verts[vbase + 1u] = 0.0f;
+  verts[vbase + 2u] = 0.0f;
+  const unsigned int cbase = index * 4u;
+  colors[cbase + 0u] = 0.0f;
+  colors[cbase + 1u] = 0.0f;
+  colors[cbase + 2u] = 0.0f;
+  colors[cbase + 3u] = 0.0f;
+}
+
+__device__ bool rasterSourceRowInRange(int y, int y1, int y2) {
+  return y1 >= 0 && y2 > y1 && y >= y1 && y < y2;
+}
+
+__device__ bool rasterSourceRowInCube(const RasterSourceKernelUniforms& u, int y) {
+  return rasterSourceRowInRange(y, u.identityCubeY1, u.identityCubeY2);
+}
+
+__device__ bool rasterSourceRowInRamp(const RasterSourceKernelUniforms& u, int y) {
+  return rasterSourceRowInRange(y, u.identityRampY1, u.identityRampY2);
+}
+
+__device__ bool rasterAppendSampleCoords(unsigned int index,
+                                         int offset,
+                                         int count,
+                                         int y1,
+                                         int y2,
+                                         int rowStep,
+                                         int xStep,
+                                         int sourceWidth,
+                                         int* outX,
+                                         int* outY) {
+  if (!outX || !outY || count <= 0 || index < static_cast<unsigned int>(max(offset, 0)) ||
+      index >= static_cast<unsigned int>(max(offset + count, offset))) {
+    return false;
+  }
+  const int local = static_cast<int>(index) - offset;
+  const int safeXStep = max(xStep, 1);
+  const int safeRowStep = max(rowStep, 1);
+  const int samplesPerRow = max(1, (max(sourceWidth, 0) + safeXStep - 1) / safeXStep);
+  const int rowIndex = local / samplesPerRow;
+  const int xIndex = local - rowIndex * samplesPerRow;
+  *outX = min(max(xIndex * safeXStep, 0), max(sourceWidth - 1, 0));
+  *outY = min(max(y1 + rowIndex * safeRowStep, y1), max(y2 - 1, y1));
+  return true;
+}
+
+__device__ float rasterHalton(unsigned int index, unsigned int base) {
+  float f = 1.0f;
+  float r = 0.0f;
+  while (index > 0u) {
+    f /= static_cast<float>(base);
+    r += f * static_cast<float>(index % base);
+    index /= base;
+  }
+  return r;
+}
+
+__device__ bool rasterOccupancySampleCoords(unsigned int index,
+                                            const RasterSourceKernelUniforms& u,
+                                            int* outX,
+                                            int* outY) {
+  if (!outX || !outY || u.occupancyAppendCount <= 0 ||
+      index < static_cast<unsigned int>(max(u.occupancyAppendOffset, 0)) ||
+      index >= static_cast<unsigned int>(max(u.occupancyAppendOffset + u.occupancyAppendCount,
+                                             u.occupancyAppendOffset))) {
+    return false;
+  }
+  const unsigned int local = index - static_cast<unsigned int>(max(u.occupancyAppendOffset, 0));
+  const unsigned int attemptCount = static_cast<unsigned int>(max(u.occupancyCandidateCount, u.occupancyAppendCount));
+  const unsigned int attempt = attemptCount > 0u
+                                   ? (local * max(attemptCount, 1u)) /
+                                         static_cast<unsigned int>(max(u.occupancyAppendCount, 1))
+                                   : local;
+  const float xNorm = rasterHalton(attempt + 1u, 2u);
+  const float yNorm = rasterHalton(attempt + 1u, 3u);
+  *outX = min(max(static_cast<int>(xNorm * static_cast<float>(max(u.sourceWidth, 1))), 0),
+              max(u.sourceWidth - 1, 0));
+  *outY = min(max(static_cast<int>(yNorm * static_cast<float>(max(u.sourceHeight, 1))), 0),
+              max(u.sourceHeight - 1, 0));
+  return true;
+}
+
+__device__ bool rasterLassoPointInStroke(const RasterSourceKernelUniforms& u,
+                                         int strokeIndex,
+                                         float xNorm,
+                                         float yNorm) {
+  if (strokeIndex < 0 || strokeIndex >= min(max(u.lassoStrokeCount, 0), 16)) return false;
+  const int first = u.lassoStrokeFirst[strokeIndex];
+  const int count = u.lassoStrokeCountPerStroke[strokeIndex];
+  if (count < 3 || first < 0 || first + count > min(max(u.lassoPointCount, 0), 256)) return false;
+  bool inside = false;
+  for (int i = 0, j = count - 1; i < count; j = i++) {
+    const float xi = u.lassoX[first + i];
+    const float yi = u.lassoY[first + i];
+    const float xj = u.lassoX[first + j];
+    const float yj = u.lassoY[first + j];
+    const bool intersects = ((yi > yNorm) != (yj > yNorm)) &&
+                            (xNorm < (xj - xi) * (yNorm - yi) / ((yj - yi) + 1.0e-12f) + xi);
+    if (intersects) inside = !inside;
+  }
+  return inside;
+}
+
+__device__ bool rasterLassoContainsPoint(const RasterSourceKernelUniforms& u,
+                                         float xNorm,
+                                         float yNorm) {
+  bool inside = false;
+  const int strokeCount = min(max(u.lassoStrokeCount, 0), 16);
+  for (int stroke = 0; stroke < strokeCount; ++stroke) {
+    if (!rasterLassoPointInStroke(u, stroke, xNorm, yNorm)) continue;
+    inside = u.lassoStrokeSubtract[stroke] == 0;
+  }
+  return inside;
+}
+
+__device__ float rasterNeutralRadius(float r, float g, float b, const RasterSourceKernelUniforms& u) {
+  constexpr float kRgbAxisMaxRadius = 0.8164965809277260f;
+  constexpr float kPolarMax = 0.9553166181245093f;
+  constexpr float kChenPolarScale = 1.0467733744265997f;
+  const int mode = u.input.plotMode;
+  if (mode == 1) {
+    const float cMax = fmaxf(r, fmaxf(g, b));
+    const float cMin = fminf(r, fminf(g, b));
+    if (u.input.circularHsl != 0) {
+      const float l = 0.5f * (cMax + cMin);
+      float denom = 1.0f - fabsf(2.0f * l - 1.0f);
+      if (fabsf(denom) <= 1e-6f) denom = denom < 0.0f ? -1e-6f : 1e-6f;
+      return clamp01(fabsf((cMax - cMin) / denom));
+    }
+    return clamp01(cMax - cMin);
+  }
+  if (mode == 2) {
+    if (u.input.circularHsv != 0) {
+      const float cMax = fmaxf(r, fmaxf(g, b));
+      const float cMin = fminf(r, fminf(g, b));
+      const float delta = cMax - cMin;
+      return (delta > 1e-6f && cMax > 1e-6f) ? clamp01(delta / cMax) : 0.0f;
+    }
+    const float x = r - 0.5f * g - 0.5f * b;
+    const float z = 0.8660254037844386f * (g - b);
+    return clamp01(sqrtf(x * x + z * z));
+  }
+  const bool overflowMode = u.input.showOverflow != 0 && (mode == 5 || mode == 6 || mode == 7);
+  const float rr = overflowMode ? r : clamp01(r);
+  const float gg = overflowMode ? g : clamp01(g);
+  const float bb = overflowMode ? b : clamp01(b);
+  const float rotX = 0.81649658093f * rr - 0.40824829046f * gg - 0.40824829046f * bb;
+  const float rotY = 0.70710678118f * gg - 0.70710678118f * bb;
+  const float rotZ = 0.57735026919f * (rr + gg + bb);
+  const float chromaRadius = sqrtf(rotX * rotX + rotY * rotY);
+  if (mode == 3) {
+    const float radius3 = sqrtf(rotX * rotX + rotY * rotY + rotZ * rotZ);
+    const float polar = atanf(chromaRadius / fmaxf(rotZ, 1e-8f));
+    const float light = radius3 * 0.5773502691896258f;
+    const float radial = light * sinf(polar * kChenPolarScale) / kRgbAxisMaxRadius;
+    return clamp01(radial);
+  }
+  if (mode == 4 || mode == 5) {
+    const float radius3 = sqrtf(rotX * rotX + rotY * rotY + rotZ * rotZ);
+    const float polar = atan2f(chromaRadius, rotZ);
+    const float radial = radius3 * sinf((polar / kPolarMax) * kPolarMax);
+    return clamp01(radial / sinf(kPolarMax));
+  }
+  if (mode == 6) {
+    const float polar = atan2f(chromaRadius, rotZ);
+    return clamp01(polar / kPolarMax);
+  }
+  if (mode == 7) {
+    const float rotZAvg = (rr + gg + bb) / 3.0f;
+    const float rx = 0.33333333333f * (2.0f * rr - gg - bb) * 0.70710678118f;
+    const float ry = (gg - bb) * 0.40824829046f;
+    const float sat = fabsf(rotZAvg) <= 1e-6f ? 0.0f : sqrtf(rx * rx + ry * ry) / rotZAvg;
+    return clamp01(fabsf(sat) / 1.41421356237f);
+  }
+  return clamp01(sqrtf(rotX * rotX + rotY * rotY) / kRgbAxisMaxRadius);
+}
+
+__device__ bool rasterCubeSliceContains(float r, float g, float b, const RasterSourceKernelUniforms& u) {
+  if (u.neutralRadiusEnabled != 0 && u.input.plotMode != 8 && u.input.showOverflow == 0) {
+    const float threshold = clamp01(u.neutralRadius) * clamp01(u.neutralRadius);
+    if (rasterNeutralRadius(r, g, b, u) > threshold + 1.0e-6f) return false;
+  }
+  if (u.cubeSlicingEnabled == 0) return true;
+  const bool anySelected = u.cubeSliceRed || u.cubeSliceYellow || u.cubeSliceGreen ||
+                           u.cubeSliceCyan || u.cubeSliceBlue || u.cubeSliceMagenta;
+  if (!anySelected) return false;
+  if (u.input.plotMode == 0 || u.input.glossView != 0) {
+    constexpr float kEps = 1.0e-6f;
+    const bool geRG = r + kEps >= g;
+    const bool geGB = g + kEps >= b;
+    const bool geGR = g + kEps >= r;
+    const bool geRB = r + kEps >= b;
+    const bool geBG = b + kEps >= g;
+    const bool geBR = b + kEps >= r;
+    if (u.cubeSliceRed && geRG && geGB) return true;
+    if (u.cubeSliceYellow && geGR && geRB) return true;
+    if (u.cubeSliceGreen && geGB && geBR) return true;
+    if (u.cubeSliceCyan && geBG && geGR) return true;
+    if (u.cubeSliceBlue && geBR && geRG) return true;
+    if (u.cubeSliceMagenta && geRB && geBG) return true;
+    return false;
+  }
+  const float cMax = fmaxf(r, fmaxf(g, b));
+  const float cMin = fminf(r, fminf(g, b));
+  const float delta = cMax - cMin;
+  if (delta <= 1.0e-6f) return false;
+  const float hue = wrapHue01(rawRgbHue01(r, g, b, cMax, delta));
+  const int sector = static_cast<int>(floorf((hue + (1.0f / 12.0f)) * 6.0f)) % 6;
+  if (sector == 0) return u.cubeSliceRed != 0;
+  if (sector == 1) return u.cubeSliceYellow != 0;
+  if (sector == 2) return u.cubeSliceGreen != 0;
+  if (sector == 3) return u.cubeSliceCyan != 0;
+  if (sector == 4) return u.cubeSliceBlue != 0;
+  return u.cubeSliceMagenta != 0;
+}
+
+__device__ float halfBitsToFloatDevice(unsigned short h) {
+  const float signScale = (h & 0x8000u) != 0u ? -1.0f : 1.0f;
+  unsigned int exp = static_cast<unsigned int>(h & 0x7C00u) >> 10u;
+  unsigned int mant = static_cast<unsigned int>(h & 0x03FFu);
+  if (exp == 0u) {
+    return signScale * ldexpf(static_cast<float>(mant), -24);
+  }
+  const unsigned int sign = (static_cast<unsigned int>(h & 0x8000u)) << 16u;
+  unsigned int bits = 0u;
+  if (exp == 31u) {
+    bits = sign | 0x7F800000u | (mant << 13u);
+  } else {
+    bits = sign | ((exp + 112u) << 23u) | (mant << 13u);
+  }
+  return __uint_as_float(bits);
+}
+
+__device__ void readRasterSourceRgb(const unsigned char* source,
+                                    RasterSourceKernelUniforms u,
+                                    int x,
+                                    int y,
+                                    float* r,
+                                    float* g,
+                                    float* b) {
+  x = min(max(x, 0), max(u.sourceWidth - 1, 0));
+  y = min(max(y, 0), max(u.sourceHeight - 1, 0));
+  const unsigned int pixel = static_cast<unsigned int>(y * u.sourceWidth + x);
+  if (u.pixelFormat == 1) {
+    const float* values = reinterpret_cast<const float*>(source);
+    const unsigned int base = pixel * 4u;
+    *r = values[base + 0u];
+    *g = values[base + 1u];
+    *b = values[base + 2u];
+    return;
+  }
+  const unsigned short* values = reinterpret_cast<const unsigned short*>(source);
+  const unsigned int base = pixel * 4u;
+  *r = halfBitsToFloatDevice(values[base + 0u]);
+  *g = halfBitsToFloatDevice(values[base + 1u]);
+  *b = halfBitsToFloatDevice(values[base + 2u]);
+}
+
+__device__ int rasterOccupancyBinIndex(float r, float g, float b) {
+  constexpr int binsPerAxis = 18;
+  auto toBin = [](float value) {
+    if (value < 0.0f) return 0;
+    if (value > 1.0f) return 17;
+    return 1 + min(max(static_cast<int>(floorf(value * 16.0f)), 0), 15);
+  };
+  return (toBin(r) * binsPerAxis + toBin(g)) * binsPerAxis + toBin(b);
+}
+
+__device__ bool rasterSampleVisible(const RasterSourceKernelUniforms& u,
+                                    int x,
+                                    int y,
+                                    float xNorm,
+                                    float yNorm,
+                                    float r,
+                                    float g,
+                                    float b) {
+  const bool inCubeStrip = rasterSourceRowInCube(u, y);
+  const bool inRampStrip = rasterSourceRowInRamp(u, y);
+  const bool inAnyIdentityStrip = inCubeStrip || inRampStrip;
+  bool visible = true;
+  if (u.excludeIdentityData != 0 && inAnyIdentityStrip) {
+    visible = false;
+  } else if (u.isolateIdentityData != 0) {
+    visible = (u.readIdentityPlot != 0 && inCubeStrip) || (u.readGrayRamp != 0 && inRampStrip);
+  }
+  if (visible && u.lassoEnabled != 0 && !rasterLassoContainsPoint(u, xNorm, yNorm)) {
+    visible = false;
+  }
+  if (visible && !rasterCubeSliceContains(r, g, b, u)) {
+    visible = false;
+  }
+  (void)x;
+  return visible;
+}
+
+__device__ void rasterReadTransformedSample(const unsigned char* source,
+                                            const RasterSourceKernelUniforms& u,
+                                            int x,
+                                            int y,
+                                            float* r,
+                                            float* g,
+                                            float* b) {
+  readRasterSourceRgb(source, u, x, y, r, g, b);
+  if (u.plotLinear != 0 && u.input.plotMode != 8) {
+    *r = decodeTransferChannel(*r, u.plotLinearTransfer);
+    *g = decodeTransferChannel(*g, u.plotLinearTransfer);
+    *b = decodeTransferChannel(*b, u.plotLinearTransfer);
+  }
+}
+
+__global__ void rasterOccupancyCountKernel(const unsigned char* source,
+                                           RasterSourceKernelUniforms u,
+                                           int* occupancyBins,
+                                           int* visibleCount) {
+  const unsigned int index = blockIdx.x * blockDim.x + threadIdx.x;
+  const unsigned int total = static_cast<unsigned int>(max(u.basePointCount, 0));
+  if (index >= total || !source || !occupancyBins || !visibleCount) return;
+  const int sampleCountX = max(u.sampleCountX, 1);
+  const int stride = max(u.sampleStride, 1);
+  int x = static_cast<int>(index % static_cast<unsigned int>(sampleCountX)) * stride;
+  int y = static_cast<int>(index / static_cast<unsigned int>(sampleCountX)) * stride;
+  x = min(max(x, 0), max(u.sourceWidth - 1, 0));
+  y = min(max(y, 0), max(u.sourceHeight - 1, 0));
+  const float xNorm = (static_cast<float>(x) + 0.5f) / static_cast<float>(max(u.sourceWidth, 1));
+  const float yNorm = (static_cast<float>(y) + 0.5f) / static_cast<float>(max(u.sourceHeight, 1));
+  float r = 0.0f;
+  float g = 0.0f;
+  float b = 0.0f;
+  rasterReadTransformedSample(source, u, x, y, &r, &g, &b);
+  if (!rasterSampleVisible(u, x, y, xNorm, yNorm, r, g, b)) return;
+  atomicAdd(&occupancyBins[rasterOccupancyBinIndex(r, g, b)], 1);
+  atomicAdd(visibleCount, 1);
+}
+
+__global__ void inputKernel(float* verts, float* colors, const float* input, InputKernelUniforms u) {
+  const unsigned int index = blockIdx.x * blockDim.x + threadIdx.x;
+  const unsigned int total = static_cast<unsigned int>(max(u.pointCount, 0));
+  if (index >= total) return;
+  const unsigned int stride = static_cast<unsigned int>(max(u.inputStride, 3));
+  const unsigned int ibase = index * stride;
+  float xNorm = 0.5f;
+  float yNorm = 0.5f;
+  float r = input[ibase + 0u];
+  float g = input[ibase + 1u];
+  float b = input[ibase + 2u];
+  if (u.glossView != 0 && stride >= 6u) {
+    xNorm = fminf(fmaxf(input[ibase + 0u], 0.0f), 1.0f);
+    yNorm = fminf(fmaxf(input[ibase + 1u], 0.0f), 1.0f);
+    r = input[ibase + 3u];
+    g = input[ibase + 4u];
+    b = input[ibase + 5u];
+  }
+  writeMappedInputPoint(verts, colors, index, xNorm, yNorm, r, g, b, u);
+}
+
+__global__ void rasterSourceKernel(float* verts,
+                                   float* colors,
+                                   const unsigned char* source,
+                                   RasterSourceKernelUniforms u,
+                                   const int* occupancyBins) {
+  const unsigned int index = blockIdx.x * blockDim.x + threadIdx.x;
+  const unsigned int total = static_cast<unsigned int>(max(u.input.pointCount, 0));
+  if (index >= total || !source) return;
+  const int sampleCountX = max(u.sampleCountX, 1);
+  const int stride = max(u.sampleStride, 1);
+  int x = static_cast<int>(index % static_cast<unsigned int>(sampleCountX)) * stride;
+  int y = static_cast<int>(index / static_cast<unsigned int>(sampleCountX)) * stride;
+  bool occupancyCandidate = false;
+  if (!rasterOccupancySampleCoords(index, u, &x, &y)) {
+    if (!rasterAppendSampleCoords(index,
+                                  u.identityCubeAppendOffset,
+                                  u.identityCubeAppendCount,
+                                  u.identityCubeAppendY1,
+                                  u.identityCubeAppendY2,
+                                  u.identityCubeAppendRowStep,
+                                  u.identityCubeAppendXStep,
+                                  u.sourceWidth,
+                                  &x,
+                                  &y)) {
+      rasterAppendSampleCoords(index,
+                               u.identityRampAppendOffset,
+                               u.identityRampAppendCount,
+                               u.identityRampAppendY1,
+                               u.identityRampAppendY2,
+                               u.identityRampAppendRowStep,
+                               u.identityRampAppendXStep,
+                               u.sourceWidth,
+                               &x,
+                               &y);
+    }
+  } else {
+    occupancyCandidate = true;
+  }
+  x = min(max(x, 0), max(u.sourceWidth - 1, 0));
+  y = min(max(y, 0), max(u.sourceHeight - 1, 0));
+  const float xNorm = (static_cast<float>(min(max(x, 0), max(u.sourceWidth - 1, 0))) + 0.5f) /
+                      static_cast<float>(max(u.sourceWidth, 1));
+  const float yNorm = (static_cast<float>(min(max(y, 0), max(u.sourceHeight - 1, 0))) + 0.5f) /
+                      static_cast<float>(max(u.sourceHeight, 1));
+  float r = 0.0f;
+  float g = 0.0f;
+  float b = 0.0f;
+  rasterReadTransformedSample(source, u, x, y, &r, &g, &b);
+  bool visible = rasterSampleVisible(u, x, y, xNorm, yNorm, r, g, b);
+  if (visible && occupancyCandidate && occupancyBins) {
+    const int bin = rasterOccupancyBinIndex(r, g, b);
+    visible = occupancyBins[bin] <= max(u.occupancyTargetThreshold, 0);
+  }
+  if (!visible) {
+    writeHiddenInputPoint(verts, colors, index);
+    return;
+  }
+  writeMappedInputPoint(verts, colors, index, xNorm, yNorm, r, g, b, u.input);
+}
+
+__global__ void boundsKernel(const float* verts, const float* colors, unsigned int* boundsVals, int pointCount) {
   const unsigned int index = blockIdx.x * blockDim.x + threadIdx.x;
   if (index >= static_cast<unsigned int>(max(pointCount, 0))) return;
+  if (colors && colors[index * 4u + 3u] <= 1.0e-6f) return;
   const unsigned int base = index * 3u;
   const unsigned int ox = orderedUintFromFloat(verts[base + 0u]);
   const unsigned int oy = orderedUintFromFloat(verts[base + 1u]);
@@ -992,6 +1476,49 @@ __global__ void inputSampleKernel(float* dstVerts,
   dstColors[dstColorBase + 1u] = srcColors[srcColorBase + 1u];
   dstColors[dstColorBase + 2u] = srcColors[srcColorBase + 2u];
   dstColors[dstColorBase + 3u] = srcColors[srcColorBase + 3u];
+}
+
+inline __device__ void accumulateScopeDensity(unsigned int* density,
+                                              const ScopeDensityRequest& request,
+                                              int channel,
+                                              float xNorm,
+                                              float value) {
+  if (request.excludeOverflow != 0 && (value < 0.0f || value > 1.0f)) return;
+  const int width = max(request.width, 1);
+  const int height = max(request.height, 1);
+  const int x = min(max(static_cast<int>(xNorm * static_cast<float>(width)), 0), width - 1);
+  const int signalBins = request.waveform != 0 ? height : width;
+  const int y = min(max(static_cast<int>((value - request.rangeMin) * request.invRange *
+                                         static_cast<float>(signalBins)),
+                        0),
+                    signalBins - 1);
+  const unsigned int binIndex =
+      request.waveform != 0
+          ? static_cast<unsigned int>((channel * width + x) * height + y)
+          : static_cast<unsigned int>(channel * width + y);
+  atomicAdd(&density[binIndex], 1u);
+}
+
+__global__ void scopeDensityKernel(const float* samples, unsigned int* density, ScopeDensityRequest request) {
+  const unsigned int index = blockIdx.x * blockDim.x + threadIdx.x;
+  const unsigned int total = static_cast<unsigned int>(max(request.pointCount, 0));
+  if (index >= total || !samples || !density) return;
+  const unsigned int base = index * 5u;
+  const float xNorm = samples[base + 0u];
+  const float r = samples[base + 2u];
+  const float g = samples[base + 3u];
+  const float b = samples[base + 4u];
+  const bool lumaOnly =
+      (request.waveform != 0 && request.scopeMode == 2) ||
+      (request.waveform == 0 && request.scopeMode == 1);
+
+  if (lumaOnly) {
+    accumulateScopeDensity(density, request, 0, xNorm, 0.2126f * r + 0.7152f * g + 0.0722f * b);
+  } else {
+    accumulateScopeDensity(density, request, 0, xNorm, r);
+    accumulateScopeDensity(density, request, 1, xNorm, g);
+    accumulateScopeDensity(density, request, 2, xNorm, b);
+  }
 }
 
 __global__ void glossFieldAccumulateKernel(const float* packedPoints,
@@ -1434,7 +1961,7 @@ bool computeInputBounds(InputCache* cache, std::string* error) {
     return false;
   }
 
-  std::array<cudaGraphicsResource*, 1> resources = {impl->vertsResource};
+  std::array<cudaGraphicsResource*, 2> resources = {impl->vertsResource, impl->colorsResource};
   err = cudaGraphicsMapResources(static_cast<int>(resources.size()), resources.data(), 0);
   if (err != cudaSuccess) {
     if (error) *error = std::string("Failed to map CUDA bounds resource: ") + errorString(err);
@@ -1442,12 +1969,17 @@ bool computeInputBounds(InputCache* cache, std::string* error) {
   }
 
   float* devVerts = nullptr;
+  float* devColors = nullptr;
   size_t vertsBytes = 0;
+  size_t colorsBytes = 0;
   err = cudaGraphicsResourceGetMappedPointer(reinterpret_cast<void**>(&devVerts), &vertsBytes, impl->vertsResource);
+  if (err == cudaSuccess) {
+    err = cudaGraphicsResourceGetMappedPointer(reinterpret_cast<void**>(&devColors), &colorsBytes, impl->colorsResource);
+  }
   if (err == cudaSuccess) {
     const unsigned int threads = 256u;
     const unsigned int blocks = static_cast<unsigned int>((static_cast<size_t>(cache->pointCount) + threads - 1u) / threads);
-    boundsKernel<<<blocks, threads>>>(devVerts, impl->deviceBounds, cache->pointCount);
+    boundsKernel<<<blocks, threads>>>(devVerts, devColors, impl->deviceBounds, cache->pointCount);
     err = cudaGetLastError();
     if (err == cudaSuccess) err = cudaDeviceSynchronize();
   }
@@ -1627,6 +2159,214 @@ bool buildInputMesh(InputCache* cache,
   return true;
 }
 
+bool buildRasterSourceMesh(InputCache* cache,
+                           const RasterSourceRequest& request,
+                           const void* sourceBytes,
+                           size_t sourceByteCount,
+                           unsigned long long serial,
+                           std::string* error) {
+  if (!cache || cache->verts == 0 || cache->colors == 0) {
+    if (error) *error = "CUDA raster source cache has no GL buffers.";
+    return false;
+  }
+  const size_t pointCount = static_cast<size_t>(std::max(request.pointCount, 0));
+  if (pointCount == 0 || !sourceBytes || sourceByteCount == 0 ||
+      request.sourceWidth <= 0 || request.sourceHeight <= 0 || request.sampleCountX <= 0) {
+    if (error) *error = "Invalid CUDA raster source request.";
+    return false;
+  }
+
+  std::string localError;
+  if (!ensureContext(&localError)) {
+    if (error) *error = localError;
+    return false;
+  }
+  CacheImpl* impl = ensureImpl(cache);
+  if (!impl) {
+    if (error) *error = "Failed to allocate CUDA raster source cache.";
+    return false;
+  }
+  if (!ensureRegistered(cache->verts, cache->colors, pointCount, impl, &localError)) {
+    if (error) *error = localError;
+    return false;
+  }
+  if (!ensureSourceCapacity(impl, sourceByteCount, &localError)) {
+    if (error) *error = localError;
+    return false;
+  }
+  cudaError_t err = cudaMemcpy(impl->deviceSource, sourceBytes, sourceByteCount, cudaMemcpyHostToDevice);
+  if (err != cudaSuccess) {
+    if (error) *error = std::string("Failed to upload CUDA raster source: ") + errorString(err);
+    return false;
+  }
+
+  RasterSourceKernelUniforms uniforms{};
+  uniforms.input.pointCount = request.pointCount;
+  uniforms.input.inputStride = 3;
+  uniforms.input.glossView = request.remap.plotMode == 9 ? 1 : 0;
+  uniforms.input.sourceAspect = request.sourceAspect;
+  uniforms.input.glossLiftScale = request.glossLiftScale;
+  uniforms.input.showOverflow = request.remap.showOverflow;
+  uniforms.input.highlightOverflow = request.remap.highlightOverflow;
+  uniforms.input.plotMode = request.remap.plotMode;
+  uniforms.input.circularHsl = request.remap.circularHsl;
+  uniforms.input.circularHsv = request.remap.circularHsv;
+  uniforms.input.normConeNormalized = request.remap.normConeNormalized;
+  uniforms.input.chromaticityInputTransfer = request.remap.chromaticityInputTransfer;
+  uniforms.input.chromaticityReferenceBasis = request.remap.chromaticityReferenceBasis;
+  uniforms.input.chromaticityWhiteX = request.remap.chromaticityWhiteX;
+  uniforms.input.chromaticityWhiteY = request.remap.chromaticityWhiteY;
+  for (int i = 0; i < 9; ++i) {
+    uniforms.input.chromaticityRgbToXyz[i] = request.remap.chromaticityRgbToXyz[i];
+    uniforms.input.chromaticityXyzToRgb[i] = request.remap.chromaticityXyzToRgb[i];
+  }
+  uniforms.input.pointAlphaScale = request.pointAlphaScale;
+  uniforms.input.denseAlphaBias = request.denseAlphaBias;
+  uniforms.input.colorSaturation = request.colorSaturation;
+  uniforms.basePointCount = request.basePointCount > 0 ? request.basePointCount : request.pointCount;
+  uniforms.sourceWidth = request.sourceWidth;
+  uniforms.sourceHeight = request.sourceHeight;
+  uniforms.sampleStride = request.sampleStride;
+  uniforms.sampleCountX = request.sampleCountX;
+  uniforms.pixelFormat = request.pixelFormat;
+  uniforms.plotLinear = request.plotLinear;
+  uniforms.plotLinearTransfer = request.plotLinearTransfer;
+  uniforms.excludeIdentityData = request.excludeIdentityData;
+  uniforms.isolateIdentityData = request.isolateIdentityData;
+  uniforms.readIdentityPlot = request.readIdentityPlot;
+  uniforms.readGrayRamp = request.readGrayRamp;
+  uniforms.identityCubeY1 = request.identityCubeY1;
+  uniforms.identityCubeY2 = request.identityCubeY2;
+  uniforms.identityRampY1 = request.identityRampY1;
+  uniforms.identityRampY2 = request.identityRampY2;
+  uniforms.identityCubeAppendOffset = request.identityCubeAppendOffset;
+  uniforms.identityCubeAppendCount = request.identityCubeAppendCount;
+  uniforms.identityCubeAppendY1 = request.identityCubeAppendY1;
+  uniforms.identityCubeAppendY2 = request.identityCubeAppendY2;
+  uniforms.identityCubeAppendRowStep = request.identityCubeAppendRowStep;
+  uniforms.identityCubeAppendXStep = request.identityCubeAppendXStep;
+  uniforms.identityRampAppendOffset = request.identityRampAppendOffset;
+  uniforms.identityRampAppendCount = request.identityRampAppendCount;
+  uniforms.identityRampAppendY1 = request.identityRampAppendY1;
+  uniforms.identityRampAppendY2 = request.identityRampAppendY2;
+  uniforms.identityRampAppendRowStep = request.identityRampAppendRowStep;
+  uniforms.identityRampAppendXStep = request.identityRampAppendXStep;
+  uniforms.occupancyFill = request.occupancyFill;
+  uniforms.occupancyAppendOffset = request.occupancyAppendOffset;
+  uniforms.occupancyAppendCount = request.occupancyAppendCount;
+  uniforms.occupancyCandidateCount = request.occupancyCandidateCount;
+  uniforms.occupancyTargetThreshold = 0;
+  uniforms.lassoEnabled = request.lassoEnabled;
+  uniforms.lassoStrokeCount = request.lassoStrokeCount;
+  uniforms.lassoPointCount = request.lassoPointCount;
+  for (int i = 0; i < 16; ++i) {
+    uniforms.lassoStrokeFirst[i] = request.lassoStrokeFirst[i];
+    uniforms.lassoStrokeCountPerStroke[i] = request.lassoStrokeCountPerStroke[i];
+    uniforms.lassoStrokeSubtract[i] = request.lassoStrokeSubtract[i];
+  }
+  for (int i = 0; i < 256; ++i) {
+    uniforms.lassoX[i] = request.lassoX[i];
+    uniforms.lassoY[i] = request.lassoY[i];
+  }
+  uniforms.cubeSlicingEnabled = request.cubeSlicingEnabled;
+  uniforms.neutralRadiusEnabled = request.neutralRadiusEnabled;
+  uniforms.neutralRadius = request.neutralRadius;
+  uniforms.cubeSliceRed = request.cubeSliceRed;
+  uniforms.cubeSliceYellow = request.cubeSliceYellow;
+  uniforms.cubeSliceGreen = request.cubeSliceGreen;
+  uniforms.cubeSliceCyan = request.cubeSliceCyan;
+  uniforms.cubeSliceBlue = request.cubeSliceBlue;
+  uniforms.cubeSliceMagenta = request.cubeSliceMagenta;
+
+  int* occupancyBins = nullptr;
+  int* visibleCount = nullptr;
+  constexpr int kRasterOccupancyBinCount = 18 * 18 * 18;
+  if (request.occupancyFill != 0 && request.occupancyAppendCount > 0) {
+    err = cudaMalloc(reinterpret_cast<void**>(&occupancyBins),
+                     static_cast<size_t>(kRasterOccupancyBinCount) * sizeof(int));
+    if (err == cudaSuccess) err = cudaMalloc(reinterpret_cast<void**>(&visibleCount), sizeof(int));
+    if (err != cudaSuccess || !occupancyBins || !visibleCount) {
+      if (occupancyBins) cudaFree(occupancyBins);
+      if (visibleCount) cudaFree(visibleCount);
+      if (error) *error = std::string("Failed to allocate CUDA raster occupancy buffers: ") + errorString(err);
+      return false;
+    }
+    err = cudaMemset(occupancyBins, 0, static_cast<size_t>(kRasterOccupancyBinCount) * sizeof(int));
+    if (err == cudaSuccess) err = cudaMemset(visibleCount, 0, sizeof(int));
+    if (err != cudaSuccess) {
+      cudaFree(occupancyBins);
+      cudaFree(visibleCount);
+      if (error) *error = std::string("Failed to clear CUDA raster occupancy buffers: ") + errorString(err);
+      return false;
+    }
+    const unsigned int threads = 256u;
+    const unsigned int countBlocks =
+        static_cast<unsigned int>((static_cast<size_t>(std::max(uniforms.basePointCount, 0)) + threads - 1u) / threads);
+    rasterOccupancyCountKernel<<<std::max(1u, countBlocks), threads>>>(
+        impl->deviceSource, uniforms, occupancyBins, visibleCount);
+    err = cudaGetLastError();
+    if (err == cudaSuccess) err = cudaDeviceSynchronize();
+    int hostVisibleCount = 0;
+    if (err == cudaSuccess) err = cudaMemcpy(&hostVisibleCount, visibleCount, sizeof(int), cudaMemcpyDeviceToHost);
+    if (err != cudaSuccess) {
+      cudaFree(occupancyBins);
+      cudaFree(visibleCount);
+      if (error) *error = std::string("CUDA raster occupancy count failed: ") + errorString(err);
+      return false;
+    }
+    const float meanOccupancy =
+        static_cast<float>(std::max(hostVisibleCount, 0)) / static_cast<float>(kRasterOccupancyBinCount);
+    uniforms.occupancyTargetThreshold = std::max(0, static_cast<int>(std::ceil(meanOccupancy * 0.72f)));
+  }
+
+  std::array<cudaGraphicsResource*, 2> resources = {impl->vertsResource, impl->colorsResource};
+  err = cudaGraphicsMapResources(static_cast<int>(resources.size()), resources.data(), 0);
+  if (err != cudaSuccess) {
+    if (occupancyBins) cudaFree(occupancyBins);
+    if (visibleCount) cudaFree(visibleCount);
+    if (error) *error = std::string("Failed to map CUDA raster GL resources: ") + errorString(err);
+    return false;
+  }
+
+  float* devVerts = nullptr;
+  float* devColors = nullptr;
+  size_t vertsBytes = 0;
+  size_t colorsBytes = 0;
+  err = cudaGraphicsResourceGetMappedPointer(reinterpret_cast<void**>(&devVerts), &vertsBytes, impl->vertsResource);
+  if (err == cudaSuccess) {
+    err = cudaGraphicsResourceGetMappedPointer(reinterpret_cast<void**>(&devColors), &colorsBytes, impl->colorsResource);
+  }
+  if (err != cudaSuccess) {
+    cudaGraphicsUnmapResources(static_cast<int>(resources.size()), resources.data(), 0);
+    if (occupancyBins) cudaFree(occupancyBins);
+    if (visibleCount) cudaFree(visibleCount);
+    if (error) *error = std::string("Failed to access CUDA raster mapped buffers: ") + errorString(err);
+    return false;
+  }
+
+  const unsigned int threads = 256u;
+  const unsigned int blocks = static_cast<unsigned int>((pointCount + threads - 1u) / threads);
+  rasterSourceKernel<<<blocks, threads>>>(devVerts, devColors, impl->deviceSource, uniforms, occupancyBins);
+  err = cudaGetLastError();
+  if (err == cudaSuccess) err = cudaDeviceSynchronize();
+  cudaGraphicsUnmapResources(static_cast<int>(resources.size()), resources.data(), 0);
+  if (occupancyBins) cudaFree(occupancyBins);
+  if (visibleCount) cudaFree(visibleCount);
+  if (err != cudaSuccess) {
+    if (error) *error = std::string("CUDA raster source kernel failed: ") + errorString(err);
+    return false;
+  }
+
+  cache->builtSerial = serial;
+  cache->pointCount = static_cast<int>(pointCount);
+  cache->available = true;
+  cache->hasFitBounds = false;
+  if (!computeInputBounds(cache, &localError) && error && error->empty()) {
+    *error = localError;
+  }
+  return true;
+}
+
 bool buildInputSampledMesh(InputCache* sourceCache,
                            InputSampleCache* sampleCache,
                            const InputSampleRequest& request,
@@ -1709,6 +2449,85 @@ bool buildInputSampledMesh(InputCache* sourceCache,
   sampleCache->builtSerial = serial;
   sampleCache->pointCount = request.visiblePointCount;
   sampleCache->available = true;
+  return true;
+}
+
+bool buildScopeDensity(const ScopeDensityRequest& request,
+                       const std::vector<float>& packedSamples,
+                       std::vector<float>* outDensity,
+                       std::string* error) {
+  if (!outDensity) {
+    if (error) *error = "Missing CUDA scope-density output.";
+    return false;
+  }
+  outDensity->clear();
+  const int pointCount = request.pointCount > 0
+                             ? request.pointCount
+                             : static_cast<int>(packedSamples.size() / 5u);
+  const int width = std::max(request.width, 1);
+  const int height = std::max(request.height, 1);
+  const size_t binCount = static_cast<size_t>(width) * static_cast<size_t>(height) * 3u;
+  if (pointCount <= 0 || packedSamples.size() < static_cast<size_t>(pointCount) * 5u || binCount == 0u) {
+    if (error) *error = "Invalid CUDA scope-density request.";
+    return false;
+  }
+
+  std::string localError;
+  if (!ensureContext(&localError)) {
+    if (error) *error = localError;
+    return false;
+  }
+
+  float* deviceSamples = nullptr;
+  unsigned int* deviceDensity = nullptr;
+  cudaError_t err = cudaMalloc(&deviceSamples, static_cast<size_t>(pointCount) * 5u * sizeof(float));
+  if (err == cudaSuccess) err = cudaMalloc(&deviceDensity, binCount * sizeof(unsigned int));
+  if (err != cudaSuccess) {
+    if (deviceSamples) cudaFree(deviceSamples);
+    if (deviceDensity) cudaFree(deviceDensity);
+    if (error) *error = std::string("Failed to allocate CUDA scope-density buffers: ") + errorString(err);
+    return false;
+  }
+
+  err = cudaMemcpy(deviceSamples,
+                   packedSamples.data(),
+                   static_cast<size_t>(pointCount) * 5u * sizeof(float),
+                   cudaMemcpyHostToDevice);
+  if (err == cudaSuccess) err = cudaMemset(deviceDensity, 0, binCount * sizeof(unsigned int));
+  if (err != cudaSuccess) {
+    cudaFree(deviceSamples);
+    cudaFree(deviceDensity);
+    if (error) *error = std::string("Failed to upload CUDA scope-density input: ") + errorString(err);
+    return false;
+  }
+
+  ScopeDensityRequest kernelRequest = request;
+  kernelRequest.pointCount = pointCount;
+  kernelRequest.width = width;
+  kernelRequest.height = height;
+  const unsigned int threads = 256u;
+  const unsigned int blocks = static_cast<unsigned int>((static_cast<size_t>(pointCount) + threads - 1u) / threads);
+  scopeDensityKernel<<<blocks, threads>>>(deviceSamples, deviceDensity, kernelRequest);
+  err = cudaGetLastError();
+  if (err == cudaSuccess) err = cudaDeviceSynchronize();
+  if (err != cudaSuccess) {
+    cudaFree(deviceSamples);
+    cudaFree(deviceDensity);
+    if (error) *error = std::string("CUDA scope-density kernel failed: ") + errorString(err);
+    return false;
+  }
+
+  std::vector<unsigned int> bins(binCount, 0u);
+  err = cudaMemcpy(bins.data(), deviceDensity, binCount * sizeof(unsigned int), cudaMemcpyDeviceToHost);
+  cudaFree(deviceSamples);
+  cudaFree(deviceDensity);
+  if (err != cudaSuccess) {
+    if (error) *error = std::string("Failed to read CUDA scope-density bins: ") + errorString(err);
+    return false;
+  }
+  outDensity->resize(binCount);
+  std::transform(bins.begin(), bins.end(), outDensity->begin(),
+                 [](unsigned int value) { return static_cast<float>(value); });
   return true;
 }
 

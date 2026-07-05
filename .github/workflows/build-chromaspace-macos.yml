@@ -82,13 +82,16 @@ jobs:
           grep -q "CHROMASPACE_TEXT_DEPS_PROVIDER:INTERNAL=bundled" build-mac/CMakeCache.txt
           test -f bundle/Chromaspace.ofx.bundle/Contents/MacOS/Chromaspace.ofx
           test -f bundle/Chromaspace.ofx.bundle/Contents/MacOS/Chromaspace_CubeViewer
+          test -f bundle/Chromaspace.ofx.bundle/Contents/MacOS/Chromaspace_ResolveBridge
           test -f bundle/Chromaspace.ofx.bundle/Contents/MacOS/OpenSans-Regular.ttf
           test -f bundle/Chromaspace.ofx.bundle/Contents/Resources/com.moazelgabry.chromaspace.png
           test -f bundle/Chromaspace.ofx.bundle/Contents/Resources/chromaspace_resolve_bridge.py
           lipo -archs bundle/Chromaspace.ofx.bundle/Contents/MacOS/Chromaspace.ofx | grep -q "x86_64 arm64"
           lipo -archs bundle/Chromaspace.ofx.bundle/Contents/MacOS/Chromaspace_CubeViewer | grep -q "x86_64 arm64"
+          lipo -archs bundle/Chromaspace.ofx.bundle/Contents/MacOS/Chromaspace_ResolveBridge | grep -q "x86_64 arm64"
           otool -l bundle/Chromaspace.ofx.bundle/Contents/MacOS/Chromaspace.ofx | grep -A3 LC_BUILD_VERSION | grep -q "minos 13.0"
           otool -l bundle/Chromaspace.ofx.bundle/Contents/MacOS/Chromaspace_CubeViewer | grep -A3 LC_BUILD_VERSION | grep -q "minos 13.0"
+          otool -l bundle/Chromaspace.ofx.bundle/Contents/MacOS/Chromaspace_ResolveBridge | grep -A3 LC_BUILD_VERSION | grep -q "minos 13.0"
 
       - name: Package macOS portable bundle
         run: |

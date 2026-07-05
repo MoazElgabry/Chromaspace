@@ -5,7 +5,9 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstring>
+#include <cstdint>
 #include <mutex>
 #include <sstream>
 
@@ -20,7 +22,10 @@ struct MetalContext {
   id<MTLLibrary> library = nil;
   id<MTLComputePipelineState> overlayPipeline = nil;
   id<MTLComputePipelineState> inputPipeline = nil;
+  id<MTLComputePipelineState> rasterSourcePipeline = nil;
+  id<MTLComputePipelineState> rasterOccupancyCountPipeline = nil;
   id<MTLComputePipelineState> inputSamplePipeline = nil;
+  id<MTLComputePipelineState> scopeDensityPipeline = nil;
   id<MTLComputePipelineState> glossFieldAccumulatePipeline = nil;
   id<MTLComputePipelineState> glossFieldFinalizePipeline = nil;
   id<MTLComputePipelineState> glossFieldMaxPipeline = nil;
@@ -77,9 +82,74 @@ struct InputUniforms {
   float colorSaturation;
 };
 
+struct RasterSourceUniforms {
+  InputUniforms input;
+  int basePointCount;
+  int sourceWidth;
+  int sourceHeight;
+  int sampleStride;
+  int sampleCountX;
+  int pixelFormat;
+  int plotLinear;
+  int plotLinearTransfer;
+  int excludeIdentityData;
+  int isolateIdentityData;
+  int readIdentityPlot;
+  int readGrayRamp;
+  int identityCubeY1;
+  int identityCubeY2;
+  int identityRampY1;
+  int identityRampY2;
+  int identityCubeAppendOffset;
+  int identityCubeAppendCount;
+  int identityCubeAppendY1;
+  int identityCubeAppendY2;
+  int identityCubeAppendRowStep;
+  int identityCubeAppendXStep;
+  int identityRampAppendOffset;
+  int identityRampAppendCount;
+  int identityRampAppendY1;
+  int identityRampAppendY2;
+  int identityRampAppendRowStep;
+  int identityRampAppendXStep;
+  int occupancyFill;
+  int occupancyAppendOffset;
+  int occupancyAppendCount;
+  int occupancyCandidateCount;
+  int occupancyTargetThreshold;
+  int lassoEnabled;
+  int lassoStrokeCount;
+  int lassoPointCount;
+  int lassoStrokeFirst[16];
+  int lassoStrokeCountPerStroke[16];
+  int lassoStrokeSubtract[16];
+  float lassoX[256];
+  float lassoY[256];
+  int cubeSlicingEnabled;
+  int neutralRadiusEnabled;
+  float neutralRadius;
+  int cubeSliceRed;
+  int cubeSliceYellow;
+  int cubeSliceGreen;
+  int cubeSliceCyan;
+  int cubeSliceBlue;
+  int cubeSliceMagenta;
+};
+
 struct InputSampleUniforms {
   int fullPointCount;
   int visiblePointCount;
+};
+
+struct ScopeDensityUniforms {
+  int pointCount;
+  int waveform;
+  int scopeMode;
+  int width;
+  int height;
+  float rangeMin;
+  float invRange;
+  int excludeOverflow;
 };
 
 struct GlossFieldAccumulateUniforms {
@@ -155,9 +225,74 @@ struct InputUniforms {
   float colorSaturation;
 };
 
+struct RasterSourceUniforms {
+  InputUniforms input;
+  int basePointCount;
+  int sourceWidth;
+  int sourceHeight;
+  int sampleStride;
+  int sampleCountX;
+  int pixelFormat;
+  int plotLinear;
+  int plotLinearTransfer;
+  int excludeIdentityData;
+  int isolateIdentityData;
+  int readIdentityPlot;
+  int readGrayRamp;
+  int identityCubeY1;
+  int identityCubeY2;
+  int identityRampY1;
+  int identityRampY2;
+  int identityCubeAppendOffset;
+  int identityCubeAppendCount;
+  int identityCubeAppendY1;
+  int identityCubeAppendY2;
+  int identityCubeAppendRowStep;
+  int identityCubeAppendXStep;
+  int identityRampAppendOffset;
+  int identityRampAppendCount;
+  int identityRampAppendY1;
+  int identityRampAppendY2;
+  int identityRampAppendRowStep;
+  int identityRampAppendXStep;
+  int occupancyFill;
+  int occupancyAppendOffset;
+  int occupancyAppendCount;
+  int occupancyCandidateCount;
+  int occupancyTargetThreshold;
+  int lassoEnabled;
+  int lassoStrokeCount;
+  int lassoPointCount;
+  int lassoStrokeFirst[16];
+  int lassoStrokeCountPerStroke[16];
+  int lassoStrokeSubtract[16];
+  float lassoX[256];
+  float lassoY[256];
+  int cubeSlicingEnabled;
+  int neutralRadiusEnabled;
+  float neutralRadius;
+  int cubeSliceRed;
+  int cubeSliceYellow;
+  int cubeSliceGreen;
+  int cubeSliceCyan;
+  int cubeSliceBlue;
+  int cubeSliceMagenta;
+};
+
 struct InputSampleUniforms {
   int fullPointCount;
   int visiblePointCount;
+};
+
+struct ScopeDensityUniforms {
+  int pointCount;
+  int waveform;
+  int scopeMode;
+  int width;
+  int height;
+  float rangeMin;
+  float invRange;
+  int excludeOverflow;
 };
 
 struct GlossFieldAccumulateUniforms {
@@ -609,6 +744,433 @@ bool pointOverflowsCube(float r, float g, float b) {
   return r < 0.0 || r > 1.0 || g < 0.0 || g > 1.0 || b < 0.0 || b > 1.0;
 }
 
+void writeHiddenInputPoint(device packed_float3* vertVals, device float4* colorVals, uint index) {
+  vertVals[index] = packed_float3(0.0, 0.0, 0.0);
+  colorVals[index] = float4(0.0, 0.0, 0.0, 0.0);
+}
+
+void writeMappedInputPoint(device packed_float3* vertVals,
+                           device float4* colorVals,
+                           uint index,
+                           float xNorm,
+                           float yNorm,
+                           float r,
+                           float g,
+                           float b,
+                           constant InputUniforms& u) {
+  bool overflowPoint = pointOverflowsCube(r, g, b);
+  float plotR = (u.showOverflow != 0) ? r : clamp01(r);
+  float plotG = (u.showOverflow != 0) ? g : clamp01(g);
+  float plotB = (u.showOverflow != 0) ? b : clamp01(b);
+  float3 pos = mapPlotPosition(plotR, plotG, plotB, u.plotMode, u.circularHsl, u.circularHsv, u.normConeNormalized, u.showOverflow);
+  if (u.plotMode == 8) {
+    pos = mapChromaticityPosition(r, g, b, u);
+  }
+  if (u.glossView != 0) {
+    float aspect = clamp(u.sourceAspect, 0.25, 4.0);
+    float halfWidth = aspect >= 1.0 ? 1.22 : (1.22 * aspect);
+    float halfDepth = aspect >= 1.0 ? (1.22 / aspect) : 1.22;
+    float common = glossCommonComponent(plotR, plotG, plotB);
+    float bodyR = max(plotR - common, 0.0);
+    float bodyG = max(plotG - common, 0.0);
+    float bodyB = max(plotB - common, 0.0);
+    float bodyLuma = clamp(bodyR * 0.2126 + bodyG * 0.7152 + bodyB * 0.0722, 0.0, 1.0);
+    float glossCue = glossStrengthCue(plotR, plotG, plotB);
+    float glossPresence = glossPresenceWeight(glossCue);
+    float xPos = -halfWidth + (2.0 * halfWidth * xNorm);
+    float zPos = halfDepth - (2.0 * halfDepth * yNorm);
+    float yPos = -0.92 + bodyLuma * 0.92 + glossCue * glossPresence * u.glossLiftScale * 1.34;
+    pos = float3(xPos, yPos, zPos);
+  }
+  vertVals[index] = packed_float3(pos.x, pos.y, pos.z);
+  float cr;
+  float cg;
+  float cb;
+  if (u.showOverflow != 0 && u.highlightOverflow != 0 && overflowPoint) {
+    cr = 1.0;
+    cg = 0.0;
+    cb = 0.0;
+  } else {
+    mapDisplayColor(r, g, b, cr, cg, cb);
+    applyDisplaySaturation(u.colorSaturation, cr, cg, cb);
+    if (u.glossView != 0) {
+      float glossPresence = glossPresenceWeight(glossStrengthCue(plotR, plotG, plotB));
+      float neutralBlend = clamp(0.08 + 0.52 * glossPresence, 0.0, 0.62);
+      float brightnessGain = 1.18 + 1.20 * glossPresence;
+      cr = clamp((cr * (1.0 - neutralBlend) + neutralBlend) * brightnessGain, 0.0, 1.0);
+      cg = clamp((cg * (1.0 - neutralBlend) + neutralBlend) * brightnessGain, 0.0, 1.0);
+      cb = clamp((cb * (1.0 - neutralBlend) + neutralBlend) * brightnessGain, 0.0, 1.0);
+    }
+  }
+  bool overflowHighlighted = (u.showOverflow != 0 && u.highlightOverflow != 0 && overflowPoint);
+  float baseAlpha = overflowHighlighted ? 0.95 : 0.72;
+  if (u.glossView != 0 && !overflowHighlighted) {
+    float glossPresence = glossPresenceWeight(glossStrengthCue(plotR, plotG, plotB));
+    baseAlpha = 0.01 + 0.97 * glossPresence;
+  }
+  colorVals[index] = float4(cr, cg, cb,
+                            luminanceAwareAlpha(baseAlpha,
+                                                cr,
+                                                cg,
+                                                cb,
+                                                u.denseAlphaBias,
+                                                overflowHighlighted,
+                                                u.pointAlphaScale));
+}
+
+bool rasterSourceRowInRange(int y, int y1, int y2) {
+  return y1 >= 0 && y2 > y1 && y >= y1 && y < y2;
+}
+
+bool rasterSourceRowInCube(constant RasterSourceUniforms& u, int y) {
+  return rasterSourceRowInRange(y, u.identityCubeY1, u.identityCubeY2);
+}
+
+bool rasterSourceRowInRamp(constant RasterSourceUniforms& u, int y) {
+  return rasterSourceRowInRange(y, u.identityRampY1, u.identityRampY2);
+}
+
+bool rasterAppendSampleCoords(uint index,
+                              int offset,
+                              int count,
+                              int y1,
+                              int y2,
+                              int rowStep,
+                              int xStep,
+                              int sourceWidth,
+                              thread int* outX,
+                              thread int* outY) {
+  if (count <= 0 || index < uint(max(offset, 0)) || index >= uint(max(offset + count, offset))) {
+    return false;
+  }
+  int local = int(index) - offset;
+  int safeXStep = max(xStep, 1);
+  int safeRowStep = max(rowStep, 1);
+  int samplesPerRow = max(1, (max(sourceWidth, 0) + safeXStep - 1) / safeXStep);
+  int rowIndex = local / samplesPerRow;
+  int xIndex = local - rowIndex * samplesPerRow;
+  *outX = min(max(xIndex * safeXStep, 0), max(sourceWidth - 1, 0));
+  *outY = min(max(y1 + rowIndex * safeRowStep, y1), max(y2 - 1, y1));
+  return true;
+}
+
+float rasterHalton(uint index, uint base) {
+  float f = 1.0;
+  float r = 0.0;
+  while (index > 0u) {
+    f /= float(base);
+    r += f * float(index % base);
+    index /= base;
+  }
+  return r;
+}
+
+bool rasterOccupancySampleCoords(uint index, constant RasterSourceUniforms& u, thread int* outX, thread int* outY) {
+  if (u.occupancyAppendCount <= 0 || index < uint(max(u.occupancyAppendOffset, 0)) ||
+      index >= uint(max(u.occupancyAppendOffset + u.occupancyAppendCount, u.occupancyAppendOffset))) {
+    return false;
+  }
+  uint local = index - uint(max(u.occupancyAppendOffset, 0));
+  uint attemptCount = uint(max(u.occupancyCandidateCount, u.occupancyAppendCount));
+  uint attempt = attemptCount > 0u ? (local * max(attemptCount, 1u)) / uint(max(u.occupancyAppendCount, 1)) : local;
+  float xNorm = rasterHalton(attempt + 1u, 2u);
+  float yNorm = rasterHalton(attempt + 1u, 3u);
+  *outX = min(max(int(xNorm * float(max(u.sourceWidth, 1))), 0), max(u.sourceWidth - 1, 0));
+  *outY = min(max(int(yNorm * float(max(u.sourceHeight, 1))), 0), max(u.sourceHeight - 1, 0));
+  return true;
+}
+
+bool rasterLassoPointInStroke(constant RasterSourceUniforms& u, int strokeIndex, float xNorm, float yNorm) {
+  if (strokeIndex < 0 || strokeIndex >= min(max(u.lassoStrokeCount, 0), 16)) return false;
+  int first = u.lassoStrokeFirst[strokeIndex];
+  int count = u.lassoStrokeCountPerStroke[strokeIndex];
+  if (count < 3 || first < 0 || first + count > min(max(u.lassoPointCount, 0), 256)) return false;
+  bool inside = false;
+  for (int i = 0, j = count - 1; i < count; j = i++) {
+    float xi = u.lassoX[first + i];
+    float yi = u.lassoY[first + i];
+    float xj = u.lassoX[first + j];
+    float yj = u.lassoY[first + j];
+    bool intersects = ((yi > yNorm) != (yj > yNorm)) &&
+                      (xNorm < (xj - xi) * (yNorm - yi) / ((yj - yi) + 1.0e-12) + xi);
+    if (intersects) inside = !inside;
+  }
+  return inside;
+}
+
+bool rasterLassoContainsPoint(constant RasterSourceUniforms& u, float xNorm, float yNorm) {
+  bool inside = false;
+  int strokeCount = min(max(u.lassoStrokeCount, 0), 16);
+  for (int stroke = 0; stroke < strokeCount; ++stroke) {
+    if (!rasterLassoPointInStroke(u, stroke, xNorm, yNorm)) continue;
+    inside = u.lassoStrokeSubtract[stroke] == 0;
+  }
+  return inside;
+}
+
+float rasterNeutralRadius(float r, float g, float b, constant RasterSourceUniforms& u) {
+  const float kRgbAxisMaxRadius = 0.8164965809277260;
+  const float kPolarMax = 0.9553166181245093;
+  const float kChenPolarScale = 1.0467733744265997;
+  int mode = u.input.plotMode;
+  if (mode == 1) {
+    float cMax = max(r, max(g, b));
+    float cMin = min(r, min(g, b));
+    if (u.input.circularHsl != 0) {
+      float l = 0.5 * (cMax + cMin);
+      float denom = 1.0 - abs(2.0 * l - 1.0);
+      if (abs(denom) <= 1e-6) denom = denom < 0.0 ? -1e-6 : 1e-6;
+      return clamp01(abs((cMax - cMin) / denom));
+    }
+    return clamp01(cMax - cMin);
+  }
+  if (mode == 2) {
+    if (u.input.circularHsv != 0) {
+      float cMax = max(r, max(g, b));
+      float cMin = min(r, min(g, b));
+      float delta = cMax - cMin;
+      return (delta > 1e-6 && cMax > 1e-6) ? clamp01(delta / cMax) : 0.0;
+    }
+    float x = r - 0.5 * g - 0.5 * b;
+    float z = 0.8660254037844386 * (g - b);
+    return clamp01(sqrt(x * x + z * z));
+  }
+  bool overflowMode = u.input.showOverflow != 0 && (mode == 5 || mode == 6 || mode == 7);
+  float rr = overflowMode ? r : clamp01(r);
+  float gg = overflowMode ? g : clamp01(g);
+  float bb = overflowMode ? b : clamp01(b);
+  float rotX = 0.81649658093 * rr - 0.40824829046 * gg - 0.40824829046 * bb;
+  float rotY = 0.70710678118 * gg - 0.70710678118 * bb;
+  float rotZ = 0.57735026919 * (rr + gg + bb);
+  float chromaRadius = sqrt(rotX * rotX + rotY * rotY);
+  if (mode == 3) {
+    float radius3 = sqrt(rotX * rotX + rotY * rotY + rotZ * rotZ);
+    float polar = atan2(chromaRadius, max(rotZ, 1e-8));
+    float light = radius3 * 0.5773502691896258;
+    float radial = light * sin(polar * kChenPolarScale) / kRgbAxisMaxRadius;
+    return clamp01(radial);
+  }
+  if (mode == 4 || mode == 5) {
+    float radius3 = sqrt(rotX * rotX + rotY * rotY + rotZ * rotZ);
+    float polar = atan2(chromaRadius, rotZ);
+    float radial = radius3 * sin((polar / kPolarMax) * kPolarMax);
+    return clamp01(radial / sin(kPolarMax));
+  }
+  if (mode == 6) {
+    float polar = atan2(chromaRadius, rotZ);
+    return clamp01(polar / kPolarMax);
+  }
+  if (mode == 7) {
+    float rotZAvg = (rr + gg + bb) / 3.0;
+    float rx = 0.33333333333 * (2.0 * rr - gg - bb) * 0.70710678118;
+    float ry = (gg - bb) * 0.40824829046;
+    float sat = abs(rotZAvg) <= 1e-6 ? 0.0 : sqrt(rx * rx + ry * ry) / rotZAvg;
+    return clamp01(abs(sat) / 1.41421356237);
+  }
+  return clamp01(sqrt(rotX * rotX + rotY * rotY) / kRgbAxisMaxRadius);
+}
+
+bool rasterCubeSliceContains(float r, float g, float b, constant RasterSourceUniforms& u) {
+  if (u.neutralRadiusEnabled != 0 && u.input.plotMode != 8 && u.input.showOverflow == 0) {
+    float threshold = clamp01(u.neutralRadius) * clamp01(u.neutralRadius);
+    if (rasterNeutralRadius(r, g, b, u) > threshold + 1.0e-6) return false;
+  }
+  if (u.cubeSlicingEnabled == 0) return true;
+  bool anySelected = u.cubeSliceRed || u.cubeSliceYellow || u.cubeSliceGreen ||
+                     u.cubeSliceCyan || u.cubeSliceBlue || u.cubeSliceMagenta;
+  if (!anySelected) return false;
+  if (u.input.plotMode == 0 || u.input.glossView != 0) {
+    const float kEps = 1.0e-6;
+    bool geRG = r + kEps >= g;
+    bool geGB = g + kEps >= b;
+    bool geGR = g + kEps >= r;
+    bool geRB = r + kEps >= b;
+    bool geBG = b + kEps >= g;
+    bool geBR = b + kEps >= r;
+    if (u.cubeSliceRed && geRG && geGB) return true;
+    if (u.cubeSliceYellow && geGR && geRB) return true;
+    if (u.cubeSliceGreen && geGB && geBR) return true;
+    if (u.cubeSliceCyan && geBG && geGR) return true;
+    if (u.cubeSliceBlue && geBR && geRG) return true;
+    if (u.cubeSliceMagenta && geRB && geBG) return true;
+    return false;
+  }
+  float cMax = max(r, max(g, b));
+  float cMin = min(r, min(g, b));
+  float delta = cMax - cMin;
+  if (delta <= 1.0e-6) return false;
+  float hue = wrapHue01(rawRgbHue01(r, g, b, cMax, delta));
+  int sector = int(floor((hue + (1.0 / 12.0)) * 6.0)) % 6;
+  if (sector == 0) return u.cubeSliceRed != 0;
+  if (sector == 1) return u.cubeSliceYellow != 0;
+  if (sector == 2) return u.cubeSliceGreen != 0;
+  if (sector == 3) return u.cubeSliceCyan != 0;
+  if (sector == 4) return u.cubeSliceBlue != 0;
+  return u.cubeSliceMagenta != 0;
+}
+
+void readRasterSourceRgb(const device half4* source16,
+                         const device float4* source32,
+                         constant RasterSourceUniforms& u,
+                         int x,
+                         int y,
+                         thread float& r,
+                         thread float& g,
+                         thread float& b) {
+  x = min(max(x, 0), max(u.sourceWidth - 1, 0));
+  y = min(max(y, 0), max(u.sourceHeight - 1, 0));
+  uint pixel = uint(y * u.sourceWidth + x);
+  if (u.pixelFormat == 1) {
+    float4 v = source32[pixel];
+    r = v.x;
+    g = v.y;
+    b = v.z;
+  } else {
+    half4 v = source16[pixel];
+    r = float(v.x);
+    g = float(v.y);
+    b = float(v.z);
+  }
+}
+
+int rasterOccupancyComponentBin(float value) {
+  if (value < 0.0) return 0;
+  if (value > 1.0) return 17;
+  return 1 + min(max(int(floor(value * 16.0)), 0), 15);
+}
+
+int rasterOccupancyBinIndex(float r, float g, float b) {
+  return (rasterOccupancyComponentBin(r) * 18 + rasterOccupancyComponentBin(g)) * 18 +
+         rasterOccupancyComponentBin(b);
+}
+
+bool rasterSampleVisible(constant RasterSourceUniforms& u,
+                         int x,
+                         int y,
+                         float xNorm,
+                         float yNorm,
+                         float r,
+                         float g,
+                         float b) {
+  bool inCubeStrip = rasterSourceRowInCube(u, y);
+  bool inRampStrip = rasterSourceRowInRamp(u, y);
+  bool inAnyIdentityStrip = inCubeStrip || inRampStrip;
+  bool visible = true;
+  if (u.excludeIdentityData != 0 && inAnyIdentityStrip) {
+    visible = false;
+  } else if (u.isolateIdentityData != 0) {
+    visible = (u.readIdentityPlot != 0 && inCubeStrip) || (u.readGrayRamp != 0 && inRampStrip);
+  }
+  if (visible && u.lassoEnabled != 0 && !rasterLassoContainsPoint(u, xNorm, yNorm)) {
+    visible = false;
+  }
+  if (visible && !rasterCubeSliceContains(r, g, b, u)) {
+    visible = false;
+  }
+  (void)x;
+  return visible;
+}
+
+void rasterReadTransformedSample(const device half4* source16,
+                                 const device float4* source32,
+                                 constant RasterSourceUniforms& u,
+                                 int x,
+                                 int y,
+                                 thread float& r,
+                                 thread float& g,
+                                 thread float& b) {
+  readRasterSourceRgb(source16, source32, u, x, y, r, g, b);
+  if (u.plotLinear != 0 && u.input.plotMode != 8) {
+    r = decodeTransferChannel(r, u.plotLinearTransfer);
+    g = decodeTransferChannel(g, u.plotLinearTransfer);
+    b = decodeTransferChannel(b, u.plotLinearTransfer);
+  }
+}
+
+kernel void rasterOccupancyCountKernel(const device half4* source16 [[buffer(0)]],
+                                       const device float4* source32 [[buffer(1)]],
+                                       device atomic_uint* occupancyBins [[buffer(2)]],
+                                       device atomic_uint* visibleCount [[buffer(3)]],
+                                       constant RasterSourceUniforms& u [[buffer(4)]],
+                                       uint index [[thread_position_in_grid]]) {
+  uint total = uint(max(u.basePointCount, 0));
+  if (index >= total) return;
+  int sampleCountX = max(u.sampleCountX, 1);
+  int stride = max(u.sampleStride, 1);
+  int x = int(index % uint(sampleCountX)) * stride;
+  int y = int(index / uint(sampleCountX)) * stride;
+  x = min(max(x, 0), max(u.sourceWidth - 1, 0));
+  y = min(max(y, 0), max(u.sourceHeight - 1, 0));
+  float xNorm = (float(x) + 0.5) / float(max(u.sourceWidth, 1));
+  float yNorm = (float(y) + 0.5) / float(max(u.sourceHeight, 1));
+  float r = 0.0;
+  float g = 0.0;
+  float b = 0.0;
+  rasterReadTransformedSample(source16, source32, u, x, y, r, g, b);
+  if (!rasterSampleVisible(u, x, y, xNorm, yNorm, r, g, b)) return;
+  atomic_fetch_add_explicit(&occupancyBins[rasterOccupancyBinIndex(r, g, b)], 1u, memory_order_relaxed);
+  atomic_fetch_add_explicit(&visibleCount[0], 1u, memory_order_relaxed);
+}
+
+kernel void rasterSourceKernel(const device half4* source16 [[buffer(0)]],
+                               const device float4* source32 [[buffer(1)]],
+                               device packed_float3* vertVals [[buffer(2)]],
+                               device float4* colorVals [[buffer(3)]],
+                               device atomic_uint* occupancyBins [[buffer(4)]],
+                               constant RasterSourceUniforms& u [[buffer(5)]],
+                               uint index [[thread_position_in_grid]]) {
+  uint total = uint(max(u.input.pointCount, 0));
+  if (index >= total) return;
+  int sampleCountX = max(u.sampleCountX, 1);
+  int stride = max(u.sampleStride, 1);
+  int x = int(index % uint(sampleCountX)) * stride;
+  int y = int(index / uint(sampleCountX)) * stride;
+  bool occupancyCandidate = false;
+  if (!rasterOccupancySampleCoords(index, u, &x, &y)) {
+    if (!rasterAppendSampleCoords(index,
+                                  u.identityCubeAppendOffset,
+                                  u.identityCubeAppendCount,
+                                  u.identityCubeAppendY1,
+                                  u.identityCubeAppendY2,
+                                  u.identityCubeAppendRowStep,
+                                  u.identityCubeAppendXStep,
+                                  u.sourceWidth,
+                                  &x,
+                                  &y)) {
+      rasterAppendSampleCoords(index,
+                               u.identityRampAppendOffset,
+                               u.identityRampAppendCount,
+                               u.identityRampAppendY1,
+                               u.identityRampAppendY2,
+                               u.identityRampAppendRowStep,
+                               u.identityRampAppendXStep,
+                               u.sourceWidth,
+                               &x,
+                               &y);
+    }
+  } else {
+    occupancyCandidate = true;
+  }
+  x = min(max(x, 0), max(u.sourceWidth - 1, 0));
+  y = min(max(y, 0), max(u.sourceHeight - 1, 0));
+  float xNorm = (float(x) + 0.5) / float(max(u.sourceWidth, 1));
+  float yNorm = (float(y) + 0.5) / float(max(u.sourceHeight, 1));
+  float r = 0.0;
+  float g = 0.0;
+  float b = 0.0;
+  rasterReadTransformedSample(source16, source32, u, x, y, r, g, b);
+  bool visible = rasterSampleVisible(u, x, y, xNorm, yNorm, r, g, b);
+  if (visible && occupancyCandidate) {
+    uint binCount = atomic_load_explicit(&occupancyBins[rasterOccupancyBinIndex(r, g, b)], memory_order_relaxed);
+    visible = int(binCount) <= max(u.occupancyTargetThreshold, 0);
+  }
+  if (!visible) {
+    writeHiddenInputPoint(vertVals, colorVals, index);
+    return;
+  }
+  writeMappedInputPoint(vertVals, colorVals, index, xNorm, yNorm, r, g, b, u.input);
+}
+
 kernel void overlayKernel(const device float4* inputVals [[buffer(0)]],
                           device packed_float3* vertVals [[buffer(1)]],
                           device float4* colorVals [[buffer(2)]],
@@ -758,6 +1320,45 @@ kernel void inputSampleKernel(const device packed_float3* srcVerts [[buffer(0)]]
   packed_float3 src = srcVerts[srcIndex];
   dstVerts[index] = packed_float3(src.x, src.y, src.z);
   dstColors[index] = srcColors[srcIndex];
+}
+
+void accumulateScopeDensity(device atomic_uint* density,
+                            constant ScopeDensityUniforms& u,
+                            int channel,
+                            float xNorm,
+                            float value) {
+  if (u.excludeOverflow != 0 && (value < 0.0 || value > 1.0)) return;
+  int x = clamp(int(xNorm * float(u.width)), 0, max(u.width - 1, 0));
+  int signalBins = u.waveform != 0 ? u.height : u.width;
+  int y = clamp(int((value - u.rangeMin) * u.invRange * float(signalBins)),
+                0,
+                max(signalBins - 1, 0));
+  int binIndex = u.waveform != 0
+      ? (channel * u.width + x) * u.height + y
+      : channel * u.width + y;
+  atomic_fetch_add_explicit(&density[binIndex], 1u, memory_order_relaxed);
+}
+
+kernel void scopeDensityKernel(const device float* samples [[buffer(0)]],
+                               device atomic_uint* density [[buffer(1)]],
+                               constant ScopeDensityUniforms& u [[buffer(2)]],
+                               uint index [[thread_position_in_grid]]) {
+  uint total = uint(max(u.pointCount, 0));
+  if (index >= total || u.width <= 0 || u.height <= 0) return;
+  uint base = index * 5u;
+  float xNorm = clamp(samples[base + 0u], 0.0, 1.0);
+  float r = samples[base + 2u];
+  float g = samples[base + 3u];
+  float b = samples[base + 4u];
+  bool lumaOnly = (u.waveform != 0 && u.scopeMode == 2) ||
+                  (u.waveform == 0 && u.scopeMode == 1);
+  if (lumaOnly) {
+    accumulateScopeDensity(density, u, 0, xNorm, 0.2126 * r + 0.7152 * g + 0.0722 * b);
+  } else {
+    accumulateScopeDensity(density, u, 0, xNorm, r);
+    accumulateScopeDensity(density, u, 1, xNorm, g);
+    accumulateScopeDensity(density, u, 2, xNorm, b);
+  }
 }
 
 int glossNeighborhoodRadiusCells(int neighborhoodChoice) {
@@ -1137,6 +1738,28 @@ bool ensureContext(std::string* error) {
         return;
       }
       pipelineError = nil;
+      id<MTLFunction> rasterSourceFn = [c.library newFunctionWithName:@"rasterSourceKernel"];
+      if (rasterSourceFn == nil) {
+        c.initError = "Missing raster source Metal kernel.";
+        return;
+      }
+      c.rasterSourcePipeline = [c.device newComputePipelineStateWithFunction:rasterSourceFn error:&pipelineError];
+      if (c.rasterSourcePipeline == nil) {
+        c.initError = pipelineError != nil ? [[pipelineError localizedDescription] UTF8String] : "Failed to create raster source Metal pipeline.";
+        return;
+      }
+      pipelineError = nil;
+      id<MTLFunction> rasterOccupancyFn = [c.library newFunctionWithName:@"rasterOccupancyCountKernel"];
+      if (rasterOccupancyFn == nil) {
+        c.initError = "Missing raster occupancy Metal kernel.";
+        return;
+      }
+      c.rasterOccupancyCountPipeline = [c.device newComputePipelineStateWithFunction:rasterOccupancyFn error:&pipelineError];
+      if (c.rasterOccupancyCountPipeline == nil) {
+        c.initError = pipelineError != nil ? [[pipelineError localizedDescription] UTF8String] : "Failed to create raster occupancy Metal pipeline.";
+        return;
+      }
+      pipelineError = nil;
       id<MTLFunction> inputSampleFn = [c.library newFunctionWithName:@"inputSampleKernel"];
       if (inputSampleFn == nil) {
         c.initError = "Missing input sample Metal kernel.";
@@ -1161,6 +1784,12 @@ bool ensureContext(std::string* error) {
         }
         return pipeline;
       };
+      c.scopeDensityPipeline = buildPipeline(@"scopeDensityKernel",
+                                             "Missing scope density Metal kernel.",
+                                             "Failed to create scope density Metal pipeline.");
+      if (c.scopeDensityPipeline == nil) {
+        return;
+      }
       c.glossFieldAccumulatePipeline = buildPipeline(@"glossFieldAccumulateKernel",
                                                      "Missing gloss field accumulate Metal kernel.",
                                                      "Failed to create gloss field accumulate Metal pipeline.");
@@ -1486,6 +2115,101 @@ bool buildOverlayMesh(const OverlayRequest& request,
   return true;
 }
 
+void fillInputUniforms(const InputRequest& request, InputUniforms* uniforms) {
+  if (!uniforms) return;
+  uniforms->pointCount = request.pointCount;
+  uniforms->inputStride = request.inputStride;
+  uniforms->glossView = request.glossView;
+  uniforms->sourceAspect = request.sourceAspect;
+  uniforms->glossLiftScale = request.glossLiftScale;
+  uniforms->showOverflow = request.remap.showOverflow;
+  uniforms->highlightOverflow = request.remap.highlightOverflow;
+  uniforms->plotMode = request.remap.plotMode;
+  uniforms->circularHsl = request.remap.circularHsl;
+  uniforms->circularHsv = request.remap.circularHsv;
+  uniforms->normConeNormalized = request.remap.normConeNormalized;
+  uniforms->chromaticityInputTransfer = request.remap.chromaticityInputTransfer;
+  uniforms->chromaticityReferenceBasis = request.remap.chromaticityReferenceBasis;
+  uniforms->chromaticityWhiteX = request.remap.chromaticityWhiteX;
+  uniforms->chromaticityWhiteY = request.remap.chromaticityWhiteY;
+  for (int i = 0; i < 9; ++i) {
+    uniforms->chromaticityRgbToXyz[i] = request.remap.chromaticityRgbToXyz[i];
+    uniforms->chromaticityXyzToRgb[i] = request.remap.chromaticityXyzToRgb[i];
+  }
+  uniforms->pointAlphaScale = request.pointAlphaScale;
+  uniforms->denseAlphaBias = request.denseAlphaBias;
+  uniforms->colorSaturation = request.colorSaturation;
+}
+
+void fillRasterSourceUniforms(const RasterSourceRequest& request, RasterSourceUniforms* uniforms) {
+  if (!uniforms) return;
+  InputRequest inputRequest{};
+  inputRequest.pointCount = request.pointCount;
+  inputRequest.inputStride = 3;
+  inputRequest.glossView = request.remap.plotMode == 9 ? 1 : 0;
+  inputRequest.sourceAspect = request.sourceAspect;
+  inputRequest.glossLiftScale = request.glossLiftScale;
+  inputRequest.pointAlphaScale = request.pointAlphaScale;
+  inputRequest.denseAlphaBias = request.denseAlphaBias;
+  inputRequest.colorSaturation = request.colorSaturation;
+  inputRequest.remap = request.remap;
+  fillInputUniforms(inputRequest, &uniforms->input);
+  uniforms->basePointCount = request.basePointCount > 0 ? request.basePointCount : request.pointCount;
+  uniforms->sourceWidth = request.sourceWidth;
+  uniforms->sourceHeight = request.sourceHeight;
+  uniforms->sampleStride = request.sampleStride;
+  uniforms->sampleCountX = request.sampleCountX;
+  uniforms->pixelFormat = request.pixelFormat;
+  uniforms->plotLinear = request.plotLinear;
+  uniforms->plotLinearTransfer = request.plotLinearTransfer;
+  uniforms->excludeIdentityData = request.excludeIdentityData;
+  uniforms->isolateIdentityData = request.isolateIdentityData;
+  uniforms->readIdentityPlot = request.readIdentityPlot;
+  uniforms->readGrayRamp = request.readGrayRamp;
+  uniforms->identityCubeY1 = request.identityCubeY1;
+  uniforms->identityCubeY2 = request.identityCubeY2;
+  uniforms->identityRampY1 = request.identityRampY1;
+  uniforms->identityRampY2 = request.identityRampY2;
+  uniforms->identityCubeAppendOffset = request.identityCubeAppendOffset;
+  uniforms->identityCubeAppendCount = request.identityCubeAppendCount;
+  uniforms->identityCubeAppendY1 = request.identityCubeAppendY1;
+  uniforms->identityCubeAppendY2 = request.identityCubeAppendY2;
+  uniforms->identityCubeAppendRowStep = request.identityCubeAppendRowStep;
+  uniforms->identityCubeAppendXStep = request.identityCubeAppendXStep;
+  uniforms->identityRampAppendOffset = request.identityRampAppendOffset;
+  uniforms->identityRampAppendCount = request.identityRampAppendCount;
+  uniforms->identityRampAppendY1 = request.identityRampAppendY1;
+  uniforms->identityRampAppendY2 = request.identityRampAppendY2;
+  uniforms->identityRampAppendRowStep = request.identityRampAppendRowStep;
+  uniforms->identityRampAppendXStep = request.identityRampAppendXStep;
+  uniforms->occupancyFill = request.occupancyFill;
+  uniforms->occupancyAppendOffset = request.occupancyAppendOffset;
+  uniforms->occupancyAppendCount = request.occupancyAppendCount;
+  uniforms->occupancyCandidateCount = request.occupancyCandidateCount;
+  uniforms->occupancyTargetThreshold = 0;
+  uniforms->lassoEnabled = request.lassoEnabled;
+  uniforms->lassoStrokeCount = request.lassoStrokeCount;
+  uniforms->lassoPointCount = request.lassoPointCount;
+  for (int i = 0; i < 16; ++i) {
+    uniforms->lassoStrokeFirst[i] = request.lassoStrokeFirst[i];
+    uniforms->lassoStrokeCountPerStroke[i] = request.lassoStrokeCountPerStroke[i];
+    uniforms->lassoStrokeSubtract[i] = request.lassoStrokeSubtract[i];
+  }
+  for (int i = 0; i < 256; ++i) {
+    uniforms->lassoX[i] = request.lassoX[i];
+    uniforms->lassoY[i] = request.lassoY[i];
+  }
+  uniforms->cubeSlicingEnabled = request.cubeSlicingEnabled;
+  uniforms->neutralRadiusEnabled = request.neutralRadiusEnabled;
+  uniforms->neutralRadius = request.neutralRadius;
+  uniforms->cubeSliceRed = request.cubeSliceRed;
+  uniforms->cubeSliceYellow = request.cubeSliceYellow;
+  uniforms->cubeSliceGreen = request.cubeSliceGreen;
+  uniforms->cubeSliceCyan = request.cubeSliceCyan;
+  uniforms->cubeSliceBlue = request.cubeSliceBlue;
+  uniforms->cubeSliceMagenta = request.cubeSliceMagenta;
+}
+
 bool buildInputMesh(const InputRequest& request,
                     const std::vector<float>& rawPoints,
                     std::vector<float>* outVerts,
@@ -1510,28 +2234,7 @@ bool buildInputMesh(const InputRequest& request,
 
   MetalContext& ctx = context();
   InputUniforms uniforms{};
-  uniforms.pointCount = request.pointCount;
-  uniforms.inputStride = request.inputStride;
-  uniforms.glossView = request.glossView;
-  uniforms.sourceAspect = request.sourceAspect;
-  uniforms.glossLiftScale = request.glossLiftScale;
-  uniforms.showOverflow = request.remap.showOverflow;
-  uniforms.highlightOverflow = request.remap.highlightOverflow;
-  uniforms.plotMode = request.remap.plotMode;
-  uniforms.circularHsl = request.remap.circularHsl;
-  uniforms.circularHsv = request.remap.circularHsv;
-  uniforms.normConeNormalized = request.remap.normConeNormalized;
-  uniforms.chromaticityInputTransfer = request.remap.chromaticityInputTransfer;
-  uniforms.chromaticityReferenceBasis = request.remap.chromaticityReferenceBasis;
-  uniforms.chromaticityWhiteX = request.remap.chromaticityWhiteX;
-  uniforms.chromaticityWhiteY = request.remap.chromaticityWhiteY;
-  for (int i = 0; i < 9; ++i) {
-    uniforms.chromaticityRgbToXyz[i] = request.remap.chromaticityRgbToXyz[i];
-    uniforms.chromaticityXyzToRgb[i] = request.remap.chromaticityXyzToRgb[i];
-  }
-  uniforms.pointAlphaScale = request.pointAlphaScale;
-  uniforms.denseAlphaBias = request.denseAlphaBias;
-  uniforms.colorSaturation = request.colorSaturation;
+  fillInputUniforms(request, &uniforms);
 
   id<MTLBuffer> inputBuffer = makeSharedBuffer(rawPoints.data(), rawPoints.size());
   id<MTLBuffer> vertBuffer = makeEmptySharedBuffer(pointCount * sizeof(PackedFloat3));
@@ -1549,6 +2252,134 @@ bool buildInputMesh(const InputRequest& request,
 
   copySharedBuffer<PackedFloat3>(vertBuffer, pointCount, outVerts);
   copySharedBuffer<simd_float4>(colorBuffer, pointCount, outColors);
+  return true;
+}
+
+bool buildRasterSourceMesh(const RasterSourceRequest& request,
+                           const void* sourceBytes,
+                           size_t sourceByteCount,
+                           std::vector<float>* outVerts,
+                           std::vector<float>* outColors,
+                           std::string* error) {
+  std::string localError;
+  if (!ensureContext(&localError)) {
+    if (error) *error = localError;
+    return false;
+  }
+  const NSUInteger pointCount = static_cast<NSUInteger>(std::max(request.pointCount, 0));
+  if (pointCount == 0 || sourceBytes == nullptr || sourceByteCount == 0 ||
+      request.sourceWidth <= 0 || request.sourceHeight <= 0 || request.sampleCountX <= 0) {
+    if (error) *error = "Invalid Metal raster source request.";
+    return false;
+  }
+
+  MetalContext& ctx = context();
+  if (ctx.rasterSourcePipeline == nil || ctx.rasterOccupancyCountPipeline == nil) {
+    if (error) *error = "Metal raster source pipeline unavailable.";
+    return false;
+  }
+
+  RasterSourceUniforms uniforms{};
+  fillRasterSourceUniforms(request, &uniforms);
+
+  @autoreleasepool {
+    id<MTLBuffer> sourceBuffer = [ctx.device newBufferWithBytes:sourceBytes
+                                                         length:static_cast<NSUInteger>(sourceByteCount)
+                                                        options:MTLResourceStorageModeShared];
+    id<MTLBuffer> vertBuffer = makeEmptySharedBuffer(pointCount * sizeof(PackedFloat3));
+    id<MTLBuffer> colorBuffer = makeEmptySharedBuffer(pointCount * sizeof(simd_float4));
+    id<MTLBuffer> uniformBuffer = makeSharedBuffer(&uniforms, 1u);
+    constexpr NSUInteger kRasterOccupancyBinCount = 18u * 18u * 18u;
+    id<MTLBuffer> occupancyBuffer =
+        makeEmptySharedBuffer(kRasterOccupancyBinCount * sizeof(uint32_t));
+    if (sourceBuffer == nil || vertBuffer == nil || colorBuffer == nil ||
+        uniformBuffer == nil || occupancyBuffer == nil) {
+      if (error) *error = "Failed to allocate Metal raster source buffers.";
+      return false;
+    }
+    clearSharedBuffer(occupancyBuffer);
+
+    if (request.occupancyFill != 0 && request.occupancyAppendCount > 0) {
+      id<MTLBuffer> visibleCountBuffer = makeEmptySharedBuffer(sizeof(uint32_t));
+      if (visibleCountBuffer == nil) {
+        if (error) *error = "Failed to allocate Metal raster occupancy counter.";
+        return false;
+      }
+      clearSharedBuffer(visibleCountBuffer);
+
+      id<MTLCommandBuffer> countCommand = [ctx.queue commandBuffer];
+      if (countCommand == nil) {
+        if (error) *error = "Failed to create Metal raster occupancy command buffer.";
+        return false;
+      }
+      id<MTLComputeCommandEncoder> countEncoder = [countCommand computeCommandEncoder];
+      if (countEncoder == nil) {
+        if (error) *error = "Failed to create Metal raster occupancy encoder.";
+        return false;
+      }
+      [countEncoder setComputePipelineState:ctx.rasterOccupancyCountPipeline];
+      [countEncoder setBuffer:sourceBuffer offset:0 atIndex:0];
+      [countEncoder setBuffer:sourceBuffer offset:0 atIndex:1];
+      [countEncoder setBuffer:occupancyBuffer offset:0 atIndex:2];
+      [countEncoder setBuffer:visibleCountBuffer offset:0 atIndex:3];
+      [countEncoder setBuffer:uniformBuffer offset:0 atIndex:4];
+      NSUInteger width = ctx.rasterOccupancyCountPipeline.maxTotalThreadsPerThreadgroup;
+      if (width == 0) width = 64;
+      width = std::min<NSUInteger>(width, 256);
+      [countEncoder dispatchThreads:MTLSizeMake(static_cast<NSUInteger>(std::max(uniforms.basePointCount, 0)), 1, 1)
+               threadsPerThreadgroup:MTLSizeMake(width, 1, 1)];
+      [countEncoder endEncoding];
+      [countCommand commit];
+      [countCommand waitUntilCompleted];
+      NSError* countError = countCommand.error;
+      if (countError != nil) {
+        if (error) *error = [[countError localizedDescription] UTF8String];
+        return false;
+      }
+
+      uint32_t visibleCount = 0;
+      std::memcpy(&visibleCount, [visibleCountBuffer contents], sizeof(visibleCount));
+      const float meanOccupancy =
+          static_cast<float>(visibleCount) / static_cast<float>(kRasterOccupancyBinCount);
+      uniforms.occupancyTargetThreshold =
+          std::max(0, static_cast<int>(std::ceil(meanOccupancy * 0.72f)));
+      std::memcpy([uniformBuffer contents], &uniforms, sizeof(uniforms));
+    }
+
+    id<MTLCommandBuffer> commandBuffer = [ctx.queue commandBuffer];
+    if (commandBuffer == nil) {
+      if (error) *error = "Failed to create Metal raster source command buffer.";
+      return false;
+    }
+    id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
+    if (encoder == nil) {
+      if (error) *error = "Failed to create Metal raster source encoder.";
+      return false;
+    }
+    [encoder setComputePipelineState:ctx.rasterSourcePipeline];
+    [encoder setBuffer:sourceBuffer offset:0 atIndex:0];
+    [encoder setBuffer:sourceBuffer offset:0 atIndex:1];
+    [encoder setBuffer:vertBuffer offset:0 atIndex:2];
+    [encoder setBuffer:colorBuffer offset:0 atIndex:3];
+    [encoder setBuffer:occupancyBuffer offset:0 atIndex:4];
+    [encoder setBuffer:uniformBuffer offset:0 atIndex:5];
+    NSUInteger width = ctx.rasterSourcePipeline.maxTotalThreadsPerThreadgroup;
+    if (width == 0) width = 64;
+    width = std::min<NSUInteger>(width, 256);
+    [encoder dispatchThreads:MTLSizeMake(pointCount, 1, 1)
+       threadsPerThreadgroup:MTLSizeMake(width, 1, 1)];
+    [encoder endEncoding];
+    [commandBuffer commit];
+    [commandBuffer waitUntilCompleted];
+    NSError* cbError = commandBuffer.error;
+    if (cbError != nil) {
+      if (error) *error = [[cbError localizedDescription] UTF8String];
+      return false;
+    }
+
+    copySharedBuffer<PackedFloat3>(vertBuffer, pointCount, outVerts);
+    copySharedBuffer<simd_float4>(colorBuffer, pointCount, outColors);
+  }
   return true;
 }
 
@@ -1589,6 +2420,71 @@ bool buildInputSampledMesh(const InputSampleRequest& request,
     }
     copySharedBuffer<PackedFloat3>(dstVertBuffer, visiblePointCount, outVerts);
     copySharedBuffer<simd_float4>(dstColorBuffer, visiblePointCount, outColors);
+  }
+  return true;
+}
+
+bool buildScopeDensity(const ScopeDensityRequest& request,
+                       const std::vector<float>& packedSamples,
+                       std::vector<float>* outDensity,
+                       std::string* error) {
+  std::string localError;
+  if (!outDensity) {
+    if (error) *error = "Missing Metal scope density output.";
+    return false;
+  }
+  if (!ensureContext(&localError)) {
+    if (error) *error = localError;
+    return false;
+  }
+  const int pointCount = std::max(request.pointCount, 0);
+  const int width = std::max(request.width, 1);
+  const int height = std::max(request.height, 1);
+  const size_t expectedSampleFloats = static_cast<size_t>(pointCount) * 5u;
+  if (pointCount == 0 || packedSamples.size() < expectedSampleFloats) {
+    if (error) *error = "Invalid Metal scope density sample buffer.";
+    return false;
+  }
+  const size_t binCount = static_cast<size_t>(width) *
+                          static_cast<size_t>(height) * 3u;
+  if (binCount == 0) {
+    if (error) *error = "Invalid Metal scope density dimensions.";
+    return false;
+  }
+
+  MetalContext& ctx = context();
+  @autoreleasepool {
+    ScopeDensityUniforms uniforms{};
+    uniforms.pointCount = pointCount;
+    uniforms.waveform = request.waveform;
+    uniforms.scopeMode = request.scopeMode;
+    uniforms.width = width;
+    uniforms.height = height;
+    uniforms.rangeMin = request.rangeMin;
+    uniforms.invRange = request.invRange;
+    uniforms.excludeOverflow = request.excludeOverflow;
+
+    id<MTLBuffer> sampleBuffer = makeSharedBuffer(packedSamples.data(), expectedSampleFloats);
+    id<MTLBuffer> densityBuffer = makeEmptySharedBuffer(static_cast<NSUInteger>(binCount * sizeof(uint32_t)));
+    id<MTLBuffer> uniformBuffer = makeSharedBuffer(&uniforms, 1u);
+    if (sampleBuffer == nil || densityBuffer == nil || uniformBuffer == nil) {
+      if (error) *error = "Failed to allocate Metal scope density buffers.";
+      return false;
+    }
+    clearSharedBuffer(densityBuffer);
+    if (!runComputeBuffers(ctx.scopeDensityPipeline,
+                           std::array<id<MTLBuffer>, 3>{sampleBuffer, densityBuffer, uniformBuffer},
+                           static_cast<NSUInteger>(pointCount),
+                           &localError)) {
+      if (error) *error = localError;
+      return false;
+    }
+
+    outDensity->assign(binCount, 0.0f);
+    const uint32_t* counts = reinterpret_cast<const uint32_t*>([densityBuffer contents]);
+    for (size_t i = 0; i < binCount; ++i) {
+      (*outDensity)[i] = static_cast<float>(counts[i]);
+    }
   }
   return true;
 }

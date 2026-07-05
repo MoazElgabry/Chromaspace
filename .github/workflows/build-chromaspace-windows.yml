@@ -124,6 +124,9 @@ jobs:
           if (!(Test-Path "bundle/Chromaspace.ofx.bundle/Contents/Win64/Chromaspace_CubeViewer.exe")) {
             throw "Missing Windows cube viewer binary"
           }
+          if (!(Test-Path "bundle/Chromaspace.ofx.bundle/Contents/Win64/Chromaspace_ResolveBridge.exe")) {
+            throw "Missing Windows named Resolve bridge helper"
+          }
           if (!(Test-Path "bundle/Chromaspace.ofx.bundle/Contents/Win64/OpenSans-Regular.ttf")) {
             throw "Missing bundled font asset"
           }
@@ -136,6 +139,10 @@ jobs:
           $viewerDeps = cmd /c "call ""$env:VSDEVCMD"" -arch=x64 -host_arch=x64 && dumpbin /dependents ""bundle\Chromaspace.ofx.bundle\Contents\Win64\Chromaspace_CubeViewer.exe"""
           if ($viewerDeps -match "cudart64_") {
             throw "Windows viewer still depends on shared CUDA runtime. Link CUDA cudart statically before packaging."
+          }
+          $bridgeDeps = cmd /c "call ""$env:VSDEVCMD"" -arch=x64 -host_arch=x64 && dumpbin /dependents ""bundle\Chromaspace.ofx.bundle\Contents\Win64\Chromaspace_ResolveBridge.exe"""
+          if ($bridgeDeps -match "cudart64_") {
+            throw "Windows Resolve bridge helper should not depend on CUDA runtime."
           }
           $pluginDeps = cmd /c "call ""$env:VSDEVCMD"" -arch=x64 -host_arch=x64 && dumpbin /dependents ""bundle\Chromaspace.ofx.bundle\Contents\Win64\Chromaspace.ofx"""
           if ($pluginDeps -match "cudart64_") {

@@ -7775,8 +7775,26 @@ class ChromaspaceEffect : public ImageEffect {
     if (nativeTier) *nativeTier = false;
     const int sourceLongEdge = std::max(sourceWidth, sourceHeight);
     if (sourceLongEdge <= 0) return 0;
-    const int maxProxy = std::clamp(state.sourceMaxProxyLongEdge, 768, 4096);
+    int maxProxy = std::clamp(state.sourceMaxProxyLongEdge, 768, 4096);
+    if (const char* envMax = std::getenv("CHROMASPACE_SOURCE_MAX_LONG_EDGE")) {
+      if (envMax[0] != '\0') {
+        char* end = nullptr;
+        const long value = std::strtol(envMax, &end, 10);
+        if (end != envMax && value > 0) {
+          maxProxy = std::clamp(static_cast<int>(value), 768, std::max(768, sourceLongEdge));
+        }
+      }
+    }
     const int detailMode = std::clamp(state.sourceDetailMode, 0, 4);
+    const char* nativeEnv = std::getenv("CHROMASPACE_SOURCE_NATIVE");
+    const bool forceNative =
+        nativeEnv && nativeEnv[0] != '\0' && nativeEnv[0] != '0' &&
+        nativeEnv[0] != 'f' && nativeEnv[0] != 'F' &&
+        nativeEnv[0] != 'n' && nativeEnv[0] != 'N';
+    const bool disableNative =
+        nativeEnv && (nativeEnv[0] == '0' || nativeEnv[0] == 'f' ||
+                      nativeEnv[0] == 'F' || nativeEnv[0] == 'n' ||
+                      nativeEnv[0] == 'N');
     const double sourcePixels =
         static_cast<double>(std::max(1, sourceWidth)) *
         static_cast<double>(std::max(1, sourceHeight));
@@ -7784,21 +7802,22 @@ class ChromaspaceEffect : public ImageEffect {
       if (nativeTier) *nativeTier = true;
       return sourceLongEdge;
     };
+    if (forceNative && !previewMode) return useNative();
     switch (detailMode) {
       case 1:
         return std::min(sourceLongEdge, std::min(maxProxy, previewMode ? 768 : 1024));
       case 2:
         return std::min(sourceLongEdge, std::min(maxProxy, previewMode ? 1280 : 2048));
       case 3:
-        if (state.sourceUseNativeWhenAvailable && !previewMode &&
+        if (!disableNative && state.sourceUseNativeWhenAvailable && !previewMode &&
             sourcePixels <= static_cast<double>(4096 * 2160)) {
           return useNative();
         }
         return std::min(sourceLongEdge, std::min(maxProxy, previewMode ? 2048 : 4096));
       case 4:
-        return useNative();
+        return disableNative ? std::min(sourceLongEdge, maxProxy) : useNative();
       default:
-        if (state.sourceUseNativeWhenAvailable && !previewMode &&
+        if (!disableNative && state.sourceUseNativeWhenAvailable && !previewMode &&
             sourcePixels <= static_cast<double>(1920 * 1080)) {
           return useNative();
         }
@@ -7811,6 +7830,15 @@ class ChromaspaceEffect : public ImageEffect {
     std::ostringstream os;
     os << "Source: " << proxyLongEdge << " proxy";
     return os.str();
+  }
+
+  bool sourceSignalUsesRgba32f() const {
+    const char* env = std::getenv("CHROMASPACE_SOURCE_SIGNAL_FORMAT");
+    if (!env || env[0] == '\0') return false;
+    std::string value(env);
+    std::transform(value.begin(), value.end(), value.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return value == "rgba32f" || value == "float32" || value == "32f";
   }
 
   template <typename FetchPixelFn>
@@ -7845,10 +7873,18 @@ class ChromaspaceEffect : public ImageEffect {
     }
     const std::size_t pixelCount =
         static_cast<std::size_t>(proxyWidth) * static_cast<std::size_t>(proxyHeight);
-    if (pixelCount == 0 || pixelCount > (std::numeric_limits<std::size_t>::max() / (4u * sizeof(uint16_t)))) {
+    const bool rgba32f = sourceSignalUsesRgba32f();
+    const std::size_t scalarBytes = rgba32f ? sizeof(float) : sizeof(uint16_t);
+    if (pixelCount == 0 || pixelCount > (std::numeric_limits<std::size_t>::max() / (4u * scalarBytes))) {
       return out;
     }
-    std::vector<uint16_t> rgba16f(pixelCount * 4u, 0);
+    std::vector<uint16_t> rgba16f;
+    std::vector<float> rgba32;
+    if (rgba32f) {
+      rgba32.assign(pixelCount * 4u, 0.0f);
+    } else {
+      rgba16f.assign(pixelCount * 4u, 0);
+    }
 
     auto readPixel = [&](int x, int y, std::array<float, 4>* rgba) -> bool {
       if (!rgba) return false;
@@ -7894,15 +7930,24 @@ class ChromaspaceEffect : public ImageEffect {
                             p10[static_cast<std::size_t>(c)] * tx;
           const float bottom = p01[static_cast<std::size_t>(c)] * (1.0f - tx) +
                                p11[static_cast<std::size_t>(c)] * tx;
-          rgba16f[dst + static_cast<std::size_t>(c)] = floatToHalfBits(top * (1.0f - ty) + bottom * ty);
+          const float value = top * (1.0f - ty) + bottom * ty;
+          if (rgba32f) {
+            rgba32[dst + static_cast<std::size_t>(c)] = value;
+          } else {
+            rgba16f[dst + static_cast<std::size_t>(c)] = floatToHalfBits(value);
+          }
         }
       }
     }
 
     const uint64_t seq = gSharedCubeViewerSeqCounter.fetch_add(1, std::memory_order_relaxed);
-    const uint64_t contentHash = fnv1a64Bytes(rgba16f.data(), rgba16f.size() * sizeof(uint16_t));
+    const void* sourceBytes = rgba32f ? static_cast<const void*>(rgba32.data())
+                                      : static_cast<const void*>(rgba16f.data());
+    const std::size_t sourceByteCount =
+        rgba32f ? rgba32.size() * sizeof(float) : rgba16f.size() * sizeof(uint16_t);
+    const uint64_t contentHash = fnv1a64Bytes(sourceBytes, sourceByteCount);
     std::shared_ptr<ViewerCloudTransportBlob> blob =
-        createTransportBlobFromBytes(rgba16f.data(), rgba16f.size() * sizeof(uint16_t), seq);
+        createTransportBlobFromBytes(sourceBytes, sourceByteCount, seq);
     if (!blob) return out;
 
     const bool fullCoverage = footprint.coverageKind == CloudCoverageKind::Full;
@@ -7936,7 +7981,7 @@ class ChromaspaceEffect : public ImageEffect {
        << ",\"sampledY1\":" << footprint.sampledY1
        << ",\"sampledWidth\":" << sampledWidth
        << ",\"sampledHeight\":" << sampledHeight
-       << ",\"pixelFormat\":\"rgba16f\""
+       << ",\"pixelFormat\":\"" << (rgba32f ? "rgba32f" : "rgba16f") << "\""
        << ",\"transport\":\"shm\""
        << ",\"coverage\":\"" << coverage << "\""
        << ",\"tier\":\"" << jsonEscape(sourceSignalTierLabel(nativeTier, proxyLongEdge)) << "\""

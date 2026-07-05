@@ -23,16 +23,32 @@ from typing import Dict, Optional, Tuple
 
 LIVE_REFRESH_INTERVAL_SECONDS = 0.08
 LIVE_PULSE_STALE_SECONDS = 1.5
+VIEWER_LEASE_STALE_SECONDS = 5.0
 POLL_INTERVAL_SECONDS = 0.025
 LOCK_HEARTBEAT_SECONDS = 2.0
 STALE_LOCK_SECONDS = 30.0
 RESOLVE_RECONNECT_SECONDS = 1.0
 DAEMON_STATUS_SECONDS = 2.0
 MAILBOX_ACTIVE_SECONDS = 30.0
+DEFAULT_BRIDGE_IDLE_EXIT_SECONDS = 10.0
 CHROMASPACE_TOOL_TOKENS = ("chromaspace", "com.moazelgabry.chromaspace")
 DRAW_LABEL_TOKENS = ("draw", "generator", "identity", "instance 1", "instance1", "upstream", "hald")
 PLOT_LABEL_TOKENS = ("plot", "viewer", "view", "cube", "3d")
 NODE_SELECT_METHODS = ("SetCurrentNode", "SetSelectedNode", "SelectNode", "SetActiveNode")
+
+
+def env_float(name: str, default: float, min_value: float, max_value: float) -> float:
+    try:
+        value = float(os.environ.get(name, ""))
+    except Exception:
+        return default
+    if not (min_value <= value <= max_value):
+        return default
+    return value
+
+
+def bridge_idle_exit_seconds() -> float:
+    return env_float("CHROMASPACE_BRIDGE_IDLE_EXIT_SECONDS", DEFAULT_BRIDGE_IDLE_EXIT_SECONDS, 0.0, 3600.0)
 
 
 def sessions_root() -> pathlib.Path:
@@ -651,6 +667,27 @@ def active_live_refresh_pulse(root: pathlib.Path) -> bool:
     return False
 
 
+def active_viewer_lease(root: pathlib.Path) -> bool:
+    wall_now = time.time()
+    for lease_path in root.glob("*/viewer_alive.json"):
+        lease = read_json(lease_path)
+        try:
+            age = max(0.0, wall_now - lease_path.stat().st_mtime)
+        except Exception:
+            continue
+        if age > VIEWER_LEASE_STALE_SECONDS:
+            continue
+        if not bool(lease.get("active")):
+            continue
+        if not bool(lease.get("needsBridge", True)):
+            continue
+        pid = int(lease.get("viewerPid") or 0)
+        if pid > 0 and not process_alive(pid):
+            continue
+        return True
+    return False
+
+
 def graph_worker_main(requests: queue.Queue) -> None:
     client = ResolveRefreshClient()
     last_plot_focus_status: Optional[Dict] = None
@@ -724,10 +761,13 @@ def main() -> int:
     last_refresh_at = 0.0
     last_daemon_status_at = time.monotonic()
     last_live_status_at = 0.0
+    last_activity_at = time.monotonic()
+    idle_exit_seconds = bridge_idle_exit_seconds()
     refresh_in_flight = False
     while True:
         now = time.monotonic()
         owner.write_heartbeat()
+        active_viewer = active_viewer_lease(root)
         continuous_live_refresh = active_live_refresh_pulse(root)
         if continuous_live_refresh and now - last_live_status_at >= 0.5:
             last_live_status_at = now
@@ -817,6 +857,25 @@ def main() -> int:
         for desired, revision in draw_scan_ready:
             draw_scan_sent[desired] = revision
             graph_requests.put(("scan", desired, revision))
+        bridge_busy = (
+            active_viewer
+            or continuous_live_refresh
+            or bool(ready)
+            or bool(pending)
+            or bool(focus_ready)
+            or bool(draw_scan_ready)
+            or refresh_in_flight
+            or not graph_requests.empty()
+            or not refresh_requests.empty()
+        )
+        if bridge_busy or idle_exit_seconds <= 0.0:
+            last_activity_at = now
+        elif now - last_activity_at >= idle_exit_seconds:
+            write_daemon_status(
+                "Chromaspace Resolve bridge idle shutdown: no active viewer sessions.",
+                idle_shutdown=True,
+            )
+            return 0
         time.sleep(POLL_INTERVAL_SECONDS)
 
 

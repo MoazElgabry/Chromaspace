@@ -109,6 +109,9 @@
 #ifndef GL_RGBA16F
 #define GL_RGBA16F 0x881A
 #endif
+#ifndef GL_RGBA32F
+#define GL_RGBA32F 0x8814
+#endif
 #ifndef GL_HALF_FLOAT
 #define GL_HALF_FLOAT 0x140B
 #endif
@@ -304,6 +307,53 @@ bool viewerEnvFlagEnabled(const char* name, bool defaultValue) {
     default:
       return true;
   }
+}
+
+std::string viewerEnvString(const char* name, const std::string& defaultValue = std::string()) {
+  const char* env = std::getenv(name);
+  if (!env || env[0] == '\0') return defaultValue;
+  return std::string(env);
+}
+
+int viewerEnvIntClamped(const char* name, int defaultValue, int minValue, int maxValue) {
+  const char* env = std::getenv(name);
+  if (!env || env[0] == '\0') return defaultValue;
+  char* end = nullptr;
+  const long value = std::strtol(env, &end, 10);
+  if (end == env) return defaultValue;
+  return std::clamp(static_cast<int>(value), minValue, maxValue);
+}
+
+enum class SourceDeriveMode {
+  Raster = 0,
+  Cloud,
+  Dual,
+};
+
+SourceDeriveMode sourceDeriveMode() {
+  std::string mode = viewerEnvString("CHROMASPACE_SOURCE_DERIVE_MODE", "raster");
+  std::transform(mode.begin(), mode.end(), mode.begin(),
+                 [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+  if (mode == "cloud" || mode == "legacy" || mode == "pointcloud") return SourceDeriveMode::Cloud;
+  if (mode == "dual" || mode == "compare" || mode == "ab") return SourceDeriveMode::Dual;
+  return SourceDeriveMode::Raster;
+}
+
+const char* sourceDeriveModeLabel(SourceDeriveMode mode) {
+  switch (mode) {
+    case SourceDeriveMode::Cloud: return "cloud";
+    case SourceDeriveMode::Dual: return "dual";
+    case SourceDeriveMode::Raster:
+    default: return "raster";
+  }
+}
+
+bool rasterBenchmarkEnabled() {
+  return viewerEnvFlagEnabled("CHROMASPACE_RASTER_BENCHMARK", false) || viewerDiagnosticsEnabled();
+}
+
+bool rasterGpuDerivationEnabled() {
+  return viewerEnvFlagEnabled("CHROMASPACE_RASTER_GPU", true);
 }
 
 bool viewerCudaDisabled() {
@@ -1657,6 +1707,40 @@ void setMeshFitBoundsFromVerts(MeshData* mesh) {
   }
 }
 
+void setMeshFitBoundsFromVisibleVerts(MeshData* mesh) {
+  if (!mesh || mesh->pointVerts.empty() || mesh->pointColors.empty() || mesh->pointCount == 0 ||
+      mesh->pointVerts.size() < mesh->pointCount * 3u ||
+      mesh->pointColors.size() < mesh->pointCount * 4u) {
+    return;
+  }
+  bool haveAny = false;
+  Vec3 minP{};
+  Vec3 maxP{};
+  for (size_t i = 0; i < mesh->pointCount; ++i) {
+    if (mesh->pointColors[i * 4u + 3u] <= 1.0e-6f) continue;
+    Vec3 p{mesh->pointVerts[i * 3u + 0u],
+           mesh->pointVerts[i * 3u + 1u],
+           mesh->pointVerts[i * 3u + 2u]};
+    if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z)) continue;
+    if (!haveAny) {
+      minP = p;
+      maxP = p;
+      haveAny = true;
+    } else {
+      minP.x = std::min(minP.x, p.x);
+      minP.y = std::min(minP.y, p.y);
+      minP.z = std::min(minP.z, p.z);
+      maxP.x = std::max(maxP.x, p.x);
+      maxP.y = std::max(maxP.y, p.y);
+      maxP.z = std::max(maxP.z, p.z);
+    }
+  }
+  if (!haveAny) return;
+  mesh->fitMin = minP;
+  mesh->fitMax = maxP;
+  mesh->hasFitBounds = true;
+}
+
 uint64_t nextMeshSerial() {
   static std::atomic<uint64_t> serial{1u};
   return serial.fetch_add(1u, std::memory_order_relaxed);
@@ -1721,6 +1805,19 @@ struct InputCloudComputeCache {
   GLint chromaticityInverseRow2Loc = -1;
   uint64_t builtSerial = 0;
   GLsizei pointCount = 0;
+  bool available = false;
+};
+
+struct RasterSignalComputeCache {
+  GLuint source = 0;
+  GLuint program = 0;
+  GLint pointCountLoc = -1;
+  GLint sourceWidthLoc = -1;
+  GLint sourceHeightLoc = -1;
+  GLint sampleStrideLoc = -1;
+  GLint sampleCountXLoc = -1;
+  GLint pixelFormatLoc = -1;
+  bool initAttempted = false;
   bool available = false;
 };
 
@@ -1858,6 +1955,30 @@ bool meshHasResidentInputPointStorage(
          computeCache.colors != 0 &&
          static_cast<size_t>(std::max(computeCache.pointCount, 0)) >= mesh.pointCount;
 }
+
+#if defined(CHROMASPACE_VIEWER_HAS_CUDA) && !defined(__APPLE__)
+bool residentCudaPointDrawBuffers(const MeshData& mesh,
+                                  const InputCloudCudaCache& cudaCache,
+                                  PointDrawBuffers* out) {
+  if (!out) return false;
+  *out = PointDrawBuffers{};
+  if (mesh.pointCount == 0 ||
+      !cudaCache.available ||
+      cudaCache.builtSerial != mesh.serial ||
+      cudaCache.verts == 0 ||
+      cudaCache.colors == 0 ||
+      static_cast<size_t>(std::max(cudaCache.pointCount, 0)) < mesh.pointCount) {
+    return false;
+  }
+  out->verts = cudaCache.verts;
+  out->colors = cudaCache.colors;
+  out->pointCount = mesh.pointCount;
+  out->sourceSerial = mesh.serial;
+  out->visiblePointCount = mesh.pointCount;
+  out->available = true;
+  return true;
+}
+#endif
 
 void releasePointBufferCache(PointBufferCache* cache) {
   if (!cache) return;
@@ -2343,6 +2464,9 @@ bool ensureInputCloudBoundsProgram(InputCloudComputeCache* cache);
 bool parseInputCloudSamples(const InputCloudPayload& cloud,
                             std::vector<InputCloudSample>* samples,
                             bool includeWaveformLayer = false);
+bool payloadWantsIdentityReadPreview(const ResolvedPayload& payload);
+bool payloadImageLassoModeEnabled(const ResolvedPayload& payload);
+bool payloadHasImageLassoSelection(const ResolvedPayload& payload);
 bool cubeSliceContainsPoint(const PlotRemapSpec& spec, float r, float g, float b);
 bool cubeSliceContainsPoint(const ResolvedPayload& payload, float r, float g, float b);
 void filterInputCloudSamples(const ResolvedPayload& payload, std::vector<InputCloudSample>* samples);
@@ -2357,6 +2481,14 @@ bool buildInputCloudMeshCpu(const ResolvedPayload& payload,
                             const InputCloudPayload& cloud,
                             const std::vector<float>& rawPoints,
                             MeshData* out);
+bool buildInputCloudFitMeshCpu(const ResolvedPayload& payload,
+                               const InputCloudPayload& cloud,
+                               MeshData* out);
+bool buildAnalyticalScopeMeshCpu(const ResolvedPayload& payload,
+                                 const InputCloudPayload& cloud,
+                                 const MeshData* previousScope,
+                                 MeshData* out,
+                                 const ViewerGpuCapabilities* gpuCaps = nullptr);
 bool buildInputCloudMeshOnGpu(const ResolvedPayload& payload,
                               const ViewerGpuCapabilities& gpuCaps,
                               ComputeSessionState* sessionState,
@@ -2369,6 +2501,15 @@ bool buildInputCloudMeshOnGpu(const ResolvedPayload& payload,
                               , InputCloudCudaCache* cudaCache
 #endif
                               );
+bool buildInputCloudMesh(const ResolvedPayload& payload,
+                         const ViewerGpuCapabilities& gpuCaps,
+                         ComputeSessionState* sessionState,
+                         InputCloudComputeCache* computeCache,
+#if defined(CHROMASPACE_VIEWER_HAS_CUDA) && !defined(__APPLE__)
+                         InputCloudCudaCache* cudaCache,
+#endif
+                         const InputCloudPayload& cloud,
+                         MeshData* out);
 float wrapHue01(float h);
 float rawRgbHue01(float r, float g, float b, float cMax, float delta);
 void rgbToHsvHexconePlane(float r, float g, float b, float* outX, float* outZ);
@@ -2620,6 +2761,10 @@ struct SourceSignalPayload {
   std::string senderId;
   int sourceWidth = 0;
   int sourceHeight = 0;
+  int sampledX1 = 0;
+  int sampledY1 = 0;
+  int sampledWidth = 0;
+  int sampledHeight = 0;
   int proxyWidth = 0;
   int proxyHeight = 0;
   std::string pixelFormat = "rgba16f";
@@ -2629,6 +2774,16 @@ struct SourceSignalPayload {
   std::string coverage = "full";
   std::string tierLabel = "Proxy";
   std::vector<uint16_t> rgba16f;
+  std::vector<float> rgba32f;
+  bool identityStripPresent = false;
+  int identityStripResolution = 0;
+  bool identityStripDrawCube = false;
+  bool identityStripDrawRamp = false;
+  int identityStripHeight = 0;
+  int identityCubeY1 = 0;
+  int identityCubeY2 = 0;
+  int identityRampY1 = 0;
+  int identityRampY2 = 0;
 };
 
 struct SourceSignalStore {
@@ -4755,6 +4910,1437 @@ bool parseInputCloudSamples(const InputCloudPayload& cloud,
   return !samples->empty();
 }
 
+float halfBitsToFloat(uint16_t h) {
+  const uint32_t sign = (static_cast<uint32_t>(h & 0x8000u)) << 16u;
+  uint32_t exp = static_cast<uint32_t>(h & 0x7C00u) >> 10u;
+  uint32_t mant = static_cast<uint32_t>(h & 0x03FFu);
+  uint32_t bits = 0;
+  if (exp == 0) {
+    if (mant == 0) {
+      bits = sign;
+    } else {
+      exp = 1;
+      while ((mant & 0x0400u) == 0u) {
+        mant <<= 1u;
+        --exp;
+      }
+      mant &= 0x03FFu;
+      bits = sign | ((exp + 112u) << 23u) | (mant << 13u);
+    }
+  } else if (exp == 31u) {
+    bits = sign | 0x7F800000u | (mant << 13u);
+  } else {
+    bits = sign | ((exp + 112u) << 23u) | (mant << 13u);
+  }
+  float out = 0.0f;
+  std::memcpy(&out, &bits, sizeof(out));
+  return out;
+}
+
+bool sourceSignalReadRgb(const SourceSignalPayload& source, int x, int y, InputCloudSample* out) {
+  if (!out || source.proxyWidth <= 0 || source.proxyHeight <= 0) return false;
+  x = std::clamp(x, 0, source.proxyWidth - 1);
+  y = std::clamp(y, 0, source.proxyHeight - 1);
+  const size_t base =
+      (static_cast<size_t>(y) * static_cast<size_t>(source.proxyWidth) + static_cast<size_t>(x)) * 4u;
+  if (source.pixelFormat == "rgba32f" && base + 2u < source.rgba32f.size()) {
+    out->r = source.rgba32f[base + 0u];
+    out->g = source.rgba32f[base + 1u];
+    out->b = source.rgba32f[base + 2u];
+  } else if (base + 2u < source.rgba16f.size()) {
+    out->r = halfBitsToFloat(source.rgba16f[base + 0u]);
+    out->g = halfBitsToFloat(source.rgba16f[base + 1u]);
+    out->b = halfBitsToFloat(source.rgba16f[base + 2u]);
+  } else {
+    return false;
+  }
+  out->xNorm = (static_cast<float>(x) + 0.5f) / static_cast<float>(std::max(1, source.proxyWidth));
+  out->yNorm = (static_cast<float>(y) + 0.5f) / static_cast<float>(std::max(1, source.proxyHeight));
+  return true;
+}
+
+size_t rasterSampleBudgetForPayload(const ResolvedPayload& payload, bool analyticalScope) {
+  const int resolution = std::clamp(payload.resolution > 0 ? payload.resolution : 57, 17, 97);
+  size_t budget = static_cast<size_t>(resolution) *
+                  static_cast<size_t>(resolution) *
+                  static_cast<size_t>(resolution);
+  const int scaleChoice = std::clamp(payload.viewerState.scale, 0, 3);
+  const float scaleFactor =
+      scaleChoice == 0 ? 0.25f :
+      scaleChoice == 1 ? 0.50f :
+      scaleChoice == 2 ? 0.75f :
+                         1.00f;
+  const int samplingChoice = std::clamp(payload.viewerState.sampling, 0, 2);
+  const float samplingScale =
+      samplingChoice == 1 ? 1.10f :
+      samplingChoice == 2 ? 0.82f :
+                            1.00f;
+  budget = static_cast<size_t>(
+      std::max<double>(4096.0,
+                       std::round(static_cast<double>(budget) *
+                                  std::max(0.12f, scaleFactor * scaleFactor) *
+                                  samplingScale)));
+  if (analyticalScope) {
+    budget = std::max<size_t>(budget, 220000u);
+  }
+  return std::clamp<size_t>(budget, 4096u, analyticalScope ? 750000u : 250000u);
+}
+
+double rasterHalton(uint32_t index, uint32_t base) {
+  double f = 1.0;
+  double r = 0.0;
+  while (index > 0u) {
+    f /= static_cast<double>(base);
+    r += f * static_cast<double>(index % base);
+    index /= base;
+  }
+  return r;
+}
+
+bool rasterTransformSampleForPayload(const ResolvedPayload& payload, InputCloudSample* sample);
+
+void appendRasterRowsAsSamples(const SourceSignalPayload& source,
+                               int y1,
+                               int y2,
+                               int maxRows,
+                               const ResolvedPayload* payload,
+                               std::vector<InputCloudSample>* samples) {
+  if (!samples || source.proxyWidth <= 0 || source.proxyHeight <= 0 || y2 <= y1) return;
+  const float scaleY =
+      static_cast<float>(source.proxyHeight) /
+      static_cast<float>(std::max(1, source.sampledHeight > 0 ? source.sampledHeight : source.sourceHeight));
+  const int localY1 = y1 - source.sampledY1;
+  const int localY2 = y2 - source.sampledY1;
+  int py1 = std::clamp(static_cast<int>(std::floor(static_cast<float>(localY1) * scaleY)),
+                       0,
+                       source.proxyHeight - 1);
+  int py2 = std::clamp(static_cast<int>(std::ceil(static_cast<float>(localY2) * scaleY)),
+                       py1 + 1,
+                       source.proxyHeight);
+  const int rowCount = std::max(1, py2 - py1);
+  const int rowStep = std::max(1, rowCount / std::max(1, maxRows));
+  const int xStep = std::max(1, source.proxyWidth / 1024);
+  for (int y = py1; y < py2; y += rowStep) {
+    for (int x = 0; x < source.proxyWidth; x += xStep) {
+      InputCloudSample sample{};
+      if (!sourceSignalReadRgb(source, x, y, &sample)) continue;
+      if (payload) (void)rasterTransformSampleForPayload(*payload, &sample);
+      samples->push_back(sample);
+    }
+  }
+}
+
+bool sourceSignalRowsToProxyRange(const SourceSignalPayload& source,
+                                  int y1,
+                                  int y2,
+                                  int* outY1,
+                                  int* outY2) {
+  if (!outY1 || !outY2 || source.proxyHeight <= 0 || y2 <= y1) return false;
+  const int sourceSampleHeight =
+      std::max(1, source.sampledHeight > 0 ? source.sampledHeight : source.sourceHeight);
+  const float scaleY = static_cast<float>(source.proxyHeight) /
+                       static_cast<float>(sourceSampleHeight);
+  const int localY1 = y1 - source.sampledY1;
+  const int localY2 = y2 - source.sampledY1;
+  const int py1 = std::clamp(static_cast<int>(std::floor(static_cast<float>(localY1) * scaleY)),
+                             0,
+                             source.proxyHeight - 1);
+  const int py2 = std::clamp(static_cast<int>(std::ceil(static_cast<float>(localY2) * scaleY)),
+                             py1 + 1,
+                             source.proxyHeight);
+  if (py2 <= py1) return false;
+  *outY1 = py1;
+  *outY2 = py2;
+  return true;
+}
+
+bool sourceSignalSampleInsideExcludedIdentityRows(const SourceSignalPayload& source, int proxyY) {
+  if (!source.identityStripPresent) return false;
+  int y1 = 0;
+  int y2 = 0;
+  if (source.identityStripDrawCube &&
+      sourceSignalRowsToProxyRange(source, source.identityCubeY1, source.identityCubeY2, &y1, &y2) &&
+      proxyY >= y1 && proxyY < y2) {
+    return true;
+  }
+  if (source.identityStripDrawRamp &&
+      sourceSignalRowsToProxyRange(source, source.identityRampY1, source.identityRampY2, &y1, &y2) &&
+      proxyY >= y1 && proxyY < y2) {
+    return true;
+  }
+  return false;
+}
+
+int rasterOccupancyBinIndex(float r, float g, float b, bool preserveOverflow) {
+  const int binsPerAxis = preserveOverflow ? 18 : 16;
+  const auto toBin = [&](float value) {
+    if (!preserveOverflow) {
+      return std::clamp(static_cast<int>(std::floor(clampf(value, 0.0f, 1.0f) * 16.0f)), 0, 15);
+    }
+    if (value < 0.0f) return 0;
+    if (value > 1.0f) return 17;
+    return 1 + std::clamp(static_cast<int>(std::floor(value * 16.0f)), 0, 15);
+  };
+  return (toBin(r) * binsPerAxis + toBin(g)) * binsPerAxis + toBin(b);
+}
+
+bool rasterTransformSampleForPayload(const ResolvedPayload& payload, InputCloudSample* sample) {
+  if (!sample) return false;
+  *sample = viewerPlotInputSample(payload, *sample);
+  return true;
+}
+
+bool rasterSampleVisibleForPayload(const SourceSignalPayload& source,
+                                   const ResolvedPayload& payload,
+                                   const PlotRemapSpec& remap,
+                                   const LassoRegionState& lassoState,
+                                   int x,
+                                   int y,
+                                   const InputCloudSample& sample) {
+  const bool inAnyIdentityStrip = sourceSignalSampleInsideExcludedIdentityRows(source, y);
+  if (payload.excludeIdentityData && inAnyIdentityStrip) return false;
+  if (payload.isolateIdentityData) {
+    bool inRequestedIdentity = false;
+    int y1 = 0;
+    int y2 = 0;
+    if (payload.readIdentityPlot && source.identityStripDrawCube &&
+        sourceSignalRowsToProxyRange(source, source.identityCubeY1, source.identityCubeY2, &y1, &y2) &&
+        y >= y1 && y < y2) {
+      inRequestedIdentity = true;
+    }
+    if (payload.readGrayRamp && source.identityStripDrawRamp &&
+        sourceSignalRowsToProxyRange(source, source.identityRampY1, source.identityRampY2, &y1, &y2) &&
+        y >= y1 && y < y2) {
+      inRequestedIdentity = true;
+    }
+    if (!inRequestedIdentity) return false;
+  }
+  if (payload.volumeSlicingEnabled && payload.volumeSlicingMode == "lasso") {
+    if (lassoState.strokes.empty()) return false;
+    if (!viewerLassoContainsPoint(lassoState, sample.xNorm, sample.yNorm)) return false;
+  }
+  (void)x;
+  return cubeSliceContainsPoint(remap, sample.r, sample.g, sample.b);
+}
+
+bool sourceSignalToInputCloudSamples(const SourceSignalPayload& source,
+                                     const ResolvedPayload& payload,
+                                     bool analyticalScope,
+                                     std::vector<InputCloudSample>* samples) {
+  if (!samples) return false;
+  samples->clear();
+  if (source.proxyWidth <= 0 || source.proxyHeight <= 0 ||
+      (source.rgba16f.empty() && source.rgba32f.empty())) {
+    return false;
+  }
+  const size_t totalPixels =
+      static_cast<size_t>(source.proxyWidth) * static_cast<size_t>(source.proxyHeight);
+  const size_t budget = rasterSampleBudgetForPayload(payload, analyticalScope);
+  const int stride =
+      totalPixels <= budget
+          ? 1
+          : std::max(1,
+                     static_cast<int>(std::ceil(std::sqrt(static_cast<double>(totalPixels) /
+                                                         static_cast<double>(budget)))));
+  samples->reserve(std::min(totalPixels, budget) + 4096u);
+  const PlotRemapSpec remap = makePlotRemapSpec(payload);
+  const LassoRegionState lassoState =
+      payload.volumeSlicingEnabled && payload.volumeSlicingMode == "lasso"
+          ? parseViewerLassoRegionState(payload.lassoData)
+          : LassoRegionState{};
+  constexpr bool preserveOverflow = true;
+  const int binsPerAxis = preserveOverflow ? 18 : 16;
+  std::vector<int> occupancy(static_cast<size_t>(binsPerAxis * binsPerAxis * binsPerAxis), 0);
+  for (int y = 0; y < source.proxyHeight; y += stride) {
+    for (int x = 0; x < source.proxyWidth; x += stride) {
+      InputCloudSample sample{};
+      if (!sourceSignalReadRgb(source, x, y, &sample)) continue;
+      if (!rasterTransformSampleForPayload(payload, &sample)) continue;
+      if (!rasterSampleVisibleForPayload(source, payload, remap, lassoState, x, y, sample)) continue;
+      samples->push_back(sample);
+      ++occupancy[static_cast<size_t>(rasterOccupancyBinIndex(sample.r, sample.g, sample.b, preserveOverflow))];
+    }
+  }
+
+  if (!analyticalScope && payload.occupancyFill && !samples->empty()) {
+    struct Candidate {
+      InputCloudSample sample{};
+      int bin = 0;
+      int binRank = 0;
+      uint32_t tie = 0;
+    };
+    const int minExtraPointCount = 2048;
+    const int minCandidateTarget = 8192;
+    const int extraPointCount =
+        std::max(minExtraPointCount,
+                 static_cast<int>(std::min<size_t>(std::numeric_limits<int>::max() / 4,
+                                                   std::max<size_t>(samples->size() / 2u, 1u))));
+    const int candidateTarget = std::min(std::max(extraPointCount * 3, minCandidateTarget), 131072);
+    const int maxCandidateAttempts = std::min(std::max(candidateTarget * 4, candidateTarget + 4096), 3000000);
+    std::vector<int> binCandidateRank(occupancy.size(), 0);
+    std::vector<Candidate> candidates;
+    candidates.reserve(static_cast<size_t>(candidateTarget));
+    for (int attempt = 0; attempt < maxCandidateAttempts &&
+                          static_cast<int>(candidates.size()) < candidateTarget; ++attempt) {
+      const double u = rasterHalton(static_cast<uint32_t>(attempt + 1), 2u);
+      const double v = rasterHalton(static_cast<uint32_t>(attempt + 1), 3u);
+      const int x = std::clamp(static_cast<int>(u * static_cast<double>(source.proxyWidth)), 0, source.proxyWidth - 1);
+      const int y = std::clamp(static_cast<int>(v * static_cast<double>(source.proxyHeight)), 0, source.proxyHeight - 1);
+      InputCloudSample sample{};
+      if (!sourceSignalReadRgb(source, x, y, &sample)) continue;
+      if (!rasterTransformSampleForPayload(payload, &sample)) continue;
+      if (!rasterSampleVisibleForPayload(source, payload, remap, lassoState, x, y, sample)) continue;
+      const int bin = rasterOccupancyBinIndex(sample.r, sample.g, sample.b, preserveOverflow);
+      Candidate candidate{};
+      candidate.sample = sample;
+      candidate.bin = bin;
+      candidate.binRank = binCandidateRank[static_cast<size_t>(bin)]++;
+      candidate.tie = static_cast<uint32_t>(attempt);
+      candidates.push_back(candidate);
+    }
+    std::sort(candidates.begin(), candidates.end(), [&](const Candidate& a, const Candidate& b) {
+      if (occupancy[static_cast<size_t>(a.bin)] != occupancy[static_cast<size_t>(b.bin)]) {
+        return occupancy[static_cast<size_t>(a.bin)] < occupancy[static_cast<size_t>(b.bin)];
+      }
+      if (a.binRank != b.binRank) return a.binRank < b.binRank;
+      return a.tie < b.tie;
+    });
+    const int appendCount = std::min<int>(extraPointCount, static_cast<int>(candidates.size()));
+    samples->reserve(samples->size() + static_cast<size_t>(appendCount));
+    for (int i = 0; i < appendCount; ++i) {
+      samples->push_back(candidates[static_cast<size_t>(i)].sample);
+    }
+  }
+
+  if (!payload.excludeIdentityData && payloadWantsIdentityReadPreview(payload) &&
+      source.identityStripPresent) {
+    if (payload.readIdentityPlot && source.identityStripDrawCube) {
+      appendRasterRowsAsSamples(source, source.identityCubeY1, source.identityCubeY2, 96, &payload, samples);
+    }
+    if (payload.readGrayRamp && source.identityStripDrawRamp) {
+      appendRasterRowsAsSamples(source, source.identityRampY1, source.identityRampY2, 96, &payload, samples);
+    }
+  }
+  return !samples->empty();
+}
+
+InputCloudPayload makeVirtualCloudFromRasterSamples(const SourceSignalPayload& source,
+                                                    const ResolvedPayload& payload,
+                                                    const std::vector<InputCloudSample>& samples) {
+  InputCloudPayload cloud{};
+  cloud.seq = source.seq;
+  cloud.contentHash = source.contentHash;
+  cloud.stabilityHash = source.contentHash;
+  cloud.senderId = source.senderId;
+  cloud.resolution = payload.resolution > 0 ? payload.resolution : 57;
+  cloud.quality = source.tierLabel.empty() ? std::string("Raster") : source.tierLabel;
+  cloud.paramHash = std::string("raster:") + source.tierLabel + ":" + source.pixelFormat;
+  cloud.settingsKey = cloud.paramHash;
+  cloud.transport = "raster";
+  cloud.pointCount = samples.size();
+  cloud.primaryPointCount = 0;
+  cloud.basePointCount = 0;
+  cloud.pointStride = static_cast<int>(6u * sizeof(float));
+  cloud.packedPoints.reserve(samples.size() * 6u);
+  for (const auto& sample : samples) {
+    cloud.packedPoints.push_back(sample.xNorm);
+    cloud.packedPoints.push_back(sample.yNorm);
+    cloud.packedPoints.push_back(0.0f);
+    cloud.packedPoints.push_back(sample.r);
+    cloud.packedPoints.push_back(sample.g);
+    cloud.packedPoints.push_back(sample.b);
+  }
+  return cloud;
+}
+
+struct RasterSamplePlan {
+  int stride = 1;
+  int countX = 0;
+  int countY = 0;
+  size_t pointCount = 0;
+};
+
+struct RasterIdentityAppendPlan {
+  int y1 = -1;
+  int y2 = -1;
+  int rowStep = 1;
+  int xStep = 1;
+  int samplesPerRow = 0;
+  int rowCount = 0;
+  size_t pointCount = 0;
+};
+
+struct RasterGpuDerivationPlan {
+  RasterSamplePlan sample;
+  RasterIdentityAppendPlan cubeAppend;
+  RasterIdentityAppendPlan rampAppend;
+  size_t basePointCount = 0;
+  size_t occupancyAppendOffset = 0;
+  size_t occupancyAppendCount = 0;
+  size_t occupancyCandidateCount = 0;
+  size_t totalPointCount = 0;
+};
+
+RasterIdentityAppendPlan rasterIdentityAppendPlanForRows(const SourceSignalPayload& source,
+                                                         int y1,
+                                                         int y2,
+                                                         int maxRows) {
+  RasterIdentityAppendPlan plan{};
+  if (!sourceSignalRowsToProxyRange(source, y1, y2, &plan.y1, &plan.y2)) return {};
+  const int stripRows = std::max(1, plan.y2 - plan.y1);
+  plan.rowStep = std::max(1, stripRows / std::max(1, maxRows));
+  plan.xStep = std::max(1, source.proxyWidth / 1024);
+  plan.samplesPerRow = std::max(1, (std::max(0, source.proxyWidth) + plan.xStep - 1) / plan.xStep);
+  plan.rowCount = std::max(1, (stripRows + plan.rowStep - 1) / plan.rowStep);
+  plan.pointCount = static_cast<size_t>(plan.samplesPerRow) * static_cast<size_t>(plan.rowCount);
+  return plan;
+}
+
+RasterSamplePlan rasterSamplePlanForPayload(const SourceSignalPayload& source,
+                                            const ResolvedPayload& payload,
+                                            bool analyticalScope);
+
+RasterGpuDerivationPlan rasterGpuDerivationPlanForPayload(const SourceSignalPayload& source,
+                                                          const ResolvedPayload& payload,
+                                                          bool analyticalScope) {
+  RasterGpuDerivationPlan plan{};
+  plan.sample = rasterSamplePlanForPayload(source, payload, analyticalScope);
+  plan.basePointCount = plan.sample.pointCount;
+  plan.totalPointCount = plan.basePointCount;
+  if (!payload.excludeIdentityData && payloadWantsIdentityReadPreview(payload) &&
+      source.identityStripPresent) {
+    if (payload.readIdentityPlot && source.identityStripDrawCube) {
+      plan.cubeAppend =
+          rasterIdentityAppendPlanForRows(source, source.identityCubeY1, source.identityCubeY2, 96);
+    }
+    if (payload.readGrayRamp && source.identityStripDrawRamp) {
+      plan.rampAppend =
+          rasterIdentityAppendPlanForRows(source, source.identityRampY1, source.identityRampY2, 96);
+    }
+  }
+  plan.totalPointCount += plan.cubeAppend.pointCount + plan.rampAppend.pointCount;
+  const bool occupancyFillApplies =
+      payload.occupancyFill &&
+      !analyticalScope &&
+      payload.plotMode != "source_signal" &&
+      classifyPlotMode(payload) != PlotModeKind::GlossLift;
+  plan.occupancyAppendOffset = plan.totalPointCount;
+  if (occupancyFillApplies && plan.basePointCount > 0) {
+    plan.occupancyAppendCount = std::clamp<size_t>(
+        std::max<size_t>(2048u, plan.basePointCount / 2u), 2048u, 131072u);
+    plan.occupancyCandidateCount =
+        std::clamp<size_t>(plan.occupancyAppendCount * 3u, 8192u, 393216u);
+    plan.totalPointCount += plan.occupancyAppendCount;
+  }
+  return plan;
+}
+
+RasterSamplePlan rasterSamplePlanForPayload(const SourceSignalPayload& source,
+                                            const ResolvedPayload& payload,
+                                            bool analyticalScope) {
+  RasterSamplePlan plan{};
+  if (source.proxyWidth <= 0 || source.proxyHeight <= 0) return plan;
+  const size_t totalPixels =
+      static_cast<size_t>(source.proxyWidth) * static_cast<size_t>(source.proxyHeight);
+  const size_t budget = rasterSampleBudgetForPayload(payload, analyticalScope);
+  plan.stride =
+      totalPixels <= budget
+          ? 1
+          : std::max(1,
+                     static_cast<int>(std::ceil(std::sqrt(static_cast<double>(totalPixels) /
+                                                         static_cast<double>(budget)))));
+  plan.countX = (source.proxyWidth + plan.stride - 1) / plan.stride;
+  plan.countY = (source.proxyHeight + plan.stride - 1) / plan.stride;
+  plan.pointCount = static_cast<size_t>(std::max(0, plan.countX)) *
+                    static_cast<size_t>(std::max(0, plan.countY));
+  return plan;
+}
+
+template <typename RequestT, typename RemapT>
+void populateRasterSourceRequestCommon(RequestT* request,
+                                       const RasterGpuDerivationPlan& plan,
+                                       const SourceSignalPayload& source,
+                                       const ResolvedPayload& payload,
+                                       const PlotRemapSpec& remap,
+                                       const RemapT& backendRemap,
+                                       int pixelFormat) {
+  if (!request) return;
+  request->pointCount = static_cast<int>(plan.totalPointCount);
+  request->basePointCount = static_cast<int>(plan.basePointCount);
+  request->sourceWidth = source.proxyWidth;
+  request->sourceHeight = source.proxyHeight;
+  request->sampleStride = plan.sample.stride;
+  request->sampleCountX = plan.sample.countX;
+  request->pixelFormat = pixelFormat;
+  request->sourceAspect = payload.sourceAspect;
+  request->glossLiftScale = payload.glossLiftScale;
+  request->pointAlphaScale =
+      pointAlphaScaleForPlot(payload.pointSize, payload.pointDensity, payload.resolution);
+  request->denseAlphaBias =
+      denseAlphaBiasForPlot(payload.pointSize, payload.pointDensity, payload.resolution);
+  request->colorSaturation = bakedColorSaturationForPlot(payload);
+  request->remap = backendRemap;
+  request->plotLinear = viewerPlotLinearApplies(payload) ? 1 : 0;
+  request->plotLinearTransfer = payload.plotDisplayLinearTransfer;
+  request->excludeIdentityData = payload.excludeIdentityData ? 1 : 0;
+  request->isolateIdentityData = payload.isolateIdentityData ? 1 : 0;
+  request->readIdentityPlot = payload.readIdentityPlot ? 1 : 0;
+  request->readGrayRamp = payload.readGrayRamp ? 1 : 0;
+  int stripY1 = 0;
+  int stripY2 = 0;
+  if (source.identityStripPresent && source.identityStripDrawCube &&
+      sourceSignalRowsToProxyRange(source, source.identityCubeY1, source.identityCubeY2, &stripY1, &stripY2)) {
+    request->identityCubeY1 = stripY1;
+    request->identityCubeY2 = stripY2;
+  }
+  if (source.identityStripPresent && source.identityStripDrawRamp &&
+      sourceSignalRowsToProxyRange(source, source.identityRampY1, source.identityRampY2, &stripY1, &stripY2)) {
+    request->identityRampY1 = stripY1;
+    request->identityRampY2 = stripY2;
+  }
+  size_t appendOffset = plan.basePointCount;
+  if (plan.cubeAppend.pointCount > 0) {
+    request->identityCubeAppendOffset = static_cast<int>(appendOffset);
+    request->identityCubeAppendCount = static_cast<int>(plan.cubeAppend.pointCount);
+    request->identityCubeAppendY1 = plan.cubeAppend.y1;
+    request->identityCubeAppendY2 = plan.cubeAppend.y2;
+    request->identityCubeAppendRowStep = plan.cubeAppend.rowStep;
+    request->identityCubeAppendXStep = plan.cubeAppend.xStep;
+    appendOffset += plan.cubeAppend.pointCount;
+  }
+  if (plan.rampAppend.pointCount > 0) {
+    request->identityRampAppendOffset = static_cast<int>(appendOffset);
+    request->identityRampAppendCount = static_cast<int>(plan.rampAppend.pointCount);
+    request->identityRampAppendY1 = plan.rampAppend.y1;
+    request->identityRampAppendY2 = plan.rampAppend.y2;
+    request->identityRampAppendRowStep = plan.rampAppend.rowStep;
+    request->identityRampAppendXStep = plan.rampAppend.xStep;
+    appendOffset += plan.rampAppend.pointCount;
+  }
+  if (plan.occupancyAppendCount > 0) {
+    request->occupancyFill = 1;
+    request->occupancyAppendOffset = static_cast<int>(plan.occupancyAppendOffset);
+    request->occupancyAppendCount = static_cast<int>(plan.occupancyAppendCount);
+    request->occupancyCandidateCount = static_cast<int>(plan.occupancyCandidateCount);
+  }
+  const bool lassoMode =
+      payload.volumeSlicingEnabled && payload.volumeSlicingMode == "lasso";
+  if (lassoMode) {
+    request->lassoEnabled = 1;
+    const LassoRegionState lassoState = parseViewerLassoRegionState(payload.lassoData);
+    int strokeIndex = 0;
+    int pointIndex = 0;
+    for (const auto& stroke : lassoState.strokes) {
+      if (stroke.points.size() < 3 || strokeIndex >= 16 || pointIndex >= 256) continue;
+      const int available = 256 - pointIndex;
+      const int count = std::min<int>(available, static_cast<int>(stroke.points.size()));
+      if (count < 3) break;
+      request->lassoStrokeFirst[strokeIndex] = pointIndex;
+      request->lassoStrokeCountPerStroke[strokeIndex] = count;
+      request->lassoStrokeSubtract[strokeIndex] = stroke.subtract ? 1 : 0;
+      for (int i = 0; i < count; ++i) {
+        request->lassoX[pointIndex + i] =
+            clampf(stroke.points[static_cast<size_t>(i)].xNorm, 0.0f, 1.0f);
+        request->lassoY[pointIndex + i] =
+            clampf(stroke.points[static_cast<size_t>(i)].yNorm, 0.0f, 1.0f);
+      }
+      pointIndex += count;
+      ++strokeIndex;
+    }
+    request->lassoStrokeCount = strokeIndex;
+    request->lassoPointCount = pointIndex;
+  }
+  request->cubeSlicingEnabled = remap.cubeSlicingEnabled ? 1 : 0;
+  request->neutralRadiusEnabled = remap.neutralRadiusEnabled ? 1 : 0;
+  request->neutralRadius = remap.neutralRadius;
+  request->cubeSliceRed = remap.cubeSliceRed ? 1 : 0;
+  request->cubeSliceYellow = remap.cubeSliceYellow ? 1 : 0;
+  request->cubeSliceGreen = remap.cubeSliceGreen ? 1 : 0;
+  request->cubeSliceCyan = remap.cubeSliceCyan ? 1 : 0;
+  request->cubeSliceBlue = remap.cubeSliceBlue ? 1 : 0;
+  request->cubeSliceMagenta = remap.cubeSliceMagenta ? 1 : 0;
+}
+
+bool rasterGlComputeCanRepresentPayload(const ResolvedPayload& payload,
+                                        const SourceSignalPayload& source,
+                                        bool analyticalScope,
+                                        std::string* reason) {
+  const auto reject = [reason](const char* why) {
+    if (reason) *reason = why;
+    return false;
+  };
+  if (!rasterGpuDerivationEnabled()) return reject("disabled");
+  if (analyticalScope) return reject("analytical-scope-cpu-reference");
+  if (classifyPlotMode(payload) == PlotModeKind::GlossLift) return reject("gloss-field-cpu-reference");
+  if (viewerPlotLinearApplies(payload)) return reject("plot-linear-filter");
+  if (payload.occupancyFill) return reject("occupancy-fill-filter");
+  if (payload.readGrayRamp || payload.readIdentityPlot || payload.isolateIdentityData ||
+      payload.excludeIdentityData) {
+    return reject("identity-ramp-filter");
+  }
+  if (payload.volumeSlicingEnabled && payload.volumeSlicingMode == "lasso") {
+    return reject("source-lasso-filter");
+  }
+  const PlotRemapSpec remap = makePlotRemapSpec(payload);
+  if (remap.cubeSlicingEnabled || remap.neutralRadiusEnabled) return reject("volume-slicing-filter");
+  if (source.proxyWidth <= 0 || source.proxyHeight <= 0) return reject("empty-source");
+  if (source.pixelFormat == "rgba32f") {
+    if (source.rgba32f.size() < static_cast<size_t>(source.proxyWidth) *
+                                  static_cast<size_t>(source.proxyHeight) * 4u) {
+      return reject("incomplete-rgba32f");
+    }
+  } else if (source.pixelFormat == "rgba16f") {
+    if (source.rgba16f.size() < static_cast<size_t>(source.proxyWidth) *
+                                   static_cast<size_t>(source.proxyHeight) * 4u) {
+      return reject("incomplete-rgba16f");
+    }
+  } else {
+    return reject("unsupported-format");
+  }
+  if (reason) *reason = "gl-raster-compute";
+  return true;
+}
+
+bool rasterCudaDirectCanRepresentPayload(const ResolvedPayload& payload,
+                                         const SourceSignalPayload& source,
+                                         bool analyticalScope,
+                                         std::string* reason) {
+  const auto reject = [reason](const char* why) {
+    if (reason) *reason = why;
+    return false;
+  };
+  if (!rasterGpuDerivationEnabled()) return reject("disabled");
+  if (analyticalScope) return reject("analytical-scope-density");
+  if (source.proxyWidth <= 0 || source.proxyHeight <= 0) return reject("empty-source");
+  if (source.pixelFormat == "rgba32f") {
+    if (source.rgba32f.size() < static_cast<size_t>(source.proxyWidth) *
+                                  static_cast<size_t>(source.proxyHeight) * 4u) {
+      return reject("incomplete-rgba32f");
+    }
+  } else if (source.pixelFormat == "rgba16f") {
+    if (source.rgba16f.size() < static_cast<size_t>(source.proxyWidth) *
+                                   static_cast<size_t>(source.proxyHeight) * 4u) {
+      return reject("incomplete-rgba16f");
+    }
+  } else {
+    return reject("unsupported-format");
+  }
+  if (reason) *reason = "cuda-raster-direct";
+  return true;
+}
+
+bool rasterMetalDirectCanRepresentPayload(const ResolvedPayload& payload,
+                                          const SourceSignalPayload& source,
+                                          bool analyticalScope,
+                                          std::string* reason) {
+  const auto reject = [reason](const char* why) {
+    if (reason) *reason = why;
+    return false;
+  };
+  if (!rasterGpuDerivationEnabled()) return reject("disabled");
+  if (analyticalScope) return reject("analytical-scope-density");
+  if (source.proxyWidth <= 0 || source.proxyHeight <= 0) return reject("empty-source");
+  if (source.pixelFormat == "rgba32f") {
+    if (source.rgba32f.size() < static_cast<size_t>(source.proxyWidth) *
+                                  static_cast<size_t>(source.proxyHeight) * 4u) {
+      return reject("incomplete-rgba32f");
+    }
+  } else if (source.pixelFormat == "rgba16f") {
+    if (source.rgba16f.size() < static_cast<size_t>(source.proxyWidth) *
+                                   static_cast<size_t>(source.proxyHeight) * 4u) {
+      return reject("incomplete-rgba16f");
+    }
+  } else {
+    return reject("unsupported-format");
+  }
+  if (reason) *reason = "metal-raster-direct";
+  return true;
+}
+
+bool ensureRasterSignalComputeProgram(RasterSignalComputeCache* cache) {
+  if (!cache) return false;
+  if (cache->available && cache->program != 0) return true;
+  if (cache->initAttempted) return false;
+  cache->initAttempted = true;
+  const ViewerGlComputeApi& api = viewerGlComputeApi();
+  if (!api.available) return false;
+  static const char* kShaderSrc = R"GLSL(
+#version 430
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) readonly buffer SourceWords { uint sourceWords[]; };
+layout(std430, binding = 1) buffer InputSamples { float inputVals[]; };
+uniform int uPointCount;
+uniform int uSourceWidth;
+uniform int uSourceHeight;
+uniform int uSampleStride;
+uniform int uSampleCountX;
+uniform int uPixelFormat; // 0=rgba16f packed as two uint words per pixel, 1=rgba32f as float bits.
+
+vec3 readSourceRgb(int x, int y) {
+  x = clamp(x, 0, max(uSourceWidth - 1, 0));
+  y = clamp(y, 0, max(uSourceHeight - 1, 0));
+  uint pixel = uint(y * uSourceWidth + x);
+  if (uPixelFormat == 1) {
+    uint base = pixel * 4u;
+    return vec3(uintBitsToFloat(sourceWords[base + 0u]),
+                uintBitsToFloat(sourceWords[base + 1u]),
+                uintBitsToFloat(sourceWords[base + 2u]));
+  }
+  uint base = pixel * 2u;
+  vec2 rg = unpackHalf2x16(sourceWords[base + 0u]);
+  vec2 ba = unpackHalf2x16(sourceWords[base + 1u]);
+  return vec3(rg.x, rg.y, ba.x);
+}
+
+void main() {
+  int index = int(gl_GlobalInvocationID.x);
+  if (index >= uPointCount) return;
+  int sx = max(uSampleCountX, 1);
+  int x = (index % sx) * max(uSampleStride, 1);
+  int y = (index / sx) * max(uSampleStride, 1);
+  vec3 rgb = readSourceRgb(x, y);
+  int base = index * 3;
+  inputVals[base + 0] = rgb.r;
+  inputVals[base + 1] = rgb.g;
+  inputVals[base + 2] = rgb.b;
+}
+)GLSL";
+  const GLuint shader = api.createShader(GL_COMPUTE_SHADER);
+  if (shader == 0) return false;
+  api.shaderSource(shader, 1, &kShaderSrc, nullptr);
+  api.compileShader(shader);
+  GLint compiled = 0;
+  api.getShaderiv(shader, GL_COMPILE_STATUS, &compiled);
+  if (!compiled) {
+    logViewerEvent(std::string("Raster source compute shader compile failed: ") +
+                   readShaderLog(shader, false, api));
+    api.deleteShader(shader);
+    return false;
+  }
+  const GLuint program = api.createProgram();
+  if (program == 0) {
+    api.deleteShader(shader);
+    return false;
+  }
+  api.attachShader(program, shader);
+  api.linkProgram(program);
+  api.deleteShader(shader);
+  GLint linked = 0;
+  api.getProgramiv(program, GL_LINK_STATUS, &linked);
+  if (!linked) {
+    logViewerEvent(std::string("Raster source compute program link failed: ") +
+                   readShaderLog(program, true, api));
+    api.deleteProgram(program);
+    return false;
+  }
+  cache->program = program;
+  cache->pointCountLoc = api.getUniformLocation(program, "uPointCount");
+  cache->sourceWidthLoc = api.getUniformLocation(program, "uSourceWidth");
+  cache->sourceHeightLoc = api.getUniformLocation(program, "uSourceHeight");
+  cache->sampleStrideLoc = api.getUniformLocation(program, "uSampleStride");
+  cache->sampleCountXLoc = api.getUniformLocation(program, "uSampleCountX");
+  cache->pixelFormatLoc = api.getUniformLocation(program, "uPixelFormat");
+  cache->available = cache->pointCountLoc >= 0 &&
+                     cache->sourceWidthLoc >= 0 &&
+                     cache->sourceHeightLoc >= 0 &&
+                     cache->sampleStrideLoc >= 0 &&
+                     cache->sampleCountXLoc >= 0 &&
+                     cache->pixelFormatLoc >= 0;
+  if (!cache->available) {
+    logViewerEvent("Raster source compute program missing uniforms; falling back to CPU.");
+    return false;
+  }
+  return true;
+}
+
+bool packSourceSignalWordsForGl(const SourceSignalPayload& source, std::vector<uint32_t>* out) {
+  if (!out) return false;
+  out->clear();
+  const size_t pixelCount =
+      static_cast<size_t>(std::max(0, source.proxyWidth)) *
+      static_cast<size_t>(std::max(0, source.proxyHeight));
+  if (source.pixelFormat == "rgba32f") {
+    if (source.rgba32f.size() < pixelCount * 4u) return false;
+    out->resize(pixelCount * 4u);
+    std::memcpy(out->data(), source.rgba32f.data(), out->size() * sizeof(uint32_t));
+    return true;
+  }
+  if (source.pixelFormat != "rgba16f" || source.rgba16f.size() < pixelCount * 4u) return false;
+  out->resize(pixelCount * 2u);
+  for (size_t pixel = 0; pixel < pixelCount; ++pixel) {
+    const size_t src = pixel * 4u;
+    const uint32_t rg = static_cast<uint32_t>(source.rgba16f[src + 0u]) |
+                        (static_cast<uint32_t>(source.rgba16f[src + 1u]) << 16u);
+    const uint32_t ba = static_cast<uint32_t>(source.rgba16f[src + 2u]) |
+                        (static_cast<uint32_t>(source.rgba16f[src + 3u]) << 16u);
+    out->at(pixel * 2u + 0u) = rg;
+    out->at(pixel * 2u + 1u) = ba;
+  }
+  return true;
+}
+
+bool buildRasterDerivedMeshGlCompute(const ResolvedPayload& resolved,
+                                     const SourceSignalPayload& source,
+                                     bool analyticalScope,
+                                     MeshData* out,
+                                     std::string* fallbackReason) {
+  if (!out) return false;
+  ResolvedPayload payload = resolved;
+  if (source.sourceWidth > 0 && source.sourceHeight > 0) {
+    payload.sourceAspect =
+        static_cast<float>(source.sourceWidth) / static_cast<float>(std::max(1, source.sourceHeight));
+  }
+  std::string reason;
+  if (!rasterGlComputeCanRepresentPayload(payload, source, analyticalScope, &reason)) {
+    if (fallbackReason) *fallbackReason = reason;
+    return false;
+  }
+  RasterSamplePlan plan = rasterSamplePlanForPayload(source, payload, analyticalScope);
+  if (plan.pointCount == 0) {
+    if (fallbackReason) *fallbackReason = "empty-sample-plan";
+    return false;
+  }
+  const ViewerGlBufferApi& bufferApi = viewerGlBufferApi();
+  const ViewerGlComputeApi& computeApi = viewerGlComputeApi();
+  if (!bufferApi.available || !bufferApi.getBufferSubData || !computeApi.available) {
+    if (fallbackReason) *fallbackReason = "no-gl-compute";
+    return false;
+  }
+  static RasterSignalComputeCache rasterCache{};
+  static InputCloudComputeCache mapCache{};
+  if (!ensureRasterSignalComputeProgram(&rasterCache) ||
+      !ensureInputCloudComputeProgram(&mapCache)) {
+    if (fallbackReason) *fallbackReason = "program-unavailable";
+    return false;
+  }
+  auto ensureBuffer = [&](GLuint* id) {
+    if (*id == 0) bufferApi.genBuffers(1, id);
+    return *id != 0;
+  };
+  if (!ensureBuffer(&rasterCache.source) ||
+      !ensureBuffer(&mapCache.input) ||
+      !ensureBuffer(&mapCache.verts) ||
+      !ensureBuffer(&mapCache.colors)) {
+    if (fallbackReason) *fallbackReason = "buffer-allocation";
+    return false;
+  }
+  std::vector<uint32_t> sourceWords;
+  if (!packSourceSignalWordsForGl(source, &sourceWords) || sourceWords.empty()) {
+    if (fallbackReason) *fallbackReason = "source-pack";
+    return false;
+  }
+  while (glGetError() != GL_NO_ERROR) {
+  }
+  bufferApi.bindBuffer(GL_SHADER_STORAGE_BUFFER, rasterCache.source);
+  bufferApi.bufferData(GL_SHADER_STORAGE_BUFFER,
+                       static_cast<ViewerGLsizeiptr>(sourceWords.size() * sizeof(uint32_t)),
+                       sourceWords.data(),
+                       GL_DYNAMIC_DRAW);
+  bufferApi.bindBuffer(GL_SHADER_STORAGE_BUFFER, mapCache.input);
+  bufferApi.bufferData(GL_SHADER_STORAGE_BUFFER,
+                       static_cast<ViewerGLsizeiptr>(plan.pointCount * 3u * sizeof(float)),
+                       nullptr,
+                       GL_DYNAMIC_DRAW);
+  bufferApi.bindBuffer(GL_SHADER_STORAGE_BUFFER, mapCache.verts);
+  bufferApi.bufferData(GL_SHADER_STORAGE_BUFFER,
+                       static_cast<ViewerGLsizeiptr>(plan.pointCount * 3u * sizeof(float)),
+                       nullptr,
+                       GL_DYNAMIC_DRAW);
+  bufferApi.bindBuffer(GL_SHADER_STORAGE_BUFFER, mapCache.colors);
+  bufferApi.bufferData(GL_SHADER_STORAGE_BUFFER,
+                       static_cast<ViewerGLsizeiptr>(plan.pointCount * 4u * sizeof(float)),
+                       nullptr,
+                       GL_DYNAMIC_DRAW);
+
+  computeApi.useProgram(rasterCache.program);
+  computeApi.uniform1i(rasterCache.pointCountLoc, static_cast<GLint>(plan.pointCount));
+  computeApi.uniform1i(rasterCache.sourceWidthLoc, source.proxyWidth);
+  computeApi.uniform1i(rasterCache.sourceHeightLoc, source.proxyHeight);
+  computeApi.uniform1i(rasterCache.sampleStrideLoc, plan.stride);
+  computeApi.uniform1i(rasterCache.sampleCountXLoc, plan.countX);
+  computeApi.uniform1i(rasterCache.pixelFormatLoc, source.pixelFormat == "rgba32f" ? 1 : 0);
+  computeApi.bindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, rasterCache.source);
+  computeApi.bindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, mapCache.input);
+  computeApi.dispatchCompute(static_cast<GLuint>((plan.pointCount + 255u) / 256u), 1u, 1u);
+  computeApi.memoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+
+  const PlotRemapSpec remap = makePlotRemapSpec(payload);
+  const ComputeRemapUniforms uniforms = makeComputeRemapUniforms(remap);
+  computeApi.useProgram(mapCache.program);
+  computeApi.uniform1i(mapCache.pointCountLoc, static_cast<GLint>(plan.pointCount));
+  computeApi.uniform1i(mapCache.showOverflowLoc, uniforms.showOverflow);
+  computeApi.uniform1i(mapCache.highlightOverflowLoc, uniforms.highlightOverflow);
+  computeApi.uniform1i(mapCache.plotModeLoc, uniforms.plotMode);
+  computeApi.uniform1i(mapCache.circularHslLoc, uniforms.circularHsl);
+  computeApi.uniform1i(mapCache.circularHsvLoc, uniforms.circularHsv);
+  computeApi.uniform1i(mapCache.normConeNormalizedLoc, uniforms.normConeNormalized);
+  computeApi.uniform1i(mapCache.inputStrideLoc, 3);
+  computeApi.uniform1i(mapCache.glossViewLoc, 0);
+  computeApi.uniform1f(mapCache.sourceAspectLoc, payload.sourceAspect);
+  computeApi.uniform1f(mapCache.glossLiftScaleLoc, payload.glossLiftScale);
+  computeApi.uniform1f(mapCache.pointAlphaScaleLoc,
+                       pointAlphaScaleForPlot(payload.pointSize, payload.pointDensity, payload.resolution));
+  computeApi.uniform1f(mapCache.denseAlphaBiasLoc,
+                       denseAlphaBiasForPlot(payload.pointSize, payload.pointDensity, payload.resolution));
+  computeApi.uniform1f(mapCache.colorSaturationLoc, bakedColorSaturationForPlot(payload));
+  computeApi.uniform1i(mapCache.chromaticityTransferLoc, uniforms.chromaticityInputTransfer);
+  computeApi.uniform1i(mapCache.chromaticityReferenceBasisLoc, uniforms.chromaticityReferenceBasis);
+  computeApi.uniform2f(mapCache.chromaticityWhiteLoc, uniforms.chromaticityWhiteX, uniforms.chromaticityWhiteY);
+  computeApi.uniform3f(mapCache.chromaticityMatrixRow0Loc,
+                       uniforms.chromaticityRgbToXyz[0],
+                       uniforms.chromaticityRgbToXyz[1],
+                       uniforms.chromaticityRgbToXyz[2]);
+  computeApi.uniform3f(mapCache.chromaticityMatrixRow1Loc,
+                       uniforms.chromaticityRgbToXyz[3],
+                       uniforms.chromaticityRgbToXyz[4],
+                       uniforms.chromaticityRgbToXyz[5]);
+  computeApi.uniform3f(mapCache.chromaticityMatrixRow2Loc,
+                       uniforms.chromaticityRgbToXyz[6],
+                       uniforms.chromaticityRgbToXyz[7],
+                       uniforms.chromaticityRgbToXyz[8]);
+  computeApi.uniform3f(mapCache.chromaticityInverseRow0Loc,
+                       uniforms.chromaticityXyzToRgb[0],
+                       uniforms.chromaticityXyzToRgb[1],
+                       uniforms.chromaticityXyzToRgb[2]);
+  computeApi.uniform3f(mapCache.chromaticityInverseRow1Loc,
+                       uniforms.chromaticityXyzToRgb[3],
+                       uniforms.chromaticityXyzToRgb[4],
+                       uniforms.chromaticityXyzToRgb[5]);
+  computeApi.uniform3f(mapCache.chromaticityInverseRow2Loc,
+                       uniforms.chromaticityXyzToRgb[6],
+                       uniforms.chromaticityXyzToRgb[7],
+                       uniforms.chromaticityXyzToRgb[8]);
+  computeApi.bindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, mapCache.input);
+  computeApi.bindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, mapCache.verts);
+  computeApi.bindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, mapCache.colors);
+  computeApi.dispatchCompute(static_cast<GLuint>((plan.pointCount + 63u) / 64u), 1u, 1u);
+  computeApi.memoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_BUFFER_UPDATE_BARRIER_BIT |
+                           GL_VERTEX_ATTRIB_ARRAY_BARRIER_BIT);
+  computeApi.useProgram(0);
+
+  MeshData mesh{};
+  mesh.resolution = payload.resolution <= 25 ? 25 : (payload.resolution <= 41 ? 41 : 57);
+  mesh.quality = source.tierLabel.empty() ? std::string("Raster GL") : source.tierLabel + " GL";
+  mesh.paramHash = std::string("raster-gl:") + source.tierLabel + ":" + source.pixelFormat;
+  mesh.serial = nextMeshSerial();
+  mesh.pointCount = plan.pointCount;
+  mesh.pointVerts.resize(plan.pointCount * 3u);
+  mesh.pointColors.resize(plan.pointCount * 4u);
+  bufferApi.bindBuffer(GL_SHADER_STORAGE_BUFFER, mapCache.verts);
+  bufferApi.getBufferSubData(GL_SHADER_STORAGE_BUFFER,
+                             0,
+                             static_cast<ViewerGLsizeiptr>(mesh.pointVerts.size() * sizeof(float)),
+                             mesh.pointVerts.data());
+  bufferApi.bindBuffer(GL_SHADER_STORAGE_BUFFER, mapCache.colors);
+  bufferApi.getBufferSubData(GL_SHADER_STORAGE_BUFFER,
+                             0,
+                             static_cast<ViewerGLsizeiptr>(mesh.pointColors.size() * sizeof(float)),
+                             mesh.pointColors.data());
+  bufferApi.bindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+  if (glGetError() != GL_NO_ERROR) {
+    if (fallbackReason) *fallbackReason = "gl-error";
+    return false;
+  }
+  setMeshFitBoundsFromVerts(&mesh);
+  mapCache.builtSerial = mesh.serial;
+  mapCache.pointCount = static_cast<GLsizei>(mesh.pointCount);
+  *out = std::move(mesh);
+  if (fallbackReason) *fallbackReason = "gl-raster-compute";
+  return true;
+}
+
+bool buildRasterDerivedMeshBackendMapped(const ResolvedPayload& resolved,
+                                         const SourceSignalPayload& source,
+                                         const ViewerGpuCapabilities& gpuCaps,
+                                         ComputeSessionState* sessionState,
+#if defined(CHROMASPACE_VIEWER_HAS_CUDA) && !defined(__APPLE__)
+                                         InputCloudCudaCache* residentCudaCache,
+#endif
+                                         bool analyticalScope,
+                                         MeshData* out,
+                                         std::string* fallbackReason) {
+  if (!out) return false;
+  ResolvedPayload payload = resolved;
+  if (source.sourceWidth > 0 && source.sourceHeight > 0) {
+    payload.sourceAspect =
+        static_cast<float>(source.sourceWidth) / static_cast<float>(std::max(1, source.sourceHeight));
+  }
+  if (payloadImageLassoModeEnabled(payload) && !payloadHasImageLassoSelection(payload)) {
+    MeshData mesh{};
+    mesh.resolution = payload.resolution <= 25 ? 25 : (payload.resolution <= 41 ? 41 : 57);
+    mesh.quality = source.tierLabel.empty() ? std::string("Raster") : source.tierLabel;
+    mesh.paramHash = std::string("raster-empty-lasso:") + source.tierLabel + ":" + source.pixelFormat;
+    mesh.serial = nextMeshSerial();
+    mesh.pointCount = 0;
+    *out = std::move(mesh);
+    if (fallbackReason) *fallbackReason = "empty-image-lasso";
+    return true;
+  }
+  if (classifyPlotMode(payload) == PlotModeKind::GlossLift) {
+    std::vector<InputCloudSample> samples;
+    if (!sourceSignalToInputCloudSamples(source, payload, false, &samples)) {
+      if (fallbackReason) *fallbackReason = "gloss-raster-sampling";
+      return false;
+    }
+    InputCloudPayload virtualCloud = makeVirtualCloudFromRasterSamples(source, payload, samples);
+    if (!buildInputCloudMesh(payload,
+                             gpuCaps,
+                             sessionState,
+                             nullptr,
+#if defined(CHROMASPACE_VIEWER_HAS_CUDA) && !defined(__APPLE__)
+                             residentCudaCache,
+#endif
+                             virtualCloud,
+                             out)) {
+      if (fallbackReason) *fallbackReason = "gloss-raster-field-build";
+      return false;
+    }
+    if (fallbackReason) *fallbackReason = "gloss-raster-gpu-field";
+    return true;
+  }
+  if (analyticalScope) {
+    if (fallbackReason) *fallbackReason = "analytical-scope-density";
+    return false;
+  }
+#if defined(CHROMASPACE_VIEWER_HAS_CUDA) && !defined(__APPLE__)
+  const PlotRemapSpec directRemap = makePlotRemapSpec(payload);
+  std::string directRepresentReason;
+  if (sessionWantsCuda(gpuCaps) && sessionState &&
+      canUseCudaInputPath(gpuCaps, sessionState, directRemap) &&
+      rasterCudaDirectCanRepresentPayload(payload, source, analyticalScope, &directRepresentReason)) {
+    if (!residentCudaCache) {
+      if (fallbackReason) *fallbackReason = "cuda-no-resident-cache";
+      return false;
+    }
+    RasterGpuDerivationPlan gpuPlan = rasterGpuDerivationPlanForPayload(source, payload, analyticalScope);
+    if (gpuPlan.totalPointCount == 0) {
+      if (fallbackReason) *fallbackReason = "cuda-empty-sample-plan";
+      return false;
+    }
+    RasterSamplePlan plan = gpuPlan.sample;
+    plan.pointCount = gpuPlan.totalPointCount;
+    const size_t basePointCount = gpuPlan.basePointCount;
+    const RasterIdentityAppendPlan& cubeAppend = gpuPlan.cubeAppend;
+    const RasterIdentityAppendPlan& rampAppend = gpuPlan.rampAppend;
+    const size_t occupancyAppendOffset = gpuPlan.occupancyAppendOffset;
+    const size_t occupancyAppendCount = gpuPlan.occupancyAppendCount;
+    const size_t occupancyCandidateCount = gpuPlan.occupancyCandidateCount;
+    if (plan.pointCount > static_cast<size_t>(std::numeric_limits<int>::max())) {
+      if (fallbackReason) *fallbackReason = "cuda-raster-point-limit";
+      return false;
+    }
+    const void* sourceBytes = nullptr;
+    size_t sourceByteCount = 0;
+    int cudaPixelFormat = 0;
+    const size_t pixelCount = static_cast<size_t>(std::max(0, source.proxyWidth)) *
+                              static_cast<size_t>(std::max(0, source.proxyHeight));
+    if (source.pixelFormat == "rgba32f") {
+      sourceBytes = source.rgba32f.data();
+      sourceByteCount = std::min(source.rgba32f.size(), pixelCount * 4u) * sizeof(float);
+      cudaPixelFormat = 1;
+    } else {
+      sourceBytes = source.rgba16f.data();
+      sourceByteCount = std::min(source.rgba16f.size(), pixelCount * 4u) * sizeof(uint16_t);
+      cudaPixelFormat = 0;
+    }
+    const ViewerGlBufferApi& bufferApi = viewerGlBufferApi();
+    if (!bufferApi.available || !sourceBytes || sourceByteCount == 0) {
+      if (fallbackReason) *fallbackReason = "cuda-raster-source-unavailable";
+      return false;
+    }
+    auto ensureBuffer = [&](GLuint* id, size_t bytes) {
+      if (*id == 0) bufferApi.genBuffers(1, id);
+      if (*id == 0) return false;
+      bufferApi.bindBuffer(GL_ARRAY_BUFFER, *id);
+      bufferApi.bufferData(GL_ARRAY_BUFFER,
+                           static_cast<ViewerGLsizeiptr>(bytes),
+                           nullptr,
+                           GL_DYNAMIC_DRAW);
+      return true;
+    };
+    if (!ensureBuffer(&residentCudaCache->verts, plan.pointCount * 3u * sizeof(float)) ||
+        !ensureBuffer(&residentCudaCache->colors, plan.pointCount * 4u * sizeof(float))) {
+      bufferApi.bindBuffer(GL_ARRAY_BUFFER, 0);
+      if (fallbackReason) *fallbackReason = "cuda-raster-buffer-allocation";
+      return false;
+    }
+    bufferApi.bindBuffer(GL_ARRAY_BUFFER, 0);
+
+    const ComputeRemapUniforms directUniforms = makeComputeRemapUniforms(directRemap);
+    ChromaspaceCuda::RasterSourceRequest request{};
+    request.pointCount = static_cast<int>(plan.pointCount);
+    request.basePointCount = static_cast<int>(basePointCount);
+    request.sourceWidth = source.proxyWidth;
+    request.sourceHeight = source.proxyHeight;
+    request.sampleStride = plan.stride;
+    request.sampleCountX = plan.countX;
+    request.pixelFormat = cudaPixelFormat;
+    request.sourceAspect = payload.sourceAspect;
+    request.glossLiftScale = payload.glossLiftScale;
+    request.pointAlphaScale = pointAlphaScaleForPlot(payload.pointSize, payload.pointDensity, payload.resolution);
+    request.denseAlphaBias = denseAlphaBiasForPlot(payload.pointSize, payload.pointDensity, payload.resolution);
+    request.colorSaturation = bakedColorSaturationForPlot(payload);
+    request.remap = makeCudaRemapUniforms(directUniforms);
+    request.plotLinear = viewerPlotLinearApplies(payload) ? 1 : 0;
+    request.plotLinearTransfer = payload.plotDisplayLinearTransfer;
+    request.excludeIdentityData = payload.excludeIdentityData ? 1 : 0;
+    request.isolateIdentityData = payload.isolateIdentityData ? 1 : 0;
+    request.readIdentityPlot = payload.readIdentityPlot ? 1 : 0;
+    request.readGrayRamp = payload.readGrayRamp ? 1 : 0;
+    int stripY1 = 0;
+    int stripY2 = 0;
+    if (source.identityStripPresent && source.identityStripDrawCube &&
+        sourceSignalRowsToProxyRange(source, source.identityCubeY1, source.identityCubeY2, &stripY1, &stripY2)) {
+      request.identityCubeY1 = stripY1;
+      request.identityCubeY2 = stripY2;
+    }
+    if (source.identityStripPresent && source.identityStripDrawRamp &&
+        sourceSignalRowsToProxyRange(source, source.identityRampY1, source.identityRampY2, &stripY1, &stripY2)) {
+      request.identityRampY1 = stripY1;
+      request.identityRampY2 = stripY2;
+    }
+    size_t appendOffset = basePointCount;
+    if (cubeAppend.pointCount > 0) {
+      request.identityCubeAppendOffset = static_cast<int>(appendOffset);
+      request.identityCubeAppendCount = static_cast<int>(cubeAppend.pointCount);
+      request.identityCubeAppendY1 = cubeAppend.y1;
+      request.identityCubeAppendY2 = cubeAppend.y2;
+      request.identityCubeAppendRowStep = cubeAppend.rowStep;
+      request.identityCubeAppendXStep = cubeAppend.xStep;
+      appendOffset += cubeAppend.pointCount;
+    }
+    if (rampAppend.pointCount > 0) {
+      request.identityRampAppendOffset = static_cast<int>(appendOffset);
+      request.identityRampAppendCount = static_cast<int>(rampAppend.pointCount);
+      request.identityRampAppendY1 = rampAppend.y1;
+      request.identityRampAppendY2 = rampAppend.y2;
+      request.identityRampAppendRowStep = rampAppend.rowStep;
+      request.identityRampAppendXStep = rampAppend.xStep;
+      appendOffset += rampAppend.pointCount;
+    }
+    if (occupancyAppendCount > 0) {
+      request.occupancyFill = 1;
+      request.occupancyAppendOffset = static_cast<int>(occupancyAppendOffset);
+      request.occupancyAppendCount = static_cast<int>(occupancyAppendCount);
+      request.occupancyCandidateCount = static_cast<int>(occupancyCandidateCount);
+    }
+    const bool lassoMode =
+        payload.volumeSlicingEnabled && payload.volumeSlicingMode == "lasso";
+    if (lassoMode) {
+      request.lassoEnabled = 1;
+      const LassoRegionState lassoState = parseViewerLassoRegionState(payload.lassoData);
+      int strokeIndex = 0;
+      int pointIndex = 0;
+      for (const auto& stroke : lassoState.strokes) {
+        if (stroke.points.size() < 3 || strokeIndex >= 16 || pointIndex >= 256) continue;
+        const int available = 256 - pointIndex;
+        const int count = std::min<int>(available, static_cast<int>(stroke.points.size()));
+        if (count < 3) break;
+        request.lassoStrokeFirst[strokeIndex] = pointIndex;
+        request.lassoStrokeCountPerStroke[strokeIndex] = count;
+        request.lassoStrokeSubtract[strokeIndex] = stroke.subtract ? 1 : 0;
+        for (int i = 0; i < count; ++i) {
+          request.lassoX[pointIndex + i] = clampf(stroke.points[static_cast<size_t>(i)].xNorm, 0.0f, 1.0f);
+          request.lassoY[pointIndex + i] = clampf(stroke.points[static_cast<size_t>(i)].yNorm, 0.0f, 1.0f);
+        }
+        pointIndex += count;
+        ++strokeIndex;
+      }
+      request.lassoStrokeCount = strokeIndex;
+      request.lassoPointCount = pointIndex;
+    }
+    request.cubeSlicingEnabled = directRemap.cubeSlicingEnabled ? 1 : 0;
+    request.neutralRadiusEnabled = directRemap.neutralRadiusEnabled ? 1 : 0;
+    request.neutralRadius = directRemap.neutralRadius;
+    request.cubeSliceRed = directRemap.cubeSliceRed ? 1 : 0;
+    request.cubeSliceYellow = directRemap.cubeSliceYellow ? 1 : 0;
+    request.cubeSliceGreen = directRemap.cubeSliceGreen ? 1 : 0;
+    request.cubeSliceCyan = directRemap.cubeSliceCyan ? 1 : 0;
+    request.cubeSliceBlue = directRemap.cubeSliceBlue ? 1 : 0;
+    request.cubeSliceMagenta = directRemap.cubeSliceMagenta ? 1 : 0;
+    const uint64_t serial = nextMeshSerial();
+    const auto cudaT0 = std::chrono::steady_clock::now();
+    std::string error;
+    if (!ChromaspaceCuda::buildRasterSourceMesh(
+            reinterpret_cast<ChromaspaceCuda::InputCache*>(residentCudaCache),
+            request,
+            sourceBytes,
+            sourceByteCount,
+            serial,
+            &error)) {
+      demoteCudaInputPath(directRemap, sessionState, error.empty() ? std::string("raster-source-runtime") : error);
+      if (fallbackReason) *fallbackReason = error.empty() ? "cuda-raster-runtime" : error;
+      return false;
+    }
+    MeshData mesh{};
+    mesh.resolution = payload.resolution <= 25 ? 25 : (payload.resolution <= 41 ? 41 : 57);
+    mesh.quality = (source.tierLabel.empty() ? std::string("Raster") : source.tierLabel) + " CUDA Raster";
+    mesh.paramHash = std::string("raster-cuda-direct:") + source.tierLabel + ":" + source.pixelFormat;
+    mesh.serial = residentCudaCache->builtSerial != 0 ? residentCudaCache->builtSerial : serial;
+    mesh.pointCount = plan.pointCount;
+    if (residentCudaCache->hasFitBounds) {
+      mesh.hasFitBounds = true;
+      mesh.fitMin = Vec3{residentCudaCache->fitMin[0], residentCudaCache->fitMin[1], residentCudaCache->fitMin[2]};
+      mesh.fitMax = Vec3{residentCudaCache->fitMax[0], residentCudaCache->fitMax[1], residentCudaCache->fitMax[2]};
+    } else {
+      setMeshFitBoundsFromVerts(&mesh);
+    }
+    if (rasterBenchmarkEnabled()) {
+      const auto cudaT1 = std::chrono::steady_clock::now();
+      std::ostringstream os;
+      os << "[raster-bench] stage=cuda-raster-direct"
+         << " ms=" << std::fixed << std::setprecision(3)
+         << std::chrono::duration<double, std::milli>(cudaT1 - cudaT0).count()
+         << " sourceBytes=" << sourceByteCount
+         << " points=" << mesh.pointCount
+         << " stride=" << plan.stride
+         << " proxy=" << source.proxyWidth << "x" << source.proxyHeight
+         << " format=" << source.pixelFormat;
+      logViewerEvent(os.str());
+    }
+    *out = std::move(mesh);
+    if (fallbackReason) *fallbackReason = "cuda-raster-direct";
+    return true;
+  }
+#endif
+#if defined(__APPLE__)
+  {
+    const PlotRemapSpec directRemap = makePlotRemapSpec(payload);
+    std::string directRepresentReason;
+    if (gpuCaps.sessionBackend == ViewerComputeBackendKind::MetalCompute &&
+        gpuCaps.metalQueueReady &&
+        rasterMetalDirectCanRepresentPayload(payload, source, analyticalScope, &directRepresentReason)) {
+      RasterGpuDerivationPlan plan = rasterGpuDerivationPlanForPayload(source, payload, analyticalScope);
+      if (plan.totalPointCount == 0) {
+        if (fallbackReason) *fallbackReason = "metal-empty-sample-plan";
+        return false;
+      }
+      if (plan.totalPointCount > static_cast<size_t>(std::numeric_limits<int>::max())) {
+        if (fallbackReason) *fallbackReason = "metal-raster-point-limit";
+        return false;
+      }
+      const void* sourceBytes = nullptr;
+      size_t sourceByteCount = 0;
+      int metalPixelFormat = 0;
+      const size_t pixelCount = static_cast<size_t>(std::max(0, source.proxyWidth)) *
+                                static_cast<size_t>(std::max(0, source.proxyHeight));
+      if (source.pixelFormat == "rgba32f") {
+        sourceBytes = source.rgba32f.data();
+        sourceByteCount = std::min(source.rgba32f.size(), pixelCount * 4u) * sizeof(float);
+        metalPixelFormat = 1;
+      } else {
+        sourceBytes = source.rgba16f.data();
+        sourceByteCount = std::min(source.rgba16f.size(), pixelCount * 4u) * sizeof(uint16_t);
+        metalPixelFormat = 0;
+      }
+      if (!sourceBytes || sourceByteCount == 0) {
+        if (fallbackReason) *fallbackReason = "metal-raster-source-unavailable";
+        return false;
+      }
+
+      const ComputeRemapUniforms directUniforms = makeComputeRemapUniforms(directRemap);
+      ChromaspaceMetal::RasterSourceRequest request{};
+      populateRasterSourceRequestCommon(&request,
+                                        plan,
+                                        source,
+                                        payload,
+                                        directRemap,
+                                        makeMetalRemapUniforms(directUniforms),
+                                        metalPixelFormat);
+      MeshData mesh{};
+      mesh.resolution = payload.resolution <= 25 ? 25 : (payload.resolution <= 41 ? 41 : 57);
+      mesh.quality = (source.tierLabel.empty() ? std::string("Raster") : source.tierLabel) + " Metal Raster";
+      mesh.paramHash = std::string("raster-metal-direct:") + source.tierLabel + ":" + source.pixelFormat;
+      mesh.serial = nextMeshSerial();
+      const auto metalT0 = std::chrono::steady_clock::now();
+      std::string error;
+      if (!ChromaspaceMetal::buildRasterSourceMesh(
+              request, sourceBytes, sourceByteCount, &mesh.pointVerts, &mesh.pointColors, &error)) {
+        if (fallbackReason) *fallbackReason = error.empty() ? "metal-raster-runtime" : error;
+      } else {
+        mesh.pointCount = mesh.pointVerts.size() / 3u;
+        setMeshFitBoundsFromVisibleVerts(&mesh);
+        if (rasterBenchmarkEnabled()) {
+          const auto metalT1 = std::chrono::steady_clock::now();
+          std::ostringstream os;
+          os << "[raster-bench] stage=metal-raster-direct"
+             << " ms=" << std::fixed << std::setprecision(3)
+             << std::chrono::duration<double, std::milli>(metalT1 - metalT0).count()
+             << " sourceBytes=" << sourceByteCount
+             << " points=" << mesh.pointCount
+             << " stride=" << plan.sample.stride
+             << " proxy=" << source.proxyWidth << "x" << source.proxyHeight
+             << " format=" << source.pixelFormat;
+          logViewerEvent(os.str());
+        }
+        *out = std::move(mesh);
+        if (fallbackReason) *fallbackReason = "metal-raster-direct";
+        return true;
+      }
+    }
+  }
+#endif
+  std::vector<InputCloudSample> samples;
+  if (!sourceSignalToInputCloudSamples(source, payload, false, &samples)) {
+    if (fallbackReason) *fallbackReason = "raster-sampling";
+    return false;
+  }
+  InputCloudPayload virtualCloud = makeVirtualCloudFromRasterSamples(source, payload, samples);
+  std::vector<float> rawPoints;
+  rawPoints.reserve(samples.size() * 3u);
+  for (const auto& sample : samples) {
+    rawPoints.push_back(sample.r);
+    rawPoints.push_back(sample.g);
+    rawPoints.push_back(sample.b);
+  }
+  if (rawPoints.empty()) {
+    MeshData mesh{};
+    mesh.resolution = virtualCloud.resolution <= 25 ? 25 : (virtualCloud.resolution <= 41 ? 41 : 57);
+    mesh.quality = virtualCloud.quality;
+    mesh.paramHash = virtualCloud.paramHash;
+    mesh.serial = nextMeshSerial();
+    *out = std::move(mesh);
+    if (fallbackReason) *fallbackReason = "empty-filtered-raster";
+    return true;
+  }
+  const PlotRemapSpec remap = makePlotRemapSpec(payload);
+  const ComputeRemapUniforms uniforms = makeComputeRemapUniforms(remap);
+
+#if defined(__APPLE__)
+  if (gpuCaps.sessionBackend == ViewerComputeBackendKind::MetalCompute && gpuCaps.metalQueueReady) {
+    ChromaspaceMetal::InputRequest request{};
+    request.pointCount = static_cast<int>(rawPoints.size() / 3u);
+    request.inputStride = 3;
+    request.glossView = 0;
+    request.sourceAspect = payload.sourceAspect;
+    request.glossLiftScale = payload.glossLiftScale;
+    request.pointAlphaScale = pointAlphaScaleForPlot(payload.pointSize, payload.pointDensity, payload.resolution);
+    request.denseAlphaBias = denseAlphaBiasForPlot(payload.pointSize, payload.pointDensity, payload.resolution);
+    request.colorSaturation = bakedColorSaturationForPlot(payload);
+    request.remap = makeMetalRemapUniforms(uniforms);
+    MeshData mesh{};
+    mesh.resolution = virtualCloud.resolution <= 25 ? 25 : (virtualCloud.resolution <= 41 ? 41 : 57);
+    mesh.quality = virtualCloud.quality + " Metal";
+    mesh.paramHash = virtualCloud.paramHash + ":metal-map";
+    mesh.serial = nextMeshSerial();
+    std::string error;
+    if (ChromaspaceMetal::buildInputMesh(request, rawPoints, &mesh.pointVerts, &mesh.pointColors, &error)) {
+      mesh.pointCount = mesh.pointVerts.size() / 3u;
+      setMeshFitBoundsFromVerts(&mesh);
+      *out = std::move(mesh);
+      if (fallbackReason) *fallbackReason = "metal-map";
+      return true;
+    }
+    if (fallbackReason) *fallbackReason = error.empty() ? "metal-runtime" : error;
+    return false;
+  }
+#endif
+
+#if defined(CHROMASPACE_VIEWER_HAS_CUDA) && !defined(__APPLE__)
+  if (sessionWantsCuda(gpuCaps) && sessionState && canUseCudaInputPath(gpuCaps, sessionState, remap)) {
+    if (!residentCudaCache) {
+      if (fallbackReason) *fallbackReason = "cuda-no-resident-cache";
+      return false;
+    }
+    const ViewerGlBufferApi& bufferApi = viewerGlBufferApi();
+    if (!bufferApi.available) {
+      if (fallbackReason) *fallbackReason = "cuda-no-gl-buffer-api";
+      return false;
+    }
+    auto ensureBuffer = [&](GLuint* id, size_t bytes) {
+      if (*id == 0) bufferApi.genBuffers(1, id);
+      if (*id == 0) return false;
+      bufferApi.bindBuffer(GL_ARRAY_BUFFER, *id);
+      bufferApi.bufferData(GL_ARRAY_BUFFER,
+                           static_cast<ViewerGLsizeiptr>(bytes),
+                           nullptr,
+                           GL_DYNAMIC_DRAW);
+      return true;
+    };
+    const size_t pointCount = rawPoints.size() / 3u;
+    if (!ensureBuffer(&residentCudaCache->verts, pointCount * 3u * sizeof(float)) ||
+        !ensureBuffer(&residentCudaCache->colors, pointCount * 4u * sizeof(float))) {
+      bufferApi.bindBuffer(GL_ARRAY_BUFFER, 0);
+      if (fallbackReason) *fallbackReason = "cuda-buffer-allocation";
+      return false;
+    }
+    bufferApi.bindBuffer(GL_ARRAY_BUFFER, 0);
+    ChromaspaceCuda::InputRequest request{};
+    request.pointCount = static_cast<int>(pointCount);
+    request.inputStride = 3;
+    request.glossView = 0;
+    request.sourceAspect = payload.sourceAspect;
+    request.glossLiftScale = payload.glossLiftScale;
+    request.pointAlphaScale = pointAlphaScaleForPlot(payload.pointSize, payload.pointDensity, payload.resolution);
+    request.denseAlphaBias = denseAlphaBiasForPlot(payload.pointSize, payload.pointDensity, payload.resolution);
+    request.colorSaturation = bakedColorSaturationForPlot(payload);
+    request.remap = makeCudaRemapUniforms(uniforms);
+    const uint64_t serial = nextMeshSerial();
+    std::string error;
+    if (!ChromaspaceCuda::buildInputMesh(reinterpret_cast<ChromaspaceCuda::InputCache*>(residentCudaCache),
+                                        request,
+                                        rawPoints,
+                                        serial,
+                                        &error)) {
+      demoteCudaInputPath(remap, sessionState, error.empty() ? std::string("raster-map-runtime") : error);
+      if (fallbackReason) *fallbackReason = error.empty() ? "cuda-runtime" : error;
+      return false;
+    }
+    MeshData mesh{};
+    mesh.resolution = virtualCloud.resolution <= 25 ? 25 : (virtualCloud.resolution <= 41 ? 41 : 57);
+    mesh.quality = virtualCloud.quality + " CUDA";
+    mesh.paramHash = virtualCloud.paramHash + ":cuda-map";
+    mesh.serial = residentCudaCache->builtSerial != 0 ? residentCudaCache->builtSerial : serial;
+    mesh.pointCount = pointCount;
+    bufferApi.bindBuffer(GL_ARRAY_BUFFER, 0);
+    if (residentCudaCache->hasFitBounds) {
+      mesh.hasFitBounds = true;
+      mesh.fitMin = Vec3{residentCudaCache->fitMin[0], residentCudaCache->fitMin[1], residentCudaCache->fitMin[2]};
+      mesh.fitMax = Vec3{residentCudaCache->fitMax[0], residentCudaCache->fitMax[1], residentCudaCache->fitMax[2]};
+    } else {
+      setMeshFitBoundsFromVerts(&mesh);
+    }
+    *out = std::move(mesh);
+    if (fallbackReason) *fallbackReason = "cuda-map";
+    return true;
+  }
+#else
+  (void)gpuCaps;
+  (void)sessionState;
+#endif
+  if (fallbackReason) *fallbackReason = "no-cuda-metal-map";
+  return false;
+}
+
+bool buildRasterDerivedMeshCpu(const ResolvedPayload& resolved,
+                               const SourceSignalPayload& source,
+                               bool analyticalScope,
+                               const MeshData* previousScope,
+                               MeshData* out,
+                               const ViewerGpuCapabilities* gpuCaps = nullptr) {
+  if (!out) return false;
+  ResolvedPayload payload = resolved;
+  if (source.sourceWidth > 0 && source.sourceHeight > 0) {
+    payload.sourceAspect =
+        static_cast<float>(source.sourceWidth) / static_cast<float>(std::max(1, source.sourceHeight));
+  }
+  if (source.identityStripPresent) {
+    payload.generatedIdentityResolution =
+        source.identityStripResolution > 0 ? source.identityStripResolution : payload.generatedIdentityResolution;
+    payload.generatedIdentityDrawCube = source.identityStripDrawCube;
+    payload.generatedIdentityDrawRamp = source.identityStripDrawRamp;
+    payload.generatedIdentityStripBandCount =
+        (source.identityStripDrawCube ? 1 : 0) + (source.identityStripDrawRamp ? 1 : 0);
+  }
+  std::vector<InputCloudSample> samples;
+  if (!sourceSignalToInputCloudSamples(source, payload, analyticalScope, &samples)) return false;
+  InputCloudPayload virtualCloud = makeVirtualCloudFromRasterSamples(source, payload, samples);
+  if (analyticalScope) {
+    return buildAnalyticalScopeMeshCpu(payload, virtualCloud, previousScope, out, gpuCaps);
+  }
+  return buildInputCloudFitMeshCpu(payload, virtualCloud, out);
+}
+
 void filterInputCloudSamples(const ResolvedPayload& payload, std::vector<InputCloudSample>* samples) {
   if (!samples || samples->empty()) return;
   const PlotRemapSpec remap = makePlotRemapSpec(payload);
@@ -6133,18 +7719,24 @@ uint64_t inputCloudPrimaryStabilityHash(const InputCloudPayload& cloud) {
 bool loadSourceSignalSharedMemory(SourceSignalPayload* payload) {
   if (!payload) return false;
   payload->rgba16f.clear();
+  payload->rgba32f.clear();
   if (payload->transport != "shm" || payload->shmName.empty() ||
       payload->proxyWidth <= 0 || payload->proxyHeight <= 0 ||
-      payload->pixelFormat != "rgba16f") {
+      (payload->pixelFormat != "rgba16f" && payload->pixelFormat != "rgba32f")) {
     return false;
   }
+  const uint64_t scalarBytes = payload->pixelFormat == "rgba32f" ? sizeof(float) : sizeof(uint16_t);
   const uint64_t expectedBytes =
       static_cast<uint64_t>(payload->proxyWidth) *
-      static_cast<uint64_t>(payload->proxyHeight) * 4u * sizeof(uint16_t);
+      static_cast<uint64_t>(payload->proxyHeight) * 4u * scalarBytes;
   if (expectedBytes == 0 || (payload->shmSize != 0 && expectedBytes > payload->shmSize)) {
     return false;
   }
-  payload->rgba16f.assign(static_cast<size_t>(expectedBytes / sizeof(uint16_t)), 0);
+  if (payload->pixelFormat == "rgba32f") {
+    payload->rgba32f.assign(static_cast<size_t>(expectedBytes / sizeof(float)), 0.0f);
+  } else {
+    payload->rgba16f.assign(static_cast<size_t>(expectedBytes / sizeof(uint16_t)), 0);
+  }
 #if defined(_WIN32)
   HANDLE mapping = OpenFileMappingA(FILE_MAP_READ, FALSE, payload->shmName.c_str());
   if (mapping == nullptr) return false;
@@ -6153,7 +7745,11 @@ bool loadSourceSignalSharedMemory(SourceSignalPayload* payload) {
     CloseHandle(mapping);
     return false;
   }
-  std::memcpy(payload->rgba16f.data(), mapped, static_cast<size_t>(expectedBytes));
+  if (payload->pixelFormat == "rgba32f") {
+    std::memcpy(payload->rgba32f.data(), mapped, static_cast<size_t>(expectedBytes));
+  } else {
+    std::memcpy(payload->rgba16f.data(), mapped, static_cast<size_t>(expectedBytes));
+  }
   UnmapViewOfFile(mapped);
   CloseHandle(mapping);
   return true;
@@ -6165,7 +7761,11 @@ bool loadSourceSignalSharedMemory(SourceSignalPayload* payload) {
     ::close(fd);
     return false;
   }
-  std::memcpy(payload->rgba16f.data(), mapped, static_cast<size_t>(expectedBytes));
+  if (payload->pixelFormat == "rgba32f") {
+    std::memcpy(payload->rgba32f.data(), mapped, static_cast<size_t>(expectedBytes));
+  } else {
+    std::memcpy(payload->rgba16f.data(), mapped, static_cast<size_t>(expectedBytes));
+  }
   munmap(mapped, static_cast<size_t>(expectedBytes));
   ::close(fd);
   return true;
@@ -6185,23 +7785,46 @@ bool parseSourceSignalMessage(const std::string& line, SourceSignalPayload* out)
   extractQuoted(line, "tier", &p.tierLabel);
   extractInt(line, "sourceWidth", &p.sourceWidth);
   extractInt(line, "sourceHeight", &p.sourceHeight);
+  extractInt(line, "sampledX1", &p.sampledX1);
+  extractInt(line, "sampledY1", &p.sampledY1);
+  extractInt(line, "sampledWidth", &p.sampledWidth);
+  extractInt(line, "sampledHeight", &p.sampledHeight);
   extractInt(line, "proxyWidth", &p.proxyWidth);
   extractInt(line, "proxyHeight", &p.proxyHeight);
   extractUInt64(line, "shmSize", &p.shmSize);
+  int stripPresent = 0;
+  p.identityStripPresent = extractInt(line, "present", &stripPresent) && stripPresent != 0;
+  extractInt(line, "resolution", &p.identityStripResolution);
+  int stripDrawCube = 0;
+  int stripDrawRamp = 0;
+  extractInt(line, "drawCube", &stripDrawCube);
+  extractInt(line, "drawRamp", &stripDrawRamp);
+  p.identityStripDrawCube = stripDrawCube != 0;
+  p.identityStripDrawRamp = stripDrawRamp != 0;
+  extractInt(line, "stripHeight", &p.identityStripHeight);
+  extractInt(line, "cubeY1", &p.identityCubeY1);
+  extractInt(line, "cubeY2", &p.identityCubeY2);
+  extractInt(line, "rampY1", &p.identityRampY1);
+  extractInt(line, "rampY2", &p.identityRampY2);
   if (p.transport == "shm" && !loadSourceSignalSharedMemory(&p)) {
     logViewerEvent(std::string("Failed to load shared-memory source signal: ") + p.shmName);
     return false;
   }
-  if (p.contentHash == 0 && !p.rgba16f.empty()) {
+  if (p.contentHash == 0 && !p.rgba32f.empty()) {
+    p.contentHash = inputCloudContentHashBytes(p.rgba32f.data(), p.rgba32f.size() * sizeof(float));
+  } else if (p.contentHash == 0 && !p.rgba16f.empty()) {
     p.contentHash = inputCloudContentHashBytes(p.rgba16f.data(), p.rgba16f.size() * sizeof(uint16_t));
   }
   if (p.sourceWidth <= 0 || p.sourceHeight <= 0) {
     p.sourceWidth = p.proxyWidth;
     p.sourceHeight = p.proxyHeight;
   }
+  if (p.sampledWidth <= 0) p.sampledWidth = p.sourceWidth;
+  if (p.sampledHeight <= 0) p.sampledHeight = p.sourceHeight;
   if (p.tierLabel.empty()) p.tierLabel = p.coverage == "partial-preview" ? "Preview" : "Proxy";
   *out = std::move(p);
-  return out->proxyWidth > 0 && out->proxyHeight > 0 && !out->rgba16f.empty();
+  return out->proxyWidth > 0 && out->proxyHeight > 0 &&
+         (!out->rgba16f.empty() || !out->rgba32f.empty());
 }
 
 // Stage: parse the plot cloud payload exactly as shipped by the OFX instance.
@@ -9138,9 +10761,9 @@ Vec3 analyticalScopeOverflowColor(int channel, bool lumaOnly, bool highlighted) 
 }
 
 void reconstructWaveformDensity(std::vector<float>* density,
-                                int width,
-                                int height,
-                                int channelCount) {
+                                 int width,
+                                 int height,
+                                 int channelCount) {
   if (!density || width <= 0 || height <= 0 || channelCount <= 0) return;
   const size_t expected =
       static_cast<size_t>(width) * static_cast<size_t>(height) * 3u;
@@ -9165,6 +10788,125 @@ void reconstructWaveformDensity(std::vector<float>* density,
     }
   }
   density->swap(horizontal);
+}
+
+bool buildAnalyticalScopeDensityCuda(const ViewerGpuCapabilities& gpuCaps,
+                                     const std::vector<InputCloudSample>& samples,
+                                     bool waveform,
+                                     int scopeMode,
+                                     int width,
+                                     int height,
+                                     float rangeMin,
+                                     float invRange,
+                                     bool excludeOverflow,
+                                     std::vector<float>* outDensity,
+                                     std::string* reason) {
+#if defined(CHROMASPACE_VIEWER_HAS_CUDA) && !defined(__APPLE__)
+  if (!outDensity || samples.empty() || width <= 0 || height <= 0) {
+    if (reason) *reason = "invalid-request";
+    return false;
+  }
+  if (!sessionWantsCuda(gpuCaps) || !gpuCaps.cudaComputeEnabled) {
+    if (reason) {
+      const std::string cudaReason =
+          !gpuCaps.cudaStartupReason.empty() ? gpuCaps.cudaStartupReason : gpuCaps.cudaReason;
+      *reason = cudaReason.empty() ? std::string("cuda-not-active") : cudaReason;
+    }
+    return false;
+  }
+  std::vector<float> packed;
+  packed.reserve(samples.size() * 5u);
+  for (const auto& sample : samples) {
+    packed.insert(packed.end(), {sample.xNorm, sample.yNorm, sample.r, sample.g, sample.b});
+  }
+  ChromaspaceCuda::ScopeDensityRequest request{};
+  request.pointCount = static_cast<int>(samples.size());
+  request.waveform = waveform ? 1 : 0;
+  request.scopeMode = scopeMode;
+  request.width = width;
+  request.height = height;
+  request.rangeMin = rangeMin;
+  request.invRange = invRange;
+  request.excludeOverflow = excludeOverflow ? 1 : 0;
+  std::string error;
+  if (!ChromaspaceCuda::buildScopeDensity(request, packed, outDensity, &error)) {
+    if (reason) *reason = error.empty() ? std::string("cuda-runtime") : error;
+    return false;
+  }
+  if (reason) *reason = "cuda-scope-density";
+  return true;
+#else
+  (void)gpuCaps;
+  (void)samples;
+  (void)waveform;
+  (void)scopeMode;
+  (void)width;
+  (void)height;
+  (void)rangeMin;
+  (void)invRange;
+  (void)excludeOverflow;
+  (void)outDensity;
+  if (reason) *reason = "cuda-unavailable";
+  return false;
+#endif
+}
+
+bool buildAnalyticalScopeDensityMetal(const ViewerGpuCapabilities& gpuCaps,
+                                      const std::vector<InputCloudSample>& samples,
+                                      bool waveform,
+                                      int scopeMode,
+                                      int width,
+                                      int height,
+                                      float rangeMin,
+                                      float invRange,
+                                      bool excludeOverflow,
+                                      std::vector<float>* outDensity,
+                                      std::string* reason) {
+#if defined(__APPLE__)
+  if (!outDensity || samples.empty() || width <= 0 || height <= 0) {
+    if (reason) *reason = "invalid-request";
+    return false;
+  }
+  if (gpuCaps.sessionBackend != ViewerComputeBackendKind::MetalCompute ||
+      !gpuCaps.metalQueueReady || !gpuCaps.inputComputeEnabled) {
+    if (reason) *reason = gpuCaps.metalQueueReady ? "metal-input-disabled" : "metal-not-active";
+    return false;
+  }
+  std::vector<float> packed;
+  packed.reserve(samples.size() * 5u);
+  for (const auto& sample : samples) {
+    packed.insert(packed.end(), {sample.xNorm, sample.yNorm, sample.r, sample.g, sample.b});
+  }
+  ChromaspaceMetal::ScopeDensityRequest request{};
+  request.pointCount = static_cast<int>(samples.size());
+  request.waveform = waveform ? 1 : 0;
+  request.scopeMode = scopeMode;
+  request.width = width;
+  request.height = height;
+  request.rangeMin = rangeMin;
+  request.invRange = invRange;
+  request.excludeOverflow = excludeOverflow ? 1 : 0;
+  std::string error;
+  if (!ChromaspaceMetal::buildScopeDensity(request, packed, outDensity, &error)) {
+    if (reason) *reason = error.empty() ? std::string("metal-runtime") : error;
+    return false;
+  }
+  if (reason) *reason = "metal-scope-density";
+  return true;
+#else
+  (void)gpuCaps;
+  (void)samples;
+  (void)waveform;
+  (void)scopeMode;
+  (void)width;
+  (void)height;
+  (void)rangeMin;
+  (void)invRange;
+  (void)excludeOverflow;
+  (void)outDensity;
+  if (reason) *reason = "metal-unavailable";
+  return false;
+#endif
 }
 
 bool ensureAnalyticalScopeComputeProgram(AnalyticalScopeComputeCache* cache) {
@@ -9395,7 +11137,8 @@ std::pair<float, float> analyticalScopeRange(const ResolvedPayload& payload,
 bool buildAnalyticalScopeMeshCpu(const ResolvedPayload& payload,
                                  const InputCloudPayload& cloud,
                                  const MeshData* previousScope,
-                                 MeshData* out) {
+                                 MeshData* out,
+                                 const ViewerGpuCapabilities* gpuCaps) {
   if (!out || (payload.plotMode != "waveform" && payload.plotMode != "histogram")) return false;
   std::vector<InputCloudSample> samples;
   const bool useHighWaveformLayer =
@@ -9508,7 +11251,38 @@ bool buildAnalyticalScopeMeshCpu(const ResolvedPayload& payload,
       mesh.scopeDensity[(static_cast<size_t>(channel) * kPositionBins + static_cast<size_t>(x)) * kSignalBins +
                         static_cast<size_t>(y)] += 1.0f;
     };
-    const bool gpuDensityReady =
+    std::string densityBackendReason;
+    const bool metalDensityReady =
+        (!lumaOnly || payload.viewerState.waveformLumaMethod == 0) &&
+        gpuCaps &&
+        buildAnalyticalScopeDensityMetal(*gpuCaps,
+                                         samples,
+                                         true,
+                                         mesh.scopeMode,
+                                         kPositionBins,
+                                         kSignalBins,
+                                         range.first,
+                                         invRange,
+                                         true,
+                                         &mesh.scopeDensity,
+                                         &densityBackendReason);
+    const bool cudaDensityReady =
+        !metalDensityReady &&
+        (!lumaOnly || payload.viewerState.waveformLumaMethod == 0) &&
+        gpuCaps &&
+        buildAnalyticalScopeDensityCuda(*gpuCaps,
+                                        samples,
+                                        true,
+                                        mesh.scopeMode,
+                                        kPositionBins,
+                                        kSignalBins,
+                                        range.first,
+                                        invRange,
+                                        true,
+                                        &mesh.scopeDensity,
+                                        &densityBackendReason);
+    const bool glDensityReady =
+        !cudaDensityReady &&
         (!lumaOnly || payload.viewerState.waveformLumaMethod == 0) &&
         buildAnalyticalScopeDensityGlCompute(samples,
                                              true,
@@ -9519,6 +11293,17 @@ bool buildAnalyticalScopeMeshCpu(const ResolvedPayload& payload,
                                              invRange,
                                              true,
                                              &mesh.scopeDensity);
+    const bool gpuDensityReady = metalDensityReady || cudaDensityReady || glDensityReady;
+    if (metalDensityReady) {
+      mesh.quality += " Metal";
+      mesh.paramHash += ":metal-scope";
+    } else if (cudaDensityReady) {
+      mesh.quality += " CUDA";
+      mesh.paramHash += ":cuda-scope";
+    } else if (glDensityReady) {
+      mesh.quality += " GL";
+      mesh.paramHash += ":gl-scope";
+    }
     if (!gpuDensityReady) {
       for (const auto& sample : samples) {
         if (lumaOnly) {
@@ -9749,7 +11534,36 @@ bool buildAnalyticalScopeMeshCpu(const ResolvedPayload& payload,
       const int bin = std::clamp(static_cast<int>((value - range.first) * invRange * kSignalBins), 0, kSignalBins - 1);
       mesh.scopeDensity[static_cast<size_t>(channel * kSignalBins + bin)] += 1.0f;
     };
-    const bool gpuDensityReady =
+    std::string densityBackendReason;
+    const bool metalDensityReady =
+        gpuCaps &&
+        buildAnalyticalScopeDensityMetal(*gpuCaps,
+                                         samples,
+                                         false,
+                                         mesh.scopeMode,
+                                         kSignalBins,
+                                         1,
+                                         range.first,
+                                         invRange,
+                                         true,
+                                         &mesh.scopeDensity,
+                                         &densityBackendReason);
+    const bool cudaDensityReady =
+        !metalDensityReady &&
+        gpuCaps &&
+        buildAnalyticalScopeDensityCuda(*gpuCaps,
+                                        samples,
+                                        false,
+                                        mesh.scopeMode,
+                                        kSignalBins,
+                                        1,
+                                        range.first,
+                                        invRange,
+                                        true,
+                                        &mesh.scopeDensity,
+                                        &densityBackendReason);
+    const bool glDensityReady =
+        !cudaDensityReady &&
         buildAnalyticalScopeDensityGlCompute(samples,
                                              false,
                                              mesh.scopeMode,
@@ -9759,6 +11573,17 @@ bool buildAnalyticalScopeMeshCpu(const ResolvedPayload& payload,
                                              invRange,
                                              true,
                                              &mesh.scopeDensity);
+    const bool gpuDensityReady = metalDensityReady || cudaDensityReady || glDensityReady;
+    if (metalDensityReady) {
+      mesh.quality += " Metal";
+      mesh.paramHash += ":metal-scope";
+    } else if (cudaDensityReady) {
+      mesh.quality += " CUDA";
+      mesh.paramHash += ":cuda-scope";
+    } else if (glDensityReady) {
+      mesh.quality += " GL";
+      mesh.paramHash += ":gl-scope";
+    }
     if (!gpuDensityReady) {
       for (const auto& sample : samples) {
         if (lumaOnly) {
@@ -10638,19 +12463,67 @@ struct PlotWindowState {
   std::string viewerLassoData;
   MeshData derivedMesh{};
   MeshData overlayMesh{};
+#if defined(CHROMASPACE_VIEWER_HAS_CUDA) && !defined(__APPLE__)
+  InputCloudCudaCache residentInputCudaCache{};
+  InputCloudSampleCudaCache residentInputSampleCudaCache{};
+#endif
   std::string derivedBuildKey;
   std::string overlayBuildKey;
   std::string syncLabel = "Waiting for Resolve";
+  std::string stableSyncLabel = "Waiting for Resolve";
+  double lastHealthySyncLabelTime = -10.0;
   bool derivedMeshValid = false;
   bool overlayMeshValid = false;
+  bool fitRequested = false;
   bool selected = false;
+  bool sourceSignalDocked = false;
+  bool sourceSignalTemporaryLassoSurface = false;
+  int sourceSignalDockOwnerWindowId = -1;
+  PlotWindowRectNorm sourceSignalRestoreRect{};
+  double sourceSignalDockAnimStart = -10.0;
+  bool sourceSignalDockAnimatingToDock = false;
+  bool slicingDrawerOpen = false;
+  double slicingDrawerAnimStart = -10.0;
 };
+
+void releasePlotWindowGpuCaches(PlotWindowState* window) {
+  if (!window) return;
+#if defined(CHROMASPACE_VIEWER_HAS_CUDA) && !defined(__APPLE__)
+  releaseInputCloudCudaCache(&window->residentInputCudaCache);
+  releaseInputCloudSampleCudaCache(&window->residentInputSampleCudaCache);
+#endif
+}
+
+void setPlotWindowSyncLabel(PlotWindowState* window, const std::string& nextLabel) {
+  if (!window) return;
+  constexpr double kSyncDowngradeGraceSeconds = 1.15;
+  const double now = glfwGetTime();
+  window->syncLabel = nextLabel;
+  if (nextLabel == "Live" || nextLabel == "Proxy" || nextLabel == "Refining") {
+    window->stableSyncLabel = nextLabel;
+    window->lastHealthySyncLabelTime = now;
+    return;
+  }
+  if (nextLabel == "Waiting for Resolve" &&
+      window->lastHealthySyncLabelTime >= 0.0 &&
+      now - window->lastHealthySyncLabelTime <= kSyncDowngradeGraceSeconds &&
+      (window->stableSyncLabel == "Live" ||
+       window->stableSyncLabel == "Proxy" ||
+       window->stableSyncLabel == "Refining")) {
+    window->syncLabel = window->stableSyncLabel;
+    return;
+  }
+  window->stableSyncLabel = nextLabel;
+}
 
 ChromaspaceViewer::ViewerRuntimeState viewerStateForPlotModel(
     const ChromaspaceViewer::ViewerRuntimeState& source,
     int plotModel);
 ChromaspaceViewer::ViewerRuntimeState viewerStateWithModelCapabilities(
     const ChromaspaceViewer::ViewerRuntimeState& source);
+bool plotWindowIsDockedSourceSignal(const PlotWindowState& window);
+bool plotWindowIsSourceSignal(const PlotWindowState& window);
+bool plotWindowIsTemporarySourceSignalLassoSurface(const PlotWindowState& window);
 
 const InputCloudPayload* sourceCloudForPlotWindow(const SourceCloudStore& store,
                                                   const PlotWindowState& window,
@@ -10813,6 +12686,14 @@ struct AppState {
   int viewerSettingsHoverSubtab = -1;
   int viewerMenuHoverChoice = -1;
   bool viewerMenuDraggingSlider = false;
+  bool slicingVectorDragging = false;
+  bool slicingVectorDragFromMenu = false;
+  int slicingVectorDragWindowId = -1;
+  int slicingVectorLastDragIndex = -1;
+  bool slicingVectorDragEnable = false;
+  double slicingVectorLastClick = -10.0;
+  int slicingVectorLastClickWindowId = -9999;
+  bool slicingVectorLastClickMenu = false;
   int viewerMenuSliderAction = 0;
   int viewerMenuChoiceAction = 0;
   bool viewerPresetChoiceAnchorCompact = false;
@@ -10835,6 +12716,8 @@ struct AppState {
   uint64_t lastObservedOfxImageLassoRevision = 0;
   uint64_t clearImageLassoBaselineRevision = 0;
   bool plotModelMenuVisible = false;
+  bool plotModelMenuTargetVisible = false;
+  double plotModelMenuAnimStart = -10.0;
   bool quickPlotModelMenuVisible = false;
   int quickPlotModelMenuHover = -1;
   double quickPlotModelMenuX = 12.0;
@@ -10845,6 +12728,10 @@ struct AppState {
   double addPlotMenuY = 12.0;
   bool layoutMenuVisible = false;
   int layoutMenuHover = -1;
+  bool rightClickMenuCandidate = false;
+  double rightClickMenuPressTime = -10.0;
+  double rightClickMenuPressX = 0.0;
+  double rightClickMenuPressY = 0.0;
   double layoutMenuX = 84.0;
   double layoutMenuY = 12.0;
   bool showWorkspaceButtons = true;
@@ -10884,6 +12771,7 @@ struct AppState {
   double lastResolveDrawStatusPoll = -10.0;
   double lastResolveDrawScanRequest = -10.0;
   double lastResolveLivePulseWrite = -10.0;
+  double lastViewerAliveLeaseWrite = -10.0;
   double resolveLivePulseUntil = -10.0;
   uint64_t lastResolveLivePulseRevisionSeen = 0;
   uint64_t resolveDrawScanRequestedRevision = 0;
@@ -10934,19 +12822,59 @@ const PlotWindowState* focusedPlotWindow(const AppState& app) {
   return app.plotWindows.empty() ? nullptr : &app.plotWindows.front();
 }
 
+bool plotWindowIsSourceSignal(const PlotWindowState& window) {
+  return window.viewState.plotModel == ChromaspaceViewer::kPlotModelSourceSignal;
+}
+
+bool plotWindowIsTemporarySourceSignalLassoSurface(const PlotWindowState& window) {
+  return plotWindowIsSourceSignal(window) && window.sourceSignalTemporaryLassoSurface;
+}
+
+PlotWindowState* effectiveSettingsPlotWindow(AppState* app) {
+  if (!app) return nullptr;
+  PlotWindowState* focused = focusedPlotWindow(app);
+  if (focused && plotWindowIsTemporarySourceSignalLassoSurface(*focused)) {
+    if (PlotWindowState* owner = plotWindowById(app, focused->sourceSignalDockOwnerWindowId);
+        owner && !plotWindowIsSourceSignal(*owner)) {
+      return owner;
+    }
+    if (PlotWindowState* target = plotWindowById(app, app->viewerLassoTargetWindowId);
+        target && !plotWindowIsSourceSignal(*target)) {
+      return target;
+    }
+  }
+  return focused;
+}
+
+const PlotWindowState* effectiveSettingsPlotWindow(const AppState& app) {
+  const PlotWindowState* focused = focusedPlotWindow(app);
+  if (focused && plotWindowIsTemporarySourceSignalLassoSurface(*focused)) {
+    if (const PlotWindowState* owner = plotWindowById(app, focused->sourceSignalDockOwnerWindowId);
+        owner && !plotWindowIsSourceSignal(*owner)) {
+      return owner;
+    }
+    if (const PlotWindowState* target = plotWindowById(app, app.viewerLassoTargetWindowId);
+        target && !plotWindowIsSourceSignal(*target)) {
+      return target;
+    }
+  }
+  return focused;
+}
+
 void captureFocusedPlotWindowFromApp(AppState* app) {
   if (!app) return;
-  if (auto* window = focusedPlotWindow(app)) {
+  if (auto* window = effectiveSettingsPlotWindow(app)) {
     window->viewState = viewerStateWithModelCapabilities(app->viewerState);
     window->camera = app->cam;
     window->selected = true;
   }
 }
 
-void applyPlotWindowToApp(AppState* app, const PlotWindowState& window) {
+void applySettingsStateToAppRuntime(AppState* app,
+                                    const ChromaspaceViewer::ViewerRuntimeState& state,
+                                    const CameraState* camera = nullptr) {
   if (!app) return;
-  app->focusedPlotWindowId = window.windowId;
-  app->viewerState = viewerStateWithModelCapabilities(window.viewState);
+  app->viewerState = viewerStateWithModelCapabilities(state);
   app->plotMode = ChromaspaceViewer::plotModeForModel(app->viewerState.plotModel);
   app->circularHsl = app->viewerState.circularHsl;
   app->circularHsv = app->viewerState.circularHsv;
@@ -10956,7 +12884,23 @@ void applyPlotWindowToApp(AppState* app, const PlotWindowState& window) {
   app->isolateIdentityData = app->viewerState.isolateIdentityData;
   app->excludeIdentityData = app->viewerState.excludeIdentityData;
   app->identityReadResolution = app->viewerState.identityReadResolution;
-  app->cam = window.camera;
+  if (camera) app->cam = *camera;
+}
+
+void applyPlotWindowToApp(AppState* app, const PlotWindowState& window) {
+  if (!app) return;
+  app->focusedPlotWindowId = window.windowId;
+  const PlotWindowState* settingsWindow = &window;
+  if (plotWindowIsTemporarySourceSignalLassoSurface(window)) {
+    if (const PlotWindowState* owner = plotWindowById(*app, window.sourceSignalDockOwnerWindowId);
+        owner && !plotWindowIsSourceSignal(*owner)) {
+      settingsWindow = owner;
+    } else if (const PlotWindowState* target = plotWindowById(*app, app->viewerLassoTargetWindowId);
+               target && !plotWindowIsSourceSignal(*target)) {
+      settingsWindow = target;
+    }
+  }
+  applySettingsStateToAppRuntime(app, settingsWindow->viewState, &settingsWindow->camera);
   for (auto& other : app->plotWindows) other.selected = other.windowId == window.windowId;
 }
 
@@ -10994,6 +12938,63 @@ float plotWorkspaceTopNorm(int windowHeight) {
   return clampf(kViewerWorkspaceToolbarHeight / static_cast<float>(std::max(1, windowHeight)),
                 0.0f,
                 0.45f);
+}
+
+struct PlotMenuRect {
+  float x0 = 0.0f;
+  float y0 = 0.0f;
+  float x1 = 0.0f;
+  float y1 = 0.0f;
+};
+
+bool pointInPlotMenuRect(const PlotMenuRect& rect, double x, double y);
+
+float viewerMenuDrawerWidthPixels(int width) {
+  const float w = static_cast<float>(std::max(1, width));
+  constexpr float kDrawerPreferredFraction = 0.44f;
+  constexpr float kDrawerComfortMin = 390.0f;
+  constexpr float kDrawerComfortMax = 760.0f;
+  const float reservedPlotWidth = std::min(320.0f, std::max(170.0f, w * 0.34f));
+  const float maxWidth = std::max(168.0f, w - reservedPlotWidth);
+  const float minWidth = std::min(kDrawerComfortMin, maxWidth);
+  return clampf(w * kDrawerPreferredFraction, minWidth, std::min(maxWidth, kDrawerComfortMax));
+}
+
+float plotWorkspaceReservedLeftPixels(const AppState& app, int windowWidth) {
+  return app.plotModelMenuVisible ? viewerMenuDrawerWidthPixels(windowWidth) : 0.0f;
+}
+
+PlotMenuRect plotWindowLogicalScreenRect(const AppState& app,
+                                         const PlotWindowState& window,
+                                         int windowWidth,
+                                         int windowHeight) {
+  const float w = static_cast<float>(std::max(1, windowWidth));
+  const float h = static_cast<float>(std::max(1, windowHeight));
+  const float left = plotWorkspaceReservedLeftPixels(app, windowWidth);
+  const float availableW = std::max(1.0f, w - left);
+  const float x0 = left + window.rect.x * availableW;
+  const float y0 = window.rect.y * h;
+  return {x0,
+          y0,
+          x0 + std::max(1.0f, window.rect.w * availableW),
+          y0 + std::max(1.0f, window.rect.h * h)};
+}
+
+float plotWindowTitleBarLogicalHeight(const PlotMenuRect& screenRect) {
+  const float windowH = std::max(1.0f, screenRect.y1 - screenRect.y0);
+  const float target = 24.0f;
+  if (windowH < 88.0f) return clampf(windowH * 0.24f, 12.0f, 20.0f);
+  return clampf(target, 20.0f, std::max(20.0f, windowH * 0.22f));
+}
+
+PlotMenuRect plotWindowContentLogicalScreenRect(const AppState& app,
+                                                const PlotWindowState& window,
+                                                int windowWidth,
+                                                int windowHeight) {
+  PlotMenuRect rect = plotWindowLogicalScreenRect(app, window, windowWidth, windowHeight);
+  const float titleH = plotWindowTitleBarLogicalHeight(rect);
+  rect.y0 = std::min(rect.y1 - 1.0f, rect.y0 + titleH);
+  return rect;
 }
 
 PlotWindowRectNorm plotWorkspaceRect(float x,
@@ -11065,19 +13066,42 @@ PlotWindowRectNorm defaultPlotWindowRectNearCursor(const AppState& app,
   return clampedPlotWindowRect(rect, windowWidth, windowHeight);
 }
 
-bool pointInPlotWindowRect(const PlotWindowState& window, int windowWidth, int windowHeight, double x, double y) {
-  const float x0 = window.rect.x * static_cast<float>(std::max(1, windowWidth));
-  const float y0 = window.rect.y * static_cast<float>(std::max(1, windowHeight));
-  const float x1 = x0 + window.rect.w * static_cast<float>(std::max(1, windowWidth));
-  const float y1 = y0 + window.rect.h * static_cast<float>(std::max(1, windowHeight));
-  return x >= x0 && x <= x1 && y >= y0 && y <= y1;
+bool pointInPlotWindowRect(const AppState& app,
+                           const PlotWindowState& window,
+                           int windowWidth,
+                           int windowHeight,
+                           double x,
+                           double y) {
+  if (plotWindowIsDockedSourceSignal(window)) return false;
+  const PlotMenuRect rect = plotWindowLogicalScreenRect(app, window, windowWidth, windowHeight);
+  return x >= rect.x0 && x <= rect.x1 && y >= rect.y0 && y <= rect.y1;
 }
 
 int plotWindowAt(const AppState& app, int windowWidth, int windowHeight, double x, double y) {
   for (auto it = app.plotWindows.rbegin(); it != app.plotWindows.rend(); ++it) {
-    if (pointInPlotWindowRect(*it, windowWidth, windowHeight, x, y)) return it->windowId;
+    if (pointInPlotWindowRect(app, *it, windowWidth, windowHeight, x, y)) return it->windowId;
   }
   return -1;
+}
+
+float plotWindowAreaNorm(const PlotWindowState& window) {
+  return std::max(0.0f, window.rect.w) * std::max(0.0f, window.rect.h);
+}
+
+void sortPlotWindowsForReadableStacking(AppState* app, int focusedId) {
+  if (!app || app->plotWindows.size() < 2u) return;
+  std::stable_sort(app->plotWindows.begin(),
+                   app->plotWindows.end(),
+                   [focusedId](const PlotWindowState& a, const PlotWindowState& b) {
+                     const float areaA = plotWindowAreaNorm(a);
+                     const float areaB = plotWindowAreaNorm(b);
+                     if (std::abs(areaA - areaB) > 1e-5f) {
+                       return areaA > areaB;
+                     }
+                     if (a.windowId == focusedId && b.windowId != focusedId) return false;
+                     if (b.windowId == focusedId && a.windowId != focusedId) return true;
+                     return false;
+                   });
 }
 
 void bringPlotWindowToFront(AppState* app, int id) {
@@ -11088,6 +13112,7 @@ void bringPlotWindowToFront(AppState* app, int id) {
   PlotWindowState window = *it;
   app->plotWindows.erase(it);
   app->plotWindows.push_back(window);
+  sortPlotWindowsForReadableStacking(app, id);
 }
 
 bool closePlotWindow(AppState* app, int id) {
@@ -11097,6 +13122,7 @@ bool closePlotWindow(AppState* app, int id) {
                          [&](const PlotWindowState& window) { return window.windowId == id; });
   if (it == app->plotWindows.end()) return false;
   const bool closedFocused = id == app->focusedPlotWindowId;
+  releasePlotWindowGpuCaches(&(*it));
   app->plotWindows.erase(it);
   if (closedFocused && !app->plotWindows.empty()) {
     focusPlotWindow(app, app->plotWindows.back().windowId);
@@ -11160,6 +13186,12 @@ void fitAnalyticalScopeCamera(PlotWindowState* window) {
   window->camera.qw = 1.0f;
 }
 
+bool fitPlotWindowCameraToCurrentContent(AppState* app,
+                                         PlotWindowState* window,
+                                         int windowWidth,
+                                         int windowHeight,
+                                         int fbWidth,
+                                         int fbHeight);
 void addPlotWindow(AppState* app, int plotModel, int windowWidth, int windowHeight, double cursorX, double cursorY) {
   if (!app) return;
   ensureDefaultPlotWindow(app);
@@ -11181,12 +13213,13 @@ void addPlotWindow(AppState* app, int plotModel, int windowWidth, int windowHeig
   }
   app->plotWindows.push_back(window);
   focusPlotWindow(app, window.windowId);
+  sortPlotWindowsForReadableStacking(app, window.windowId);
   logViewerEvent(std::string("Added plot window: id=") + std::to_string(window.windowId) +
                  " model=" + ChromaspaceViewer::plotModelLabel(window.viewState.plotModel));
 }
 
-bool plotWindowIsSourceSignal(const PlotWindowState& window) {
-  return window.viewState.plotModel == ChromaspaceViewer::kPlotModelSourceSignal;
+bool plotWindowIsDockedSourceSignal(const PlotWindowState& window) {
+  return plotWindowIsSourceSignal(window) && window.sourceSignalDocked;
 }
 
 bool plotWindowCanOwnViewerLassoSelection(const PlotWindowState& window) {
@@ -11195,8 +13228,20 @@ bool plotWindowCanOwnViewerLassoSelection(const PlotWindowState& window) {
          ChromaspaceViewer::volumeSlicingSupported(state, false);
 }
 
+constexpr int kSlicingVectorCount = 6;
+
 bool viewerSourceSelectionsSynced(const AppState& app) {
   return app.viewerState.sourceSyncSelections;
+}
+
+bool viewerImageLassoSessionActive(const AppState& app) {
+  if (app.viewerState.volumeSliceLassoRegion || app.viewerLassoDrawing) return true;
+  for (const auto& window : app.plotWindows) {
+    if (viewerStateWithModelCapabilities(window.viewState).volumeSliceLassoRegion) {
+      return true;
+    }
+  }
+  return false;
 }
 
 PlotWindowState* sourceSignalPlotWindow(AppState* app) {
@@ -11222,11 +13267,247 @@ PlotWindowState* sourceSignalPlotWindowAt(AppState* app,
   if (!app) return nullptr;
   for (auto it = app->plotWindows.rbegin(); it != app->plotWindows.rend(); ++it) {
     if (plotWindowIsSourceSignal(*it) &&
-        pointInPlotWindowRect(*it, windowWidth, windowHeight, x, y)) {
+        pointInPlotWindowRect(*app, *it, windowWidth, windowHeight, x, y)) {
       return &(*it);
     }
   }
   return nullptr;
+}
+
+PlotWindowState* sourceSignalDockOwnerWindow(AppState* app, const PlotWindowState* sourceWindow = nullptr) {
+  if (!app) return nullptr;
+  const int preferredId =
+      sourceWindow && sourceWindow->sourceSignalDockOwnerWindowId >= 0
+          ? sourceWindow->sourceSignalDockOwnerWindowId
+          : app->viewerLassoTargetWindowId;
+  if (PlotWindowState* owner = plotWindowById(app, preferredId);
+      owner && plotWindowCanOwnViewerLassoSelection(*owner)) {
+    return owner;
+  }
+  if (PlotWindowState* focused = focusedPlotWindow(app);
+      focused && plotWindowCanOwnViewerLassoSelection(*focused)) {
+    return focused;
+  }
+  for (auto it = app->plotWindows.rbegin(); it != app->plotWindows.rend(); ++it) {
+    if (plotWindowCanOwnViewerLassoSelection(*it)) return &(*it);
+  }
+  return nullptr;
+}
+
+const PlotWindowState* sourceSignalDockOwnerWindow(const AppState& app,
+                                                   const PlotWindowState& sourceWindow) {
+  if (const PlotWindowState* owner = plotWindowById(app, sourceWindow.sourceSignalDockOwnerWindowId);
+      owner && plotWindowCanOwnViewerLassoSelection(*owner)) {
+    return owner;
+  }
+  if (const PlotWindowState* owner = plotWindowById(app, app.viewerLassoTargetWindowId);
+      owner && plotWindowCanOwnViewerLassoSelection(*owner)) {
+    return owner;
+  }
+  if (const PlotWindowState* focused = focusedPlotWindow(app);
+      focused && plotWindowCanOwnViewerLassoSelection(*focused)) {
+    return focused;
+  }
+  for (auto it = app.plotWindows.rbegin(); it != app.plotWindows.rend(); ++it) {
+    if (plotWindowCanOwnViewerLassoSelection(*it)) return &(*it);
+  }
+  return nullptr;
+}
+
+bool plotWindowSupportsSlicingQuickButton(const PlotWindowState& window) {
+  return !plotWindowIsSourceSignal(window) &&
+         window.viewState.plotModel != ChromaspaceViewer::kPlotModelGlossView;
+}
+
+PlotMenuRect slicingQuickButtonRect(const AppState& app,
+                                    const PlotWindowState& window,
+                                    int windowWidth,
+                                    int windowHeight) {
+  if (!plotWindowSupportsSlicingQuickButton(window)) return {};
+  const PlotMenuRect content = plotWindowContentLogicalScreenRect(app, window, windowWidth, windowHeight);
+  const float size = 34.0f;
+  const float margin = 10.0f;
+  const float x0 = clampf(content.x0 + margin,
+                          content.x0 + 4.0f,
+                          std::max(content.x0 + 4.0f, content.x1 - size - 4.0f));
+  const float y0 = clampf(content.y1 - size - margin,
+                          content.y0 + 4.0f,
+                          std::max(content.y0 + 4.0f, content.y1 - size - 4.0f));
+  return {x0, y0, x0 + size, y0 + size};
+}
+
+float bottomLeftControlLaneOffset(const AppState& app,
+                                  const PlotWindowState& owner,
+                                  int windowWidth,
+                                  int windowHeight) {
+  if (!plotWindowSupportsSlicingQuickButton(owner)) return 0.0f;
+  const PlotMenuRect button = slicingQuickButtonRect(app, owner, windowWidth, windowHeight);
+  return std::max(0.0f, button.x1 - button.x0 + 8.0f);
+}
+
+struct SlicingQuickDrawerRects {
+  PlotMenuRect drawer{};
+  std::array<PlotMenuRect, kSlicingVectorCount> vectors{};
+  PlotMenuRect lasso{};
+};
+
+PlotMenuRect slicingQuickDrawerRect(const AppState& app,
+                                    const PlotWindowState& window,
+                                    int windowWidth,
+                                    int windowHeight) {
+  const PlotMenuRect content = plotWindowContentLogicalScreenRect(app, window, windowWidth, windowHeight);
+  const PlotMenuRect button = slicingQuickButtonRect(app, window, windowWidth, windowHeight);
+  if (button.x1 <= button.x0 || button.y1 <= button.y0) return {};
+  const float pad = 9.0f;
+  const float gap = 7.0f;
+  const float maxWidth = std::max(80.0f, content.x1 - button.x0 - 6.0f);
+  const float preferredItem = 24.0f;
+  const float item =
+      clampf((maxWidth - pad * 2.0f - gap * 6.0f) / 7.0f, 14.0f, preferredItem);
+  const float width = std::min(maxWidth, pad * 2.0f + item * 7.0f + gap * 6.0f);
+  const float height = pad * 2.0f + item;
+  const float x0 = button.x0;
+  float y1 = button.y0 - 7.0f;
+  float y0 = y1 - height;
+  if (y0 < content.y0 + 4.0f) {
+    y0 = std::min(content.y1 - height - 4.0f, button.y1 + 7.0f);
+    y1 = y0 + height;
+  }
+  return {x0, y0, std::min(content.x1 - 4.0f, x0 + width), y1};
+}
+
+SlicingQuickDrawerRects slicingQuickDrawerItemRects(const AppState& app,
+                                                    const PlotWindowState& window,
+                                                    int windowWidth,
+                                                    int windowHeight) {
+  SlicingQuickDrawerRects out{};
+  out.drawer = slicingQuickDrawerRect(app, window, windowWidth, windowHeight);
+  if (out.drawer.x1 <= out.drawer.x0 || out.drawer.y1 <= out.drawer.y0) return out;
+  const float pad = 9.0f;
+  const float gap = 7.0f;
+  const float available = std::max(20.0f, out.drawer.x1 - out.drawer.x0 - pad * 2.0f);
+  const float item = clampf((available - gap * 6.0f) / 7.0f, 12.0f, 24.0f);
+  const float y0 = out.drawer.y0 + (out.drawer.y1 - out.drawer.y0 - item) * 0.5f;
+  float x = out.drawer.x0 + pad;
+  for (int i = 0; i < kSlicingVectorCount; ++i) {
+    out.vectors[static_cast<size_t>(i)] = {x, y0, x + item, y0 + item};
+    x += item + gap;
+  }
+  out.lasso = {x, y0, x + item, y0 + item};
+  return out;
+}
+
+int slicingQuickDrawerVectorIndexAt(const SlicingQuickDrawerRects& rects, double x, double y) {
+  for (int i = 0; i < kSlicingVectorCount; ++i) {
+    const PlotMenuRect& rect = rects.vectors[static_cast<std::size_t>(i)];
+    if (x >= rect.x0 && x <= rect.x1 && y >= rect.y0 && y <= rect.y1) return i;
+  }
+  return -1;
+}
+
+bool pointInSlicingQuickDrawerLasso(const SlicingQuickDrawerRects& rects, double x, double y) {
+  return x >= rects.lasso.x0 && x <= rects.lasso.x1 && y >= rects.lasso.y0 && y <= rects.lasso.y1;
+}
+
+PlotMenuRect sourceSignalDockButtonRect(const AppState& app,
+                                        const PlotWindowState& sourceWindow,
+                                        int windowWidth,
+                                        int windowHeight) {
+  const PlotWindowState* owner = sourceSignalDockOwnerWindow(app, sourceWindow);
+  if (!owner) return {};
+  const PlotMenuRect content = plotWindowContentLogicalScreenRect(app, *owner, windowWidth, windowHeight);
+  const float buttonW = 48.0f;
+  const float buttonH = 34.0f;
+  const float margin = 10.0f;
+  const float laneOffset = bottomLeftControlLaneOffset(app, *owner, windowWidth, windowHeight);
+  const float x0 = clampf(content.x0 + margin + laneOffset,
+                          content.x0 + 4.0f,
+                          std::max(content.x0 + 4.0f, content.x1 - buttonW - 4.0f));
+  const float y0 = clampf(content.y1 - buttonH - margin,
+                          content.y0 + 4.0f,
+                          std::max(content.y0 + 4.0f, content.y1 - buttonH - 4.0f));
+  return {x0, y0, x0 + buttonW, y0 + buttonH};
+}
+
+PlotWindowState* dockedSourceSignalWindowAtPoint(AppState* app,
+                                                 int windowWidth,
+                                                 int windowHeight,
+                                                 double x,
+                                                 double y) {
+  if (!app) return nullptr;
+  for (auto it = app->plotWindows.rbegin(); it != app->plotWindows.rend(); ++it) {
+    if (!plotWindowIsDockedSourceSignal(*it)) continue;
+    if (pointInPlotMenuRect(sourceSignalDockButtonRect(*app, *it, windowWidth, windowHeight), x, y)) {
+      return &(*it);
+    }
+  }
+  return nullptr;
+}
+
+bool plotWindowRectLooksRestorable(const PlotWindowRectNorm& rect) {
+  return rect.w > 0.08f && rect.h > 0.08f && rect.x >= -0.001f && rect.y >= -0.001f;
+}
+
+void dockSourceSignalForLasso(AppState* app,
+                              PlotWindowState* sourceWindow,
+                              int windowWidth,
+                              int windowHeight) {
+  if (!app || !sourceWindow || !plotWindowIsSourceSignal(*sourceWindow) ||
+      !viewerImageLassoSessionActive(*app)) {
+    return;
+  }
+  PlotWindowState* owner = sourceSignalDockOwnerWindow(app, sourceWindow);
+  if (!owner) return;
+  if (!sourceWindow->sourceSignalDocked) {
+    sourceWindow->sourceSignalRestoreRect = sourceWindow->rect;
+  }
+  sourceWindow->sourceSignalDockOwnerWindowId = owner->windowId;
+  sourceWindow->sourceSignalDocked = true;
+  sourceWindow->sourceSignalDockAnimStart = glfwGetTime();
+  sourceWindow->sourceSignalDockAnimatingToDock = true;
+  if (app->focusedPlotWindowId == sourceWindow->windowId) {
+    focusPlotWindow(app, owner->windowId);
+  }
+  logViewerEvent(std::string("Docked Source Signal lasso surface to plot window: owner=") +
+                 std::to_string(owner->windowId));
+  (void)windowWidth;
+  (void)windowHeight;
+}
+
+void restoreDockedSourceSignalWindow(AppState* app,
+                                     PlotWindowState* sourceWindow,
+                                     int windowWidth,
+                                     int windowHeight) {
+  if (!app || !sourceWindow || !plotWindowIsDockedSourceSignal(*sourceWindow)) return;
+  PlotWindowState* owner = sourceSignalDockOwnerWindow(app, sourceWindow);
+  if (plotWindowRectLooksRestorable(sourceWindow->sourceSignalRestoreRect)) {
+    sourceWindow->rect =
+        clampedPlotWindowRect(sourceWindow->sourceSignalRestoreRect, windowWidth, windowHeight);
+  } else if (owner) {
+    const PlotMenuRect ownerContent = plotWindowContentLogicalScreenRect(*app, *owner, windowWidth, windowHeight);
+    const float left = plotWorkspaceReservedLeftPixels(*app, windowWidth);
+    const float availableW = std::max(1.0f, static_cast<float>(windowWidth) - left);
+    PlotWindowRectNorm rect{};
+    rect.w = 0.38f;
+    rect.h = std::min(0.42f, std::max(0.28f, owner->rect.h * 0.62f));
+    const float logicalX = ownerContent.x0 + 18.0f;
+    const float logicalY = std::max(ownerContent.y0 + 18.0f, ownerContent.y1 - rect.h * windowHeight - 18.0f);
+    rect.x = (logicalX - left) / availableW;
+    rect.y = logicalY / static_cast<float>(std::max(1, windowHeight));
+    sourceWindow->rect = clampedPlotWindowRect(rect, windowWidth, windowHeight);
+  } else {
+    sourceWindow->rect = clampedPlotWindowRect({0.08f, plotWorkspaceTopNorm(windowHeight) + 0.06f, 0.42f, 0.42f},
+                                               windowWidth,
+                                               windowHeight);
+  }
+  const int previousLassoTarget = app->viewerLassoTargetWindowId;
+  sourceWindow->sourceSignalDocked = false;
+  sourceWindow->sourceSignalDockAnimStart = glfwGetTime();
+  sourceWindow->sourceSignalDockAnimatingToDock = false;
+  focusPlotWindow(app, sourceWindow->windowId);
+  app->viewerLassoTargetWindowId = previousLassoTarget;
+  bringPlotWindowToFront(app, sourceWindow->windowId);
+  logViewerEvent("Restored docked Source Signal lasso surface.");
 }
 
 PlotWindowState* activeViewerLassoTargetWindow(AppState* app) {
@@ -11267,30 +13548,118 @@ const PlotWindowState* activeViewerLassoTargetWindow(const AppState& app) {
 }
 
 void rememberViewerLassoTargetFromCurrentFocus(AppState* app) {
-  if (!app || viewerSourceSelectionsSynced(*app)) return;
+  if (!app) return;
   if (PlotWindowState* focused = focusedPlotWindow(app);
       focused && plotWindowCanOwnViewerLassoSelection(*focused)) {
     app->viewerLassoTargetWindowId = focused->windowId;
   }
 }
 
+void rememberViewerLassoTargetFromSettingsWindow(AppState* app) {
+  if (!app) return;
+  if (PlotWindowState* settings = effectiveSettingsPlotWindow(app);
+      settings && plotWindowCanOwnViewerLassoSelection(*settings)) {
+    app->viewerLassoTargetWindowId = settings->windowId;
+    return;
+  }
+  rememberViewerLassoTargetFromCurrentFocus(app);
+}
+
 const PlotWindowState* activeSourceSignalLassoWindow(const AppState& app) {
   if (const PlotWindowState* focused = focusedPlotWindow(app);
-      focused && plotWindowIsSourceSignal(*focused)) {
+      focused && plotWindowIsSourceSignal(*focused) && !plotWindowIsDockedSourceSignal(*focused)) {
     return focused;
   }
-  return sourceSignalPlotWindow(app);
+  const PlotWindowState* source = sourceSignalPlotWindow(app);
+  return source && !plotWindowIsDockedSourceSignal(*source) ? source : nullptr;
+}
+
+PlotWindowRectNorm sourceSignalLassoSurfaceRectForOwner(const AppState& app,
+                                                        const PlotWindowState* owner,
+                                                        int windowWidth,
+                                                        int windowHeight) {
+  const float left = plotWorkspaceReservedLeftPixels(app, windowWidth);
+  const float availableW = std::max(1.0f, static_cast<float>(windowWidth) - left);
+  const float toolbarBottom = plotWorkspaceTopNorm(windowHeight) * static_cast<float>(windowHeight);
+  if (!owner) {
+    return clampedPlotWindowRect({0.08f,
+                                  plotWorkspaceTopNorm(windowHeight) + 0.06f,
+                                  0.46f,
+                                  0.46f},
+                                 windowWidth,
+                                 windowHeight);
+  }
+
+  const PlotMenuRect ownerContent =
+      plotWindowContentLogicalScreenRect(app, *owner, windowWidth, windowHeight);
+  const float ownerW = std::max(1.0f, ownerContent.x1 - ownerContent.x0);
+  const float ownerH = std::max(1.0f, ownerContent.y1 - ownerContent.y0);
+  const float targetW = clampf(ownerW * 0.72f,
+                               std::min(300.0f, availableW * 0.72f),
+                               std::min(620.0f, availableW - 20.0f));
+  const float targetH = clampf(ownerH * 0.68f,
+                               std::min(220.0f, static_cast<float>(windowHeight) * 0.55f),
+                               std::min(520.0f, static_cast<float>(windowHeight) - toolbarBottom - 20.0f));
+  const float xPx = clampf(ownerContent.x0 + (ownerW - targetW) * 0.5f,
+                           left + 10.0f,
+                           std::max(left + 10.0f, static_cast<float>(windowWidth) - targetW - 10.0f));
+  const float yPx = clampf(ownerContent.y0 + (ownerH - targetH) * 0.5f,
+                           toolbarBottom + 10.0f,
+                           std::max(toolbarBottom + 10.0f,
+                                    static_cast<float>(windowHeight) - targetH - 10.0f));
+  return clampedPlotWindowRect({(xPx - left) / availableW,
+                                yPx / static_cast<float>(std::max(1, windowHeight)),
+                                targetW / availableW,
+                                targetH / static_cast<float>(std::max(1, windowHeight))},
+                               windowWidth,
+                               windowHeight);
 }
 
 void ensureSourceSignalWindowForLasso(AppState* app,
                                       int windowWidth,
                                       int windowHeight,
                                       bool focusExisting) {
-  if (!app || !app->viewerState.volumeSliceLassoRegion) return;
-  if (focusExisting) rememberViewerLassoTargetFromCurrentFocus(app);
+  if (!app || !viewerImageLassoSessionActive(*app)) return;
+  if (focusExisting) rememberViewerLassoTargetFromSettingsWindow(app);
   if (PlotWindowState* existing = sourceSignalPlotWindow(app)) {
-    if (focusExisting) focusPlotWindow(app, existing->windowId);
+    PlotWindowState* owner = sourceSignalDockOwnerWindow(app, existing);
+    const int ownerId = owner ? owner->windowId : -1;
+    if (owner) {
+      existing->sourceSignalDockOwnerWindowId = owner->windowId;
+    }
+    if (focusExisting && plotWindowIsDockedSourceSignal(*existing)) {
+      restoreDockedSourceSignalWindow(app, existing, windowWidth, windowHeight);
+      if (PlotWindowState* restoredOwner = plotWindowById(app, ownerId)) {
+        app->focusedPlotWindowId = restoredOwner->windowId;
+        for (auto& window : app->plotWindows) {
+          window.selected = window.windowId == restoredOwner->windowId;
+        }
+        applySettingsStateToAppRuntime(app, restoredOwner->viewState, &restoredOwner->camera);
+      }
+      return;
+    }
+    if (focusExisting) {
+      bringPlotWindowToFront(app, existing->windowId);
+      if (PlotWindowState* restoredOwner = plotWindowById(app, ownerId)) {
+        app->focusedPlotWindowId = restoredOwner->windowId;
+        for (auto& window : app->plotWindows) {
+          window.selected = window.windowId == restoredOwner->windowId;
+        }
+        applySettingsStateToAppRuntime(app, restoredOwner->viewState, &restoredOwner->camera);
+      } else {
+        focusPlotWindow(app, existing->windowId);
+      }
+    }
     return;
+  }
+  PlotWindowState* ownerBeforeCreate = sourceSignalDockOwnerWindow(app);
+  const int ownerId = ownerBeforeCreate ? ownerBeforeCreate->windowId : -1;
+  ChromaspaceViewer::ViewerRuntimeState ownerViewState{};
+  CameraState ownerCamera{};
+  const bool hasOwnerSnapshot = ownerBeforeCreate != nullptr;
+  if (hasOwnerSnapshot) {
+    ownerViewState = ownerBeforeCreate->viewState;
+    ownerCamera = ownerBeforeCreate->camera;
   }
   const double cursorX = (app->hoverX > 0.0) ? app->hoverX : static_cast<double>(windowWidth) * 0.5;
   const double cursorY = (app->hoverY > 0.0) ? app->hoverY : static_cast<double>(windowHeight) * 0.5;
@@ -11300,18 +13669,45 @@ void ensureSourceSignalWindowForLasso(AppState* app,
                 windowHeight,
                 cursorX,
                 cursorY);
+  if (PlotWindowState* source = sourceSignalPlotWindow(app)) {
+    source->sourceSignalDockOwnerWindowId = ownerId;
+    if (hasOwnerSnapshot) {
+      source->rect =
+          sourceSignalLassoSurfaceRectForOwner(*app, plotWindowById(app, ownerId), windowWidth, windowHeight);
+    }
+    source->sourceSignalRestoreRect = source->rect;
+    source->sourceSignalTemporaryLassoSurface = true;
+    bringPlotWindowToFront(app, source->windowId);
+  }
+  if (hasOwnerSnapshot) {
+    if (PlotWindowState* ownerAfterCreate = plotWindowById(app, ownerId)) {
+      ownerAfterCreate->viewState = ownerViewState;
+      ownerAfterCreate->camera = ownerCamera;
+      for (auto& window : app->plotWindows) window.selected = window.windowId == ownerId;
+    }
+    app->focusedPlotWindowId = ownerId;
+    app->viewerLassoTargetWindowId = ownerId;
+    applySettingsStateToAppRuntime(app, ownerViewState, &ownerCamera);
+  }
   logViewerEvent("Opened Source Signal window for viewer lasso drawing.");
 }
 
 void propagateViewerLassoEnabledToPlotWindows(AppState* app) {
   if (!app) return;
   const bool enabled = app->viewerState.volumeSliceLassoRegion;
+  PlotWindowState* target = nullptr;
+  if (enabled && !viewerSourceSelectionsSynced(*app)) {
+    target = activeViewerLassoTargetWindow(app);
+  }
   for (auto& window : app->plotWindows) {
     auto state = viewerStateWithModelCapabilities(window.viewState);
-    if (!enabled && !state.volumeSliceLassoRegion) continue;
-    if (enabled && !ChromaspaceViewer::volumeSlicingSupported(state, false)) continue;
-    if (state.volumeSliceLassoRegion == enabled) continue;
-    state.volumeSliceLassoRegion = enabled;
+    const bool nextEnabled =
+        enabled &&
+        ChromaspaceViewer::volumeSlicingSupported(state, false) &&
+        (viewerSourceSelectionsSynced(*app) ||
+         (target && target->windowId == window.windowId));
+    if (state.volumeSliceLassoRegion == nextEnabled) continue;
+    state.volumeSliceLassoRegion = nextEnabled;
     state.stateRevision = std::max<uint64_t>(state.stateRevision + 1, 1);
     window.viewState = viewerStateWithModelCapabilities(state);
   }
@@ -11360,10 +13756,11 @@ bool sourceSignalImageRectForCanvas(const AppState& app,
   if (!outX0 || !outY0 || !outX1 || !outY1 || canvasWidth <= 0 || canvasHeight <= 0) {
     return false;
   }
-  const float plotX = window.rect.x * static_cast<float>(canvasWidth);
-  const float plotTop = window.rect.y * static_cast<float>(canvasHeight);
-  const float plotW = std::max(1.0f, window.rect.w * static_cast<float>(canvasWidth));
-  const float plotH = std::max(1.0f, window.rect.h * static_cast<float>(canvasHeight));
+  const PlotMenuRect screenRect = plotWindowContentLogicalScreenRect(app, window, canvasWidth, canvasHeight);
+  const float plotX = screenRect.x0;
+  const float plotTop = screenRect.y0;
+  const float plotW = std::max(1.0f, screenRect.x1 - screenRect.x0);
+  const float plotH = std::max(1.0f, screenRect.y1 - screenRect.y0);
   const int proxyW = app.sourceSignalProxyWidth > 0 ? app.sourceSignalProxyWidth : app.sourceSignalSourceWidth;
   const int proxyH = app.sourceSignalProxyHeight > 0 ? app.sourceSignalProxyHeight : app.sourceSignalSourceHeight;
   if (proxyW <= 0 || proxyH <= 0) {
@@ -11559,14 +13956,14 @@ bool viewerLassoInteractionEnabled(const AppState& app,
                                    GLFWwindow* window,
                                    double xpos,
                                    double ypos) {
-  if (!window || !app.viewerState.volumeSliceLassoRegion) return false;
+  if (!window || !viewerImageLassoSessionActive(app)) return false;
   int windowWidth = 1;
   int windowHeight = 1;
   glfwGetWindowSize(window, &windowWidth, &windowHeight);
   const PlotWindowState* sourceWindow = nullptr;
   for (auto it = app.plotWindows.rbegin(); it != app.plotWindows.rend(); ++it) {
     if (plotWindowIsSourceSignal(*it) &&
-        pointInPlotWindowRect(*it, windowWidth, windowHeight, xpos, ypos)) {
+        pointInPlotWindowRect(app, *it, windowWidth, windowHeight, xpos, ypos)) {
       sourceWindow = &(*it);
       break;
     }
@@ -11661,7 +14058,7 @@ bool activeViewerLassoSelectionHasData(const AppState& app) {
 }
 
 bool plotWindowShouldShowImageLassoStandby(const AppState& app, const PlotWindowState* window) {
-  if (!window || app.viewerLassoDrawing || !app.viewerState.volumeSliceLassoRegion) return false;
+  if (!window || app.viewerLassoDrawing || !viewerImageLassoSessionActive(app)) return false;
   const auto state = viewerStateWithModelCapabilities(window->viewState);
   if (!state.volumeSliceLassoRegion || !plotWindowCanOwnViewerLassoSelection(*window)) return false;
   if (viewerSourceSelectionsSynced(app)) {
@@ -11771,6 +14168,34 @@ void clearActiveViewerLassoSelection(AppState* app) {
   app->viewerLassoRevision = std::max<uint64_t>(app->viewerLassoRevision + 1, 1);
   app->viewerLassoData.clear();
   bumpViewerLocalStateRevision(app);
+}
+
+bool undoActiveViewerLassoStroke(AppState* app) {
+  if (!app || !viewerImageLassoSessionActive(*app)) return false;
+  if (app->viewerLassoDrawing) {
+    app->viewerLassoDrawing = false;
+    app->viewerLassoActiveStroke = LassoStroke{};
+    bumpViewerLocalStateRevision(app);
+    return true;
+  }
+  if (!viewerSourceSelectionsSynced(*app)) {
+    if (PlotWindowState* target = activeViewerLassoTargetWindow(app)) {
+      if (target->viewerLassoStrokes.empty()) return false;
+      target->viewerLassoStrokes.pop_back();
+      target->viewerLassoRevision = std::max<uint64_t>(target->viewerLassoRevision + 1, 1);
+      target->viewState.stateRevision = std::max<uint64_t>(target->viewState.stateRevision + 1, 1);
+      rebuildViewerLassoData(target);
+      bumpViewerLocalStateRevision(app);
+      return true;
+    }
+    return false;
+  }
+  if (app->viewerLassoStrokes.empty()) return false;
+  app->viewerLassoStrokes.pop_back();
+  app->viewerLassoRevision = std::max<uint64_t>(app->viewerLassoRevision + 1, 1);
+  rebuildViewerLassoData(app);
+  bumpViewerLocalStateRevision(app);
+  return true;
 }
 
 void clearViewerLassoState(AppState* app) {
@@ -12058,6 +14483,7 @@ struct ViewerMenuRow {
   bool choiceItem = false;
   bool note = false;
   bool channelSelector = false;
+  bool slicingVectorSelector = false;
   bool presetActionButtons = false;
   bool spacer = false;
   int choiceValue = 0;
@@ -12772,12 +15198,13 @@ std::vector<ViewerMenuRow> buildViewerMenuRows(const AppState& app) {
                                  !state.showOverflow);
       }
       if (ChromaspaceViewer::hueSlicingAllowed(state, false)) {
-        appendRow(&rows, "Red Sector", onOffLabel(state.volumeSliceRed), ViewerMenuAction::SliceRed);
-        appendRow(&rows, "Yellow Sector", onOffLabel(state.volumeSliceYellow), ViewerMenuAction::SliceYellow);
-        appendRow(&rows, "Green Sector", onOffLabel(state.volumeSliceGreen), ViewerMenuAction::SliceGreen);
-        appendRow(&rows, "Cyan Sector", onOffLabel(state.volumeSliceCyan), ViewerMenuAction::SliceCyan);
-        appendRow(&rows, "Blue Sector", onOffLabel(state.volumeSliceBlue), ViewerMenuAction::SliceBlue);
-        appendRow(&rows, "Magenta Sector", onOffLabel(state.volumeSliceMagenta), ViewerMenuAction::SliceMagenta);
+        ViewerMenuRow vectors{};
+        vectors.label = "Vectors";
+        vectors.action = ViewerMenuAction::None;
+        vectors.enabled = true;
+        vectors.refreshPolicy = "reinterpret";
+        vectors.slicingVectorSelector = true;
+        rows.push_back(std::move(vectors));
       }
       if (ChromaspaceViewer::volumeSlicingSupported(state, false)) {
         appendRow(&rows, "Image Lasso", onOffLabel(state.volumeSliceLassoRegion), ViewerMenuAction::ViewerLasso, true, "resample");
@@ -13138,16 +15565,31 @@ std::filesystem::path viewerSettingsFilePath() {
 #endif
 }
 
-#if defined(_WIN32)
-std::atomic<bool> gResolveBridgeLaunchAttempted{false};
+std::atomic<int64_t> gResolveBridgeLastLaunchAttemptMs{0};
 
 std::filesystem::path viewerExecutableDirectory() {
+#if defined(_WIN32)
   wchar_t buffer[MAX_PATH];
   const DWORD len = GetModuleFileNameW(nullptr, buffer, static_cast<DWORD>(std::size(buffer)));
   if (len == 0 || len >= static_cast<DWORD>(std::size(buffer))) return {};
   return std::filesystem::path(buffer).parent_path();
+#elif defined(__APPLE__)
+  uint32_t size = 0;
+  _NSGetExecutablePath(nullptr, &size);
+  std::vector<char> buffer(size + 1, '\0');
+  if (_NSGetExecutablePath(buffer.data(), &size) != 0) return {};
+  std::error_code ec;
+  return std::filesystem::canonical(buffer.data(), ec).parent_path();
+#else
+  std::vector<char> buffer(4096, '\0');
+  const ssize_t len = readlink("/proc/self/exe", buffer.data(), buffer.size() - 1);
+  if (len <= 0) return {};
+  buffer[static_cast<size_t>(len)] = '\0';
+  return std::filesystem::path(buffer.data()).parent_path();
+#endif
 }
 
+#if defined(_WIN32)
 std::wstring findProgramOnPath(const wchar_t* name) {
   if (!name || !name[0]) return {};
   wchar_t buffer[MAX_PATH];
@@ -13155,18 +15597,60 @@ std::wstring findProgramOnPath(const wchar_t* name) {
   if (len == 0 || len >= static_cast<DWORD>(std::size(buffer))) return {};
   return std::wstring(buffer, buffer + len);
 }
+#endif
+
+bool launchResolveBridgeHelper(const std::filesystem::path& helperPath) {
+  std::error_code ec;
+  if (!std::filesystem::is_regular_file(helperPath, ec)) return false;
+#if defined(_WIN32)
+  std::wstring command = L"\"" + helperPath.wstring() + L"\"";
+  STARTUPINFOW si{};
+  si.cb = sizeof(si);
+  PROCESS_INFORMATION pi{};
+  const BOOL ok = CreateProcessW(nullptr,
+                                 command.data(),
+                                 nullptr,
+                                 nullptr,
+                                 FALSE,
+                                 CREATE_NO_WINDOW | DETACHED_PROCESS,
+                                 nullptr,
+                                 nullptr,
+                                 &si,
+                                 &pi);
+  if (!ok) return false;
+  CloseHandle(pi.hThread);
+  CloseHandle(pi.hProcess);
+#else
+  const pid_t pid = fork();
+  if (pid < 0) return false;
+  if (pid == 0) {
+    const std::string helper = helperPath.string();
+    execl(helper.c_str(), helper.c_str(), static_cast<char*>(nullptr));
+    _exit(127);
+  }
+#endif
+  logViewerEvent(std::string("Started Chromaspace Resolve bridge helper: ") + helperPath.string());
+  return true;
+}
 
 bool launchResolveBridgeWithPython(const std::filesystem::path& scriptPath) {
+#if defined(_WIN32)
+  SetEnvironmentVariableW(L"CHROMASPACE_BRIDGE_PROCESS_NAME", L"Chromaspace Resolve Bridge");
   const std::wstring script = scriptPath.wstring();
-  const std::wstring candidates[] = {
-      findProgramOnPath(L"pythonw.exe"),
-      findProgramOnPath(L"pyw.exe"),
-      findProgramOnPath(L"python.exe"),
-      findProgramOnPath(L"py.exe"),
+  struct Candidate {
+    std::wstring exe;
+    std::wstring argsPrefix;
+  };
+  const Candidate candidates[] = {
+      {findProgramOnPath(L"pythonw.exe"), L""},
+      {findProgramOnPath(L"pyw.exe"), L"-3 "},
+      {findProgramOnPath(L"python.exe"), L""},
+      {findProgramOnPath(L"py.exe"), L"-3 "},
   };
   for (const auto& candidate : candidates) {
-    if (candidate.empty()) continue;
-    std::wstring command = L"\"" + candidate + L"\" \"" + script + L"\"";
+    if (candidate.exe.empty()) continue;
+    std::wstring command = L"\"" + candidate.exe + L"\" " + candidate.argsPrefix +
+                           L"\"" + script + L"\" --chromaspace-resolve-bridge-worker";
     STARTUPINFOW si{};
     si.cb = sizeof(si);
     PROCESS_INFORMATION pi{};
@@ -13183,16 +15667,57 @@ bool launchResolveBridgeWithPython(const std::filesystem::path& scriptPath) {
     if (ok) {
       CloseHandle(pi.hThread);
       CloseHandle(pi.hProcess);
-      logViewerEvent(std::string("Started Chromaspace Resolve bridge: ") + scriptPath.string());
+      logViewerEvent(std::string("Started Chromaspace Resolve bridge Python fallback: ") + scriptPath.string());
       return true;
     }
   }
   return false;
+#else
+  setenv("CHROMASPACE_BRIDGE_PROCESS_NAME", "Chromaspace Resolve Bridge", 1);
+  const std::string script = scriptPath.string();
+  const char* candidates[] = {"python3", "python"};
+  for (const char* candidate : candidates) {
+    const pid_t pid = fork();
+    if (pid < 0) continue;
+    if (pid == 0) {
+      execlp(candidate,
+             candidate,
+             script.c_str(),
+             "--chromaspace-resolve-bridge-worker",
+             static_cast<char*>(nullptr));
+      _exit(127);
+    }
+    logViewerEvent(std::string("Started Chromaspace Resolve bridge Python fallback: ") + scriptPath.string());
+    return true;
+  }
+  return false;
+#endif
 }
 
 void ensureResolveBridgeRunning() {
-  if (gResolveBridgeLaunchAttempted.exchange(true)) return;
+  const int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now().time_since_epoch()).count();
+  int64_t previousMs = gResolveBridgeLastLaunchAttemptMs.load(std::memory_order_relaxed);
+  while (nowMs - previousMs >= 2000) {
+    if (gResolveBridgeLastLaunchAttemptMs.compare_exchange_weak(previousMs,
+                                                                nowMs,
+                                                                std::memory_order_relaxed)) {
+      break;
+    }
+  }
+  if (nowMs - previousMs < 2000) return;
   const std::filesystem::path exeDir = viewerExecutableDirectory();
+  std::vector<std::filesystem::path> helperCandidates;
+  if (!exeDir.empty()) {
+#if defined(_WIN32)
+    helperCandidates.push_back(exeDir / "Chromaspace_ResolveBridge.exe");
+#else
+    helperCandidates.push_back(exeDir / "Chromaspace_ResolveBridge");
+#endif
+  }
+  for (const auto& candidate : helperCandidates) {
+    if (launchResolveBridgeHelper(candidate)) return;
+  }
   std::vector<std::filesystem::path> candidates;
   if (!exeDir.empty()) {
     candidates.push_back(exeDir.parent_path() / "Resources" / "chromaspace_resolve_bridge.py");
@@ -13205,7 +15730,6 @@ void ensureResolveBridgeRunning() {
   }
   logViewerEvent("Chromaspace Resolve bridge was not started; Python or bundled bridge script was not found.");
 }
-#endif
 
 std::string sanitizeViewerSessionId(const std::string& sessionId) {
   std::string out;
@@ -13260,6 +15784,10 @@ std::filesystem::path viewerDrawInstanceScanRequestPath(const std::string& sessi
 
 std::filesystem::path viewerLiveRefreshPulsePath() {
   return viewerMailboxRootPath().parent_path() / "live_refresh_pulse.json";
+}
+
+std::filesystem::path viewerAliveLeasePath(const std::string& sessionId) {
+  return viewerMailboxSessionPath(sessionId) / "viewer_alive.json";
 }
 
 std::filesystem::path chromaspaceAppSupportRootPath() {
@@ -13502,6 +16030,13 @@ void saveViewerWorkspaceToDisk(AppState* app) {
        << ",\"y\":" << std::setprecision(8) << window.rect.y
        << ",\"w\":" << std::setprecision(8) << window.rect.w
        << ",\"h\":" << std::setprecision(8) << window.rect.h
+       << ",\"sourceSignalDocked\":" << (window.sourceSignalDocked ? 1 : 0)
+       << ",\"sourceSignalTemporaryLassoSurface\":" << (window.sourceSignalTemporaryLassoSurface ? 1 : 0)
+       << ",\"sourceSignalDockOwnerWindowId\":" << window.sourceSignalDockOwnerWindowId
+       << ",\"sourceSignalRestoreX\":" << std::setprecision(8) << window.sourceSignalRestoreRect.x
+       << ",\"sourceSignalRestoreY\":" << std::setprecision(8) << window.sourceSignalRestoreRect.y
+       << ",\"sourceSignalRestoreW\":" << std::setprecision(8) << window.sourceSignalRestoreRect.w
+       << ",\"sourceSignalRestoreH\":" << std::setprecision(8) << window.sourceSignalRestoreRect.h
        << ",\"camQx\":" << std::setprecision(8) << window.camera.qx
        << ",\"camQy\":" << std::setprecision(8) << window.camera.qy
        << ",\"camQz\":" << std::setprecision(8) << window.camera.qz
@@ -13561,6 +16096,15 @@ bool loadViewerWorkspaceFromDisk(AppState* app) {
     if (extractFloat(line, "y", &value)) window.rect.y = value;
     if (extractFloat(line, "w", &value)) window.rect.w = value;
     if (extractFloat(line, "h", &value)) window.rect.h = value;
+    if (extractInt(line, "sourceSignalDocked", &intValue)) window.sourceSignalDocked = intValue != 0;
+    if (extractInt(line, "sourceSignalTemporaryLassoSurface", &intValue)) {
+      window.sourceSignalTemporaryLassoSurface = intValue != 0;
+    }
+    extractInt(line, "sourceSignalDockOwnerWindowId", &window.sourceSignalDockOwnerWindowId);
+    if (extractFloat(line, "sourceSignalRestoreX", &value)) window.sourceSignalRestoreRect.x = value;
+    if (extractFloat(line, "sourceSignalRestoreY", &value)) window.sourceSignalRestoreRect.y = value;
+    if (extractFloat(line, "sourceSignalRestoreW", &value)) window.sourceSignalRestoreRect.w = value;
+    if (extractFloat(line, "sourceSignalRestoreH", &value)) window.sourceSignalRestoreRect.h = value;
     if (extractFloat(line, "camQx", &value)) window.camera.qx = value;
     if (extractFloat(line, "camQy", &value)) window.camera.qy = value;
     if (extractFloat(line, "camQz", &value)) window.camera.qz = value;
@@ -13593,6 +16137,15 @@ bool loadViewerWorkspaceFromDisk(AppState* app) {
     window.rect.y = clampf(window.rect.y, 0.0f, 1.0f);
     window.rect.w = clampf(window.rect.w, 0.05f, 1.0f);
     window.rect.h = clampf(window.rect.h, 0.05f, 1.0f);
+    window.sourceSignalRestoreRect.x = clampf(window.sourceSignalRestoreRect.x, 0.0f, 1.0f);
+    window.sourceSignalRestoreRect.y = clampf(window.sourceSignalRestoreRect.y, 0.0f, 1.0f);
+    window.sourceSignalRestoreRect.w = clampf(window.sourceSignalRestoreRect.w, 0.0f, 1.0f);
+    window.sourceSignalRestoreRect.h = clampf(window.sourceSignalRestoreRect.h, 0.0f, 1.0f);
+    if (!plotWindowIsSourceSignal(window)) {
+      window.sourceSignalDocked = false;
+      window.sourceSignalTemporaryLassoSurface = false;
+      window.sourceSignalDockOwnerWindowId = -1;
+    }
     window.selected = window.windowId == focusedId;
     windows.push_back(window);
   }
@@ -13600,6 +16153,19 @@ bool loadViewerWorkspaceFromDisk(AppState* app) {
   app->plotWindows = std::move(windows);
   app->focusedPlotWindowId = focusedId;
   app->nextPlotWindowId = std::max(nextId, 2);
+  for (auto& window : app->plotWindows) {
+    if (!plotWindowIsDockedSourceSignal(window)) continue;
+    if (!viewerImageLassoSessionActive(*app) || !sourceSignalDockOwnerWindow(*app, window)) {
+      window.sourceSignalDocked = false;
+      if (!viewerImageLassoSessionActive(*app)) {
+        window.sourceSignalTemporaryLassoSurface = false;
+      }
+      window.sourceSignalDockOwnerWindowId = -1;
+      if (plotWindowRectLooksRestorable(window.sourceSignalRestoreRect)) {
+        window.rect = window.sourceSignalRestoreRect;
+      }
+    }
+  }
   if (const PlotWindowState* focused = focusedPlotWindow(*app)) {
     PlotWindowState copy = *focused;
     applyPlotWindowToApp(app, copy);
@@ -14749,6 +17315,36 @@ void updateResolveLiveRefreshPulse(AppState* app) {
 #endif
 }
 
+uint64_t currentViewerProcessId() {
+#if defined(_WIN32)
+  return static_cast<uint64_t>(GetCurrentProcessId());
+#else
+  return static_cast<uint64_t>(getpid());
+#endif
+}
+
+void updateViewerAliveLease(AppState* app, bool active = true, bool force = false) {
+  if (!app || app->senderId.empty()) return;
+  const double now = glfwGetTime();
+  constexpr double kViewerLeaseWriteIntervalSeconds = 1.0;
+  if (!force && now - app->lastViewerAliveLeaseWrite < kViewerLeaseWriteIntervalSeconds) return;
+  app->lastViewerAliveLeaseWrite = now;
+  std::ostringstream lease;
+  lease << "{\"type\":\"chromaspace_viewer_alive\""
+        << ",\"active\":" << (active ? 1 : 0)
+        << ",\"needsBridge\":1"
+        << ",\"viewerPid\":" << currentViewerProcessId()
+        << ",\"sessionId\":\"" << heartbeatJsonEscape(app->senderId) << "\""
+        << ",\"updatedAtUnix\":" << std::fixed << std::setprecision(3) << std::time(nullptr)
+        << "}\n";
+  (void)writeViewerMailboxAtomic(viewerAliveLeasePath(app->senderId), lease.str());
+}
+
+void clearViewerAliveLease(AppState* app) {
+  if (!app || app->senderId.empty()) return;
+  updateViewerAliveLease(app, false, true);
+}
+
 void applyViewerPlotSelectionToPayload(const AppState& app, ResolvedPayload* payload) {
   (void)app;
   (void)payload;
@@ -14792,17 +17388,8 @@ void applyViewerIdentityReadSelectionToPayload(const AppState& app, ResolvedPayl
 
 void applyViewerStateToApp(AppState* app, const ChromaspaceViewer::ViewerRuntimeState& state) {
   if (!app) return;
-  app->viewerState = viewerStateWithModelCapabilities(state);
-  app->plotMode = ChromaspaceViewer::plotModeForModel(app->viewerState.plotModel);
-  app->circularHsl = app->viewerState.circularHsl;
-  app->circularHsv = app->viewerState.circularHsv;
-  app->keepOnTop = app->viewerState.keepOnTop;
-  app->readGrayRamp = app->viewerState.readGrayRamp;
-  app->readIdentityPlot = app->viewerState.readIdentityPlot;
-  app->isolateIdentityData = app->viewerState.isolateIdentityData;
-  app->excludeIdentityData = app->viewerState.excludeIdentityData;
-  app->identityReadResolution = app->viewerState.identityReadResolution;
-  if (auto* window = focusedPlotWindow(app)) {
+  applySettingsStateToAppRuntime(app, state);
+  if (auto* window = effectiveSettingsPlotWindow(app)) {
     window->viewState = app->viewerState;
     window->selected = true;
   }
@@ -15031,13 +17618,6 @@ void applyViewerLassoStateToResolvedPayload(const AppState& app, ResolvedPayload
   (void)applyViewerLassoStateToResolvedPayloadForWindow(app, target, payload);
 }
 
-struct PlotMenuRect {
-  float x0 = 0.0f;
-  float y0 = 0.0f;
-  float x1 = 0.0f;
-  float y1 = 0.0f;
-};
-
 std::array<PlotMenuRect, 3> waveformChannelSelectorRects(const PlotMenuRect& rowRect) {
   constexpr float kSize = 17.0f;
   constexpr float kGap = 8.0f;
@@ -15049,6 +17629,146 @@ std::array<PlotMenuRect, 3> waveformChannelSelectorRects(const PlotMenuRect& row
     rects[static_cast<size_t>(channel)] = {x1 - kSize, y0, x1, y0 + kSize};
   }
   return rects;
+}
+
+void slicingVectorColor(int index, float* r, float* g, float* b) {
+  static constexpr float kColors[kSlicingVectorCount][3] = {
+      {1.0f, 0.18f, 0.14f},
+      {1.0f, 0.86f, 0.16f},
+      {0.22f, 0.86f, 0.22f},
+      {0.16f, 0.88f, 0.94f},
+      {0.28f, 0.48f, 1.0f},
+      {0.92f, 0.32f, 0.94f},
+  };
+  const int i = std::clamp(index, 0, kSlicingVectorCount - 1);
+  if (r) *r = kColors[i][0];
+  if (g) *g = kColors[i][1];
+  if (b) *b = kColors[i][2];
+}
+
+bool slicingVectorEnabled(const ChromaspaceViewer::ViewerRuntimeState& state, int index) {
+  switch (index) {
+    case 0: return state.volumeSliceRed;
+    case 1: return state.volumeSliceYellow;
+    case 2: return state.volumeSliceGreen;
+    case 3: return state.volumeSliceCyan;
+    case 4: return state.volumeSliceBlue;
+    case 5: return state.volumeSliceMagenta;
+    default: return false;
+  }
+}
+
+void setSlicingVectorEnabled(ChromaspaceViewer::ViewerRuntimeState* state, int index, bool enabled) {
+  if (!state) return;
+  switch (index) {
+    case 0: state->volumeSliceRed = enabled; break;
+    case 1: state->volumeSliceYellow = enabled; break;
+    case 2: state->volumeSliceGreen = enabled; break;
+    case 3: state->volumeSliceCyan = enabled; break;
+    case 4: state->volumeSliceBlue = enabled; break;
+    case 5: state->volumeSliceMagenta = enabled; break;
+    default: break;
+  }
+}
+
+bool allSlicingVectorsEnabled(const ChromaspaceViewer::ViewerRuntimeState& state) {
+  for (int i = 0; i < kSlicingVectorCount; ++i) {
+    if (!slicingVectorEnabled(state, i)) return false;
+  }
+  return true;
+}
+
+bool anySlicingVectorsEnabled(const ChromaspaceViewer::ViewerRuntimeState& state) {
+  for (int i = 0; i < kSlicingVectorCount; ++i) {
+    if (slicingVectorEnabled(state, i)) return true;
+  }
+  return false;
+}
+
+std::array<PlotMenuRect, kSlicingVectorCount> slicingVectorSelectorRects(const PlotMenuRect& rowRect,
+                                                                         float preferredSize = 20.0f,
+                                                                         float preferredGap = 8.0f) {
+  const float available = std::max(48.0f, rowRect.x1 - rowRect.x0 - 28.0f);
+  const float size = clampf((available - preferredGap * static_cast<float>(kSlicingVectorCount - 1)) /
+                                static_cast<float>(kSlicingVectorCount),
+                            13.0f,
+                            preferredSize);
+  const float gap = std::min(preferredGap, std::max(3.0f, (available - size * kSlicingVectorCount) /
+                                                            static_cast<float>(kSlicingVectorCount - 1)));
+  const float total = size * kSlicingVectorCount + gap * static_cast<float>(kSlicingVectorCount - 1);
+  const float x0 = rowRect.x1 - 14.0f - total;
+  const float y0 = rowRect.y0 + (rowRect.y1 - rowRect.y0 - size) * 0.5f;
+  std::array<PlotMenuRect, kSlicingVectorCount> rects{};
+  for (int i = 0; i < kSlicingVectorCount; ++i) {
+    const float bx0 = x0 + static_cast<float>(i) * (size + gap);
+    rects[static_cast<size_t>(i)] = {bx0, y0, bx0 + size, y0 + size};
+  }
+  return rects;
+}
+
+int slicingVectorIndexAt(const std::array<PlotMenuRect, kSlicingVectorCount>& rects, double x, double y) {
+  for (int i = 0; i < kSlicingVectorCount; ++i) {
+    const PlotMenuRect& rect = rects[static_cast<size_t>(i)];
+    if (x >= rect.x0 && x <= rect.x1 && y >= rect.y0 && y <= rect.y1) return i;
+  }
+  return -1;
+}
+
+bool commitSlicingVectorState(AppState* app,
+                              int windowId,
+                              const ChromaspaceViewer::ViewerRuntimeState& nextState,
+                              const char* refreshPolicy = "reinterpret") {
+  if (!app) return false;
+  if (windowId >= 0) focusPlotWindow(app, windowId);
+  auto state = viewerStateWithModelCapabilities(nextState);
+  state.stateRevision = std::max<uint64_t>(state.stateRevision + 1, 1);
+  applyViewerStateToApp(app, state);
+  app->viewerStateLocalOverride = true;
+  queueViewerStateCommand(*app, refreshPolicy ? refreshPolicy : "reinterpret");
+  return true;
+}
+
+bool setSlicingVectorForWindow(AppState* app, int windowId, int index, bool enabled) {
+  if (!app || index < 0 || index >= kSlicingVectorCount) return false;
+  if (windowId >= 0) focusPlotWindow(app, windowId);
+  auto state = viewerStateWithModelCapabilities(app->viewerState);
+  if (slicingVectorEnabled(state, index) == enabled) return false;
+  setSlicingVectorEnabled(&state, index, enabled);
+  return commitSlicingVectorState(app, windowId, state);
+}
+
+bool toggleSlicingVectorForWindow(AppState* app, int windowId, int index) {
+  if (!app || index < 0 || index >= kSlicingVectorCount) return false;
+  if (windowId >= 0) focusPlotWindow(app, windowId);
+  auto state = viewerStateWithModelCapabilities(app->viewerState);
+  setSlicingVectorEnabled(&state, index, !slicingVectorEnabled(state, index));
+  return commitSlicingVectorState(app, windowId, state);
+}
+
+bool soloSlicingVectorForWindow(AppState* app, int windowId, int index) {
+  if (!app || index < 0 || index >= kSlicingVectorCount) return false;
+  if (windowId >= 0) focusPlotWindow(app, windowId);
+  auto state = viewerStateWithModelCapabilities(app->viewerState);
+  bool changed = false;
+  for (int i = 0; i < kSlicingVectorCount; ++i) {
+    const bool enabled = i == index;
+    changed = changed || slicingVectorEnabled(state, i) != enabled;
+    setSlicingVectorEnabled(&state, i, enabled);
+  }
+  return changed ? commitSlicingVectorState(app, windowId, state) : false;
+}
+
+bool toggleAllSlicingVectorsForWindow(AppState* app, int windowId) {
+  if (!app) return false;
+  if (windowId >= 0) focusPlotWindow(app, windowId);
+  auto state = viewerStateWithModelCapabilities(app->viewerState);
+  const bool enableAll = !allSlicingVectorsEnabled(state);
+  bool changed = false;
+  for (int i = 0; i < kSlicingVectorCount; ++i) {
+    changed = changed || slicingVectorEnabled(state, i) != enableAll;
+    setSlicingVectorEnabled(&state, i, enableAll);
+  }
+  return changed ? commitSlicingVectorState(app, windowId, state) : false;
 }
 
 std::array<PlotMenuRect, 3> presetActionButtonRects(const PlotMenuRect& rowRect) {
@@ -15109,11 +17829,13 @@ void toggleWaveformChannel(AppState* app, int channel) {
   queueViewerStateCommand(*app, "reinterpret");
 }
 
-PlotMenuRect plotWindowCloseWindowRect(const PlotWindowState& window,
+PlotMenuRect plotWindowCloseWindowRect(const AppState& app,
+                                       const PlotWindowState& window,
                                        int windowWidth,
                                        int windowHeight) {
-  const float x1 = (window.rect.x + window.rect.w) * static_cast<float>(std::max(1, windowWidth)) - 5.0f;
-  const float y0 = window.rect.y * static_cast<float>(std::max(1, windowHeight)) + 4.0f;
+  const PlotMenuRect screenRect = plotWindowLogicalScreenRect(app, window, windowWidth, windowHeight);
+  const float x1 = screenRect.x1 - 5.0f;
+  const float y0 = screenRect.y0 + 4.0f;
   return {x1 - 18.0f, y0, x1, y0 + 18.0f};
 }
 
@@ -15372,6 +18094,7 @@ void activateViewerMenuRow(AppState* app, const ViewerMenuRow& row) {
     case ViewerMenuAction::ViewerLasso:
       {
         const bool enablingLasso = !state.volumeSliceLassoRegion;
+        if (enablingLasso) rememberViewerLassoTargetFromSettingsWindow(app);
         state.volumeSliceLassoRegion = !state.volumeSliceLassoRegion;
         bump();
         if (enablingLasso) {
@@ -15622,11 +18345,20 @@ void activateViewerChoiceMenuItem(AppState* app, const ViewerChoiceMenuItem& ite
   activateViewerMenuRow(app, row);
 }
 
-int viewerMenuSliderValueForX(const ViewerMenuRow& row, const PlotMenuRect& rowRect, double x) {
+PlotMenuRect viewerMenuSliderTrackWindowRect(const PlotMenuRect& rowRect) {
   const float rowWidth = rowRect.x1 - rowRect.x0;
   const float sliderX0 = rowRect.x0 + clampf(rowWidth * 0.44f, 112.0f, 170.0f);
   const float sliderX1 = rowRect.x1 - 48.0f;
-  const float t = clampf((static_cast<float>(x) - sliderX0) / std::max(1.0f, sliderX1 - sliderX0), 0.0f, 1.0f);
+  const float sliderY = rowRect.y0 + 21.0f;
+  return {sliderX0, sliderY - 7.0f, sliderX1, sliderY + 7.0f};
+}
+
+int viewerMenuSliderValueForX(const ViewerMenuRow& row, const PlotMenuRect& rowRect, double x) {
+  const PlotMenuRect track = viewerMenuSliderTrackWindowRect(rowRect);
+  const float t = clampf((static_cast<float>(x) - track.x0) /
+                             std::max(1.0f, track.x1 - track.x0),
+                         0.0f,
+                         1.0f);
   return std::clamp(static_cast<int>(std::round(static_cast<float>(row.sliderMin) +
                                                 t * static_cast<float>(row.sliderMax - row.sliderMin))),
                     row.sliderMin,
@@ -15755,6 +18487,7 @@ void toggleViewerLassoFromIdentityPopover(AppState* app) {
   auto state = viewerStateWithModelCapabilities(app->viewerState);
   const std::string previousSampleKey = ChromaspaceViewer::sampleSettingsKey(state, false);
   const bool enablingLasso = !state.volumeSliceLassoRegion;
+  if (enablingLasso) rememberViewerLassoTargetFromSettingsWindow(app);
   state.volumeSliceLassoRegion = !state.volumeSliceLassoRegion;
   state.stateRevision = std::max<uint64_t>(state.stateRevision + 1, 1);
   if (enablingLasso) {
@@ -15762,6 +18495,15 @@ void toggleViewerLassoFromIdentityPopover(AppState* app) {
     beginPendingImageLassoClear(app, state.stateRevision);
   }
   applyViewerStateToApp(app, state);
+  if (enablingLasso) {
+    propagateViewerLassoEnabledToPlotWindows(app);
+    ensureSourceSignalWindowForLasso(app,
+                                     std::max(1, app->workspaceLayoutWindowWidth),
+                                     std::max(1, app->workspaceLayoutWindowHeight),
+                                     true);
+  } else {
+    propagateViewerLassoEnabledToPlotWindows(app);
+  }
   app->viewerStateLocalOverride =
       viewerMenuActionCanPreviewFromCachedCloud(ViewerMenuAction::ViewerLasso) ||
       previousSampleKey == ChromaspaceViewer::sampleSettingsKey(app->viewerState, false);
@@ -15770,11 +18512,8 @@ void toggleViewerLassoFromIdentityPopover(AppState* app) {
 
 PlotMenuRect plotMenuMainRect(const AppState& app, int width, int height) {
   (void)app;
-  const float w = static_cast<float>(width);
   const float h = static_cast<float>(height);
-  const float maxWidth = std::max(160.0f, w - 16.0f);
-  const float minWidth = std::min(340.0f, maxWidth);
-  const float menuWidth = clampf(w < 720.0f ? w - 16.0f : 560.0f, minWidth, maxWidth);
+  const float menuWidth = viewerMenuDrawerWidthPixels(width);
   return {0.0f, 0.0f, menuWidth, h};
 }
 
@@ -16661,6 +19400,41 @@ void clearPointerInteractionState(AppState* app) {
   resetGlossViewOrthoInteractionState(app);
 }
 
+constexpr double kViewerMenuSlideSeconds = 0.20;
+
+void setPlotModelMenuVisible(AppState* app, bool visible) {
+  if (!app) return;
+  if (visible == app->plotModelMenuTargetVisible && app->plotModelMenuVisible == visible) return;
+  app->plotModelMenuTargetVisible = visible;
+  app->plotModelMenuAnimStart = glfwGetTime();
+  if (visible) {
+    app->plotModelMenuVisible = true;
+  } else {
+    app->viewerMenuDraggingSlider = false;
+  }
+}
+
+float smoothAnimation01(double t) {
+  const float x = clampf(static_cast<float>(t), 0.0f, 1.0f);
+  return x * x * (3.0f - 2.0f * x);
+}
+
+float plotModelMenuSlideProgress(const AppState& app) {
+  if (app.plotModelMenuAnimStart < 0.0) return app.plotModelMenuTargetVisible ? 1.0f : 0.0f;
+  const double age = glfwGetTime() - app.plotModelMenuAnimStart;
+  const float eased = smoothAnimation01(age / kViewerMenuSlideSeconds);
+  return app.plotModelMenuTargetVisible ? eased : (1.0f - eased);
+}
+
+void updatePlotModelMenuAnimation(AppState* app) {
+  if (!app || app->plotModelMenuTargetVisible || !app->plotModelMenuVisible) return;
+  if (app->plotModelMenuAnimStart >= 0.0 &&
+      glfwGetTime() - app->plotModelMenuAnimStart >= kViewerMenuSlideSeconds) {
+    app->plotModelMenuVisible = false;
+    app->plotModelMenuAnimStart = -10.0;
+  }
+}
+
 bool platformRollModifierPressed(const AppState& app) {
   if (app.rollKeyHeld) return true;
 #if defined(__APPLE__)
@@ -16670,18 +19444,20 @@ bool platformRollModifierPressed(const AppState& app) {
 #endif
 }
 
-PlotWindowDragMode plotWindowDragModeAt(const PlotWindowState& window,
+PlotWindowDragMode plotWindowDragModeAt(const AppState& app,
+                                        const PlotWindowState& window,
                                         int windowWidth,
                                         int windowHeight,
                                         double x,
                                         double y) {
-  if (!pointInPlotWindowRect(window, windowWidth, windowHeight, x, y)) {
+  if (!pointInPlotWindowRect(app, window, windowWidth, windowHeight, x, y)) {
     return PlotWindowDragMode::None;
   }
-  const float px0 = window.rect.x * static_cast<float>(std::max(1, windowWidth));
-  const float py0 = window.rect.y * static_cast<float>(std::max(1, windowHeight));
-  const float px1 = px0 + window.rect.w * static_cast<float>(std::max(1, windowWidth));
-  const float py1 = py0 + window.rect.h * static_cast<float>(std::max(1, windowHeight));
+  const PlotMenuRect screenRect = plotWindowLogicalScreenRect(app, window, windowWidth, windowHeight);
+  const float px0 = screenRect.x0;
+  const float py0 = screenRect.y0;
+  const float px1 = screenRect.x1;
+  const float py1 = screenRect.y1;
   const float handle = 9.0f;
   const bool left = std::fabs(static_cast<float>(x) - px0) <= handle;
   const bool right = std::fabs(static_cast<float>(x) - px1) <= handle;
@@ -16712,7 +19488,9 @@ void updatePlotWindowDrag(AppState* app, int windowWidth, int windowHeight, doub
   PlotWindowState* window = plotWindowById(app, app->plotWindowDragId);
   if (!window) return;
   PlotWindowRectNorm rect = app->plotWindowDragStartRect;
-  const float dx = static_cast<float>((x - app->plotWindowDragStartX) / static_cast<double>(std::max(1, windowWidth)));
+  const float reservedLeft = plotWorkspaceReservedLeftPixels(*app, windowWidth);
+  const float availableWidth = std::max(1.0f, static_cast<float>(std::max(1, windowWidth)) - reservedLeft);
+  const float dx = static_cast<float>((x - app->plotWindowDragStartX) / static_cast<double>(availableWidth));
   const float dy = static_cast<float>((y - app->plotWindowDragStartY) / static_cast<double>(std::max(1, windowHeight)));
   const float minW = plotWindowMinNormW(windowWidth);
   const float minH = plotWindowMinNormH(windowHeight);
@@ -16764,7 +19542,9 @@ void updatePlotWindowSnapPreview(AppState* app,
 
   const float w = static_cast<float>(std::max(1, windowWidth));
   const float h = static_cast<float>(std::max(1, windowHeight));
-  const float nx = static_cast<float>(cursorX) / w;
+  const float reservedLeft = plotWorkspaceReservedLeftPixels(*app, windowWidth);
+  const float availableW = std::max(1.0f, w - reservedLeft);
+  const float nx = clampf((static_cast<float>(cursorX) - reservedLeft) / availableW, 0.0f, 1.0f);
   const float ny = static_cast<float>(cursorY) / h;
   const float workspaceTop = plotWorkspaceTopNorm(windowHeight);
   const float workspaceHeight = std::max(0.05f, 1.0f - workspaceTop);
@@ -16874,6 +19654,7 @@ void commitPlotWindowSnapPreview(AppState* app, int windowWidth, int windowHeigh
   if (app->plotWindowSnapPreviewVisible) {
     if (PlotWindowState* window = plotWindowById(app, app->plotWindowSnapPreviewId)) {
       window->rect = clampedPlotWindowRect(app->plotWindowSnapPreviewRect, windowWidth, windowHeight);
+      sortPlotWindowsForReadableStacking(app, window->windowId);
     }
   }
   app->plotWindowSnapPreviewVisible = false;
@@ -17043,10 +19824,18 @@ void keyCallback(GLFWwindow* window, int key, int, int action, int) {
     }
     return;
   }
+  if (action == GLFW_PRESS && key == GLFW_KEY_Z && app->ctrlHeld &&
+      !app->shiftHeld && !app->altHeld && !app->superHeld) {
+    if (undoActiveViewerLassoStroke(app)) {
+      queueViewerStateCommand(*app, "reinterpret");
+      clearPointerInteractionState(app);
+    }
+    return;
+  }
   if (action == GLFW_PRESS && key == GLFW_KEY_ESCAPE &&
       (app->plotModelMenuVisible || app->quickPlotModelMenuVisible || app->addPlotMenuVisible ||
        app->layoutMenuVisible)) {
-    app->plotModelMenuVisible = false;
+    setPlotModelMenuVisible(app, false);
     app->quickPlotModelMenuVisible = false;
     app->addPlotMenuVisible = false;
     app->layoutMenuVisible = false;
@@ -17065,7 +19854,7 @@ void keyCallback(GLFWwindow* window, int key, int, int action, int) {
   }
   if (action == GLFW_PRESS && key == GLFW_KEY_M) {
     if (app->plotModelMenuVisible) {
-      app->plotModelMenuVisible = false;
+      setPlotModelMenuVisible(app, false);
       app->plotModelMenuHoverMain = -1;
       app->plotModelMenuHoverSub = -1;
       app->viewerMenuHoverTab = -1;
@@ -17074,7 +19863,7 @@ void keyCallback(GLFWwindow* window, int key, int, int action, int) {
       app->viewerMenuChoiceAction = static_cast<int>(ViewerMenuAction::None);
       app->viewerChoiceMenuScroll = 0.0f;
     } else {
-      app->plotModelMenuVisible = true;
+      setPlotModelMenuVisible(app, true);
       app->quickPlotModelMenuVisible = false;
       app->addPlotMenuVisible = false;
       app->layoutMenuVisible = false;
@@ -17099,7 +19888,7 @@ void keyCallback(GLFWwindow* window, int key, int, int action, int) {
     double cursorY = app->hoverY;
     glfwGetCursorPos(window, &cursorX, &cursorY);
     app->quickPlotModelMenuVisible = !app->quickPlotModelMenuVisible;
-    app->plotModelMenuVisible = false;
+    setPlotModelMenuVisible(app, false);
     app->addPlotMenuVisible = false;
     app->layoutMenuVisible = false;
     app->quickPlotModelMenuX = cursorX;
@@ -17118,7 +19907,7 @@ void keyCallback(GLFWwindow* window, int key, int, int action, int) {
     return;
   }
   if (action == GLFW_PRESS && key == GLFW_KEY_A && app->shiftHeld) {
-    if (app->viewerState.volumeSliceLassoRegion) {
+    if (viewerImageLassoSessionActive(*app)) {
       clearActiveViewerLassoSelection(app);
       auto state = viewerStateWithModelCapabilities(app->viewerState);
       state.stateRevision = std::max<uint64_t>(state.stateRevision + 1, 1);
@@ -17133,7 +19922,7 @@ void keyCallback(GLFWwindow* window, int key, int, int action, int) {
     glfwGetCursorPos(window, &cursorX, &cursorY);
     app->addPlotMenuVisible = !app->addPlotMenuVisible;
     app->quickPlotModelMenuVisible = false;
-    app->plotModelMenuVisible = false;
+    setPlotModelMenuVisible(app, false);
     app->layoutMenuVisible = false;
     app->addPlotMenuX = cursorX;
     app->addPlotMenuY = cursorY;
@@ -17157,7 +19946,7 @@ void keyCallback(GLFWwindow* window, int key, int, int action, int) {
     glfwGetCursorPos(window, &cursorX, &cursorY);
     app->layoutMenuVisible = !app->layoutMenuVisible;
     app->quickPlotModelMenuVisible = false;
-    app->plotModelMenuVisible = false;
+    setPlotModelMenuVisible(app, false);
     app->addPlotMenuVisible = false;
     app->layoutMenuX = cursorX;
     app->layoutMenuY = cursorY;
@@ -17209,14 +19998,17 @@ void keyCallback(GLFWwindow* window, int key, int, int action, int) {
     }
   }
   if (action == GLFW_PRESS && key == GLFW_KEY_F) {
+    int windowWidth = 1, windowHeight = 1;
+    int fbWidth = 1, fbHeight = 1;
+    glfwGetWindowSize(window, &windowWidth, &windowHeight);
+    glfwGetFramebufferSize(window, &fbWidth, &fbHeight);
     PlotWindowState* focused = focusedPlotWindow(app);
-    if (focused && plotModelIsAnalyticalScope(focused->viewState.plotModel)) {
-      fitAnalyticalScopeCamera(focused);
-      app->cam = focused->camera;
-      app->fitVolumeRequested = false;
-    } else {
-      app->fitVolumeRequested = true;
+    bool fitApplied = false;
+    if (focused) {
+      fitApplied = fitPlotWindowCameraToCurrentContent(app, focused, windowWidth, windowHeight, fbWidth, fbHeight);
+      focused->fitRequested = !fitApplied && !plotModelIsSourceSignal(focused->viewState.plotModel);
     }
+    app->fitVolumeRequested = !fitApplied && app->plotWindows.size() <= 1u;
     app->fitFeedbackUntil = glfwGetTime() + 0.55;
   }
   if (action == GLFW_PRESS && key == GLFW_KEY_S) {
@@ -17962,6 +20754,55 @@ void drawHudTextLineRight(const HudTextRenderer& renderer,
   drawHudTextLine(renderer, text, rightX - width, baselineY, scale, alpha, r, g, b);
 }
 
+void drawHudTextLineClipped(const HudTextRenderer& renderer,
+                            const std::string& text,
+                            float x,
+                            float baselineY,
+                            float maxWidth,
+                            float scale,
+                            bool hovered,
+                            float alpha,
+                            float r,
+                            float g,
+                            float b,
+                            bool alignRight = false) {
+  if (text.empty() || maxWidth <= 2.0f) return;
+  const float fullWidth = hudTextWidth(renderer, text, scale);
+  if (fullWidth <= maxWidth) {
+    if (alignRight) {
+      drawHudTextLineRight(renderer, text, x + maxWidth, baselineY, scale, alpha, r, g, b);
+    } else {
+      drawHudTextLine(renderer, text, x, baselineY, scale, alpha, r, g, b);
+    }
+    return;
+  }
+  if (!hovered) {
+    const std::string fitted = fitHudText(renderer, text, maxWidth, scale);
+    if (alignRight) {
+      drawHudTextLineRight(renderer, fitted, x + maxWidth, baselineY, scale, alpha, r, g, b);
+    } else {
+      drawHudTextLine(renderer, fitted, x, baselineY, scale, alpha, r, g, b);
+    }
+    return;
+  }
+
+  const float excess = std::max(0.0f, fullWidth - maxWidth);
+  const float pause = 18.0f;
+  const float phase = std::fmod(static_cast<float>(glfwGetTime()) * 44.0f,
+                                std::max(1.0f, 2.0f * (excess + pause)));
+  const float offset = phase <= (excess + pause)
+                           ? std::min(excess, phase)
+                           : std::max(0.0f, 2.0f * (excess + pause) - phase);
+  const GLint clipX = static_cast<GLint>(std::floor(x));
+  const GLint clipY = static_cast<GLint>(std::floor(baselineY - 7.0f));
+  const GLsizei clipW = static_cast<GLsizei>(std::ceil(maxWidth));
+  const GLsizei clipH = 22;
+  glEnable(GL_SCISSOR_TEST);
+  glScissor(clipX, clipY, std::max<GLsizei>(1, clipW), clipH);
+  drawHudTextLine(renderer, text, x - offset, baselineY, scale, alpha, r, g, b);
+  glDisable(GL_SCISSOR_TEST);
+}
+
 void drawHudBackdrop(float x0, float y0, float x1, float y1, float alpha) {
   if (alpha <= 0.0f || x1 <= x0 || y1 <= y0) return;
   glDisable(GL_TEXTURE_2D);
@@ -18184,7 +21025,7 @@ void drawViewerMenuCheckbox(float x0,
 
 void drawViewerLassoOverlay(const AppState& app, int width, int height) {
   const std::vector<LassoStroke>* lassoStrokes = viewerLassoStrokesForActiveSelection(app);
-  if ((!app.viewerState.volumeSliceLassoRegion && !app.viewerLassoDrawing) ||
+  if ((!viewerImageLassoSessionActive(app) && !app.viewerLassoDrawing) ||
       ((!lassoStrokes || lassoStrokes->empty()) && !app.viewerLassoDrawing) ||
       width <= 0 || height <= 0) {
     return;
@@ -18193,16 +21034,19 @@ void drawViewerLassoOverlay(const AppState& app, int width, int height) {
   float drawY0 = 0.0f;
   float drawX1 = static_cast<float>(width);
   float drawY1 = static_cast<float>(height);
-  if (const PlotWindowState* sourceWindow = activeSourceSignalLassoWindow(app)) {
-    (void)sourceSignalImageRectForCanvas(app,
-                                         *sourceWindow,
-                                         width,
-                                         height,
-                                         false,
-                                         &drawX0,
-                                         &drawY0,
-                                         &drawX1,
-                                         &drawY1);
+  const PlotWindowState* sourceWindow = activeSourceSignalLassoWindow(app);
+  if (!sourceWindow ||
+      !sourceSignalImageRectForCanvas(app,
+                                      *sourceWindow,
+                                      width,
+                                      height,
+                                      false,
+                                      &drawX0,
+                                      &drawY0,
+                                      &drawX1,
+                                      &drawY1) ||
+      drawX1 <= drawX0 || drawY1 <= drawY0) {
+    return;
   }
   glMatrixMode(GL_PROJECTION);
   glPushMatrix();
@@ -18644,6 +21488,8 @@ void drawPlotModelMenuOverlay(const AppState& app,
   drawAddPlotMenuOverlay(app, width, height, windowWidth, windowHeight, renderer);
   drawLayoutMenuOverlay(app, width, height, windowWidth, windowHeight, renderer);
   if (!app.plotModelMenuVisible) return;
+  const float menuSlide = plotModelMenuSlideProgress(app);
+  if (menuSlide <= 0.001f) return;
   const float sx = static_cast<float>(width) / static_cast<float>(windowWidth);
   const float sy = static_cast<float>(height) / static_cast<float>(windowHeight);
   auto scaleRect = [&](const PlotMenuRect& rect) -> PlotMenuRect {
@@ -18668,6 +21514,7 @@ void drawPlotModelMenuOverlay(const AppState& app,
   glMatrixMode(GL_MODELVIEW);
   glPushMatrix();
   glLoadIdentity();
+  glTranslatef(-(mainRect.x1 - mainRect.x0) * (1.0f - menuSlide), 0.0f, 0.0f);
   glDisable(GL_DEPTH_TEST);
   glEnable(GL_BLEND);
   glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
@@ -18938,24 +21785,31 @@ void drawPlotModelMenuOverlay(const AppState& app,
       const std::string fittedLabel =
           fitHudText(renderer, row.label, std::max(24.0f, rowWidth - valueWidthLimit - 32.0f), textScale);
       const std::string fittedValue = fitHudText(renderer, row.value, valueWidthLimit, textScale);
-      drawHudTextLine(renderer,
-                      fittedLabel,
-                      textLabelX,
-                      singleBaseline,
-                      textScale,
-                      row.enabled ? 0.94f : 0.42f,
-                      0.96f,
-                      0.86f,
-                      0.58f);
-      drawHudTextLineRight(renderer,
-                           fittedValue,
-                           valueRightX,
-                           singleBaseline,
-                           textScale,
-                           row.enabled ? 0.92f : 0.38f,
-                           0.98f,
-                           0.82f,
-                           0.48f);
+      (void)fittedLabel;
+      (void)fittedValue;
+      drawHudTextLineClipped(renderer,
+                             row.label,
+                             textLabelX,
+                             singleBaseline,
+                             std::max(24.0f, rowWidth - valueWidthLimit - 32.0f),
+                             textScale,
+                             hovered,
+                             row.enabled ? 0.94f : 0.42f,
+                             0.96f,
+                             0.86f,
+                             0.58f);
+      drawHudTextLineClipped(renderer,
+                             row.value,
+                             valueRightX - valueWidthLimit,
+                             singleBaseline,
+                             valueWidthLimit,
+                             textScale,
+                             hovered,
+                             row.enabled ? 0.92f : 0.38f,
+                             0.98f,
+                             0.82f,
+                             0.48f,
+                             true);
       continue;
     }
     if (hasVectorSwatch) {
@@ -18964,7 +21818,39 @@ void drawPlotModelMenuOverlay(const AppState& app,
       drawPlotMenuRect(swatchX, swatchY, swatchX + swatchSize, swatchY + 1.0f,
                        1.0f, 1.0f, 1.0f, row.enabled ? 0.18f : 0.06f);
     }
-    if (row.channelSelector) {
+    if (row.slicingVectorSelector) {
+      const std::string fittedLabel =
+          fitHudText(renderer, row.label, std::max(24.0f, rowWidth - 190.0f), textScale);
+      drawHudTextLine(renderer, fittedLabel, textLabelX, singleBaseline, textScale,
+                      alpha, 0.90f, 0.94f, 0.98f);
+      const auto rects = slicingVectorSelectorRects(rr, 22.0f, 8.0f);
+      const PlotMenuRect rowWindowRect = viewerMenuRowWindowRect(app, windowWidth, windowHeight, i);
+      const auto windowRects = slicingVectorSelectorRects(rowWindowRect, 22.0f, 8.0f);
+      const int hoverVector = row.enabled ? slicingVectorIndexAt(windowRects, app.hoverX, app.hoverY) : -1;
+      for (int vector = 0; vector < kSlicingVectorCount; ++vector) {
+        float vr = 0.0f, vg = 0.0f, vb = 0.0f;
+        slicingVectorColor(vector, &vr, &vg, &vb);
+        const bool active = slicingVectorEnabled(app.viewerState, vector);
+        const bool vectorHovered = hoverVector == vector;
+        const float level = active ? (vectorHovered ? 1.12f : 1.0f) : (vectorHovered ? 0.40f : 0.22f);
+        const PlotMenuRect& r = rects[static_cast<size_t>(vector)];
+        drawPlotMenuRect(r.x0, r.y0, r.x1, r.y1,
+                         std::min(1.0f, vr * level),
+                         std::min(1.0f, vg * level),
+                         std::min(1.0f, vb * level),
+                         active ? 0.96f : 0.54f);
+        drawPlotMenuRect(r.x0, r.y1 - 1.2f, r.x1, r.y1,
+                         1.0f, 1.0f, 1.0f, active ? 0.26f : 0.08f);
+        if (vectorHovered) {
+          drawPlotMenuRect(r.x0, r.y0, r.x1, r.y0 + 1.2f,
+                           1.0f, 1.0f, 1.0f, 0.18f);
+          drawPlotMenuRect(r.x0, r.y0, r.x0 + 1.2f, r.y1,
+                           1.0f, 1.0f, 1.0f, 0.16f);
+          drawPlotMenuRect(r.x1 - 1.2f, r.y0, r.x1, r.y1,
+                           1.0f, 1.0f, 1.0f, 0.16f);
+        }
+      }
+    } else if (row.channelSelector) {
       const std::string fittedLabel =
           fitHudText(renderer, row.label, std::max(24.0f, rowWidth - 126.0f), textScale);
       drawHudTextLine(renderer, fittedLabel, textLabelX, singleBaseline, textScale,
@@ -18994,13 +21880,23 @@ void drawPlotModelMenuOverlay(const AppState& app,
                          1.0f, 1.0f, 1.0f, active[channel] ? 0.25f : 0.08f);
       }
     } else if (row.slider) {
-      const float sliderX0 = rr.x0 + clampf(rowWidth * 0.44f, 112.0f, 170.0f);
-      const float sliderX1 = rr.x1 - 48.0f;
-      const float sliderY = rr.y0 + 21.0f;
-      const std::string fittedLabel =
-          fitHudText(renderer, row.label, std::max(12.0f, sliderX0 - textLabelX - 10.0f), textScale);
-      drawHudTextLine(renderer, fittedLabel, textLabelX, singleBaseline, textScale,
-                      alpha, 0.90f, 0.94f, 0.98f);
+      const PlotMenuRect rowWindowRect = viewerMenuRowWindowRect(app, windowWidth, windowHeight, i);
+      const PlotMenuRect sliderTrackWindowRect = viewerMenuSliderTrackWindowRect(rowWindowRect);
+      const PlotMenuRect sliderTrackRect = scaleRect(sliderTrackWindowRect);
+      const float sliderX0 = sliderTrackRect.x0;
+      const float sliderX1 = sliderTrackRect.x1;
+      const float sliderY = (sliderTrackRect.y0 + sliderTrackRect.y1) * 0.5f;
+      drawHudTextLineClipped(renderer,
+                             row.label,
+                             textLabelX,
+                             singleBaseline,
+                             std::max(12.0f, sliderX0 - textLabelX - 10.0f),
+                             textScale,
+                             hovered,
+                             alpha,
+                             0.90f,
+                             0.94f,
+                             0.98f);
       const float t = (row.sliderMax > row.sliderMin)
                           ? clampf(static_cast<float>(row.sliderValue - row.sliderMin) /
                                        static_cast<float>(row.sliderMax - row.sliderMin),
@@ -19023,24 +21919,33 @@ void drawPlotModelMenuOverlay(const AppState& app,
                        row.enabled ? 0.92f : 0.54f,
                        row.enabled ? 1.0f : 0.58f,
                        row.enabled ? 0.96f : 0.58f);
-      const std::string fittedValue =
-          fitHudText(renderer, row.value, std::max(28.0f, rr.x1 - sliderX1 - 12.0f), textScale);
-      drawHudTextLineRight(renderer, fittedValue, rr.x1 - 12.0f, singleBaseline, textScale,
-                           row.enabled ? 0.86f : 0.42f,
-                           row.enabled ? 0.84f : 0.45f,
-                           row.enabled ? 0.90f : 0.50f,
-                           row.enabled ? 0.96f : 0.62f);
+      drawHudTextLineClipped(renderer,
+                             row.value,
+                             sliderX1 + 4.0f,
+                             singleBaseline,
+                             std::max(28.0f, rr.x1 - sliderX1 - 16.0f),
+                             textScale,
+                             hovered,
+                             row.enabled ? 0.86f : 0.42f,
+                             row.enabled ? 0.84f : 0.45f,
+                             row.enabled ? 0.90f : 0.50f,
+                             row.enabled ? 0.96f : 0.62f,
+                             true);
     } else if (viewerMenuActionIsCheckbox(row.action)) {
       const float checkboxSize = renderer.available ? 15.0f : 13.0f;
       const float checkboxX = rr.x1 - checkboxSize - 14.0f;
       const float checkboxY = rr.y0 + (kPlotMenuRowHeight - checkboxSize) * 0.5f;
-      const std::string fittedLabel =
-          fitHudText(renderer,
-                     row.label,
-                     std::max(24.0f, checkboxX - textLabelX - 12.0f),
-                     textScale);
-      drawHudTextLine(renderer, fittedLabel, textLabelX, singleBaseline, textScale,
-                      alpha, 0.90f, 0.94f, 0.98f);
+      drawHudTextLineClipped(renderer,
+                             row.label,
+                             textLabelX,
+                             singleBaseline,
+                             std::max(24.0f, checkboxX - textLabelX - 12.0f),
+                             textScale,
+                             hovered,
+                             alpha,
+                             0.90f,
+                             0.94f,
+                             0.98f);
       drawViewerMenuCheckbox(checkboxX,
                              checkboxY,
                              checkboxSize,
@@ -19050,12 +21955,17 @@ void drawPlotModelMenuOverlay(const AppState& app,
     } else if (viewerMenuActionIsButton(row.action)) {
       const float buttonW = std::min(150.0f, std::max(92.0f, rowWidth * 0.38f));
       const PlotMenuRect buttonRect{rr.x1 - buttonW - 10.0f, rr.y0 + 5.0f, rr.x1 - 10.0f, rr.y1 - 5.0f};
-      const std::string fittedLabel = fitHudText(renderer,
-                                                 row.label,
-                                                 std::max(24.0f, buttonRect.x0 - textLabelX - 12.0f),
-                                                 textScale);
-      drawHudTextLine(renderer, fittedLabel, textLabelX, singleBaseline, textScale,
-                      alpha, 0.90f, 0.94f, 0.98f);
+      drawHudTextLineClipped(renderer,
+                             row.label,
+                             textLabelX,
+                             singleBaseline,
+                             std::max(24.0f, buttonRect.x0 - textLabelX - 12.0f),
+                             textScale,
+                             hovered,
+                             alpha,
+                             0.90f,
+                             0.94f,
+                             0.98f);
       drawPlotMenuRect(buttonRect.x0,
                        buttonRect.y0,
                        buttonRect.x1,
@@ -19106,23 +22016,57 @@ void drawPlotModelMenuOverlay(const AppState& app,
           !row.value.empty() && (indent + labelWidth + valueWidth + 36.0f > rowWidth);
       if (splitValue) {
         const float maxLineWidth = std::max(24.0f, rowWidth - indent - 14.0f);
-        const std::string fittedLabel = fitHudText(renderer, row.label, maxLineWidth, textScale);
-        const std::string fittedValue = fitHudText(renderer, row.value, rowWidth - 28.0f, textScale);
-        drawHudTextLine(renderer, fittedLabel, textLabelX, rr.y0 + (renderer.available ? 25.0f : 26.0f),
-                        textScale, alpha, 0.90f, 0.94f, 0.98f);
-        drawHudTextLineRight(renderer, fittedValue, valueRightX, rr.y0 + (renderer.available ? 8.0f : 9.0f),
-                             textScale, row.enabled ? 0.82f : 0.34f, 0.84f, 0.90f, 0.96f);
+        drawHudTextLineClipped(renderer,
+                               row.label,
+                               textLabelX,
+                               rr.y0 + (renderer.available ? 25.0f : 26.0f),
+                               maxLineWidth,
+                               textScale,
+                               hovered,
+                               alpha,
+                               0.90f,
+                               0.94f,
+                               0.98f);
+        drawHudTextLineClipped(renderer,
+                               row.value,
+                               rr.x1 - (rowWidth - 28.0f) - 14.0f,
+                               rr.y0 + (renderer.available ? 8.0f : 9.0f),
+                               rowWidth - 28.0f,
+                               textScale,
+                               hovered,
+                               row.enabled ? 0.82f : 0.34f,
+                               0.84f,
+                               0.90f,
+                               0.96f,
+                               true);
       } else {
         const float valueMaxWidth = row.value.empty() ? 0.0f : std::min(rowWidth * 0.55f, valueWidth);
         const float labelMaxWidth = row.value.empty()
                                         ? std::max(24.0f, rowWidth - indent - 14.0f)
                                         : std::max(24.0f, valueRightX - valueMaxWidth - textLabelX - 16.0f);
-        const std::string fittedLabel = fitHudText(renderer, row.label, labelMaxWidth, textScale);
-        const std::string fittedValue = fitHudText(renderer, row.value, valueMaxWidth, textScale);
-        drawHudTextLine(renderer, fittedLabel, textLabelX, singleBaseline, textScale,
-                        alpha, 0.90f, 0.94f, 0.98f);
-        drawHudTextLineRight(renderer, fittedValue, valueRightX, singleBaseline, textScale,
-                             row.enabled ? 0.82f : 0.34f, 0.84f, 0.90f, 0.96f);
+        drawHudTextLineClipped(renderer,
+                               row.label,
+                               textLabelX,
+                               singleBaseline,
+                               labelMaxWidth,
+                               textScale,
+                               hovered,
+                               alpha,
+                               0.90f,
+                               0.94f,
+                               0.98f);
+        drawHudTextLineClipped(renderer,
+                               row.value,
+                               valueRightX - valueMaxWidth,
+                               singleBaseline,
+                               valueMaxWidth,
+                               textScale,
+                               hovered,
+                               row.enabled ? 0.82f : 0.34f,
+                               0.84f,
+                               0.90f,
+                               0.96f,
+                               true);
       }
     }
     if (rowHasDisplayGlyph) {
@@ -19221,7 +22165,7 @@ void drawPlotModelMenuOverlay(const AppState& app,
       drawPlotMenuRect(popoverRect.x1 - 2.0f, popoverRect.y0, popoverRect.x1, popoverRect.y1,
                        0.38f, 0.68f, 0.86f, 0.58f * identityLassoAlpha);
       drawWrappedHudText(renderer,
-                         "This feature is disabled when in Lasso mode, disable Lasso to use it",
+                         "Disable Lasso mode to use this feature",
                          popoverRect.x0 + 11.0f,
                          popoverRect.y1 - (renderer.available ? 21.0f : 20.0f),
                          std::max(48.0f, popoverRect.x1 - popoverRect.x0 - 22.0f),
@@ -19531,12 +22475,20 @@ struct PlotWindowFramebufferRect {
   int h = 1;
 };
 
-PlotWindowFramebufferRect plotWindowFramebufferRect(const PlotWindowState& window, int fbWidth, int fbHeight) {
+PlotWindowFramebufferRect framebufferRectFromLogicalRect(const PlotMenuRect& logicalRect,
+                                                         int fbWidth,
+                                                         int fbHeight,
+                                                         int windowWidth,
+                                                         int windowHeight) {
   PlotWindowFramebufferRect rect{};
-  rect.x = static_cast<int>(std::round(window.rect.x * static_cast<float>(std::max(1, fbWidth))));
-  const int top = static_cast<int>(std::round(window.rect.y * static_cast<float>(std::max(1, fbHeight))));
-  rect.w = std::max(1, static_cast<int>(std::round(window.rect.w * static_cast<float>(std::max(1, fbWidth)))));
-  rect.h = std::max(1, static_cast<int>(std::round(window.rect.h * static_cast<float>(std::max(1, fbHeight)))));
+  const float sx = static_cast<float>(std::max(1, fbWidth)) /
+                   static_cast<float>(std::max(1, windowWidth));
+  const float sy = static_cast<float>(std::max(1, fbHeight)) /
+                   static_cast<float>(std::max(1, windowHeight));
+  rect.x = static_cast<int>(std::round(logicalRect.x0 * sx));
+  const int top = static_cast<int>(std::round(logicalRect.y0 * sy));
+  rect.w = std::max(1, static_cast<int>(std::round((logicalRect.x1 - logicalRect.x0) * sx)));
+  rect.h = std::max(1, static_cast<int>(std::round((logicalRect.y1 - logicalRect.y0) * sy)));
   rect.y = std::max(0, fbHeight - top - rect.h);
   rect.x = std::clamp(rect.x, 0, std::max(0, fbWidth - 1));
   rect.y = std::clamp(rect.y, 0, std::max(0, fbHeight - 1));
@@ -19545,6 +22497,80 @@ PlotWindowFramebufferRect plotWindowFramebufferRect(const PlotWindowState& windo
   return rect;
 }
 
+PlotWindowFramebufferRect plotWindowFramebufferRect(const AppState& app,
+                                                    const PlotWindowState& window,
+                                                    int fbWidth,
+                                                    int fbHeight,
+                                                    int windowWidth,
+                                                    int windowHeight) {
+  return framebufferRectFromLogicalRect(plotWindowLogicalScreenRect(app, window, windowWidth, windowHeight),
+                                        fbWidth,
+                                        fbHeight,
+                                        windowWidth,
+                                        windowHeight);
+}
+
+PlotWindowFramebufferRect plotWindowContentFramebufferRect(const AppState& app,
+                                                           const PlotWindowState& window,
+                                                           int fbWidth,
+                                                           int fbHeight,
+                                                           int windowWidth,
+                                                           int windowHeight) {
+  return framebufferRectFromLogicalRect(plotWindowContentLogicalScreenRect(app, window, windowWidth, windowHeight),
+                                        fbWidth,
+                                        fbHeight,
+                                        windowWidth,
+                                        windowHeight);
+}
+
+bool fitPlotWindowCameraToCurrentContent(AppState* app,
+                                         PlotWindowState* window,
+                                         int windowWidth,
+                                         int windowHeight,
+                                         int fbWidth,
+                                         int fbHeight) {
+  if (!app || !window) return false;
+  if (plotModelIsSourceSignal(window->viewState.plotModel)) return false;
+  const PlotWindowFramebufferRect viewport =
+      plotWindowContentFramebufferRect(*app, *window, fbWidth, fbHeight, windowWidth, windowHeight);
+  const int fitWidth = std::max(1, viewport.w);
+  const int fitHeight = std::max(1, viewport.h);
+  bool fitApplied = false;
+  if (plotModelIsAnalyticalScope(window->viewState.plotModel)) {
+    fitAnalyticalScopeCamera(window);
+    fitApplied = true;
+  } else if (window->derivedMeshValid) {
+    const MeshData& mesh = window->derivedMesh;
+    if (mesh.hasFitBounds) {
+      fitApplied = fitCameraToBounds(&window->camera,
+                                     app->modelOrientation,
+                                     mesh.fitMin,
+                                     mesh.fitMax,
+                                     fitWidth,
+                                     fitHeight);
+    }
+    if (!fitApplied && !mesh.pointVerts.empty() && mesh.pointCount > 0u) {
+      fitApplied = fitCameraToPoints(&window->camera,
+                                     app->modelOrientation,
+                                     mesh.pointVerts.data(),
+                                     mesh.pointCount,
+                                     fitWidth,
+                                     fitHeight);
+    }
+    if (!fitApplied && !mesh.lineVerts.empty() && mesh.lineVertexCount > 0u) {
+      fitApplied = fitCameraToPoints(&window->camera,
+                                     app->modelOrientation,
+                                     mesh.lineVerts.data(),
+                                     mesh.lineVertexCount,
+                                     fitWidth,
+                                     fitHeight);
+    }
+  }
+  if (fitApplied && window->windowId == app->focusedPlotWindowId) {
+    app->cam = window->camera;
+  }
+  return fitApplied;
+}
 std::string plotWindowDerivedBuildKey(const PlotWindowState& window,
                                       const ResolvedPayload& payload,
                                       const InputCloudPayload& cloud) {
@@ -19592,6 +22618,40 @@ std::string plotWindowDerivedBuildKey(const PlotWindowState& window,
   return os.str();
 }
 
+std::string plotWindowRasterDerivedBuildKey(const PlotWindowState& window,
+                                            const ResolvedPayload& payload,
+                                            const SourceSignalPayload& source) {
+  const auto state = viewerStateWithModelCapabilities(window.viewState);
+  std::ostringstream os;
+  os << "win=" << window.windowId
+     << "|raster=" << (source.contentHash != 0 ? source.contentHash : source.seq)
+     << "|format=" << source.pixelFormat
+     << "|tier=" << source.tierLabel
+     << "|proxy=" << source.proxyWidth << "x" << source.proxyHeight
+     << "|coverage=" << source.coverage
+     << "|payload=" << payload.stateRevision
+     << "|view=" << state.stateRevision
+     << "|model=" << state.plotModel
+     << "|waveformMode=" << state.waveformMode
+     << "|histogramMode=" << state.histogramMode
+     << "|scopeRange=" << state.scopeRangeMode
+     << "|linear=" << (state.plotDisplayLinear ? 1 : 0)
+     << "|readRamp=" << (state.readGrayRamp ? 1 : 0)
+     << "|readIdentity=" << (state.readIdentityPlot ? 1 : 0)
+     << "|isolateIdentity=" << (state.isolateIdentityData ? 1 : 0)
+     << "|excludeIdentity=" << (state.excludeIdentityData ? 1 : 0)
+     << "|imageLasso=" << (state.volumeSliceLassoRegion ? 1 : 0)
+     << "|lassoData=" << payload.lassoData
+     << "|slices=" << (state.volumeSliceRed ? 1 : 0)
+     << (state.volumeSliceYellow ? 1 : 0)
+     << (state.volumeSliceGreen ? 1 : 0)
+     << (state.volumeSliceCyan ? 1 : 0)
+     << (state.volumeSliceBlue ? 1 : 0)
+     << (state.volumeSliceMagenta ? 1 : 0)
+     << "|neutral=" << std::setprecision(4) << state.neutralRadius;
+  return os.str();
+}
+
 std::string plotWindowOverlayBuildKey(const PlotWindowState& window,
                                       const ResolvedPayload& payload) {
   std::ostringstream os;
@@ -19626,9 +22686,10 @@ void rebuildPlotWindowOverlayMeshIfNeeded(PlotWindowState* window,
 }
 
 bool rebuildPlotWindowDerivedMeshIfNeeded(PlotWindowState* window,
-                                          const AppState& app,
+                                          AppState& app,
                                           const ResolvedPayload& resolved,
-                                          const InputCloudPayload* cloud) {
+                                          const InputCloudPayload* cloud,
+                                          const SourceSignalStore* sourceSignalStore) {
   if (!window) return false;
   const bool analyticalScope = plotModelIsAnalyticalScope(window->viewState.plotModel);
   ResolvedPayload payload = resolved;
@@ -19639,6 +22700,129 @@ bool rebuildPlotWindowDerivedMeshIfNeeded(PlotWindowState* window,
     applyCachedOfxImageLassoSelection(app, &payload);
   }
   rebuildPlotWindowOverlayMeshIfNeeded(window, payload);
+  const SourceDeriveMode deriveMode = sourceDeriveMode();
+  const SourceSignalPayload* rasterSource =
+      sourceSignalStore && sourceSignalStore->hasAuthoritative
+          ? &sourceSignalStore->authoritative
+          : nullptr;
+  const bool rasterAvailable =
+      rasterSource && senderMatchesCurrent(resolved.senderId, rasterSource->senderId) &&
+      rasterSource->coverage != "partial-preview";
+  if (deriveMode != SourceDeriveMode::Cloud) {
+    if (rasterAvailable) {
+      setPlotWindowSyncLabel(window, rasterSource->coverage == "full" ? "Live" : "Proxy");
+      const std::string key = plotWindowRasterDerivedBuildKey(*window, payload, *rasterSource);
+      if (window->derivedMeshValid && window->derivedBuildKey == key) return true;
+      const auto t0 = std::chrono::steady_clock::now();
+      MeshData mesh{};
+      std::string rasterBackend = "cpu";
+      std::string rasterFallbackReason;
+      bool built = buildRasterDerivedMeshBackendMapped(payload,
+                                                       *rasterSource,
+                                                       app.gpuCaps,
+                                                       &app.computeSession,
+#if defined(CHROMASPACE_VIEWER_HAS_CUDA) && !defined(__APPLE__)
+                                                       &window->residentInputCudaCache,
+#endif
+                                                       analyticalScope,
+                                                       &mesh,
+                                                       &rasterFallbackReason);
+      if (built) {
+        rasterBackend = rasterFallbackReason == "metal-map" ? "metal-map"
+                                                            : (rasterFallbackReason == "cuda-raster-direct"
+                                                                   ? "cuda-raster-direct"
+                                                                   : (rasterFallbackReason == "cuda-map" ? "cuda-map" : "gpu-map"));
+      } else {
+        const std::string backendFallbackReason = rasterFallbackReason;
+        built = buildRasterDerivedMeshGlCompute(payload,
+                                                *rasterSource,
+                                                analyticalScope,
+                                                &mesh,
+                                                &rasterFallbackReason);
+        if (built) {
+          rasterBackend = "gl-compute";
+        } else {
+          if (!backendFallbackReason.empty() && !rasterFallbackReason.empty()) {
+            rasterFallbackReason = backendFallbackReason + "," + rasterFallbackReason;
+          } else if (!backendFallbackReason.empty()) {
+            rasterFallbackReason = backendFallbackReason;
+          }
+          built = buildRasterDerivedMeshCpu(payload,
+                                            *rasterSource,
+                                            analyticalScope,
+                                            window->derivedMeshValid ? &window->derivedMesh : nullptr,
+                                            &mesh,
+                                            &app.gpuCaps);
+          rasterBackend = "cpu";
+        }
+      }
+      const auto t1 = std::chrono::steady_clock::now();
+      if (rasterBenchmarkEnabled()) {
+        const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        std::ostringstream os;
+        os << "[raster-bench] derive=raster-" << rasterBackend << " window=" << window->windowId
+           << " model=" << ChromaspaceViewer::plotModelLabel(window->viewState.plotModel)
+           << " ms=" << std::fixed << std::setprecision(3) << ms
+           << " sourceBytes=" << (rasterSource->rgba32f.empty()
+                                      ? rasterSource->rgba16f.size() * sizeof(uint16_t)
+                                      : rasterSource->rgba32f.size() * sizeof(float))
+           << " proxy=" << rasterSource->proxyWidth << "x" << rasterSource->proxyHeight
+           << " format=" << rasterSource->pixelFormat
+           << " points=" << mesh.pointCount
+           << " mode=" << sourceDeriveModeLabel(deriveMode);
+        if (!rasterFallbackReason.empty() && rasterBackend == "cpu") {
+          os << " fallback=" << rasterFallbackReason;
+        }
+        logViewerEvent(os.str());
+      }
+      if (deriveMode == SourceDeriveMode::Dual && cloud && rasterBenchmarkEnabled()) {
+        const auto c0 = std::chrono::steady_clock::now();
+        MeshData cloudMesh{};
+        const bool cloudBuilt = analyticalScope
+                                    ? buildAnalyticalScopeMeshCpu(payload,
+                                                                  *cloud,
+                                                                  window->derivedMeshValid ? &window->derivedMesh : nullptr,
+                                                                  &cloudMesh,
+                                                                  &app.gpuCaps)
+                                    : buildInputCloudFitMeshCpu(payload, *cloud, &cloudMesh);
+        const auto c1 = std::chrono::steady_clock::now();
+        std::ostringstream os;
+        os << "[raster-bench] derive=cloud-legacy window=" << window->windowId
+           << " model=" << ChromaspaceViewer::plotModelLabel(window->viewState.plotModel)
+           << " ms=" << std::fixed << std::setprecision(3)
+           << std::chrono::duration<double, std::milli>(c1 - c0).count()
+           << " cloudBytes=" << (cloud->packedPoints.empty()
+                                     ? cloud->points.size()
+                                     : cloud->packedPoints.size() * sizeof(float))
+           << " built=" << (cloudBuilt ? 1 : 0)
+           << " points=" << cloudMesh.pointCount;
+        logViewerEvent(os.str());
+      }
+      if (built) {
+        const bool intentionalEmptyAllowed = payloadAllowsIntentionalEmptyPlot(payload);
+        if (!intentionalEmptyAllowed &&
+            !meshHasVisibleData(mesh) &&
+            window->derivedMeshValid &&
+            meshHasVisibleData(window->derivedMesh)) {
+          logViewerEvent(std::string("Kept previous raster plot mesh after unexpected empty rebuild: window=") +
+                         std::to_string(window->windowId));
+          return true;
+        }
+        window->derivedMesh = std::move(mesh);
+        window->derivedBuildKey = key;
+        window->derivedMeshValid = true;
+        return true;
+      }
+      if (window->derivedMeshValid && meshHasVisibleData(window->derivedMesh)) {
+        logViewerEvent(std::string("Kept previous plot mesh after raster rebuild failure: window=") +
+                       std::to_string(window->windowId));
+        return true;
+      }
+    }
+    if (deriveMode == SourceDeriveMode::Raster) {
+      cloud = nullptr;
+    }
+  }
   const auto aggregateState = aggregateHostStateForWorkspace(app);
   const std::string aggregateKey = ChromaspaceViewer::sampleSettingsKey(aggregateState, false);
   const bool workspaceCloudLive =
@@ -19658,10 +22842,10 @@ bool rebuildPlotWindowDerivedMeshIfNeeded(PlotWindowState* window,
       cloud && (workspaceCloudLive ||
                 cloudMatchesResolved(resolved, *cloud) ||
                 cloudMatchesResolved(payload, *cloud));
-  window->syncLabel =
-      !cloud ? "Waiting for Resolve"
-             : (plotCloudLive ? "Live"
-                              : (scopeCloudIsCurrentApproximation ? "Refining" : "Using cache"));
+  setPlotWindowSyncLabel(window,
+                         !cloud ? "Waiting for Resolve"
+                                : (plotCloudLive ? "Live"
+                                                 : (scopeCloudIsCurrentApproximation ? "Refining" : "Using cache")));
   if (resolved.sourceMode == "identity" && !analyticalScope) {
     const std::string key = std::string("identity|") + std::to_string(window->viewState.stateRevision) +
                             "|" + std::to_string(resolved.resolution);
@@ -19698,7 +22882,8 @@ bool rebuildPlotWindowDerivedMeshIfNeeded(PlotWindowState* window,
                          ? buildAnalyticalScopeMeshCpu(payload,
                                                        *cloud,
                                                        window->derivedMeshValid ? &window->derivedMesh : nullptr,
-                                                       &mesh)
+                                                       &mesh,
+                                                       &app.gpuCaps)
                          : buildInputCloudFitMeshCpu(payload, *cloud, &mesh);
   if (!built) {
     if (window->derivedMeshValid && meshHasVisibleData(window->derivedMesh)) {
@@ -19872,16 +23057,17 @@ SourceSignalLassoButton sourceSignalLassoButtonAtPoint(const AppState& app,
                                                        double y,
                                                        int* outWindowId = nullptr) {
   if (outWindowId) *outWindowId = -1;
-  if (!app.viewerState.volumeSliceLassoRegion || windowWidth <= 0 || windowHeight <= 0) {
+  if (!viewerImageLassoSessionActive(app) || windowWidth <= 0 || windowHeight <= 0) {
     return SourceSignalLassoButton::None;
   }
   for (auto it = app.plotWindows.rbegin(); it != app.plotWindows.rend(); ++it) {
     if (!plotWindowIsSourceSignal(*it) ||
-        !pointInPlotWindowRect(*it, windowWidth, windowHeight, x, y)) {
+        !pointInPlotWindowRect(app, *it, windowWidth, windowHeight, x, y)) {
       continue;
     }
-    const double localX = x - static_cast<double>(it->rect.x) * windowWidth;
-    const double localY = y - static_cast<double>(it->rect.y) * windowHeight;
+    const PlotMenuRect screenRect = plotWindowContentLogicalScreenRect(app, *it, windowWidth, windowHeight);
+    const double localX = x - static_cast<double>(screenRect.x0);
+    const double localY = y - static_cast<double>(screenRect.y0);
     const SourceSignalLassoButton actions[] = {
         SourceSignalLassoButton::Add,
         SourceSignalLassoButton::Subtract,
@@ -19899,7 +23085,8 @@ SourceSignalLassoButton sourceSignalLassoButtonAtPoint(const AppState& app,
 }
 
 bool ensureSourceSignalTexture(SourceSignalStore* store, const SourceSignalPayload& source) {
-  if (!store || source.rgba16f.empty() || source.proxyWidth <= 0 || source.proxyHeight <= 0) {
+  if (!store || (source.rgba16f.empty() && source.rgba32f.empty()) ||
+      source.proxyWidth <= 0 || source.proxyHeight <= 0) {
     return false;
   }
   if (store->texture == 0) {
@@ -19917,15 +23104,27 @@ bool ensureSourceSignalTexture(SourceSignalStore* store, const SourceSignalPaylo
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
   glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-  glTexImage2D(GL_TEXTURE_2D,
-               0,
-               GL_RGBA16F,
-               source.proxyWidth,
-               source.proxyHeight,
-               0,
-               GL_RGBA,
-               GL_HALF_FLOAT,
-               source.rgba16f.data());
+  if (source.pixelFormat == "rgba32f" && !source.rgba32f.empty()) {
+    glTexImage2D(GL_TEXTURE_2D,
+                 0,
+                 GL_RGBA32F,
+                 source.proxyWidth,
+                 source.proxyHeight,
+                 0,
+                 GL_RGBA,
+                 GL_FLOAT,
+                 source.rgba32f.data());
+  } else {
+    glTexImage2D(GL_TEXTURE_2D,
+                 0,
+                 GL_RGBA16F,
+                 source.proxyWidth,
+                 source.proxyHeight,
+                 0,
+                 GL_RGBA,
+                 GL_HALF_FLOAT,
+                 source.rgba16f.data());
+  }
   glBindTexture(GL_TEXTURE_2D, 0);
   store->textureContentHash = source.contentHash;
   store->textureWidth = source.proxyWidth;
@@ -19941,18 +23140,17 @@ void drawSourceSignalLassoButtons(const AppState& app,
                                   int windowHeight,
                                   const HudTextRenderer& renderer,
                                   const HudTextRenderer* symbolRenderer) {
-  if (!app.viewerState.volumeSliceLassoRegion || width <= 0 || height <= 0 ||
+  if (!viewerImageLassoSessionActive(app) || width <= 0 || height <= 0 ||
       windowWidth <= 0 || windowHeight <= 0) {
     return;
   }
-  const float localWindowW =
-      std::max(1.0f, window.rect.w * static_cast<float>(windowWidth));
-  const float localWindowH =
-      std::max(1.0f, window.rect.h * static_cast<float>(windowHeight));
+  const PlotMenuRect contentRect = plotWindowContentLogicalScreenRect(app, window, windowWidth, windowHeight);
+  const float localWindowW = std::max(1.0f, contentRect.x1 - contentRect.x0);
+  const float localWindowH = std::max(1.0f, contentRect.y1 - contentRect.y0);
   const float sx = static_cast<float>(width) / localWindowW;
   const float sy = static_cast<float>(height) / localWindowH;
-  const double localHoverX = app.hoverX - static_cast<double>(window.rect.x) * windowWidth;
-  const double localHoverY = app.hoverY - static_cast<double>(window.rect.y) * windowHeight;
+  const double localHoverX = app.hoverX - static_cast<double>(contentRect.x0);
+  const double localHoverY = app.hoverY - static_cast<double>(contentRect.y0);
   const bool hasSelection = activeViewerLassoSelectionHasData(app);
 
   auto drawButton = [&](int index,
@@ -20109,32 +23307,7 @@ void drawSourceSignalPlot(const AppState& app,
                     0.90f);
   }
 
-  const std::string status =
-      source
-          ? (source->tierLabel + " | " + std::to_string(source->sourceWidth) + "x" +
-             std::to_string(source->sourceHeight) + " -> " +
-             std::to_string(source->proxyWidth) + "x" + std::to_string(source->proxyHeight))
-          : std::string("No source packet");
-  drawHudTextLine(renderer,
-                  status,
-                  10.0f,
-                  static_cast<float>(height) - 18.0f,
-                  renderer.available ? 0.82f : 1.0f,
-                  0.76f,
-                  0.82f,
-                  0.90f,
-                  0.88f);
-  if (window.viewState.sourceSyncSelections) {
-    drawHudTextLineRight(renderer,
-                         "Selections synced",
-                         static_cast<float>(width) - 10.0f,
-                         static_cast<float>(height) - 18.0f,
-                         renderer.available ? 0.76f : 1.0f,
-                         0.75f,
-                         0.86f,
-                         0.96f,
-                         0.72f);
-  }
+
   drawSourceSignalLassoButtons(app, window, width, height, windowWidth, windowHeight, renderer, symbolRenderer);
 
   glDisable(GL_BLEND);
@@ -20455,21 +23628,32 @@ void drawSecondaryPlotWindow(AppState* app,
                              const HudTextRenderer* symbolRenderer,
                              PointRenderProgramCache* pointRenderProgramCache) {
   if (!app || !window) return;
+  if (plotWindowIsDockedSourceSignal(*window)) return;
   // In a multi-window workspace every plot must use the same per-window draw
   // path. Otherwise moving focus switches that plot between the primary GPU
   // path and the secondary CPU path, visibly changing its density/shape.
   if (window->windowId == app->focusedPlotWindowId && app->plotWindows.size() <= 1u &&
+      sourceDeriveMode() == SourceDeriveMode::Cloud &&
       !plotModelIsAnalyticalScope(window->viewState.plotModel) &&
       !plotModelIsSourceSignal(window->viewState.plotModel)) return;
   ResolvedPayload payload = resolved;
   applyViewerStateToResolvedViewFields(window->viewState, &payload);
   const bool sourceSignalPlot = plotModelIsSourceSignal(window->viewState.plotModel);
-  if (!sourceSignalPlot && !rebuildPlotWindowDerivedMeshIfNeeded(window, *app, resolved, cloud)) {
+  if (!sourceSignalPlot &&
+      !rebuildPlotWindowDerivedMeshIfNeeded(window, *app, resolved, cloud, sourceSignalStore)) {
     return;
   }
-  const PlotWindowFramebufferRect rect = plotWindowFramebufferRect(*window, fbWidth, fbHeight);
+  const PlotWindowFramebufferRect frameRect =
+      plotWindowFramebufferRect(*app, *window, fbWidth, fbHeight, windowWidth, windowHeight);
+  const PlotWindowFramebufferRect rect =
+      plotWindowContentFramebufferRect(*app, *window, fbWidth, fbHeight, windowWidth, windowHeight);
+  if (window->fitRequested && !sourceSignalPlot) {
+    if (fitPlotWindowCameraToCurrentContent(app, window, windowWidth, windowHeight, fbWidth, fbHeight)) {
+      window->fitRequested = false;
+    }
+  }
   glEnable(GL_SCISSOR_TEST);
-  glScissor(rect.x, rect.y, rect.w, rect.h);
+  glScissor(frameRect.x, frameRect.y, frameRect.w, frameRect.h);
   glViewport(rect.x, rect.y, rect.w, rect.h);
   float backgroundR = payload.backgroundColorR;
   float backgroundG = payload.backgroundColorG;
@@ -20492,9 +23676,9 @@ void drawSecondaryPlotWindow(AppState* app,
   if (sourceSignalPlot) {
     const SourceSignalPayload* source =
         sourceSignalStore ? activeSourceSignalPayload(*sourceSignalStore) : nullptr;
-    window->syncLabel =
-        source ? (source->coverage == "partial-preview" ? "Proxy" : "Live")
-               : "Waiting for Resolve";
+    setPlotWindowSyncLabel(window,
+                           source ? (source->coverage == "partial-preview" ? "Proxy" : "Live")
+                                  : "Waiting for Resolve");
     drawSourceSignalPlot(*app,
                          *window,
                          sourceSignalStore,
@@ -20537,10 +23721,18 @@ void drawSecondaryPlotWindow(AppState* app,
   const float* activePointColors =
       window->derivedMesh.pointColors.empty() ? nullptr : window->derivedMesh.pointColors.data();
   size_t activePointCount = window->derivedMesh.pointCount;
+  const bool suppressPointsForEmptyImageLasso =
+      payloadImageLassoModeEnabled(payload) && !payloadHasImageLassoSelection(payload);
   std::vector<float> glossProjectionVerts;
   std::vector<float> glossProjectionColors;
+  PointDrawBuffers residentPointDraw;
   PointDrawBuffers sampledPointDraw;
-  if (glossField2DMode) {
+  bool activePointUsesGpuBuffers = false;
+  if (suppressPointsForEmptyImageLasso) {
+    activePointVerts = nullptr;
+    activePointColors = nullptr;
+    activePointCount = 0;
+  } else if (glossField2DMode) {
     activePointVerts = nullptr;
     activePointColors = nullptr;
     activePointCount = 0;
@@ -20563,18 +23755,56 @@ void drawSecondaryPlotWindow(AppState* app,
       activePointColors = nullptr;
       activePointCount = 0;
     }
+  } else if (!activePointVerts || !activePointColors) {
+#if defined(CHROMASPACE_VIEWER_HAS_CUDA) && !defined(__APPLE__)
+    if (residentCudaPointDrawBuffers(window->derivedMesh,
+                                     window->residentInputCudaCache,
+                                     &residentPointDraw)) {
+      activePointCount = residentPointDraw.pointCount;
+      activePointUsesGpuBuffers = true;
+    }
+#endif
   }
 
   const float densityForView = std::max(0.35f, payload.pointDensity);
   if (!glossViewMode && activePointCount > 0u) {
     const PointSelectionSpec pointSelection =
         makePointSelectionSpec(window->derivedMesh, densityForView);
-    if (pointSelection.needsThinning &&
-        buildCpuSampledPointDrawBuffers(window->derivedMesh, pointSelection, &sampledPointDraw) &&
-        sampledPointDraw.available) {
-      activePointVerts = sampledPointDraw.cpuVerts.data();
-      activePointColors = sampledPointDraw.cpuColors.data();
-      activePointCount = sampledPointDraw.pointCount;
+    if (pointSelection.needsThinning) {
+      bool sampledOnGpu = false;
+#if defined(CHROMASPACE_VIEWER_HAS_CUDA) && !defined(__APPLE__)
+      if (activePointUsesGpuBuffers &&
+          window->residentInputCudaCache.available &&
+          window->residentInputCudaCache.builtSerial == pointSelection.sourceSerial) {
+        std::string reason;
+        if (buildInputCloudSampledCudaBuffers(&window->residentInputCudaCache,
+                                              &window->residentInputSampleCudaCache,
+                                              pointSelection,
+                                              &reason)) {
+          sampledPointDraw.verts = window->residentInputSampleCudaCache.verts;
+          sampledPointDraw.colors = window->residentInputSampleCudaCache.colors;
+          sampledPointDraw.pointCount = pointSelection.visiblePointCount;
+          sampledPointDraw.sourceSerial = pointSelection.sourceSerial;
+          sampledPointDraw.visiblePointCount = pointSelection.visiblePointCount;
+          sampledPointDraw.visibleGlossBodyPointCount = pointSelection.visibleGlossBodyPointCount;
+          sampledPointDraw.visibleGlossHighlightPointCount = pointSelection.visibleGlossHighlightPointCount;
+          sampledPointDraw.available = true;
+          activePointCount = sampledPointDraw.pointCount;
+          sampledOnGpu = true;
+        } else if (!reason.empty()) {
+          logViewerDiagnostic(true, std::string("Resident CUDA thinning fallback: ") + reason);
+        }
+      }
+#endif
+      if (sampledOnGpu) {
+        activePointUsesGpuBuffers = true;
+      } else if (!activePointUsesGpuBuffers &&
+                 buildCpuSampledPointDrawBuffers(window->derivedMesh, pointSelection, &sampledPointDraw) &&
+                 sampledPointDraw.available) {
+        activePointVerts = sampledPointDraw.cpuVerts.data();
+        activePointColors = sampledPointDraw.cpuColors.data();
+        activePointCount = sampledPointDraw.pointCount;
+      }
     }
   }
   float pointSize = 2.5f;
@@ -20633,7 +23863,8 @@ void drawSecondaryPlotWindow(AppState* app,
       (drawAsGlossProjection ? 1.0f : (plainScopeStyle ? 1.0f : 0.84f));
   if (drawAsGlossProjection) drawAlphaGain = std::max(1.12f, drawAlphaGain * 1.24f);
 
-  if (glossViewMode && !glossField2DMode &&
+  if (!suppressPointsForEmptyImageLasso &&
+      glossViewMode && !glossField2DMode &&
       window->derivedMesh.glossBodyGuidePointCount > 0u &&
       !window->derivedMesh.glossBodyGuideVerts.empty() &&
       !window->derivedMesh.glossBodyGuideColors.empty() &&
@@ -20657,7 +23888,8 @@ void drawSecondaryPlotWindow(AppState* app,
     glDisableClientState(GL_VERTEX_ARRAY);
   }
 
-  if (activePointCount > 0 && activePointVerts && activePointColors) {
+  if (activePointCount > 0 &&
+      ((activePointVerts && activePointColors) || activePointUsesGpuBuffers)) {
     glEnableClientState(GL_VERTEX_ARRAY);
     glEnableClientState(GL_COLOR_ARRAY);
     const bool usePointRenderProgram =
@@ -20670,8 +23902,19 @@ void drawSecondaryPlotWindow(AppState* app,
       glHint(GL_POINT_SMOOTH_HINT, GL_NICEST);
     }
     glPointSize(pointSize);
-    glVertexPointer(3, GL_FLOAT, 0, activePointVerts);
-    glColorPointer(4, GL_FLOAT, 0, activePointColors);
+    if (activePointUsesGpuBuffers) {
+      const ViewerGlBufferApi& bufferApi = viewerGlBufferApi();
+      const PointDrawBuffers& drawBuffers =
+          sampledPointDraw.available ? sampledPointDraw : residentPointDraw;
+      bufferApi.bindBuffer(GL_ARRAY_BUFFER, drawBuffers.verts);
+      glVertexPointer(3, GL_FLOAT, 0, nullptr);
+      bufferApi.bindBuffer(GL_ARRAY_BUFFER, drawBuffers.colors);
+      glColorPointer(4, GL_FLOAT, 0, nullptr);
+    } else {
+      viewerGlBufferApi().bindBuffer(GL_ARRAY_BUFFER, 0);
+      glVertexPointer(3, GL_FLOAT, 0, activePointVerts);
+      glColorPointer(4, GL_FLOAT, 0, activePointColors);
+    }
     if (usePointRenderProgram) {
       const ViewerGlComputeApi& renderApi = viewerGlComputeApi();
       glEnable(GL_VERTEX_PROGRAM_POINT_SIZE);
@@ -20768,8 +24011,10 @@ void drawSecondaryPlotWindow(AppState* app,
     }
     glDisableClientState(GL_COLOR_ARRAY);
     glDisableClientState(GL_VERTEX_ARRAY);
+    viewerGlBufferApi().bindBuffer(GL_ARRAY_BUFFER, 0);
   }
-  if (!glossViewMode &&
+  if (!suppressPointsForEmptyImageLasso &&
+      !glossViewMode &&
       window->overlayMesh.pointCount > 0u &&
       !window->overlayMesh.pointVerts.empty() &&
       !window->overlayMesh.pointColors.empty()) {
@@ -20789,7 +24034,8 @@ void drawSecondaryPlotWindow(AppState* app,
     glDisableClientState(GL_COLOR_ARRAY);
     glDisableClientState(GL_VERTEX_ARRAY);
   }
-  if (!glossViewMode &&
+  if (!suppressPointsForEmptyImageLasso &&
+      !glossViewMode &&
       window->derivedMesh.lineVertexCount > 0 &&
       window->derivedMesh.lineVerts.size() >= window->derivedMesh.lineVertexCount * 3u &&
       window->derivedMesh.lineColors.size() >= window->derivedMesh.lineVertexCount * 4u) {
@@ -20887,6 +24133,205 @@ void drawSecondaryPlotWindow(AppState* app,
   glDisable(GL_SCISSOR_TEST);
 }
 
+std::string plotWindowTitleMetadata(const AppState& app, const PlotWindowState& window) {
+  if (plotModelIsSourceSignal(window.viewState.plotModel)) {
+    std::ostringstream os;
+    if (app.sourceSignalSourceWidth > 0 && app.sourceSignalSourceHeight > 0) {
+      os << "Source " << ChromaspaceViewer::sourceDetailLabel(window.viewState.sourceDetailMode)
+         << " " << app.sourceSignalSourceWidth << "x" << app.sourceSignalSourceHeight;
+      if (app.sourceSignalProxyWidth > 0 && app.sourceSignalProxyHeight > 0 &&
+          (app.sourceSignalProxyWidth != app.sourceSignalSourceWidth ||
+           app.sourceSignalProxyHeight != app.sourceSignalSourceHeight)) {
+        os << " -> " << app.sourceSignalProxyWidth << "x" << app.sourceSignalProxyHeight;
+      }
+    } else {
+      os << "No source packet";
+    }
+    if (window.viewState.sourceSyncSelections) os << " | Synced selections";
+    return os.str();
+  }
+  if (window.viewState.plotModel == ChromaspaceViewer::kPlotModelWaveform) {
+    return ChromaspaceViewer::waveformModeLabel(window.viewState.waveformMode);
+  }
+  if (window.viewState.plotModel == ChromaspaceViewer::kPlotModelHistogram) {
+    return ChromaspaceViewer::histogramModeLabel(window.viewState.histogramMode);
+  }
+  if (isGlossViewPlotModeString(ChromaspaceViewer::plotModeForModel(window.viewState.plotModel))) {
+    return "Gloss";
+  }
+  return std::string();
+}
+
+void drawPlotWindowTitleBar(const AppState& app,
+                            const PlotWindowState& window,
+                            float x0,
+                            float x1,
+                            float y1,
+                            float titleH,
+                            bool focused,
+                            const HudTextRenderer& renderer) {
+  if (x1 <= x0 + 6.0f || titleH <= 4.0f) return;
+  const float alpha = focused ? 0.60f : 0.34f;
+  drawPlotMenuRect(x0, y1 - titleH, x1, y1, 0.018f, 0.026f, 0.034f, alpha);
+  drawPlotMenuRect(x0, y1 - titleH, x1, y1 - titleH + 1.0f, 0.24f, 0.42f, 0.56f, alpha * 0.62f);
+
+  const float scale = renderer.available ? clampf(titleH / 27.0f, 0.66f, 0.88f) : 1.0f;
+  const float baselineY = y1 - titleH * 0.62f;
+  const float pad = 8.0f;
+  const float closeReserve = app.plotWindows.size() > 1u ? std::max(24.0f, titleH + 6.0f) : 0.0f;
+  const float leftX = x0 + pad;
+  const float rightX = x1 - pad - closeReserve;
+  float available = std::max(0.0f, rightX - leftX);
+  if (available < 20.0f) return;
+
+  const std::string title = std::string(ChromaspaceViewer::plotModelLabel(window.viewState.plotModel)) +
+                            " | " + window.syncLabel;
+  const std::string metadata = plotWindowTitleMetadata(app, window);
+  float metadataMax = 0.0f;
+  if (!metadata.empty() && available > 170.0f) {
+    metadataMax = std::min(hudTextWidth(renderer, metadata, scale), available * 0.44f);
+  }
+  const float gap = metadataMax > 0.0f ? 12.0f : 0.0f;
+  float titleMax = available - metadataMax - gap;
+  if (titleMax < 76.0f && metadataMax > 0.0f) {
+    metadataMax = 0.0f;
+    titleMax = available;
+  }
+
+  const std::string fittedTitle = fitHudText(renderer, title, titleMax, scale);
+  if (!fittedTitle.empty()) {
+    drawHudTextLine(renderer,
+                    fittedTitle,
+                    leftX,
+                    baselineY,
+                    scale,
+                    focused ? 0.96f : 0.74f,
+                    0.88f,
+                    0.93f,
+                    0.98f);
+  }
+  if (metadataMax > 0.0f) {
+    const std::string fittedMeta = fitHudText(renderer, metadata, metadataMax, scale);
+    if (!fittedMeta.empty()) {
+      drawHudTextLineRight(renderer,
+                           fittedMeta,
+                           rightX,
+                           baselineY,
+                           scale,
+                           focused ? 0.78f : 0.56f,
+                           0.74f,
+                           0.82f,
+                           0.90f);
+    }
+  }
+}
+
+void drawSlicingVectorCubeGlyph(const PlotMenuRect& rect,
+                                float r,
+                                float g,
+                                float b,
+                                bool enabled,
+                                bool hovered,
+                                float alpha) {
+  const float fillAlpha = enabled ? (hovered ? 0.96f : 0.82f) : (hovered ? 0.30f : 0.18f);
+  drawPlotMenuRect(rect.x0, rect.y0, rect.x1, rect.y1,
+                   r * (enabled ? 0.95f : 0.40f),
+                   g * (enabled ? 0.95f : 0.40f),
+                   b * (enabled ? 0.95f : 0.40f),
+                   fillAlpha * alpha);
+  drawPlotMenuRect(rect.x0, rect.y1 - 1.4f, rect.x1, rect.y1,
+                   1.0f, 1.0f, 1.0f, (enabled ? 0.36f : 0.13f) * alpha);
+  glLineWidth(hovered ? 1.7f : 1.1f);
+  glBegin(GL_LINE_LOOP);
+  glColor4f(hovered ? 0.95f : 0.52f,
+            hovered ? 0.98f : 0.64f,
+            hovered ? 1.00f : 0.72f,
+            (hovered ? 0.90f : 0.44f) * alpha);
+  glVertex2f(rect.x0, rect.y0);
+  glVertex2f(rect.x1, rect.y0);
+  glVertex2f(rect.x1, rect.y1);
+  glVertex2f(rect.x0, rect.y1);
+  glEnd();
+  glLineWidth(1.0f);
+}
+
+void drawSlicingPizzaButtonGlyph(const PlotMenuRect& rect,
+                                 bool active,
+                                 bool hovered,
+                                 float alpha) {
+  drawPlotMenuRect(rect.x0, rect.y0, rect.x1, rect.y1,
+                   hovered ? 0.07f : 0.035f,
+                   hovered ? 0.16f : 0.10f,
+                   hovered ? 0.22f : 0.15f,
+                   (hovered ? 0.86f : 0.68f) * alpha);
+  if (active) {
+    drawPlotMenuRect(rect.x0, rect.y1 - 2.0f, rect.x1, rect.y1,
+                     0.42f, 0.86f, 1.0f, 0.64f * alpha);
+  }
+  const float cx = (rect.x0 + rect.x1) * 0.5f;
+  const float cy = (rect.y0 + rect.y1) * 0.5f;
+  const float radius = std::min(rect.x1 - rect.x0, rect.y1 - rect.y0) * 0.30f;
+  const int steps = 30;
+  glBegin(GL_TRIANGLE_FAN);
+  glColor4f(active ? 0.32f : 0.18f,
+            active ? 0.56f : 0.30f,
+            active ? 0.72f : 0.40f,
+            (hovered ? 0.72f : 0.54f) * alpha);
+  glVertex2f(cx, cy);
+  for (int i = 0; i <= steps; ++i) {
+    const float a = static_cast<float>(i) * 6.28318530718f / static_cast<float>(steps);
+    glVertex2f(cx + std::cos(a) * radius, cy + std::sin(a) * radius);
+  }
+  glEnd();
+  glLineWidth(1.25f);
+  glBegin(GL_LINE_LOOP);
+  glColor4f(0.78f, 0.91f, 1.0f, (hovered ? 0.92f : 0.66f) * alpha);
+  for (int i = 0; i < steps; ++i) {
+    const float a = static_cast<float>(i) * 6.28318530718f / static_cast<float>(steps);
+    glVertex2f(cx + std::cos(a) * radius, cy + std::sin(a) * radius);
+  }
+  glEnd();
+  glBegin(GL_LINES);
+  glColor4f(0.78f, 0.91f, 1.0f, (hovered ? 0.86f : 0.54f) * alpha);
+  for (int i = 0; i < 6; ++i) {
+    const float a = static_cast<float>(i) * 6.28318530718f / 6.0f;
+    glVertex2f(cx, cy);
+    glVertex2f(cx + std::cos(a) * radius, cy + std::sin(a) * radius);
+  }
+  glEnd();
+  glLineWidth(1.0f);
+}
+
+void drawSlicingLassoGlyph(const PlotMenuRect& rect,
+                           bool active,
+                           bool hovered,
+                           float alpha) {
+  drawPlotMenuRect(rect.x0, rect.y0, rect.x1, rect.y1,
+                   active ? 0.07f : 0.035f,
+                   active ? 0.17f : 0.09f,
+                   active ? 0.23f : 0.13f,
+                   (hovered ? 0.86f : 0.64f) * alpha);
+  if (active) {
+    drawPlotMenuRect(rect.x0, rect.y1 - 1.5f, rect.x1, rect.y1,
+                     0.40f, 0.86f, 1.0f, 0.58f * alpha);
+  }
+  const float w = rect.x1 - rect.x0;
+  const float h = rect.y1 - rect.y0;
+  const float cx = (rect.x0 + rect.x1) * 0.5f;
+  const float cy = (rect.y0 + rect.y1) * 0.5f;
+  glLineWidth(hovered ? 1.7f : 1.25f);
+  glBegin(GL_LINE_LOOP);
+  glColor4f(0.72f, 0.92f, 1.0f, (hovered ? 0.95f : 0.68f) * alpha);
+  glVertex2f(cx - w * 0.24f, cy + h * 0.10f);
+  glVertex2f(cx - w * 0.08f, cy + h * 0.25f);
+  glVertex2f(cx + w * 0.22f, cy + h * 0.18f);
+  glVertex2f(cx + w * 0.20f, cy - h * 0.12f);
+  glVertex2f(cx - w * 0.03f, cy - h * 0.24f);
+  glVertex2f(cx - w * 0.25f, cy - h * 0.08f);
+  glEnd();
+  glLineWidth(1.0f);
+}
+
 void drawPlotWindowFramesOverlay(const AppState& app,
                                  int fbWidth,
                                  int fbHeight,
@@ -20896,6 +24341,12 @@ void drawPlotWindowFramesOverlay(const AppState& app,
   if (fbWidth <= 0 || fbHeight <= 0 || windowWidth <= 0 || windowHeight <= 0) return;
   const float sx = static_cast<float>(fbWidth) / static_cast<float>(windowWidth);
   const float sy = static_cast<float>(fbHeight) / static_cast<float>(windowHeight);
+  auto scaleLogicalRect = [&](const PlotMenuRect& rect) -> PlotMenuRect {
+    return {rect.x0 * sx,
+            static_cast<float>(fbHeight) - rect.y1 * sy,
+            rect.x1 * sx,
+            static_cast<float>(fbHeight) - rect.y0 * sy};
+  };
   glMatrixMode(GL_PROJECTION);
   glPushMatrix();
   glLoadIdentity();
@@ -20907,14 +24358,63 @@ void drawPlotWindowFramesOverlay(const AppState& app,
   glEnable(GL_BLEND);
   glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
   for (const auto& window : app.plotWindows) {
-    const float x0w = window.rect.x * static_cast<float>(windowWidth);
-    const float y0w = window.rect.y * static_cast<float>(windowHeight);
-    const float x1w = x0w + window.rect.w * static_cast<float>(windowWidth);
-    const float y1w = y0w + window.rect.h * static_cast<float>(windowHeight);
-    const float x0 = x0w * sx;
-    const float x1 = x1w * sx;
-    const float y0 = static_cast<float>(fbHeight) - y1w * sy;
-    const float y1 = static_cast<float>(fbHeight) - y0w * sy;
+    if (plotWindowIsDockedSourceSignal(window)) {
+      const PlotMenuRect dockWindowRect = sourceSignalDockButtonRect(app, window, windowWidth, windowHeight);
+      if (dockWindowRect.x1 > dockWindowRect.x0 && dockWindowRect.y1 > dockWindowRect.y0) {
+        const float x0 = dockWindowRect.x0 * sx;
+        const float x1 = dockWindowRect.x1 * sx;
+        const float y0 = static_cast<float>(fbHeight) - dockWindowRect.y1 * sy;
+        const float y1 = static_cast<float>(fbHeight) - dockWindowRect.y0 * sy;
+        const bool hovered = pointInPlotMenuRect(dockWindowRect, app.hoverX, app.hoverY);
+        const double animAge = glfwGetTime() - window.sourceSignalDockAnimStart;
+        const float pulse = animAge >= 0.0 && animAge < 0.32
+                                ? static_cast<float>(1.0 - animAge / 0.32)
+                                : 0.0f;
+        drawPlotMenuRect(x0, y0, x1, y1,
+                         hovered ? 0.08f : 0.035f,
+                         hovered ? 0.22f : 0.13f,
+                         hovered ? 0.30f : 0.20f,
+                         hovered ? 0.92f : 0.78f);
+        drawPlotMenuRect(x0, y1 - 2.0f, x1, y1,
+                         0.38f, 0.84f, 1.0f, 0.58f + pulse * 0.25f);
+        drawPlotMenuRect(x0, y0, x0 + 2.0f, y1,
+                         0.38f, 0.84f, 1.0f, 0.28f + pulse * 0.16f);
+        const float iconX0 = x0 + 9.0f * sx;
+        const float iconY0 = y0 + 8.0f * sy;
+        const float iconX1 = iconX0 + 19.0f * sx;
+        const float iconY1 = iconY0 + 15.0f * sy;
+        drawPlotMenuRect(iconX0, iconY0, iconX1, iconY1,
+                         0.10f, 0.18f, 0.23f, 0.95f);
+        drawPlotMenuRect(iconX0, iconY1 - 1.2f, iconX1, iconY1,
+                         0.78f, 0.92f, 1.0f, 0.72f);
+        glLineWidth(1.2f);
+        glBegin(GL_LINES);
+        glColor4f(0.78f, 0.92f, 1.0f, hovered ? 0.95f : 0.72f);
+        glVertex2f(iconX0, iconY0);
+        glVertex2f(iconX1, iconY1);
+        glVertex2f(iconX0, iconY1);
+        glVertex2f(iconX1, iconY0);
+        glEnd();
+        glLineWidth(1.0f);
+        if (renderer.available) {
+          drawHudTextLine(renderer,
+                          "L",
+                          x1 - 13.0f * sx,
+                          y0 + 12.0f * sy,
+                          0.78f,
+                          hovered ? 0.96f : 0.74f,
+                          0.76f,
+                          0.94f,
+                          1.0f);
+        }
+      }
+      continue;
+    }
+    const PlotMenuRect screenRect = plotWindowLogicalScreenRect(app, window, windowWidth, windowHeight);
+    const float x0 = screenRect.x0 * sx;
+    const float x1 = screenRect.x1 * sx;
+    const float y0 = static_cast<float>(fbHeight) - screenRect.y1 * sy;
+    const float y1 = static_cast<float>(fbHeight) - screenRect.y0 * sy;
     const bool focused = window.windowId == app.focusedPlotWindowId;
     const bool hovered = window.windowId == app.hoveredPlotWindowId;
     const float a = focused ? 0.86f : (hovered ? 0.58f : 0.34f);
@@ -20922,20 +24422,8 @@ void drawPlotWindowFramesOverlay(const AppState& app,
     drawPlotMenuRect(x0, y0, x1, y0 + 1.5f, 0.62f, 0.82f, 1.0f, a * 0.72f);
     drawPlotMenuRect(x0, y0, x0 + 1.5f, y1, 0.62f, 0.82f, 1.0f, a * 0.72f);
     drawPlotMenuRect(x1 - 1.5f, y0, x1, y1, 0.62f, 0.82f, 1.0f, a * 0.68f);
-    if (window.rect.w < 0.995f || window.rect.h < 0.995f) {
-      drawPlotMenuRect(x0, y1 - 22.0f, x1, y1, 0.02f, 0.03f, 0.04f, focused ? 0.52f : 0.28f);
-      const std::string label = ChromaspaceViewer::plotModelLabel(window.viewState.plotModel);
-      const std::string title = label + "  |  " + window.syncLabel;
-      drawHudTextLine(renderer,
-                      title,
-                      x0 + 8.0f,
-                      y1 - (renderer.available ? 15.0f : 14.0f),
-                      0.82f,
-                      focused ? 0.96f : 0.72f,
-                      0.88f,
-                      0.93f,
-                      0.98f);
-    }
+    const float titleH = plotWindowTitleBarLogicalHeight(screenRect) * sy;
+    drawPlotWindowTitleBar(app, window, x0, x1, y1, titleH, focused, renderer);
     PlotWindowDragMode interactionMode = PlotWindowDragMode::None;
     if (app.plotWindowDragId == window.windowId &&
         app.plotWindowDragMode != PlotWindowDragMode::None) {
@@ -20947,9 +24435,9 @@ void drawPlotWindowFramesOverlay(const AppState& app,
                             app.plotWindowDragMode != PlotWindowDragMode::None;
     if (interactionMode == PlotWindowDragMode::Move) {
       const float moveAlpha = activeDrag ? 0.36f : 0.20f;
-      drawPlotMenuRect(x0, y1 - 22.0f, x1, y1 - 18.0f, 0.20f, 0.42f, 0.58f, moveAlpha);
+      drawPlotMenuRect(x0, y1 - titleH, x1, y1 - std::max(1.0f, titleH - 4.0f), 0.20f, 0.42f, 0.58f, moveAlpha);
       const float gripX = x0 + 10.0f;
-      const float gripY = y1 - 11.0f;
+      const float gripY = y1 - titleH * 0.5f;
       glLineWidth(activeDrag ? 1.7f : 1.2f);
       glBegin(GL_LINES);
       glColor4f(0.72f, 0.90f, 1.0f, activeDrag ? 0.88f : 0.58f);
@@ -20982,7 +24470,7 @@ void drawPlotWindowFramesOverlay(const AppState& app,
       }
     }
     if (app.plotWindows.size() > 1u) {
-      const PlotMenuRect closeWindowRect = plotWindowCloseWindowRect(window, windowWidth, windowHeight);
+      const PlotMenuRect closeWindowRect = plotWindowCloseWindowRect(app, window, windowWidth, windowHeight);
       const bool closeHovered = pointInPlotMenuRect(closeWindowRect, app.hoverX, app.hoverY);
       const float closeX0 = closeWindowRect.x0 * sx;
       const float closeX1 = closeWindowRect.x1 * sx;
@@ -21002,6 +24490,62 @@ void drawPlotWindowFramesOverlay(const AppState& app,
       glVertex2f(closeX0 + 5.0f * sx, closeY1 - 5.0f * sy);
       glEnd();
       glLineWidth(1.0f);
+    }
+    if (plotWindowSupportsSlicingQuickButton(window)) {
+      const PlotMenuRect buttonWindowRect =
+          slicingQuickButtonRect(app, window, windowWidth, windowHeight);
+      if (buttonWindowRect.x1 > buttonWindowRect.x0 && buttonWindowRect.y1 > buttonWindowRect.y0) {
+        const PlotMenuRect buttonRect = scaleLogicalRect(buttonWindowRect);
+        const bool buttonHovered = pointInPlotMenuRect(buttonWindowRect, app.hoverX, app.hoverY);
+        const bool slicingActive = anySlicingVectorsEnabled(window.viewState) ||
+                                   window.viewState.volumeSliceLassoRegion;
+        drawSlicingPizzaButtonGlyph(buttonRect, slicingActive || window.slicingDrawerOpen, buttonHovered, 1.0f);
+      }
+      if (window.slicingDrawerOpen) {
+        const SlicingQuickDrawerRects drawerWindowRects =
+            slicingQuickDrawerItemRects(app, window, windowWidth, windowHeight);
+        if (drawerWindowRects.drawer.x1 > drawerWindowRects.drawer.x0 &&
+            drawerWindowRects.drawer.y1 > drawerWindowRects.drawer.y0) {
+          const double age = glfwGetTime() - window.slicingDrawerAnimStart;
+          const float t = smoothAnimation01(age / 0.16);
+          const PlotMenuRect drawerRect = scaleLogicalRect(drawerWindowRects.drawer);
+          const PlotMenuRect buttonRect = scaleLogicalRect(buttonWindowRect);
+          const float anchorX = (buttonRect.x0 + buttonRect.x1) * 0.5f;
+          const float anchorY = (buttonRect.y0 + buttonRect.y1) * 0.5f;
+          const float scale = 0.72f + 0.28f * t;
+          glPushMatrix();
+          glTranslatef(anchorX, anchorY, 0.0f);
+          glScalef(scale, scale, 1.0f);
+          glTranslatef(-anchorX, -anchorY, 0.0f);
+          drawPlotMenuRect(drawerRect.x0, drawerRect.y0, drawerRect.x1, drawerRect.y1,
+                           0.014f, 0.018f, 0.024f, 0.88f * t);
+          drawPlotMenuRect(drawerRect.x0, drawerRect.y1 - 1.0f, drawerRect.x1, drawerRect.y1,
+                           0.42f, 0.76f, 0.95f, 0.32f * t);
+          for (int i = 0; i < kSlicingVectorCount; ++i) {
+            float r = 1.0f, g = 1.0f, b = 1.0f;
+            slicingVectorColor(i, &r, &g, &b);
+            const PlotMenuRect cubeRect =
+                scaleLogicalRect(drawerWindowRects.vectors[static_cast<size_t>(i)]);
+            const bool cubeHovered = pointInPlotMenuRect(
+                drawerWindowRects.vectors[static_cast<size_t>(i)], app.hoverX, app.hoverY);
+            drawSlicingVectorCubeGlyph(cubeRect,
+                                       r,
+                                       g,
+                                       b,
+                                       slicingVectorEnabled(window.viewState, i),
+                                       cubeHovered,
+                                       t);
+          }
+          const PlotMenuRect lassoRect = scaleLogicalRect(drawerWindowRects.lasso);
+          const bool lassoHovered = pointInSlicingQuickDrawerLasso(
+              drawerWindowRects, app.hoverX, app.hoverY);
+          drawSlicingLassoGlyph(lassoRect,
+                                window.viewState.volumeSliceLassoRegion,
+                                lassoHovered,
+                                t);
+          glPopMatrix();
+        }
+      }
     }
   }
   if (app.plotWindowSnapPreviewVisible) {
@@ -22642,29 +26186,181 @@ void drawRollDirectionIndicator(int width,
   glMatrixMode(GL_MODELVIEW);
 }
 
+constexpr double kRightClickMenuMaxDurationSeconds = 0.10;
+constexpr double kRightClickMenuMaxMovePixels = 6.0;
+
+void resetSlicingVectorDrag(AppState* app) {
+  if (!app) return;
+  app->slicingVectorDragging = false;
+  app->slicingVectorDragFromMenu = false;
+  app->slicingVectorDragWindowId = -1;
+  app->slicingVectorLastDragIndex = -1;
+  app->slicingVectorDragEnable = false;
+}
+
+const ChromaspaceViewer::ViewerRuntimeState* slicingVectorStateForWindow(const AppState& app,
+                                                                         int windowId) {
+  if (windowId >= 0) {
+    if (const PlotWindowState* window = plotWindowById(app, windowId)) return &window->viewState;
+    return nullptr;
+  }
+  return &app.viewerState;
+}
+
+bool beginSlicingVectorPointerAction(AppState* app,
+                                     int windowId,
+                                     bool fromMenu,
+                                     int vectorIndex,
+                                     bool altSolo) {
+  if (!app || vectorIndex < 0 || vectorIndex >= kSlicingVectorCount) return false;
+  const ChromaspaceViewer::ViewerRuntimeState* state = slicingVectorStateForWindow(*app, windowId);
+  if (!state) return false;
+  const double now = glfwGetTime();
+  const bool doubleClick =
+      (now - app->slicingVectorLastClick) < 0.32 &&
+      app->slicingVectorLastClickWindowId == windowId &&
+      app->slicingVectorLastClickMenu == fromMenu;
+  app->slicingVectorLastClick = now;
+  app->slicingVectorLastClickWindowId = windowId;
+  app->slicingVectorLastClickMenu = fromMenu;
+  resetSlicingVectorDrag(app);
+  if (doubleClick) {
+    toggleAllSlicingVectorsForWindow(app, windowId);
+    app->slicingVectorLastClick = -10.0;
+    return true;
+  }
+  if (altSolo) {
+    soloSlicingVectorForWindow(app, windowId, vectorIndex);
+    return true;
+  }
+  const bool enable = !slicingVectorEnabled(*state, vectorIndex);
+  setSlicingVectorForWindow(app, windowId, vectorIndex, enable);
+  app->slicingVectorDragging = true;
+  app->slicingVectorDragFromMenu = fromMenu;
+  app->slicingVectorDragWindowId = windowId;
+  app->slicingVectorLastDragIndex = vectorIndex;
+  app->slicingVectorDragEnable = enable;
+  return true;
+}
+
+bool updateSlicingVectorDragAtPoint(AppState* app,
+                                    int windowWidth,
+                                    int windowHeight,
+                                    double x,
+                                    double y) {
+  if (!app || !app->slicingVectorDragging) return false;
+  int vectorIndex = -1;
+  if (app->slicingVectorDragFromMenu) {
+    const std::vector<ViewerMenuRow> rows = buildViewerMenuRows(*app);
+    for (int i = 0; i < static_cast<int>(rows.size()); ++i) {
+      if (!rows[static_cast<std::size_t>(i)].slicingVectorSelector) continue;
+      const PlotMenuRect rowRect = viewerMenuRowWindowRect(*app, windowWidth, windowHeight, i);
+      vectorIndex = slicingVectorIndexAt(slicingVectorSelectorRects(rowRect, 22.0f, 8.0f), x, y);
+      break;
+    }
+  } else if (const PlotWindowState* window = plotWindowById(*app, app->slicingVectorDragWindowId)) {
+    if (window->slicingDrawerOpen) {
+      const SlicingQuickDrawerRects rects =
+          slicingQuickDrawerItemRects(*app, *window, windowWidth, windowHeight);
+      vectorIndex = slicingQuickDrawerVectorIndexAt(rects, x, y);
+    }
+  }
+  if (vectorIndex >= 0 && vectorIndex != app->slicingVectorLastDragIndex) {
+    setSlicingVectorForWindow(app,
+                              app->slicingVectorDragWindowId,
+                              vectorIndex,
+                              app->slicingVectorDragEnable);
+    app->slicingVectorLastDragIndex = vectorIndex;
+  }
+  return true;
+}
+
+void activateViewerLassoFromSlicingDrawer(AppState* app,
+                                          int windowId,
+                                          int windowWidth,
+                                          int windowHeight) {
+  if (!app || windowId < 0) return;
+  if (PlotWindowState* owner = plotWindowById(app, windowId);
+      owner && plotWindowCanOwnViewerLassoSelection(*owner)) {
+    focusPlotWindow(app, windowId);
+    bringPlotWindowToFront(app, windowId);
+    app->viewerLassoTargetWindowId = windowId;
+  }
+  app->workspaceLayoutWindowWidth = std::max(1, windowWidth);
+  app->workspaceLayoutWindowHeight = std::max(1, windowHeight);
+  ViewerMenuRow row{};
+  row.label = "Image Lasso";
+  row.action = ViewerMenuAction::ViewerLasso;
+  row.enabled = true;
+  row.refreshPolicy = "resample";
+  activateViewerMenuRow(app, row);
+}
+
 void mouseButtonCallback(GLFWwindow* window, int button, int action, int mods) {
   AppState* app = reinterpret_cast<AppState*>(glfwGetWindowUserPointer(window));
   if (!app) return;
   refreshModifierState(window, app);
   applyMouseModifierBits(app, mods);
-  if ((app->plotModelMenuVisible || app->quickPlotModelMenuVisible || app->addPlotMenuVisible ||
-       app->layoutMenuVisible) &&
-      button == GLFW_MOUSE_BUTTON_RIGHT &&
-      action == GLFW_PRESS) {
-    app->plotModelMenuVisible = false;
-    app->quickPlotModelMenuVisible = false;
-    app->addPlotMenuVisible = false;
-    app->layoutMenuVisible = false;
-    app->plotModelMenuHoverMain = -1;
-    app->plotModelMenuHoverSub = -1;
-    app->quickPlotModelMenuHover = -1;
-    app->addPlotMenuHover = -1;
-    app->layoutMenuHover = -1;
-    app->viewerMenuHoverTab = -1;
-    app->viewerMenuHoverChoice = -1;
-    app->viewerMenuDraggingSlider = false;
-    app->viewerMenuChoiceAction = static_cast<int>(ViewerMenuAction::None);
-    app->viewerChoiceMenuScroll = 0.0f;
+  double rightCursorX = app->hoverX;
+  double rightCursorY = app->hoverY;
+  if (button == GLFW_MOUSE_BUTTON_RIGHT) glfwGetCursorPos(window, &rightCursorX, &rightCursorY);
+  if (button == GLFW_MOUSE_BUTTON_RIGHT && action == GLFW_PRESS) {
+    app->rightClickMenuCandidate = true;
+    app->rightClickMenuPressTime = glfwGetTime();
+    app->rightClickMenuPressX = rightCursorX;
+    app->rightClickMenuPressY = rightCursorY;
+  } else if (button == GLFW_MOUSE_BUTTON_RIGHT && action == GLFW_RELEASE) {
+    const double elapsed = glfwGetTime() - app->rightClickMenuPressTime;
+    const double dx = rightCursorX - app->rightClickMenuPressX;
+    const double dy = rightCursorY - app->rightClickMenuPressY;
+    const bool quickRightClick = app->rightClickMenuCandidate &&
+                                 elapsed <= kRightClickMenuMaxDurationSeconds &&
+                                 (dx * dx + dy * dy) <=
+                                     (kRightClickMenuMaxMovePixels * kRightClickMenuMaxMovePixels);
+    app->rightClickMenuCandidate = false;
+    if (quickRightClick) {
+      int windowWidth = 1, windowHeight = 1;
+      glfwGetWindowSize(window, &windowWidth, &windowHeight);
+      const int windowId = plotWindowAt(*app, windowWidth, windowHeight, rightCursorX, rightCursorY);
+      setPlotModelMenuVisible(app, false);
+      app->quickPlotModelMenuVisible = false;
+      app->addPlotMenuVisible = false;
+      app->layoutMenuVisible = false;
+      app->plotModelMenuHoverMain = -1;
+      app->plotModelMenuHoverSub = -1;
+      app->quickPlotModelMenuHover = -1;
+      app->addPlotMenuHover = -1;
+      app->layoutMenuHover = -1;
+      app->viewerMenuHoverTab = -1;
+      app->viewerMenuHoverChoice = -1;
+      app->viewerMenuDraggingSlider = false;
+      app->viewerMenuChoiceAction = static_cast<int>(ViewerMenuAction::None);
+      app->viewerChoiceMenuScroll = 0.0f;
+      if (windowId >= 0) {
+        focusPlotWindow(app, windowId);
+        bringPlotWindowToFront(app, windowId);
+        if (!viewerSourceSelectionsSynced(*app) && !app->viewerState.volumeSliceLassoRegion) {
+          if (PlotWindowState* target = plotWindowById(app, windowId);
+              target && plotWindowCanOwnViewerLassoSelection(*target)) {
+            app->viewerLassoTargetWindowId = windowId;
+          }
+        }
+        app->quickPlotModelMenuVisible = true;
+        app->quickPlotModelMenuX = rightCursorX;
+        app->quickPlotModelMenuY = rightCursorY;
+        app->quickPlotModelMenuHover = plotModelMenuEntryIndexForModel(app->viewerState.plotModel);
+      } else {
+        app->addPlotMenuVisible = true;
+        app->addPlotMenuX = rightCursorX;
+        app->addPlotMenuY = rightCursorY;
+        app->addPlotMenuHover = plotModelMenuEntryIndexForModel(app->viewerState.plotModel);
+      }
+      clearPointerInteractionState(app);
+      return;
+    }
+  }
+  if (button == GLFW_MOUSE_BUTTON_LEFT && action == GLFW_RELEASE && app->slicingVectorDragging) {
+    resetSlicingVectorDrag(app);
     clearPointerInteractionState(app);
     return;
   }
@@ -22676,7 +26372,7 @@ void mouseButtonCallback(GLFWwindow* window, int button, int action, int mods) {
     glfwGetCursorPos(window, &cursorX, &cursorY);
     if (app->showWorkspaceButtons &&
         pointInPlotMenuRect(viewerMenuIconWindowRect(windowWidth, windowHeight), cursorX, cursorY)) {
-      app->plotModelMenuVisible = true;
+      setPlotModelMenuVisible(app, true);
       app->quickPlotModelMenuVisible = false;
       app->addPlotMenuVisible = false;
       app->layoutMenuVisible = false;
@@ -22699,7 +26395,7 @@ void mouseButtonCallback(GLFWwindow* window, int button, int action, int mods) {
         pointInPlotMenuRect(viewerAddPlotIconWindowRect(windowWidth, windowHeight), cursorX, cursorY)) {
       app->addPlotMenuVisible = true;
       app->quickPlotModelMenuVisible = false;
-      app->plotModelMenuVisible = false;
+      setPlotModelMenuVisible(app, false);
       app->layoutMenuVisible = false;
       app->addPlotMenuX = cursorX;
       app->addPlotMenuY = cursorY;
@@ -22718,7 +26414,7 @@ void mouseButtonCallback(GLFWwindow* window, int button, int action, int mods) {
       app->layoutMenuVisible = true;
       app->addPlotMenuVisible = false;
       app->quickPlotModelMenuVisible = false;
-      app->plotModelMenuVisible = false;
+      setPlotModelMenuVisible(app, false);
       app->layoutMenuX = cursorX;
       app->layoutMenuY = cursorY;
       app->layoutMenuHover = -1;
@@ -22733,16 +26429,46 @@ void mouseButtonCallback(GLFWwindow* window, int button, int action, int mods) {
     }
   }
   if (button == GLFW_MOUSE_BUTTON_LEFT && action == GLFW_PRESS &&
-      !app->plotModelMenuVisible && !app->quickPlotModelMenuVisible &&
-      !app->addPlotMenuVisible && !app->layoutMenuVisible) {
+      (app->plotModelMenuVisible || app->quickPlotModelMenuVisible ||
+       app->addPlotMenuVisible || app->layoutMenuVisible)) {
     int windowWidth = 1, windowHeight = 1;
     glfwGetWindowSize(window, &windowWidth, &windowHeight);
     double cursorX = app->hoverX;
     double cursorY = app->hoverY;
     glfwGetCursorPos(window, &cursorX, &cursorY);
+    if (!pointerInViewerMenuUi(*app, windowWidth, windowHeight, cursorX, cursorY)) {
+      setPlotModelMenuVisible(app, false);
+      app->quickPlotModelMenuVisible = false;
+      app->addPlotMenuVisible = false;
+      app->layoutMenuVisible = false;
+      app->plotModelMenuHoverMain = -1;
+      app->plotModelMenuHoverSub = -1;
+      app->quickPlotModelMenuHover = -1;
+      app->addPlotMenuHover = -1;
+      app->layoutMenuHover = -1;
+      app->viewerMenuHoverTab = -1;
+      app->viewerMenuHoverChoice = -1;
+      app->viewerMenuDraggingSlider = false;
+      app->viewerMenuSliderAction = static_cast<int>(ViewerMenuAction::None);
+      app->viewerMenuChoiceAction = static_cast<int>(ViewerMenuAction::None);
+      app->viewerChoiceMenuScroll = 0.0f;
+    }
+  }
+  if (button == GLFW_MOUSE_BUTTON_LEFT && action == GLFW_PRESS &&
+      !app->quickPlotModelMenuVisible && !app->addPlotMenuVisible && !app->layoutMenuVisible) {
+    int windowWidth = 1, windowHeight = 1;
+    glfwGetWindowSize(window, &windowWidth, &windowHeight);
+    double cursorX = app->hoverX;
+    double cursorY = app->hoverY;
+    glfwGetCursorPos(window, &cursorX, &cursorY);
+    const bool pointerInsideViewerMenu =
+        app->plotModelMenuVisible &&
+        pointerInViewerMenuUi(*app, windowWidth, windowHeight, cursorX, cursorY);
     int sourceWindowId = -1;
     const SourceSignalLassoButton lassoButton =
-        sourceSignalLassoButtonAtPoint(*app, windowWidth, windowHeight, cursorX, cursorY, &sourceWindowId);
+        pointerInsideViewerMenu
+            ? SourceSignalLassoButton::None
+            : sourceSignalLassoButtonAtPoint(*app, windowWidth, windowHeight, cursorX, cursorY, &sourceWindowId);
     if (lassoButton != SourceSignalLassoButton::None) {
       (void)sourceWindowId;
       if (lassoButton == SourceSignalLassoButton::Add) {
@@ -22755,6 +26481,59 @@ void mouseButtonCallback(GLFWwindow* window, int button, int action, int mods) {
       }
       clearPointerInteractionState(app);
       return;
+    }
+    if (!pointerInsideViewerMenu) {
+    for (auto it = app->plotWindows.rbegin(); it != app->plotWindows.rend(); ++it) {
+      if (!plotWindowSupportsSlicingQuickButton(*it) || !it->slicingDrawerOpen) continue;
+      const SlicingQuickDrawerRects drawerRects =
+          slicingQuickDrawerItemRects(*app, *it, windowWidth, windowHeight);
+      if (!pointInPlotMenuRect(drawerRects.drawer, cursorX, cursorY)) continue;
+      const int vectorIndex = slicingQuickDrawerVectorIndexAt(drawerRects, cursorX, cursorY);
+      if (vectorIndex >= 0) {
+        beginSlicingVectorPointerAction(app,
+                                        it->windowId,
+                                        false,
+                                        vectorIndex,
+                                        app->altHeld || (mods & GLFW_MOD_ALT) != 0 ||
+                                            nativeAltModifierPressed());
+        clearPointerInteractionState(app);
+        return;
+      }
+      if (pointInSlicingQuickDrawerLasso(drawerRects, cursorX, cursorY)) {
+        activateViewerLassoFromSlicingDrawer(app, it->windowId, windowWidth, windowHeight);
+        clearPointerInteractionState(app);
+        return;
+      }
+      clearPointerInteractionState(app);
+      return;
+    }
+    for (auto it = app->plotWindows.rbegin(); it != app->plotWindows.rend(); ++it) {
+      if (!plotWindowSupportsSlicingQuickButton(*it)) continue;
+      if (!pointInPlotMenuRect(slicingQuickButtonRect(*app, *it, windowWidth, windowHeight),
+                               cursorX,
+                               cursorY)) {
+        continue;
+      }
+      const int clickedWindowId = it->windowId;
+      const bool nextOpen = !it->slicingDrawerOpen;
+      for (auto& other : app->plotWindows) {
+        if (other.windowId != clickedWindowId) other.slicingDrawerOpen = false;
+      }
+      focusPlotWindow(app, clickedWindowId);
+      bringPlotWindowToFront(app, clickedWindowId);
+      if (PlotWindowState* focused = plotWindowById(app, clickedWindowId)) {
+        focused->slicingDrawerOpen = nextOpen;
+        focused->slicingDrawerAnimStart = glfwGetTime();
+      }
+      clearPointerInteractionState(app);
+      return;
+    }
+    if (PlotWindowState* dockedSource =
+            dockedSourceSignalWindowAtPoint(app, windowWidth, windowHeight, cursorX, cursorY)) {
+      restoreDockedSourceSignalWindow(app, dockedSource, windowWidth, windowHeight);
+      clearPointerInteractionState(app);
+      return;
+    }
     }
   }
   if (app->layoutMenuVisible && button == GLFW_MOUSE_BUTTON_LEFT && action == GLFW_PRESS) {
@@ -22873,7 +26652,7 @@ void mouseButtonCallback(GLFWwindow* window, int button, int action, int mods) {
       double cursorY = app->hoverY;
       glfwGetCursorPos(window, &cursorX, &cursorY);
       if (pointInPlotMenuRect(viewerMenuCloseWindowRect(*app, windowWidth, windowHeight), cursorX, cursorY)) {
-        app->plotModelMenuVisible = false;
+        setPlotModelMenuVisible(app, false);
         app->plotModelMenuHoverMain = -1;
         app->plotModelMenuHoverSub = -1;
         app->viewerMenuHoverTab = -1;
@@ -23003,6 +26782,27 @@ void mouseButtonCallback(GLFWwindow* window, int button, int action, int mods) {
           clearPointerInteractionState(app);
           return;
         }
+        if (row.slicingVectorSelector && row.enabled) {
+          const PlotMenuRect rowRect =
+              viewerMenuRowWindowRect(*app, windowWidth, windowHeight, mainIndex);
+          const auto vectorRects = slicingVectorSelectorRects(rowRect, 22.0f, 8.0f);
+          const int vectorIndex = slicingVectorIndexAt(vectorRects, cursorX, cursorY);
+          if (vectorIndex >= 0) {
+            beginSlicingVectorPointerAction(app,
+                                            -1,
+                                            true,
+                                            vectorIndex,
+                                            app->altHeld || (mods & GLFW_MOD_ALT) != 0 ||
+                                                nativeAltModifierPressed());
+            app->viewerMenuLastClick = -10.0;
+            app->viewerMenuLastClickRow = -1;
+            app->viewerMenuLastClickAction =
+                static_cast<int>(ViewerMenuAction::None);
+            app->plotModelMenuHoverMain = mainIndex;
+            clearPointerInteractionState(app);
+            return;
+          }
+        }
         if (row.channelSelector && row.enabled) {
           const PlotMenuRect rowRect =
               viewerMenuRowWindowRect(*app, windowWidth, windowHeight, mainIndex);
@@ -23071,6 +26871,7 @@ void mouseButtonCallback(GLFWwindow* window, int button, int action, int mods) {
     double cursorY = app->hoverY;
     glfwGetCursorPos(window, &cursorX, &cursorY);
     commitPlotWindowSnapPreview(app, windowWidth, windowHeight);
+    sortPlotWindowsForReadableStacking(app, app->plotWindowDragId);
     app->plotWindowDragMode = PlotWindowDragMode::None;
     app->plotWindowDragId = -1;
     clearPointerInteractionState(app);
@@ -23091,7 +26892,10 @@ void mouseButtonCallback(GLFWwindow* window, int button, int action, int mods) {
         glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS ||
         glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_MIDDLE) == GLFW_PRESS ||
         glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_RIGHT) == GLFW_PRESS;
-    if (!anyDown) clearPointerInteractionState(app);
+    if (!anyDown) {
+      resetSlicingVectorDrag(app);
+      clearPointerInteractionState(app);
+    }
     return;
   }
   if (button != GLFW_MOUSE_BUTTON_LEFT || action != GLFW_PRESS) return;
@@ -23103,9 +26907,15 @@ void mouseButtonCallback(GLFWwindow* window, int button, int action, int mods) {
     glfwGetCursorPos(window, &cursorX, &cursorY);
     const int windowId = plotWindowAt(*app, windowWidth, windowHeight, cursorX, cursorY);
     if (windowId >= 0) {
-      if (const PlotWindowState* target = plotWindowById(*app, windowId);
+      if (PlotWindowState* target = plotWindowById(app, windowId);
           target && app->plotWindows.size() > 1u &&
-          pointInPlotMenuRect(plotWindowCloseWindowRect(*target, windowWidth, windowHeight), cursorX, cursorY)) {
+          pointInPlotMenuRect(plotWindowCloseWindowRect(*app, *target, windowWidth, windowHeight), cursorX, cursorY)) {
+        if (plotWindowIsSourceSignal(*target) && viewerImageLassoSessionActive(*app)) {
+          dockSourceSignalForLasso(app, target, windowWidth, windowHeight);
+          queueViewerStateCommand(*app, "reinterpret");
+          clearPointerInteractionState(app);
+          return;
+        }
         (void)closePlotWindow(app, windowId);
         queueViewerStateCommand(*app, "resample");
         clearPointerInteractionState(app);
@@ -23113,7 +26923,7 @@ void mouseButtonCallback(GLFWwindow* window, int button, int action, int mods) {
       }
       focusPlotWindow(app, windowId);
       bringPlotWindowToFront(app, windowId);
-      if (!viewerSourceSelectionsSynced(*app)) {
+      if (!viewerSourceSelectionsSynced(*app) && !app->viewerState.volumeSliceLassoRegion) {
         if (PlotWindowState* target = plotWindowById(app, windowId);
             target && plotWindowCanOwnViewerLassoSelection(*target)) {
           app->viewerLassoTargetWindowId = windowId;
@@ -23121,7 +26931,7 @@ void mouseButtonCallback(GLFWwindow* window, int button, int action, int mods) {
       }
       if (PlotWindowState* focused = focusedPlotWindow(app)) {
         const PlotWindowDragMode dragMode =
-            plotWindowDragModeAt(*focused, windowWidth, windowHeight, cursorX, cursorY);
+            plotWindowDragModeAt(*app, *focused, windowWidth, windowHeight, cursorX, cursorY);
         if (dragMode != PlotWindowDragMode::None) {
           app->plotWindowDragMode = dragMode;
           app->plotWindowDragId = focused->windowId;
@@ -23179,6 +26989,13 @@ void cursorPosCallback(GLFWwindow* window, double xpos, double ypos) {
       glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS ||
       glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_MIDDLE) == GLFW_PRESS ||
       glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_RIGHT) == GLFW_PRESS;
+  if (app->slicingVectorDragging) {
+    int windowWidth = 1, windowHeight = 1;
+    glfwGetWindowSize(window, &windowWidth, &windowHeight);
+    updateSlicingVectorDragAtPoint(app, windowWidth, windowHeight, xpos, ypos);
+    clearPointerInteractionState(app);
+    return;
+  }
   if (app->quickPlotModelMenuVisible) {
     int windowWidth = 1, windowHeight = 1;
     glfwGetWindowSize(window, &windowWidth, &windowHeight);
@@ -23312,7 +27129,7 @@ void cursorPosCallback(GLFWwindow* window, double xpos, double ypos) {
       if (const PlotWindowState* hoveredWindow =
               plotWindowById(*app, app->hoveredPlotWindowId)) {
         app->hoveredPlotWindowDragMode =
-            plotWindowDragModeAt(*hoveredWindow, windowWidth, windowHeight, xpos, ypos);
+            plotWindowDragModeAt(*app, *hoveredWindow, windowWidth, windowHeight, xpos, ypos);
       }
     }
   }
@@ -23337,8 +27154,10 @@ void cursorPosCallback(GLFWwindow* window, double xpos, double ypos) {
     glfwGetWindowSize(window, &interactionWindowWidth, &interactionWindowHeight);
     glfwGetFramebufferSize(window, &interactionFbWidth, &interactionFbHeight);
     if (const PlotWindowState* focused = focusedPlotWindow(*app)) {
-      const double localX = xpos - static_cast<double>(focused->rect.x) * interactionWindowWidth;
-      const double localY = ypos - static_cast<double>(focused->rect.y) * interactionWindowHeight;
+      const PlotMenuRect contentRect =
+          plotWindowContentLogicalScreenRect(*app, *focused, interactionWindowWidth, interactionWindowHeight);
+      const double localX = xpos - static_cast<double>(contentRect.x0);
+      const double localY = ypos - static_cast<double>(contentRect.y0);
       app->orbitVirtualX = localX * static_cast<double>(interactionFbWidth) /
                            static_cast<double>(std::max(1, interactionWindowWidth));
       app->orbitVirtualY = localY * static_cast<double>(interactionFbHeight) /
@@ -23692,21 +27511,42 @@ void scrollCallback(GLFWwindow* window, double xoffset, double yoffset) {
       app->plotModelMenuHoverMain = -1;
       app->plotModelMenuHoverSub = -1;
     } else {
-    const std::vector<ViewerMenuRow> rows = buildViewerMenuRows(*app);
-    const float rowsY0 = viewerMenuRowsY0(*app, rect);
+      const std::vector<ViewerMenuRow> rows = buildViewerMenuRows(*app);
+      const int hoverIndex = plotMenuMainIndexAt(*app, windowWidth, windowHeight, cursorX, cursorY);
+      if (hoverIndex >= 0 && hoverIndex < static_cast<int>(rows.size())) {
+        const ViewerMenuRow& row = rows[static_cast<std::size_t>(hoverIndex)];
+        if (row.slider && row.enabled) {
+          const int range = std::max(1, row.sliderMax - row.sliderMin);
+          const int step = shift ? 1 : (ctrl ? std::max(5, range / 20) : std::max(1, range / 100));
+          int delta = static_cast<int>(std::round(scrollDelta * static_cast<double>(step)));
+          if (delta == 0 && std::abs(scrollDelta) > 1.0e-5) {
+            delta = scrollDelta > 0.0 ? 1 : -1;
+          }
+          if (delta != 0) {
+            const int value = std::clamp(row.sliderValue + delta, row.sliderMin, row.sliderMax);
+            updateViewerMenuSlider(app, row.action, value, row.refreshPolicy);
+          }
+          app->viewerMenuHoverChoice = -1;
+          app->plotModelMenuHoverMain = hoverIndex;
+          app->plotModelMenuHoverSub = -1;
+          clearPointerInteractionState(app);
+          return;
+        }
+      }
+      const float rowsY0 = viewerMenuRowsY0(*app, rect);
       const float contentHeight = viewerMenuRowsHeight(rows);
-    const float visibleHeight = std::max(1.0f, rect.y1 - rowsY0 - kViewerDrawerPad);
-    const float maxScroll = std::max(0.0f, contentHeight - visibleHeight);
-    app->viewerMenuScroll =
-        clampf(app->viewerMenuScroll - static_cast<float>(scrollDelta) * kPlotMenuRowHeight * 1.5f,
-               0.0f,
-               maxScroll);
-    app->viewerMenuHoverChoice = viewerChoiceMenuIndexAt(*app, windowWidth, windowHeight, cursorX, cursorY);
-    app->plotModelMenuHoverMain =
-        app->viewerMenuHoverChoice >= 0 ? -1 : plotMenuMainIndexAt(*app, windowWidth, windowHeight, cursorX, cursorY);
-    app->plotModelMenuHoverSub = -1;
-    clearPointerInteractionState(app);
-    return;
+      const float visibleHeight = std::max(1.0f, rect.y1 - rowsY0 - kViewerDrawerPad);
+      const float maxScroll = std::max(0.0f, contentHeight - visibleHeight);
+      app->viewerMenuScroll =
+          clampf(app->viewerMenuScroll - static_cast<float>(scrollDelta) * kPlotMenuRowHeight * 1.5f,
+                 0.0f,
+                 maxScroll);
+      app->viewerMenuHoverChoice = viewerChoiceMenuIndexAt(*app, windowWidth, windowHeight, cursorX, cursorY);
+      app->plotModelMenuHoverMain =
+          app->viewerMenuHoverChoice >= 0 ? -1 : plotMenuMainIndexAt(*app, windowWidth, windowHeight, cursorX, cursorY);
+      app->plotModelMenuHoverSub = -1;
+      clearPointerInteractionState(app);
+      return;
     }
   }
   const float scale = ctrl ? 0.20f : (shift ? (0.12f * shiftPrecisionFactor()) : 0.12f);
@@ -24159,6 +27999,7 @@ int main() {
 
   while (gRun.load() && !glfwWindowShouldClose(window)) {
     glfwPollEvents();
+    updatePlotModelMenuAnimation(&app);
 #if defined(CHROMASPACE_VIEWER_HAS_CUDA) && !defined(__APPLE__)
     if (firstFramePresented &&
         cudaWarmupStarted &&
@@ -24184,6 +28025,7 @@ int main() {
     }
 #endif
     updateResolveLiveRefreshPulse(&app);
+    updateViewerAliveLease(&app);
     (void)readResolveDrawInstanceStatus(&app);
 #if defined(_WIN32)
     const bool identityMenuOpen =
@@ -24912,6 +28754,31 @@ int main() {
     for (auto& plotWindow : app.plotWindows) {
       plotWindow.rect = clampedPlotWindowRect(plotWindow.rect, windowWidth, windowHeight);
     }
+    if (!viewerImageLassoSessionActive(app)) {
+      std::vector<std::pair<int, int>> temporarySourceSignalWindowsToClose;
+      for (auto& plotWindow : app.plotWindows) {
+        if (plotWindowIsSourceSignal(plotWindow)) {
+          if (plotWindow.sourceSignalTemporaryLassoSurface) {
+            temporarySourceSignalWindowsToClose.emplace_back(plotWindow.windowId,
+                                                             plotWindow.sourceSignalDockOwnerWindowId);
+          }
+          plotWindow.sourceSignalTemporaryLassoSurface = false;
+        }
+        if (!plotWindowIsDockedSourceSignal(plotWindow)) continue;
+        plotWindow.sourceSignalDocked = false;
+        plotWindow.sourceSignalTemporaryLassoSurface = false;
+        plotWindow.sourceSignalDockOwnerWindowId = -1;
+        if (plotWindowRectLooksRestorable(plotWindow.sourceSignalRestoreRect)) {
+          plotWindow.rect = clampedPlotWindowRect(plotWindow.sourceSignalRestoreRect, windowWidth, windowHeight);
+        }
+      }
+      for (const auto& [windowId, ownerId] : temporarySourceSignalWindowsToClose) {
+        if (plotWindowById(&app, ownerId) && app.focusedPlotWindowId == windowId) {
+          focusPlotWindow(&app, ownerId);
+        }
+        (void)closePlotWindow(&app, windowId);
+      }
+    }
     ensureSourceSignalWindowForLasso(&app, windowWidth, windowHeight, false);
     captureFocusedPlotWindowFromApp(&app);
     const PlotWindowState* focusedWindowForRender = focusedPlotWindow(app);
@@ -24984,7 +28851,8 @@ int main() {
     glfwSetWindowTitle(window, title.str().c_str());
 
     const PlotWindowFramebufferRect primaryRenderRect =
-        focusedWindowForRender ? plotWindowFramebufferRect(*focusedWindowForRender, width, height)
+        focusedWindowForRender
+            ? plotWindowFramebufferRect(app, *focusedWindowForRender, width, height, windowWidth, windowHeight)
                                : PlotWindowFramebufferRect{0, 0, width, height};
     const int renderWidth = primaryRenderRect.w;
     const int renderHeight = primaryRenderRect.h;
@@ -25078,7 +28946,8 @@ int main() {
         glossViewMode && app.glossViewPresentation == GlossViewPresentationMode::Field2D && mesh.hasGlossField;
     const bool glossProjection3DMode =
         glossViewMode && app.glossViewPresentation == GlossViewPresentationMode::Projection3D;
-    const bool drawIdentityOverlay = !glossViewMode && overlayMesh.pointCount > 0;
+    const bool drawIdentityOverlay =
+        !emptyImageLassoMode && !glossViewMode && overlayMesh.pointCount > 0;
     if (!glossField2DMode) {
       drawGuideForPlotMode(resolved, app.cam, renderHeight, fovy, overlayTextRenderer);
     }
@@ -25090,6 +28959,8 @@ int main() {
     const float* activePointVerts = mesh.pointVerts.empty() ? nullptr : mesh.pointVerts.data();
     const float* activePointColors = mesh.pointColors.empty() ? nullptr : mesh.pointColors.data();
     size_t activePointCount = mesh.pointCount;
+    const bool suppressPointsForEmptyImageLasso =
+        payloadImageLassoModeEnabled(resolved) && !payloadHasImageLassoSelection(resolved);
     std::vector<float> glossProjectionVerts;
     std::vector<float> glossProjectionColors;
     bool sampledDrawReady = false;
@@ -25124,7 +28995,11 @@ int main() {
         activePointCount = sampledPointDraw.pointCount;
       }
     };
-    if (glossField2DMode) {
+    if (suppressPointsForEmptyImageLasso) {
+      activePointVerts = nullptr;
+      activePointColors = nullptr;
+      activePointCount = 0u;
+    } else if (glossField2DMode) {
       activePointVerts = nullptr;
       activePointColors = nullptr;
       activePointCount = 0u;
@@ -25385,7 +29260,7 @@ int main() {
       glDrawArrays(GL_POINTS, 0, static_cast<GLsizei>(mesh.glossBodyGuidePointCount));
       glPointSize(pointSize);
     };
-    if (!glossField2DMode) {
+    if (!glossField2DMode && !suppressPointsForEmptyImageLasso) {
       drawGlossBodyGuide();
     }
     if (usePointRenderProgram) {
@@ -25531,7 +29406,8 @@ int main() {
       glEnableClientState(GL_COLOR_ARRAY);
       glEnable(GL_DEPTH_TEST);
     }
-    if (!glossViewMode &&
+    if (!suppressPointsForEmptyImageLasso &&
+        !glossViewMode &&
         mesh.lineVertexCount > 0 &&
         mesh.lineVerts.size() >= mesh.lineVertexCount * 3u &&
         mesh.lineColors.size() >= mesh.lineVertexCount * 4u) {
@@ -25683,10 +29559,11 @@ int main() {
     if (PlotWindowState* focusedStatusWindow = focusedPlotWindow(&app)) {
       if (!plotModelIsAnalyticalScope(focusedStatusWindow->viewState.plotModel)) {
         const bool hasVisibleMesh = mesh.serial != 0 && (mesh.pointCount > 0 || mesh.hasGlossField);
-        focusedStatusWindow->syncLabel =
-            !hasVisibleMesh
-                ? "Waiting for Resolve"
-                : (app.activeCloudSettingsKey == resolved.cloudSettingsKey ? "Live" : "Using cache");
+        setPlotWindowSyncLabel(focusedStatusWindow,
+                               !hasVisibleMesh
+                                   ? "Waiting for Resolve"
+                                   : (app.activeCloudSettingsKey == resolved.cloudSettingsKey ? "Live"
+                                                                                              : "Using cache"));
       }
     }
     const InputCloudPayload* sharedPlotCloud = hasCurrentCloud ? &currentCloud
@@ -25836,6 +29713,7 @@ int main() {
   }
 
   saveViewerWorkspaceToDisk(&app);
+  clearViewerAliveLease(&app);
   gRun.store(false);
   wakeIpcServer();
 #if defined(_WIN32)
@@ -25851,6 +29729,9 @@ int main() {
   releasePointBufferCache(&meshPointBufferCache);
   releasePointBufferCache(&overlayPointBufferCache);
   releasePointRenderProgramCache(&pointRenderProgramCache);
+  for (auto& plotWindow : app.plotWindows) {
+    releasePlotWindowGpuCaches(&plotWindow);
+  }
   releaseOverlayComputeCache(&overlayComputeCache);
   releaseInputCloudComputeCache(&inputCloudComputeCache);
   releaseInputCloudSampleComputeCache(&inputCloudSampleComputeCache);
