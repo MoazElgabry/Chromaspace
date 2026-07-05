@@ -25,12 +25,12 @@ jobs:
       - name: Resolve package version
         id: version
         run: |
-          version="$(grep -Eo 'set\(CHROMASPACE_PACKAGE_VERSION "[^"]+"\)' CMakeLists.txt | sed -E 's/.*"([^"]+)".*/\1/' | head -n1)"
+          version="$(grep -Eo 'set\(CHROMASPACE_PACKAGE_VERSION "[^"]+"\)' CMakeLists.txt | sed -E 's/.*"([^"]+)".*/\1/' | head -n1 || true)"
           if [ -z "${version}" ]; then
-            version="$(grep -Eo 'set\(CUBE_DISPLAY_VERSION "[^"]+"\)' CMakeLists.txt | sed -E 's/.*"([^"]+)".*/\1/' | head -n1)"
+            version="$(grep -Eo 'set\(CUBE_DISPLAY_VERSION "[^"]+"\)' CMakeLists.txt | sed -E 's/.*"([^"]+)".*/\1/' | head -n1 || true)"
           fi
           if [ -z "${version}" ]; then
-            version="$(grep -Eo 'project\([^)]*VERSION [0-9A-Za-z.\-]+' CMakeLists.txt | sed -E 's/.*VERSION ([0-9A-Za-z.\-]+)/\1/' | head -n1)"
+            version="$(grep -Eo 'project\([^)]*VERSION [0-9A-Za-z.\-]+' CMakeLists.txt | sed -E 's/.*VERSION ([0-9A-Za-z.\-]+)/\1/' | head -n1 || true)"
           fi
           if [ -z "${version}" ]; then
             echo "Could not determine Chromaspace version from source/CMakeLists.txt"
