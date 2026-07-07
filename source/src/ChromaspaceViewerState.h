@@ -400,11 +400,11 @@ inline bool readStripData(const ViewerRuntimeState& state, bool drawOnImage) {
 }
 
 inline bool volumeSlicingSupported(const ViewerRuntimeState& state, bool drawOnImage) {
-  return !drawOnImage && !isGlossView(state);
+  return !drawOnImage && !isGlossView(state) && !isSourceSignal(state);
 }
 
 inline bool hueSlicingAllowed(const ViewerRuntimeState& state, bool drawOnImage) {
-  return volumeSlicingSupported(state, drawOnImage) && !isChromaticity(state) && !isSourceSignal(state);
+  return volumeSlicingSupported(state, drawOnImage) && !isSourceSignal(state);
 }
 
 inline bool neutralRadiusAllowed(const ViewerRuntimeState& state, bool drawOnImage) {

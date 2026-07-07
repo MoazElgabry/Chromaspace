@@ -1667,6 +1667,7 @@ struct MeshData {
   std::vector<float> pointVerts;
   std::vector<float> pointColors;
   size_t pointCount = 0;
+  bool pointCloudMayContainHiddenVerts = false;
   bool hasGlossField = false;
   int glossFieldWidth = 0;
   int glossFieldHeight = 0;
@@ -5621,6 +5622,17 @@ bool rasterMetalDirectCanRepresentPayload(const ResolvedPayload& payload,
   return true;
 }
 
+bool rasterGpuSourceRequestMayHideSamples(const ResolvedPayload& payload,
+                                          const PlotRemapSpec& remap) {
+  // CUDA/Metal raster filters keep the compact direct buffer by writing
+  // rejected samples as alpha-zero hidden vertices. Any later draw pass that
+  // ignores per-point color alpha must skip these meshes.
+  if (payload.occupancyFill) return true;
+  if (payload.excludeIdentityData || payload.isolateIdentityData) return true;
+  if (payload.volumeSlicingEnabled && payload.volumeSlicingMode == "lasso") return true;
+  return remap.cubeSlicingEnabled || remap.neutralRadiusEnabled;
+}
+
 bool ensureRasterSignalComputeProgram(RasterSignalComputeCache* cache) {
   if (!cache) return false;
   if (cache->available && cache->program != 0) return true;
@@ -6156,6 +6168,7 @@ bool buildRasterDerivedMeshBackendMapped(const ResolvedPayload& resolved,
     mesh.paramHash = std::string("raster-cuda-direct:") + source.tierLabel + ":" + source.pixelFormat;
     mesh.serial = residentCudaCache->builtSerial != 0 ? residentCudaCache->builtSerial : serial;
     mesh.pointCount = plan.pointCount;
+    mesh.pointCloudMayContainHiddenVerts = rasterGpuSourceRequestMayHideSamples(payload, directRemap);
     if (residentCudaCache->hasFitBounds) {
       mesh.hasFitBounds = true;
       mesh.fitMin = Vec3{residentCudaCache->fitMin[0], residentCudaCache->fitMin[1], residentCudaCache->fitMin[2]};
@@ -6230,6 +6243,7 @@ bool buildRasterDerivedMeshBackendMapped(const ResolvedPayload& resolved,
       mesh.quality = (source.tierLabel.empty() ? std::string("Raster") : source.tierLabel) + " Metal Raster";
       mesh.paramHash = std::string("raster-metal-direct:") + source.tierLabel + ":" + source.pixelFormat;
       mesh.serial = nextMeshSerial();
+      mesh.pointCloudMayContainHiddenVerts = rasterGpuSourceRequestMayHideSamples(payload, directRemap);
       const auto metalT0 = std::chrono::steady_clock::now();
       std::string error;
       if (!ChromaspaceMetal::buildRasterSourceMesh(
@@ -8159,6 +8173,7 @@ bool cubeSliceContainsPoint(const PlotRemapSpec& spec, float r, float g, float b
   float hue = 0.0f;
   bool hueDefined = false;
   switch (spec.plotMode) {
+    case PlotModeKind::Chromaticity:
     case PlotModeKind::Hsl:
     case PlotModeKind::Hsv: {
       const float cMax = std::max(r, std::max(g, b));
@@ -14355,7 +14370,7 @@ constexpr PlotModelDescriptor kViewerPlotModelChoices[] = {
     {"gloss_view", "Gloss View (beta)", "gloss_view", 8, PlotRenderFamily::Gloss, false, false, true, false, true, true},
     {"waveform", "Waveform", "waveform", 9, PlotRenderFamily::Waveform2D, false, true, false, false, false, false},
     {"histogram", "Histogram", "histogram", 10, PlotRenderFamily::Histogram2D, false, true, false, false, false, false},
-    {"source_signal", "Source Signal", "source_signal", 11, PlotRenderFamily::SourceSignal2D, false, true, false, false, false, false},
+    {"source_signal", "Source Signal", "source_signal", 11, PlotRenderFamily::SourceSignal2D, false, false, false, false, false, false},
 };
 
 constexpr int kViewerPlotModelChoiceCount =
@@ -24077,6 +24092,8 @@ void drawSecondaryPlotWindow(AppState* app,
                                 useSquarePoints) *
       (drawAsGlossProjection ? 1.0f : (plainScopeStyle ? 1.0f : 0.84f));
   if (drawAsGlossProjection) drawAlphaGain = std::max(1.12f, drawAlphaGain * 1.24f);
+  const bool canDrawUniformPointHaloPasses =
+      !window->derivedMesh.pointCloudMayContainHiddenVerts;
 
   if (!suppressPointsForEmptyImageLasso &&
       glossViewMode && !glossField2DMode &&
@@ -24182,7 +24199,7 @@ void drawSecondaryPlotWindow(AppState* app,
     }
     if (occlusiveInputCloud) glEnable(GL_BLEND);
     glDepthMask(GL_TRUE);
-    if (!drawAsGlossProjection) {
+    if (!drawAsGlossProjection && canDrawUniformPointHaloPasses) {
       glDisable(GL_DEPTH_TEST);
       glDisableClientState(GL_COLOR_ARRAY);
       if (!plainScopeStyle) {
@@ -29496,6 +29513,7 @@ int main() {
         drawAlphaGainForPointSize(pointSize, densityForView, mesh.resolution, activePointCount, renderWidth, renderHeight, useSquarePoints) *
         (drawAsGlossProjection ? 1.0f : (plainScopeStyle ? 1.0f : 0.84f));
     if (drawAsGlossProjection) drawAlphaGain = std::max(1.12f, drawAlphaGain * 1.24f);
+    const bool canDrawUniformPointHaloPasses = !mesh.pointCloudMayContainHiddenVerts;
     const bool usePointRenderProgram =
         haveDrawablePointSource && ensurePointRenderProgram(&pointRenderProgramCache) &&
         (drawAsGlossProjection || plainScopeStyle);
@@ -29693,7 +29711,8 @@ int main() {
     }
     if (occlusiveInputCloud) glEnable(GL_BLEND);
     glDepthMask(GL_TRUE);
-    if (!drawAsGlossProjection && activePointCount > 0 && haveDrawablePointSource) {
+    if (!drawAsGlossProjection && canDrawUniformPointHaloPasses &&
+        activePointCount > 0 && haveDrawablePointSource) {
       glDisable(GL_DEPTH_TEST);
       glDisableClientState(GL_COLOR_ARRAY);
       if (!plainScopeStyle) {
