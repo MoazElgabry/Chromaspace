@@ -22751,6 +22751,32 @@ PlotWindowFramebufferRect plotWindowContentFramebufferRect(const AppState& app,
                                         windowHeight);
 }
 
+void plotContentLocalHoverFromLogicalCursor(const AppState& app,
+                                            const PlotWindowState* window,
+                                            int windowWidth,
+                                            int windowHeight,
+                                            int contentWidth,
+                                            int contentHeight,
+                                            double* outX,
+                                            double* outY) {
+  const PlotMenuRect contentRect =
+      window ? plotWindowContentLogicalScreenRect(app, *window, windowWidth, windowHeight)
+             : PlotMenuRect{0.0f,
+                            0.0f,
+                            static_cast<float>(std::max(1, windowWidth)),
+                            static_cast<float>(std::max(1, windowHeight))};
+  const double logicalW = std::max(1.0, static_cast<double>(contentRect.x1 - contentRect.x0));
+  const double logicalH = std::max(1.0, static_cast<double>(contentRect.y1 - contentRect.y0));
+  if (outX) {
+    *outX = (app.hoverX - static_cast<double>(contentRect.x0)) *
+            static_cast<double>(std::max(1, contentWidth)) / logicalW;
+  }
+  if (outY) {
+    *outY = (app.hoverY - static_cast<double>(contentRect.y0)) *
+            static_cast<double>(std::max(1, contentHeight)) / logicalH;
+  }
+}
+
 bool fitPlotWindowCameraToCurrentContent(AppState* app,
                                          PlotWindowState* window,
                                          int windowWidth,
@@ -24325,15 +24351,21 @@ void drawSecondaryPlotWindow(AppState* app,
                               app->glossViewDiagnosticOverlay);
   }
   if (payload.plotMode == "chromaticity") {
-    const double localWindowWidth = std::max(1.0, static_cast<double>(window->rect.w) * fbWidth);
-    const double localWindowHeight = std::max(1.0, static_cast<double>(window->rect.h) * fbHeight);
-    const double localX = app->hoverX - static_cast<double>(window->rect.x) * fbWidth;
-    const double localY = app->hoverY - static_cast<double>(window->rect.y) * fbHeight;
+    double localX = 0.0;
+    double localY = 0.0;
+    plotContentLocalHoverFromLogicalCursor(*app,
+                                           window,
+                                           windowWidth,
+                                           windowHeight,
+                                           rect.w,
+                                           rect.h,
+                                           &localX,
+                                           &localY);
     drawChromaticityInfoOverlay(makePlotRemapSpec(payload),
                                 rect.w,
                                 rect.h,
-                                localX * static_cast<double>(rect.w) / localWindowWidth,
-                                localY * static_cast<double>(rect.h) / localWindowHeight,
+                                localX,
+                                localY,
                                 renderer);
   }
   if (glossViewMode && !payload.glossHideText) {
@@ -29861,21 +29893,21 @@ int main() {
     }
 
     if (resolved.plotMode == "chromaticity") {
-      const double focusedWindowX =
-          focusedWindowForRender ? static_cast<double>(focusedWindowForRender->rect.x) * windowWidth : 0.0;
-      const double focusedWindowY =
-          focusedWindowForRender ? static_cast<double>(focusedWindowForRender->rect.y) * windowHeight : 0.0;
-      const double focusedWindowWidth =
-          focusedWindowForRender ? static_cast<double>(focusedWindowForRender->rect.w) * windowWidth : windowWidth;
-      const double focusedWindowHeight =
-          focusedWindowForRender ? static_cast<double>(focusedWindowForRender->rect.h) * windowHeight : windowHeight;
-      const double hoverScaleX = static_cast<double>(renderWidth) / std::max(1.0, focusedWindowWidth);
-      const double hoverScaleY = static_cast<double>(renderHeight) / std::max(1.0, focusedWindowHeight);
+      double localHoverX = 0.0;
+      double localHoverY = 0.0;
+      plotContentLocalHoverFromLogicalCursor(app,
+                                             focusedWindowForRender,
+                                             windowWidth,
+                                             windowHeight,
+                                             renderWidth,
+                                             renderHeight,
+                                             &localHoverX,
+                                             &localHoverY);
       drawChromaticityInfoOverlay(makePlotRemapSpec(resolved),
                                   renderWidth,
                                   renderHeight,
-                                  (app.hoverX - focusedWindowX) * hoverScaleX,
-                                  (app.hoverY - focusedWindowY) * hoverScaleY,
+                                  localHoverX,
+                                  localHoverY,
                                   overlayTextRenderer ? *overlayTextRenderer : hudText);
     }
     if (isGlossViewPlotModeString(resolved.plotMode) && !resolved.glossHideText) {
