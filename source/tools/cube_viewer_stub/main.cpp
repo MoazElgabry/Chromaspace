@@ -118,6 +118,34 @@
 
 namespace {
 
+/*
+cube_viewer_stub/main.cpp navigation
+------------------------------------
+This file is the standalone viewer. Use these landmarks before editing:
+
+- Payload/IPC contracts: search "Section: payload model and IPC contracts".
+  OFX-side counterpart: src/Chromaspace.cpp "Section: cloud transport payload model".
+- Source and cloud caches: search "Section: source cloud stores and caches".
+  These choose ordinary, identity/ramp, empty-lasso, and selected-lasso variants.
+- Source-derived meshes: search "Section: source-derived mesh builders". Raster,
+  cloud, analytical waveform/histogram, Gloss View, and empty-lasso standby all
+  converge there before drawing.
+- Viewer lasso ownership: search "Section: viewer lasso ownership". This owns
+  Source Signal drawing, target-window ownership, pending OFX-clear ordering, and
+  serialization into payload lasso data.
+- Viewer menu and quick controls: search "Section: viewer menu model" and
+  "Section: menu and quick-control drawing". Slider spacing, vector toggles, and
+  Image Lasso activation are split between row construction, hit testing, drawing,
+  and mouse callbacks.
+- Plot rendering: search "Section: plot drawing". Per-window drawing, analytical
+  scopes, Source Signal, and title/frame overlays live there.
+- Input and gestures: search "Section: pointer and keyboard callbacks". Focus
+  retargeting, menu consumption, camera gestures, lasso drawing, and scroll zoom
+  are intentionally coordinated there.
+- Main loop: search "Section: IPC and main loop". Incoming params/cloud/source
+  packets are accepted before local previews and final drawing.
+*/
+
 std::atomic<bool> gRun{true};
 std::atomic<bool> gConnected{false};
 std::atomic<bool> gBringToFront{false};
@@ -2418,7 +2446,10 @@ struct InputCloudPayload;
 struct InputCloudSample;
 struct PlotRemapSpec;
 struct ComputeSessionState;
+struct AppState;
 
+// Forward declarations for payload/model helpers. Keep field additions mirrored
+// with src/Chromaspace.cpp transport serialization and ChromaspaceViewerState.h.
 void drawHslGuide();
 void drawCircularHslGuide();
 void drawHsvGuide();
@@ -2464,9 +2495,15 @@ bool ensureInputCloudBoundsProgram(InputCloudComputeCache* cache);
 bool parseInputCloudSamples(const InputCloudPayload& cloud,
                             std::vector<InputCloudSample>* samples,
                             bool includeWaveformLayer = false);
+bool buildEmptyAnalyticalScopeMesh(const ResolvedPayload& payload,
+                                   int resolution,
+                                   const std::string& quality,
+                                   const std::string& paramHash,
+                                   MeshData* out);
 bool payloadWantsIdentityReadPreview(const ResolvedPayload& payload);
 bool payloadImageLassoModeEnabled(const ResolvedPayload& payload);
 bool payloadHasImageLassoSelection(const ResolvedPayload& payload);
+void queueViewerStateCommand(AppState& app, const char* refreshPolicy);
 bool cubeSliceContainsPoint(const PlotRemapSpec& spec, float r, float g, float b);
 bool cubeSliceContainsPoint(const ResolvedPayload& payload, float r, float g, float b);
 void filterInputCloudSamples(const ResolvedPayload& payload, std::vector<InputCloudSample>* samples);
@@ -2651,6 +2688,10 @@ struct ComputeRemapUniforms {
       0.0f, 0.0f, 1.0f};
 };
 
+// Section: payload model and IPC contracts
+// ResolvedPayload mirrors the OFX params JSON. InputCloudPayload and
+// SourceSignalPayload carry sampled point clouds and raster source images.
+// Any interpretation-affecting field must participate in settings/build keys.
 struct ResolvedPayload {
   uint64_t seq = 0;
   uint64_t stateRevision = 1;
@@ -4910,6 +4951,29 @@ bool parseInputCloudSamples(const InputCloudPayload& cloud,
   return !samples->empty();
 }
 
+bool buildEmptyAnalyticalScopeMesh(const ResolvedPayload& payload,
+                                   int resolution,
+                                   const std::string& quality,
+                                   const std::string& paramHash,
+                                   MeshData* out) {
+  if (!out || (payload.plotMode != "waveform" && payload.plotMode != "histogram")) return false;
+  MeshData mesh{};
+  mesh.resolution = resolution <= 25 ? 25 : (resolution <= 41 ? 41 : 57);
+  mesh.quality = quality.empty() ? std::string("Waiting") : quality;
+  mesh.paramHash = paramHash;
+  mesh.serial = nextMeshSerial();
+  mesh.analyticalScope = true;
+  mesh.waveformScope = payload.plotMode == "waveform";
+  mesh.scopeMode = mesh.waveformScope ? payload.viewerState.waveformMode
+                                      : payload.viewerState.histogramMode;
+  mesh.scopeRangeMode = payload.viewerState.scopeRangeMode;
+  mesh.scopeLumaMethod = mesh.waveformScope ? payload.viewerState.waveformLumaMethod : 0;
+  mesh.scopeRangeMin = 0.0f;
+  mesh.scopeRangeMax = 1.0f;
+  *out = std::move(mesh);
+  return true;
+}
+
 float halfBitsToFloat(uint16_t h) {
   const uint32_t sign = (static_cast<uint32_t>(h & 0x8000u)) << 16u;
   uint32_t exp = static_cast<uint32_t>(h & 0x7C00u) >> 10u;
@@ -5849,6 +5913,10 @@ bool buildRasterDerivedMeshGlCompute(const ResolvedPayload& resolved,
   return true;
 }
 
+// Section: source-derived mesh builders
+// Raster, cloud, analytical scope, and Gloss View derivation meet here. Empty
+// image-lasso standby is intentional and must preserve the target plot family,
+// especially Waveform/Histogram analytical guides.
 bool buildRasterDerivedMeshBackendMapped(const ResolvedPayload& resolved,
                                          const SourceSignalPayload& source,
                                          const ViewerGpuCapabilities& gpuCaps,
@@ -5867,11 +5935,21 @@ bool buildRasterDerivedMeshBackendMapped(const ResolvedPayload& resolved,
   }
   if (payloadImageLassoModeEnabled(payload) && !payloadHasImageLassoSelection(payload)) {
     MeshData mesh{};
-    mesh.resolution = payload.resolution <= 25 ? 25 : (payload.resolution <= 41 ? 41 : 57);
-    mesh.quality = source.tierLabel.empty() ? std::string("Raster") : source.tierLabel;
-    mesh.paramHash = std::string("raster-empty-lasso:") + source.tierLabel + ":" + source.pixelFormat;
-    mesh.serial = nextMeshSerial();
-    mesh.pointCount = 0;
+    const std::string emptyLassoKey =
+        std::string("raster-empty-lasso:") + source.tierLabel + ":" + source.pixelFormat;
+    const std::string quality = source.tierLabel.empty() ? std::string("Raster") : source.tierLabel;
+    if (analyticalScope) {
+      if (!buildEmptyAnalyticalScopeMesh(payload, payload.resolution, quality, emptyLassoKey, &mesh)) {
+        if (fallbackReason) *fallbackReason = "empty-image-lasso-scope";
+        return false;
+      }
+    } else {
+      mesh.resolution = payload.resolution <= 25 ? 25 : (payload.resolution <= 41 ? 41 : 57);
+      mesh.quality = quality;
+      mesh.paramHash = emptyLassoKey;
+      mesh.serial = nextMeshSerial();
+      mesh.pointCount = 0;
+    }
     *out = std::move(mesh);
     if (fallbackReason) *fallbackReason = "empty-image-lasso";
     return true;
@@ -6483,6 +6561,10 @@ bool cloudCanSeedBaseInputCache(const InputCloudPayload& cloud) {
          !cloudLooksImageLassoVariant(cloud);
 }
 
+// Section: source cloud stores and caches
+// Variant stores keep ordinary, identity/ramp, selected-lasso, and empty-lasso
+// sources independent so one plot window cannot evict another window's needed
+// interpretation. See sourceCloudForPlotWindow() and rebuildPlotWindowDerivedMeshIfNeeded().
 struct SourceCloudStore {
   InputCloudPayload ordinary{};
   InputCloudPayload identity{};
@@ -12453,6 +12535,10 @@ struct PlotWindowRectNorm {
 // resized, so the toolbar cannot grow into a large normalized dead band.
 constexpr float kViewerWorkspaceToolbarHeight = 42.0f;
 
+// Section: workspace window state
+// PlotWindowState owns per-window model, camera, lasso data, derived mesh, and
+// quick-drawer UI. AppState below owns global viewer settings, IPC state, and
+// active gestures.
 struct PlotWindowState {
   int windowId = 1;
   PlotWindowRectNorm rect{};
@@ -12686,6 +12772,9 @@ struct AppState {
   int viewerSettingsHoverSubtab = -1;
   int viewerMenuHoverChoice = -1;
   bool viewerMenuDraggingSlider = false;
+  bool waveformChannelDragging = false;
+  int waveformChannelLastDragIndex = -1;
+  bool waveformChannelDragEnable = false;
   bool slicingVectorDragging = false;
   bool slicingVectorDragFromMenu = false;
   int slicingVectorDragWindowId = -1;
@@ -12718,6 +12807,7 @@ struct AppState {
   bool plotModelMenuVisible = false;
   bool plotModelMenuTargetVisible = false;
   double plotModelMenuAnimStart = -10.0;
+  bool plotModelMenuDismissAfterPointerGesture = false;
   bool quickPlotModelMenuVisible = false;
   int quickPlotModelMenuHover = -1;
   double quickPlotModelMenuX = 12.0;
@@ -12732,6 +12822,7 @@ struct AppState {
   double rightClickMenuPressTime = -10.0;
   double rightClickMenuPressX = 0.0;
   double rightClickMenuPressY = 0.0;
+  int pointerInteractionWindowId = -1;
   double layoutMenuX = 84.0;
   double layoutMenuY = 12.0;
   bool showWorkspaceButtons = true;
@@ -12960,8 +13051,25 @@ float viewerMenuDrawerWidthPixels(int width) {
   return clampf(w * kDrawerPreferredFraction, minWidth, std::min(maxWidth, kDrawerComfortMax));
 }
 
+constexpr double kViewerMenuSlideSeconds = 0.20;
+
+float smoothAnimation01(double t) {
+  const float x = clampf(static_cast<float>(t), 0.0f, 1.0f);
+  return x * x * (3.0f - 2.0f * x);
+}
+
+float plotModelMenuSlideProgress(const AppState& app) {
+  if (!app.plotModelMenuVisible) return 0.0f;
+  if (app.plotModelMenuAnimStart < 0.0) {
+    return app.plotModelMenuTargetVisible ? 1.0f : 0.0f;
+  }
+  const double age = glfwGetTime() - app.plotModelMenuAnimStart;
+  const float eased = smoothAnimation01(age / kViewerMenuSlideSeconds);
+  return app.plotModelMenuTargetVisible ? eased : (1.0f - eased);
+}
+
 float plotWorkspaceReservedLeftPixels(const AppState& app, int windowWidth) {
-  return app.plotModelMenuVisible ? viewerMenuDrawerWidthPixels(windowWidth) : 0.0f;
+  return viewerMenuDrawerWidthPixels(windowWidth) * plotModelMenuSlideProgress(app);
 }
 
 PlotMenuRect plotWindowLogicalScreenRect(const AppState& app,
@@ -13946,12 +14054,17 @@ void applyPendingImageLassoResetToResolvedPayload(const AppState& app, ResolvedP
       !payloadImageLassoModeEnabled(*payload)) {
     return;
   }
+  if (payloadHasImageLassoSelection(*payload)) return;
   payload->lassoData =
       serializeViewerLassoRegionState(std::max<uint64_t>(1, app.clearImageLassoBaselineRevision + 1), {});
   payload->lassoRegionEmpty = true;
   payload->cloudSettingsKey = cloudSettingsKeyWithoutImageLasso(payload->cloudSettingsKey) +
                               imageLassoSettingsSuffixForData(payload->lassoData);
 }
+// Section: viewer lasso ownership
+// Source Signal drawing, target-window ownership, pending OFX-clear ordering,
+// and payload lasso serialization live here. Mouse callbacks call these helpers;
+// source filtering consumes their serialized data in source-derived mesh builders.
 bool viewerLassoInteractionEnabled(const AppState& app,
                                    GLFWwindow* window,
                                    double xpos,
@@ -14112,6 +14225,7 @@ void updateViewerLassoStroke(AppState* app, GLFWwindow* window, double xpos, dou
 void finishViewerLassoStroke(AppState* app) {
   if (!app || !app->viewerLassoDrawing) return;
   app->viewerLassoDrawing = false;
+  bool committedStroke = false;
   if (app->viewerLassoActiveStroke.points.size() >= 3) {
     if (!viewerSourceSelectionsSynced(*app)) {
       if (PlotWindowState* target = activeViewerLassoTargetWindow(app)) {
@@ -14119,19 +14233,23 @@ void finishViewerLassoStroke(AppState* app) {
         target->viewerLassoRevision = std::max<uint64_t>(target->viewerLassoRevision + 1, 1);
         target->viewState.stateRevision = std::max<uint64_t>(target->viewState.stateRevision + 1, 1);
         rebuildViewerLassoData(target);
+        committedStroke = true;
       } else {
         app->viewerLassoStrokes.push_back(std::move(app->viewerLassoActiveStroke));
         app->viewerLassoRevision = std::max<uint64_t>(app->viewerLassoRevision + 1, 1);
         rebuildViewerLassoData(app);
+        committedStroke = true;
       }
     } else {
       app->viewerLassoStrokes.push_back(std::move(app->viewerLassoActiveStroke));
       app->viewerLassoRevision = std::max<uint64_t>(app->viewerLassoRevision + 1, 1);
       rebuildViewerLassoData(app);
+      committedStroke = true;
     }
     bumpViewerLocalStateRevision(app);
   }
   app->viewerLassoActiveStroke = LassoStroke{};
+  if (committedStroke) queueViewerStateCommand(*app, "reinterpret");
 }
 
 void clearAllViewerLassoState(AppState* app) {
@@ -14954,6 +15072,10 @@ ViewerMenuSection coercedViewerMenuSection(const AppState& app) {
   return viewerMenuSectionVisible(app, requested) ? requested : ViewerMenuSection::Model;
 }
 
+// Section: viewer menu model
+// This builds the main drawer rows. Rendering happens in drawViewerMenu(),
+// geometry helpers live below it, and pointer edits are handled in
+// mouseButtonCallback()/cursorPosCallback().
 std::vector<ViewerMenuRow> buildViewerMenuRows(const AppState& app) {
   const auto state = viewerStateWithModelCapabilities(app.viewerState);
   const ViewerMenuSection section = coercedViewerMenuSection(app);
@@ -17197,6 +17319,10 @@ void queueViewerPlotModelCommand(const AppState& app,
                  std::to_string(state.plotModel));
 }
 
+// Section: viewer-to-OFX desired-state commands
+// Queue commands here when a viewer UI action must reach the plugin. Source-only
+// reinterpretations should stay "reinterpret"; changes that need fresh host
+// samples should request "resample".
 void queueViewerStateCommand(AppState& app, const char* refreshPolicy) {
   auto state = aggregateHostStateForWorkspace(app);
   app.workspaceCommandRevision =
@@ -17618,6 +17744,8 @@ void applyViewerLassoStateToResolvedPayload(const AppState& app, ResolvedPayload
   (void)applyViewerLassoStateToResolvedPayloadForWindow(app, target, payload);
 }
 
+PlotMenuRect viewerMenuRowWindowRect(const AppState& app, int width, int height, int rowIndex);
+
 std::array<PlotMenuRect, 3> waveformChannelSelectorRects(const PlotMenuRect& rowRect) {
   constexpr float kSize = 17.0f;
   constexpr float kGap = 8.0f;
@@ -17816,17 +17944,84 @@ ViewerMenuAction presetActionAtPoint(const AppState& app, const PlotMenuRect& ro
   return ViewerMenuAction::None;
 }
 
-void toggleWaveformChannel(AppState* app, int channel) {
+bool waveformChannelEnabled(const ChromaspaceViewer::ViewerRuntimeState& state, int channel) {
+  switch (std::clamp(channel, 0, 2)) {
+    case 0: return state.waveformChannelRed;
+    case 1: return state.waveformChannelGreen;
+    default: return state.waveformChannelBlue;
+  }
+}
+
+void setWaveformChannelEnabled(ChromaspaceViewer::ViewerRuntimeState* state, int channel, bool enabled) {
+  if (!state) return;
+  switch (std::clamp(channel, 0, 2)) {
+    case 0: state->waveformChannelRed = enabled; break;
+    case 1: state->waveformChannelGreen = enabled; break;
+    default: state->waveformChannelBlue = enabled; break;
+  }
+}
+
+void setWaveformChannel(AppState* app, int channel, bool enabled) {
   if (!app || channel < 0 || channel > 2) return;
   auto state = viewerStateWithModelCapabilities(app->viewerState);
-  bool* enabled = channel == 0 ? &state.waveformChannelRed
-                              : (channel == 1 ? &state.waveformChannelGreen
-                                              : &state.waveformChannelBlue);
-  *enabled = !*enabled;
+  if (waveformChannelEnabled(state, channel) == enabled) return;
+  setWaveformChannelEnabled(&state, channel, enabled);
   state.stateRevision = std::max<uint64_t>(state.stateRevision + 1, 1);
   applyViewerStateToApp(app, state);
   app->viewerStateLocalOverride = true;
   queueViewerStateCommand(*app, "reinterpret");
+}
+
+void toggleWaveformChannel(AppState* app, int channel) {
+  if (!app || channel < 0 || channel > 2) return;
+  const auto state = viewerStateWithModelCapabilities(app->viewerState);
+  setWaveformChannel(app, channel, !waveformChannelEnabled(state, channel));
+}
+
+void resetWaveformChannelDrag(AppState* app) {
+  if (!app) return;
+  app->waveformChannelDragging = false;
+  app->waveformChannelLastDragIndex = -1;
+  app->waveformChannelDragEnable = false;
+}
+
+bool beginWaveformChannelPointerAction(AppState* app, int channel) {
+  if (!app || channel < 0 || channel > 2) return false;
+  const auto state = viewerStateWithModelCapabilities(app->viewerState);
+  const bool enable = !waveformChannelEnabled(state, channel);
+  setWaveformChannel(app, channel, enable);
+  app->waveformChannelDragging = true;
+  app->waveformChannelLastDragIndex = channel;
+  app->waveformChannelDragEnable = enable;
+  return true;
+}
+
+bool updateWaveformChannelDragAtPoint(AppState* app,
+                                      int windowWidth,
+                                      int windowHeight,
+                                      double x,
+                                      double y) {
+  if (!app || !app->waveformChannelDragging) return false;
+  int channelIndex = -1;
+  const std::vector<ViewerMenuRow> rows = buildViewerMenuRows(*app);
+  for (int i = 0; i < static_cast<int>(rows.size()); ++i) {
+    const ViewerMenuRow& row = rows[static_cast<std::size_t>(i)];
+    if (!row.channelSelector || !row.enabled) continue;
+    const PlotMenuRect rowRect = viewerMenuRowWindowRect(*app, windowWidth, windowHeight, i);
+    const auto channelRects = waveformChannelSelectorRects(rowRect);
+    for (int channel = 0; channel < 3; ++channel) {
+      if (pointInPlotMenuRect(channelRects[static_cast<std::size_t>(channel)], x, y)) {
+        channelIndex = channel;
+        break;
+      }
+    }
+    break;
+  }
+  if (channelIndex >= 0 && channelIndex != app->waveformChannelLastDragIndex) {
+    setWaveformChannel(app, channelIndex, app->waveformChannelDragEnable);
+    app->waveformChannelLastDragIndex = channelIndex;
+  }
+  return true;
 }
 
 PlotMenuRect plotWindowCloseWindowRect(const AppState& app,
@@ -18345,10 +18540,18 @@ void activateViewerChoiceMenuItem(AppState* app, const ViewerChoiceMenuItem& ite
   activateViewerMenuRow(app, row);
 }
 
+// Section: viewer menu geometry and hit testing
+// Keep slider track geometry, rendered value position, and pointer hit testing
+// in sync. If spacing changes here, check the draw branch for row.slider below.
+float viewerMenuSliderValueColumnWidth(float rowWidth) {
+  return clampf(rowWidth * 0.16f, 58.0f, 96.0f);
+}
+
 PlotMenuRect viewerMenuSliderTrackWindowRect(const PlotMenuRect& rowRect) {
   const float rowWidth = rowRect.x1 - rowRect.x0;
   const float sliderX0 = rowRect.x0 + clampf(rowWidth * 0.44f, 112.0f, 170.0f);
-  const float sliderX1 = rowRect.x1 - 48.0f;
+  const float valueColumnWidth = viewerMenuSliderValueColumnWidth(rowWidth);
+  const float sliderX1 = std::max(sliderX0 + 54.0f, rowRect.x1 - valueColumnWidth - 2.0f);
   const float sliderY = rowRect.y0 + 21.0f;
   return {sliderX0, sliderY - 7.0f, sliderX1, sliderY + 7.0f};
 }
@@ -19397,10 +19600,9 @@ void clearPointerInteractionState(AppState* app) {
   app->orientAxisLock = 0;
   app->orientAxisFeedbackUntil = 0.0;
   app->rollFeedbackUntil = 0.0;
+  app->pointerInteractionWindowId = -1;
   resetGlossViewOrthoInteractionState(app);
 }
-
-constexpr double kViewerMenuSlideSeconds = 0.20;
 
 void setPlotModelMenuVisible(AppState* app, bool visible) {
   if (!app) return;
@@ -19411,19 +19613,8 @@ void setPlotModelMenuVisible(AppState* app, bool visible) {
     app->plotModelMenuVisible = true;
   } else {
     app->viewerMenuDraggingSlider = false;
+    resetWaveformChannelDrag(app);
   }
-}
-
-float smoothAnimation01(double t) {
-  const float x = clampf(static_cast<float>(t), 0.0f, 1.0f);
-  return x * x * (3.0f - 2.0f * x);
-}
-
-float plotModelMenuSlideProgress(const AppState& app) {
-  if (app.plotModelMenuAnimStart < 0.0) return app.plotModelMenuTargetVisible ? 1.0f : 0.0f;
-  const double age = glfwGetTime() - app.plotModelMenuAnimStart;
-  const float eased = smoothAnimation01(age / kViewerMenuSlideSeconds);
-  return app.plotModelMenuTargetVisible ? eased : (1.0f - eased);
 }
 
 void updatePlotModelMenuAnimation(AppState* app) {
@@ -19433,6 +19624,22 @@ void updatePlotModelMenuAnimation(AppState* app) {
     app->plotModelMenuVisible = false;
     app->plotModelMenuAnimStart = -10.0;
   }
+}
+
+void finishDeferredPlotModelMenuDismiss(AppState* app) {
+  if (!app || !app->plotModelMenuDismissAfterPointerGesture) return;
+  app->plotModelMenuDismissAfterPointerGesture = false;
+  setPlotModelMenuVisible(app, false);
+  app->plotModelMenuHoverMain = -1;
+  app->plotModelMenuHoverSub = -1;
+  app->viewerMenuHoverTab = -1;
+  app->viewerSettingsHoverSubtab = -1;
+  app->viewerMenuHoverChoice = -1;
+  app->viewerMenuDraggingSlider = false;
+  app->viewerMenuSliderAction = static_cast<int>(ViewerMenuAction::None);
+  resetWaveformChannelDrag(app);
+  app->viewerMenuChoiceAction = static_cast<int>(ViewerMenuAction::None);
+  app->viewerChoiceMenuScroll = 0.0f;
 }
 
 bool platformRollModifierPressed(const AppState& app) {
@@ -20847,6 +21054,10 @@ void drawViewerDisplayGlyph(float x0, float y0, bool selected, bool enabled = tr
                    0.68f, 0.84f, 0.96f, alpha);
 }
 
+// Section: menu and quick-control drawing
+// Drawing helpers for the global menu, per-window slicing quick drawer, Source
+// Signal lasso buttons, and compact HUD controls. State comes from
+// buildViewerMenuRows(), geometry helpers, and PlotWindowState quick flags.
 void drawViewerMenuListGlyph(float x0, float y0, float x1, float y1, bool active, bool hovered) {
   drawPlotMenuRect(x0, y0, x1, y1,
                    active ? 0.10f : (hovered ? 0.08f : 0.035f),
@@ -21919,11 +22130,13 @@ void drawPlotModelMenuOverlay(const AppState& app,
                        row.enabled ? 0.92f : 0.54f,
                        row.enabled ? 1.0f : 0.58f,
                        row.enabled ? 0.96f : 0.58f);
+      const float valueX0 = sliderX1 + 2.0f;
+      const float valueWidth = std::max(36.0f, rr.x1 - valueX0 - 10.0f);
       drawHudTextLineClipped(renderer,
                              row.value,
-                             sliderX1 + 4.0f,
+                             valueX0,
                              singleBaseline,
-                             std::max(28.0f, rr.x1 - sliderX1 - 16.0f),
+                             valueWidth,
                              textScale,
                              hovered,
                              row.enabled ? 0.86f : 0.42f,
@@ -22861,14 +23074,12 @@ bool rebuildPlotWindowDerivedMeshIfNeeded(PlotWindowState* window,
     const std::string key = std::string("waiting|") + std::to_string(window->viewState.stateRevision);
     if (window->derivedMeshValid && window->derivedBuildKey == key) return true;
     MeshData waiting{};
-    waiting.quality = "Waiting";
-    waiting.resolution = resolved.resolution;
-    waiting.serial = nextMeshSerial();
-    waiting.analyticalScope = analyticalScope;
-    waiting.waveformScope =
-        window->viewState.plotModel == ChromaspaceViewer::kPlotModelWaveform;
-    waiting.scopeMode = waiting.waveformScope ? window->viewState.waveformMode
-                                              : window->viewState.histogramMode;
+    if (!analyticalScope ||
+        !buildEmptyAnalyticalScopeMesh(payload, resolved.resolution, "Waiting", "waiting", &waiting)) {
+      waiting.quality = "Waiting";
+      waiting.resolution = resolved.resolution;
+      waiting.serial = nextMeshSerial();
+    }
     window->derivedMesh = std::move(waiting);
     window->derivedBuildKey = key;
     window->derivedMeshValid = true;
@@ -23230,6 +23441,10 @@ void drawSourceSignalLassoButtons(const AppState& app,
              hasSelection);
 }
 
+// Section: plot drawing
+// Source Signal, analytical scopes, 3D clouds, Gloss View, and per-window
+// standby overlays converge in this area. If a plot looks wrong but data is
+// present, inspect these draw paths before changing source sampling.
 void drawSourceSignalPlot(const AppState& app,
                           const PlotWindowState& window,
                           SourceSignalStore* store,
@@ -24320,14 +24535,25 @@ void drawSlicingLassoGlyph(const PlotMenuRect& rect,
   const float cx = (rect.x0 + rect.x1) * 0.5f;
   const float cy = (rect.y0 + rect.y1) * 0.5f;
   glLineWidth(hovered ? 1.7f : 1.25f);
-  glBegin(GL_LINE_LOOP);
+  glBegin(GL_LINE_STRIP);
   glColor4f(0.72f, 0.92f, 1.0f, (hovered ? 0.95f : 0.68f) * alpha);
-  glVertex2f(cx - w * 0.24f, cy + h * 0.10f);
-  glVertex2f(cx - w * 0.08f, cy + h * 0.25f);
-  glVertex2f(cx + w * 0.22f, cy + h * 0.18f);
-  glVertex2f(cx + w * 0.20f, cy - h * 0.12f);
-  glVertex2f(cx - w * 0.03f, cy - h * 0.24f);
-  glVertex2f(cx - w * 0.25f, cy - h * 0.08f);
+  glVertex2f(cx - w * 0.27f, cy + h * 0.06f);
+  glVertex2f(cx - w * 0.22f, cy + h * 0.20f);
+  glVertex2f(cx - w * 0.06f, cy + h * 0.30f);
+  glVertex2f(cx + w * 0.14f, cy + h * 0.25f);
+  glVertex2f(cx + w * 0.27f, cy + h * 0.10f);
+  glVertex2f(cx + w * 0.23f, cy - h * 0.09f);
+  glVertex2f(cx + w * 0.05f, cy - h * 0.20f);
+  glVertex2f(cx - w * 0.15f, cy - h * 0.16f);
+  glVertex2f(cx - w * 0.27f, cy + h * 0.06f);
+  glVertex2f(cx - w * 0.13f, cy - h * 0.06f);
+  glVertex2f(cx + w * 0.22f, cy - h * 0.35f);
+  glEnd();
+  glBegin(GL_LINE_STRIP);
+  glColor4f(0.72f, 0.92f, 1.0f, (hovered ? 0.68f : 0.44f) * alpha);
+  glVertex2f(cx + w * 0.16f, cy - h * 0.32f);
+  glVertex2f(cx + w * 0.28f, cy - h * 0.38f);
+  glVertex2f(cx + w * 0.36f, cy - h * 0.30f);
   glEnd();
   glLineWidth(1.0f);
 }
@@ -26189,6 +26415,10 @@ void drawRollDirectionIndicator(int width,
 constexpr double kRightClickMenuMaxDurationSeconds = 0.10;
 constexpr double kRightClickMenuMaxMovePixels = 6.0;
 
+// Section: pointer and keyboard callbacks
+// Gesture ownership starts here and continues through mouseButtonCallback(),
+// cursorPosCallback(), and scrollCallback(). Menu gestures should consume input
+// before camera motion; plot gestures should focus the window under the pointer.
 void resetSlicingVectorDrag(AppState* app) {
   if (!app) return;
   app->slicingVectorDragging = false;
@@ -26296,6 +26526,18 @@ void activateViewerLassoFromSlicingDrawer(AppState* app,
   activateViewerMenuRow(app, row);
 }
 
+void focusPlotWindowForPointerInteraction(AppState* app, int windowId) {
+  if (!app || windowId < 0 || !plotWindowById(app, windowId)) return;
+  focusPlotWindow(app, windowId);
+  bringPlotWindowToFront(app, windowId);
+  if (!viewerSourceSelectionsSynced(*app) && !app->viewerState.volumeSliceLassoRegion) {
+    if (PlotWindowState* target = plotWindowById(app, windowId);
+        target && plotWindowCanOwnViewerLassoSelection(*target)) {
+      app->viewerLassoTargetWindowId = windowId;
+    }
+  }
+}
+
 void mouseButtonCallback(GLFWwindow* window, int button, int action, int mods) {
   AppState* app = reinterpret_cast<AppState*>(glfwGetWindowUserPointer(window));
   if (!app) return;
@@ -26304,6 +26546,23 @@ void mouseButtonCallback(GLFWwindow* window, int button, int action, int mods) {
   double rightCursorX = app->hoverX;
   double rightCursorY = app->hoverY;
   if (button == GLFW_MOUSE_BUTTON_RIGHT) glfwGetCursorPos(window, &rightCursorX, &rightCursorY);
+  if (action == GLFW_PRESS &&
+      (button == GLFW_MOUSE_BUTTON_LEFT ||
+       button == GLFW_MOUSE_BUTTON_MIDDLE ||
+       button == GLFW_MOUSE_BUTTON_RIGHT)) {
+    int windowWidth = 1, windowHeight = 1;
+    glfwGetWindowSize(window, &windowWidth, &windowHeight);
+    double cursorX = app->hoverX;
+    double cursorY = app->hoverY;
+    glfwGetCursorPos(window, &cursorX, &cursorY);
+    const bool pointerInMenu = pointerInViewerMenuUi(*app, windowWidth, windowHeight, cursorX, cursorY);
+    app->pointerInteractionWindowId =
+        pointerInMenu ? -1 : plotWindowAt(*app, windowWidth, windowHeight, cursorX, cursorY);
+    if ((button == GLFW_MOUSE_BUTTON_MIDDLE || button == GLFW_MOUSE_BUTTON_RIGHT) &&
+        app->pointerInteractionWindowId >= 0) {
+      focusPlotWindowForPointerInteraction(app, app->pointerInteractionWindowId);
+    }
+  }
   if (button == GLFW_MOUSE_BUTTON_RIGHT && action == GLFW_PRESS) {
     app->rightClickMenuCandidate = true;
     app->rightClickMenuPressTime = glfwGetTime();
@@ -26321,6 +26580,10 @@ void mouseButtonCallback(GLFWwindow* window, int button, int action, int mods) {
     if (quickRightClick) {
       int windowWidth = 1, windowHeight = 1;
       glfwGetWindowSize(window, &windowWidth, &windowHeight);
+      if (pointerInViewerMenuUi(*app, windowWidth, windowHeight, rightCursorX, rightCursorY)) {
+        clearPointerInteractionState(app);
+        return;
+      }
       const int windowId = plotWindowAt(*app, windowWidth, windowHeight, rightCursorX, rightCursorY);
       setPlotModelMenuVisible(app, false);
       app->quickPlotModelMenuVisible = false;
@@ -26361,6 +26624,13 @@ void mouseButtonCallback(GLFWwindow* window, int button, int action, int mods) {
   }
   if (button == GLFW_MOUSE_BUTTON_LEFT && action == GLFW_RELEASE && app->slicingVectorDragging) {
     resetSlicingVectorDrag(app);
+    finishDeferredPlotModelMenuDismiss(app);
+    clearPointerInteractionState(app);
+    return;
+  }
+  if (button == GLFW_MOUSE_BUTTON_LEFT && action == GLFW_RELEASE && app->waveformChannelDragging) {
+    resetWaveformChannelDrag(app);
+    finishDeferredPlotModelMenuDismiss(app);
     clearPointerInteractionState(app);
     return;
   }
@@ -26437,10 +26707,19 @@ void mouseButtonCallback(GLFWwindow* window, int button, int action, int mods) {
     double cursorY = app->hoverY;
     glfwGetCursorPos(window, &cursorX, &cursorY);
     if (!pointerInViewerMenuUi(*app, windowWidth, windowHeight, cursorX, cursorY)) {
-      setPlotModelMenuVisible(app, false);
-      app->quickPlotModelMenuVisible = false;
-      app->addPlotMenuVisible = false;
-      app->layoutMenuVisible = false;
+      const bool onlyMainDrawerOpen =
+          app->plotModelMenuVisible &&
+          !app->quickPlotModelMenuVisible &&
+          !app->addPlotMenuVisible &&
+          !app->layoutMenuVisible;
+      if (onlyMainDrawerOpen) {
+        app->plotModelMenuDismissAfterPointerGesture = true;
+      } else {
+        setPlotModelMenuVisible(app, false);
+        app->quickPlotModelMenuVisible = false;
+        app->addPlotMenuVisible = false;
+        app->layoutMenuVisible = false;
+      }
       app->plotModelMenuHoverMain = -1;
       app->plotModelMenuHoverSub = -1;
       app->quickPlotModelMenuHover = -1;
@@ -26811,7 +27090,7 @@ void mouseButtonCallback(GLFWwindow* window, int button, int action, int mods) {
             if (pointInPlotMenuRect(channelRects[static_cast<size_t>(channel)],
                                     cursorX,
                                     cursorY)) {
-              toggleWaveformChannel(app, channel);
+              beginWaveformChannelPointerAction(app, channel);
               app->viewerMenuLastClick = -10.0;
               app->viewerMenuLastClickRow = -1;
               app->viewerMenuLastClickAction =
@@ -26860,6 +27139,7 @@ void mouseButtonCallback(GLFWwindow* window, int button, int action, int mods) {
   }
   if (button == GLFW_MOUSE_BUTTON_LEFT && app->viewerLassoDrawing && action == GLFW_RELEASE) {
     finishViewerLassoStroke(app);
+    finishDeferredPlotModelMenuDismiss(app);
     clearPointerInteractionState(app);
     return;
   }
@@ -26874,6 +27154,7 @@ void mouseButtonCallback(GLFWwindow* window, int button, int action, int mods) {
     sortPlotWindowsForReadableStacking(app, app->plotWindowDragId);
     app->plotWindowDragMode = PlotWindowDragMode::None;
     app->plotWindowDragId = -1;
+    finishDeferredPlotModelMenuDismiss(app);
     clearPointerInteractionState(app);
     return;
   }
@@ -26894,6 +27175,8 @@ void mouseButtonCallback(GLFWwindow* window, int button, int action, int mods) {
         glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_RIGHT) == GLFW_PRESS;
     if (!anyDown) {
       resetSlicingVectorDrag(app);
+      resetWaveformChannelDrag(app);
+      finishDeferredPlotModelMenuDismiss(app);
       clearPointerInteractionState(app);
     }
     return;
@@ -26996,6 +27279,13 @@ void cursorPosCallback(GLFWwindow* window, double xpos, double ypos) {
     clearPointerInteractionState(app);
     return;
   }
+  if (app->waveformChannelDragging) {
+    int windowWidth = 1, windowHeight = 1;
+    glfwGetWindowSize(window, &windowWidth, &windowHeight);
+    updateWaveformChannelDragAtPoint(app, windowWidth, windowHeight, xpos, ypos);
+    clearPointerInteractionState(app);
+    return;
+  }
   if (app->quickPlotModelMenuVisible) {
     int windowWidth = 1, windowHeight = 1;
     glfwGetWindowSize(window, &windowWidth, &windowHeight);
@@ -27093,6 +27383,14 @@ void cursorPosCallback(GLFWwindow* window, double xpos, double ypos) {
       return;
     }
   }
+  if (menuGestureActive) {
+    int windowWidth = 1, windowHeight = 1;
+    glfwGetWindowSize(window, &windowWidth, &windowHeight);
+    if (pointerInViewerMenuUi(*app, windowWidth, windowHeight, xpos, ypos)) {
+      clearPointerInteractionState(app);
+      return;
+    }
+  }
 
   if (app->viewerLassoDrawing) {
     updateViewerLassoStroke(app, window, xpos, ypos);
@@ -27135,6 +27433,14 @@ void cursorPosCallback(GLFWwindow* window, double xpos, double ypos) {
   }
 
   if (anyDown && !app->leftDown) {
+    if (app->pointerInteractionWindowId < 0 ||
+        !plotWindowById(*app, app->pointerInteractionWindowId)) {
+      clearPointerInteractionState(app);
+      return;
+    }
+    if (app->focusedPlotWindowId != app->pointerInteractionWindowId) {
+      focusPlotWindowForPointerInteraction(app, app->pointerInteractionWindowId);
+    }
     app->leftDown = true;
     app->zoomMode = (r == GLFW_PRESS);
     const bool shiftPanFromLeft = !app->zoomMode && !rollModifier && (l == GLFW_PRESS) && shift && (m != GLFW_PRESS);
@@ -27549,6 +27855,21 @@ void scrollCallback(GLFWwindow* window, double xoffset, double yoffset) {
       return;
     }
   }
+  int windowWidth = 1, windowHeight = 1;
+  glfwGetWindowSize(window, &windowWidth, &windowHeight);
+  double cursorX = app->hoverX;
+  double cursorY = app->hoverY;
+  glfwGetCursorPos(window, &cursorX, &cursorY);
+  if (pointerInViewerMenuUi(*app, windowWidth, windowHeight, cursorX, cursorY)) {
+    clearPointerInteractionState(app);
+    return;
+  }
+  const int windowId = plotWindowAt(*app, windowWidth, windowHeight, cursorX, cursorY);
+  if (windowId < 0) {
+    clearPointerInteractionState(app);
+    return;
+  }
+  focusPlotWindowForPointerInteraction(app, windowId);
   const float scale = ctrl ? 0.20f : (shift ? (0.12f * shiftPrecisionFactor()) : 0.12f);
   if (ctrl) app->speedFeedbackUntil = glfwGetTime() + 0.18;
   if (!ctrl && shift) app->slowFeedbackUntil = glfwGetTime() + 0.18;
@@ -27593,6 +27914,10 @@ void refreshCallback(GLFWwindow*, int width, int height) {
 #if defined(_WIN32)
 DWORD WINAPI ipcThreadMain(LPVOID);
 #else
+// Section: IPC and main loop
+// The IPC thread receives params/cloud/source packets from OFX. main() accepts
+// those packets, reconciles local viewer state, rebuilds previews/meshes, then
+// draws the focused plot plus secondary windows.
 void ipcThreadMain();
 #endif
 
@@ -28794,6 +29119,8 @@ int main() {
         plotModelIsAnalyticalScope(titleState.plotModel);
     const bool sourceSignalForTitle =
         plotModelIsSourceSignal(titleState.plotModel);
+    const bool primaryRenderIsAnalyticalScope =
+        focusedWindowForRender && analyticalScopeForTitle;
     const std::string titlePlotMode =
         ChromaspaceViewer::plotModeForModel(titleState.plotModel);
     CameraState titleCamera =
@@ -28948,7 +29275,7 @@ int main() {
         glossViewMode && app.glossViewPresentation == GlossViewPresentationMode::Projection3D;
     const bool drawIdentityOverlay =
         !emptyImageLassoMode && !glossViewMode && overlayMesh.pointCount > 0;
-    if (!glossField2DMode) {
+    if (!primaryRenderIsAnalyticalScope && !glossField2DMode) {
       drawGuideForPlotMode(resolved, app.cam, renderHeight, fovy, overlayTextRenderer);
     }
 

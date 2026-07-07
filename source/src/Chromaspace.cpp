@@ -88,6 +88,31 @@ namespace {
 
 using namespace OFX;
 
+/*
+Chromaspace.cpp navigation
+--------------------------
+This file is the OFX/host side of Chromaspace. Use these landmarks before
+editing:
+
+- Viewer process/session transport: search "Section: viewer process and mailbox"
+  for launch paths, desired-state mailboxes, Resolve bridge refresh, and shared
+  viewer ownership. Viewer-side counterpart: tools/cube_viewer_stub/main.cpp
+  "Section: IPC and main loop".
+- Cloud/source generation: search "Section: cloud sampling and render handoff"
+  for render-time source/image sampling, source-signal payloads, and
+  authoritative cloud publication. Viewer counterpart: "Section: source-derived
+  meshes".
+- Viewer-owned slicing/lasso state: search "Section: slicing and lasso state".
+  The Resolve/OFX Volume Slice controls are hidden; viewer UI owns vectors,
+  neutral radius, and Source Signal lasso drawing.
+- Host callback routing: search "ChromaspaceEffect::render" and
+  "ChromaspaceEffect::changedParam". These are the only places that should
+  mutate OFX-host-facing state in response to renders or parameter changes.
+- Descriptor/UI definitions: search "Section: OFX descriptor and hidden
+  transport params". Keep plugin-visible controls separate from hidden viewer
+  state/transport params.
+*/
+
 constexpr const char* kPluginIdentifier = "com.moazelgabry.chromaspace";
 constexpr const char* kPluginGrouping = "Moaz Elgabry";
 constexpr int kPluginVersionMajor = 2;
@@ -112,6 +137,10 @@ constexpr UINT kViewerCommandDestroyMessage = WM_APP + 0x43B;
 constexpr const char* kViewerCommandWindowClass = "ChromaspaceViewerCommandBridge";
 #endif
 
+// Section: viewer process and mailbox
+// Launch paths, singleton probing, Resolve bridge refresh, and mailbox files
+// live here. Viewer-side IPC parsing and desired-state emission live in
+// cube_viewer_stub/main.cpp under "Section: IPC and main loop".
 std::string cubeViewerLogPath() {
 #if defined(_WIN32)
   const char* localAppData = std::getenv("LOCALAPPDATA");
@@ -467,6 +496,11 @@ void requestResolveRenderRefreshFromScript() {}
 
 struct ViewerCloudTransportBlob;
 
+// Section: cloud transport payload model
+// These structs are the host-to-viewer wire contracts for params, source
+// signals, input clouds, and image-lasso state. Any field that affects cloud
+// interpretation must be represented in the relevant settings key.
+
 struct PendingMessage {
   std::string reason;
   std::string payload;
@@ -712,6 +746,10 @@ bool sameViewerProbeState(const ViewerProbeResult& a, const ViewerProbeResult& b
   return a.ok == b.ok && a.visible == b.visible && a.iconified == b.iconified && a.focused == b.focused;
 }
 
+// Section: slicing and lasso state
+// Viewer-owned slicing still crosses the OFX boundary as hidden state. The
+// user-facing controls live in cube_viewer_stub/main.cpp, while this side owns
+// serialization, source sampling filters, hidden params, and host refresh.
 enum class VolumeSlicingMode {
   HueSectors = 0,
   LassoRegion = 1,
@@ -2703,6 +2741,11 @@ std::atomic<uint64_t> gSharedGeneratedIdentityStripRevision{0};
 std::mutex gSharedGeneratedIdentityStripOwnerMutex;
 std::string gSharedGeneratedIdentityStripOwnerSenderId;
 
+// Section: ChromaspaceEffect lifecycle and host callbacks
+// This class is the OFX instance boundary. Keep descriptor-only work in the
+// factory below, render work in render(), and parameter/mailbox reconciliation
+// in changedParam() or explicit host callbacks. Viewer helper code should stay
+// outside this class unless it needs OFX params, clips, or host suites.
 class ChromaspaceEffect;
 std::mutex gSharedViewerInstanceMutex;
 std::map<std::string, ChromaspaceEffect*> gSharedViewerInstancesBySender;
@@ -2992,6 +3035,11 @@ class ChromaspaceEffect : public ImageEffect {
     logSharedViewerEvent("releaseSession", std::string(), std::string("previous=") + std::to_string(previous));
   }
 
+  // ChromaspaceEffect::render
+  // Host image access, pass-through rendering, Identity Generator burn-in, and
+  // viewer cloud/source payload publication all converge here. If a change needs
+  // source pixels or render-window/bounds data, start here before touching
+  // viewer-side mesh code.
   void render(const RenderArguments& args) override {
     flushStatusLabelToHost();
     consumeViewerMailboxFromHostCallback(args.time, "render");
@@ -3370,6 +3418,10 @@ class ChromaspaceEffect : public ImageEffect {
     }
   }
 
+  // ChromaspaceEffect::changedParam
+  // Host-safe parameter mutation lives here. Viewer mailbox consumption is done
+  // at the top so viewer UI changes become OFX params only from a host callback,
+  // which keeps Resolve interaction more stable than background param writes.
   void changedParam(const InstanceChangedArgs& args, const std::string& paramName) override {
     flushStatusLabelToHost();
     consumeViewerMailboxFromHostCallback(args.time, std::string("changedParam/") + paramName);
@@ -3772,26 +3824,15 @@ class ChromaspaceEffect : public ImageEffect {
       return;
     }
     if (paramName == "cubeViewerLassoRegionMode") {
-      cubeViewerDebugLog(std::string("changedParam(cubeViewerLassoRegionMode) -> ") +
-                         (currentLassoRegionSlicingEnabled(args.time) ? "1" : "0"));
-      {
-        auto state = currentViewerRuntimeState();
-        const bool lassoEnabled = getBoolValue("cubeViewerLassoRegionMode", args.time, false);
-        if (state.volumeSliceLassoRegion != lassoEnabled) {
-          state.volumeSliceLassoRegion = lassoEnabled;
-          state.stateRevision = std::max<uint64_t>(state.stateRevision + 1, 1);
-          state.refreshPolicy = "resample";
-          state.requiresHostSamples = true;
-          state.sampleSettingsKey.clear();
-          setViewerRuntimeState(state);
-        }
+      cubeViewerDebugLog("changedParam(cubeViewerLassoRegionMode) ignored; viewer Source Signal owns image lasso");
+      if (getBoolValue("cubeViewerLassoRegionMode", args.time, false)) {
+        if (auto* p = fetchBooleanParam("cubeViewerLassoRegionMode")) p->setValue(false);
       }
       syncCubeSlicingUi(args.time);
       syncChromaspacePresetMenuState(args.time);
       if (viewerSessionRequested()) {
-        pushParamsUpdate(args.time, "cubeViewerLassoRegionMode");
+        pushParamsUpdate(args.time, "cubeViewerLassoRegionMode/hidden");
       }
-      requestHostViewerEvaluation(args.time, "cubeViewerLassoRegionMode");
       redrawOverlays();
       return;
     }
@@ -4926,8 +4967,7 @@ class ChromaspaceEffect : public ImageEffect {
       if (explicitReadResolution == 29 && legacyResolution != 29) explicitReadResolution = legacyResolution;
       state.identityReadResolution = explicitReadResolution;
     }
-    state.volumeSliceLassoRegion =
-        getBoolValue("cubeViewerLassoRegionMode", time, state.volumeSliceLassoRegion);
+    state.volumeSliceLassoRegion = false;
     state.volumeSliceRed = getBoolValue("cubeViewerSliceRed", time, state.volumeSliceRed);
     state.volumeSliceYellow = getBoolValue("cubeViewerSliceYellow", time, state.volumeSliceYellow);
     state.volumeSliceGreen = getBoolValue("cubeViewerSliceGreen", time, state.volumeSliceGreen);
@@ -5133,13 +5173,7 @@ class ChromaspaceEffect : public ImageEffect {
       syncCubeSlicingUi(time);
     }
     if (lassoModeChanged) {
-      if (getBoolValue("cubeViewerLassoRegionMode", time, false) != state.volumeSliceLassoRegion) {
-        if (auto* p = fetchBooleanParam("cubeViewerLassoRegionMode")) {
-          p->setValue(state.volumeSliceLassoRegion);
-        }
-      }
       syncCubeSlicingUi(time);
-      redrawOverlays();
     }
     if (command.hasClearImageLassoCommand &&
         command.clearImageLassoRequestedRevision > lastAppliedClearImageLassoRevision_) {
@@ -5758,8 +5792,8 @@ class ChromaspaceEffect : public ImageEffect {
   }
 
   VolumeSlicingMode currentVolumeSlicingMode(double time) {
-    return (currentViewerRuntimeState().volumeSliceLassoRegion ||
-            getBoolValue("cubeViewerLassoRegionMode", time, false))
+    (void)time;
+    return currentViewerRuntimeState().volumeSliceLassoRegion
                ? VolumeSlicingMode::LassoRegion
                : VolumeSlicingMode::HueSectors;
   }
@@ -5787,16 +5821,9 @@ class ChromaspaceEffect : public ImageEffect {
   }
 
   bool currentVolumeSlicingEnabled(double time) {
-    if (currentViewerRuntimeState().volumeSliceLassoRegion) {
-      return currentCubeSlicingSupported(time);
-    }
-    if (getBoolValue("cubeViewerLassoRegionMode", time, false)) {
-      return currentCubeSlicingSupported(time);
-    }
-    const bool ofxLassoHasData = !currentLassoRegionState(time).empty();
     return ChromaspaceViewer::volumeSlicingEnabled(currentViewerRuntimeState(),
                                                    currentDrawOnImageMode(time),
-                                                   ofxLassoHasData);
+                                                   false);
   }
 
   bool currentHueSectorSlicingEnabled(double time) {
@@ -5805,8 +5832,8 @@ class ChromaspaceEffect : public ImageEffect {
   }
 
   bool currentLassoRegionSlicingEnabled(double time) {
-    return currentVolumeSlicingEnabled(time) &&
-           currentVolumeSlicingMode(time) == VolumeSlicingMode::LassoRegion;
+    (void)time;
+    return false;
   }
 
   bool anyCubeSliceRegionSelected(double time) {
@@ -5949,7 +5976,7 @@ class ChromaspaceEffect : public ImageEffect {
                     getIntValue("cubeViewerSampleDrawnCubeSize", time, values.identityGeneratorResolution));
     values.identityReadResolution =
         ChromaspaceViewer::clampOverlaySize(currentViewerRuntimeState().identityReadResolution);
-    values.volumeSliceLassoRegion = getBoolValue("cubeViewerLassoRegionMode", time, values.volumeSliceLassoRegion);
+    values.volumeSliceLassoRegion = false;
     values.volumeSliceRed = getBoolValue("cubeViewerSliceRed", time, values.volumeSliceRed);
     values.volumeSliceYellow = getBoolValue("cubeViewerSliceYellow", time, values.volumeSliceYellow);
     values.volumeSliceGreen = getBoolValue("cubeViewerSliceGreen", time, values.volumeSliceGreen);
@@ -6007,7 +6034,7 @@ class ChromaspaceEffect : public ImageEffect {
     if (auto* p = fetchIntParam("cubeViewerIdentityGeneratorResolution")) p->setValue(values.identityGeneratorResolution);
     if (auto* p = fetchIntParam("cubeViewerIdentityReadResolution")) p->setValue(values.identityReadResolution);
     if (auto* p = fetchIntParam("cubeViewerSampleDrawnCubeSize")) p->setValue(values.identityGeneratorResolution);
-    if (auto* p = fetchBooleanParam("cubeViewerLassoRegionMode")) p->setValue(values.volumeSliceLassoRegion);
+    if (auto* p = fetchBooleanParam("cubeViewerLassoRegionMode")) p->setValue(false);
     if (auto* p = fetchBooleanParam("cubeViewerSliceRed")) p->setValue(values.volumeSliceRed);
     if (auto* p = fetchBooleanParam("cubeViewerSliceYellow")) p->setValue(values.volumeSliceYellow);
     if (auto* p = fetchBooleanParam("cubeViewerSliceGreen")) p->setValue(values.volumeSliceGreen);
@@ -6272,8 +6299,7 @@ class ChromaspaceEffect : public ImageEffect {
       }
     }
 
-    const bool lassoModeActive = currentViewerRuntimeState().volumeSliceLassoRegion ||
-                                 getBoolValue("cubeViewerLassoRegionMode", time, false);
+    const bool lassoModeActive = currentVolumeSlicingMode(time) == VolumeSlicingMode::LassoRegion;
     if (lassoModeActive && hasStableLassoRegion_) {
       return stableLassoRegion_;
     }
@@ -6385,30 +6411,24 @@ class ChromaspaceEffect : public ImageEffect {
     redrawOverlays();
   }
 
+  // Section: hidden OFX slicing controls
+  // The current implementation exposes slicing in the viewer only. Keep these
+  // host-side params hidden, but do not delete them: preset import, mailbox
+  // translation, and source-cache keys still use the same state fields.
   void syncCubeSlicingUi(double time) {
-    const bool supported = currentCubeSlicingSupported(time);
-    const bool hueSectorAllowed = currentHueSectorSlicingAllowed(time);
-    const bool neutralRadiusVisible = currentNeutralRadiusSlicingAllowed(time);
-    const bool lassoSelected = supported && getBoolValue("cubeViewerLassoRegionMode", time, false);
-    const bool lassoMode = supported && currentVolumeSlicingMode(time) == VolumeSlicingMode::LassoRegion;
-    const bool neutralRadiusEnabled = neutralRadiusVisible &&
-                                      !currentShowOverflow(time);
-    const bool hueOptionsVisible = supported && hueSectorAllowed;
-    setParamVisibility(fetchGroupParam("grp_cube_viewer_slicing"), supported);
-    setParamVisibility(fetchBooleanParam("cubeViewerLassoRegionMode"), supported);
-    if (auto* p = fetchDoubleParam("cubeViewerNeutralRadius")) {
-      p->setIsSecret(!neutralRadiusVisible);
-      p->setEnabled(neutralRadiusEnabled);
-    }
-    setParamVisibility(fetchBooleanParam("cubeViewerSliceRed"), hueOptionsVisible);
-    setParamVisibility(fetchBooleanParam("cubeViewerSliceGreen"), hueOptionsVisible);
-    setParamVisibility(fetchBooleanParam("cubeViewerSliceBlue"), hueOptionsVisible);
-    setParamVisibility(fetchBooleanParam("cubeViewerSliceCyan"), hueOptionsVisible);
-    setParamVisibility(fetchBooleanParam("cubeViewerSliceYellow"), hueOptionsVisible);
-    setParamVisibility(fetchBooleanParam("cubeViewerSliceMagenta"), hueOptionsVisible);
-    setParamVisibility(fetchChoiceParam("cubeViewerLassoOperation"), lassoMode);
-    setParamVisibility(fetchPushButtonParam("cubeViewerLassoUndo"), lassoMode);
-    setParamVisibility(fetchPushButtonParam("cubeViewerLassoReset"), lassoMode);
+    (void)time;
+    setParamVisibility(fetchGroupParam("grp_cube_viewer_slicing"), false);
+    setParamVisibility(fetchBooleanParam("cubeViewerLassoRegionMode"), false);
+    setParamVisibility(fetchDoubleParam("cubeViewerNeutralRadius"), false);
+    setParamVisibility(fetchBooleanParam("cubeViewerSliceRed"), false);
+    setParamVisibility(fetchBooleanParam("cubeViewerSliceGreen"), false);
+    setParamVisibility(fetchBooleanParam("cubeViewerSliceBlue"), false);
+    setParamVisibility(fetchBooleanParam("cubeViewerSliceCyan"), false);
+    setParamVisibility(fetchBooleanParam("cubeViewerSliceYellow"), false);
+    setParamVisibility(fetchBooleanParam("cubeViewerSliceMagenta"), false);
+    setParamVisibility(fetchChoiceParam("cubeViewerLassoOperation"), false);
+    setParamVisibility(fetchPushButtonParam("cubeViewerLassoUndo"), false);
+    setParamVisibility(fetchPushButtonParam("cubeViewerLassoReset"), false);
   }
 
   void syncShowOverflowSupport(double time) {
@@ -6617,17 +6637,13 @@ class ChromaspaceEffect : public ImageEffect {
     setParamVisibility(fetchGroupParam("grp_cube_viewer_identity_overlay"), drawOnImage);
     setParamVisibility(fetchGroupParam("grp_support_root"), true);
     syncViewerOwnedParamVisibility(time);
+    syncIdentityOverlayGroupOpenState(time);
     cubeViewerDebugLog(std::string("Draw-on-image UI state -> ") + (drawOnImage ? "draw" : "plot"));
   }
 
   void syncViewerOwnedParamVisibility(double time) {
     const bool drawOnImage = currentDrawOnImageMode(time);
     const bool drawIdentityPlot = getBoolValue("cubeViewerIdentityOverlayEnabledDraw", time, false);
-    const bool drawGrayRamp = getBoolValue("cubeViewerIdentityOverlayRampDraw", time, false);
-    const bool legacyLassoMode = !drawOnImage && getBoolValue("cubeViewerLassoRegionMode", time, false);
-    const bool viewerOwnedLassoMode = !drawOnImage && currentViewerRuntimeState().volumeSliceLassoRegion;
-    const bool legacyLassoHasData = !currentLassoRegionState(time).empty();
-    const bool imageLassoVisible = legacyLassoMode || viewerOwnedLassoMode || legacyLassoHasData;
 
     setParamVisibility(fetchChoiceParam("cubeViewerPlotModel"), false);
     setParamVisibility(fetchBooleanParam("cubeViewerPlotDisplayLinear"), false);
@@ -6695,8 +6711,8 @@ class ChromaspaceEffect : public ImageEffect {
     setParamVisibility(fetchPushButtonParam("chromaspacePresetRename"), false);
     setParamVisibility(fetchPushButtonParam("chromaspacePresetDelete"), false);
 
-    setParamVisibility(fetchGroupParam("grp_cube_viewer_slicing"), imageLassoVisible);
-    setParamVisibility(fetchBooleanParam("cubeViewerLassoRegionMode"), imageLassoVisible);
+    setParamVisibility(fetchGroupParam("grp_cube_viewer_slicing"), false);
+    setParamVisibility(fetchBooleanParam("cubeViewerLassoRegionMode"), false);
     setParamVisibility(fetchDoubleParam("cubeViewerNeutralRadius"), false);
     setParamVisibility(fetchBooleanParam("cubeViewerSliceRed"), false);
     setParamVisibility(fetchBooleanParam("cubeViewerSliceGreen"), false);
@@ -6704,9 +6720,9 @@ class ChromaspaceEffect : public ImageEffect {
     setParamVisibility(fetchBooleanParam("cubeViewerSliceCyan"), false);
     setParamVisibility(fetchBooleanParam("cubeViewerSliceYellow"), false);
     setParamVisibility(fetchBooleanParam("cubeViewerSliceMagenta"), false);
-    setParamVisibility(fetchChoiceParam("cubeViewerLassoOperation"), imageLassoVisible);
-    setParamVisibility(fetchPushButtonParam("cubeViewerLassoUndo"), imageLassoVisible);
-    setParamVisibility(fetchPushButtonParam("cubeViewerLassoReset"), imageLassoVisible);
+    setParamVisibility(fetchChoiceParam("cubeViewerLassoOperation"), false);
+    setParamVisibility(fetchPushButtonParam("cubeViewerLassoUndo"), false);
+    setParamVisibility(fetchPushButtonParam("cubeViewerLassoReset"), false);
   }
 
   void updateNormConeToggleVisibility(double time) {
@@ -12937,6 +12953,10 @@ class ChromaspaceFactory : public PluginFactoryHelper<ChromaspaceFactory> {
 #endif
   }
 
+  // Section: OFX descriptor and hidden transport params
+  // Define user-facing Resolve controls here, but keep viewer-owned controls
+  // secret. The viewer can still send desired state through hidden params and
+  // mailbox commands; visible interaction belongs in cube_viewer_stub/main.cpp.
   void describeInContext(ImageEffectDescriptor& d, ContextEnum) override {
     ClipDescriptor* src = d.defineClip(kOfxImageEffectSimpleSourceClipName);
     src->addSupportedComponent(ePixelComponentRGBA);
@@ -12966,7 +12986,7 @@ class ChromaspaceFactory : public PluginFactoryHelper<ChromaspaceFactory> {
           {"cubeViewerHighlightOverflow", "When enabled, color out-of-bound plot points with a dedicated highlight color."},
           {"cubeViewerCircularHsl", "For HSL only: switch from the default HSL bicone view to a circular cylindrical HSL view with hue as angle, saturation as radius, and lightness as height. When overflow is enabled, out-of-range RGB values are converted with the raw HSL formula so useful out-of-bound cylindrical points remain visible."},
           {"cubeViewerCircularHsv", "For HSV only: switch from the default Smith hexcone view to a circular cylindrical HSV view with hue as angle, saturation as radius, and value as height."},
-          {"cubeViewerLassoRegionMode", "When enabled, Volume Slicing uses the image-space OFX overlay lasso as a selection mask. The hue-sector filters can stay enabled to refine the lasso selection further."},
+          {"cubeViewerLassoRegionMode", "Retired host-overlay lasso control. Image Lasso is handled by the viewer Source Signal surface."},
           {"cubeViewerNeutralRadius", "Keep only samples within this normalized distance from the achromatic axis so the extreme outer saturation shell is hidden and the more typical image range is easier to inspect."},
           {"cubeViewerSliceRed", "Show only the red sector. In Cube mode this is the red-dominant tetrahedral region; in the other plot models it is the red-centered hue sector."},
           {"cubeViewerSliceGreen", "Show only the green sector. In Cube mode this is the green-dominant tetrahedral region; in the other plot models it is the green-centered hue sector."},
@@ -13255,6 +13275,7 @@ class ChromaspaceFactory : public PluginFactoryHelper<ChromaspaceFactory> {
     auto* grpCubeViewerSlicing = d.defineGroupParam("grp_cube_viewer_slicing");
     grpCubeViewerSlicing->setLabel("Volume Slice");
     grpCubeViewerSlicing->setOpen(false);
+    grpCubeViewerSlicing->setIsSecret(true);
 
     auto* cubeViewerLassoRegionMode = d.defineBooleanParam("cubeViewerLassoRegionMode");
     cubeViewerLassoRegionMode->setLabel("Lasso Region");
@@ -13267,36 +13288,42 @@ class ChromaspaceFactory : public PluginFactoryHelper<ChromaspaceFactory> {
     cubeViewerSliceRed->setLabel("Red");
     cubeViewerSliceRed->setDefault(false);
     cubeViewerSliceRed->setParent(*grpCubeViewerSlicing);
+    cubeViewerSliceRed->setIsSecret(true);
     if (const char* hint = tooltipFor("cubeViewerSliceRed")) cubeViewerSliceRed->setHint(hint);
 
     auto* cubeViewerSliceYellow = d.defineBooleanParam("cubeViewerSliceYellow");
     cubeViewerSliceYellow->setLabel("Yellow");
     cubeViewerSliceYellow->setDefault(false);
     cubeViewerSliceYellow->setParent(*grpCubeViewerSlicing);
+    cubeViewerSliceYellow->setIsSecret(true);
     if (const char* hint = tooltipFor("cubeViewerSliceYellow")) cubeViewerSliceYellow->setHint(hint);
 
     auto* cubeViewerSliceGreen = d.defineBooleanParam("cubeViewerSliceGreen");
     cubeViewerSliceGreen->setLabel("Green");
     cubeViewerSliceGreen->setDefault(false);
     cubeViewerSliceGreen->setParent(*grpCubeViewerSlicing);
+    cubeViewerSliceGreen->setIsSecret(true);
     if (const char* hint = tooltipFor("cubeViewerSliceGreen")) cubeViewerSliceGreen->setHint(hint);
 
     auto* cubeViewerSliceCyan = d.defineBooleanParam("cubeViewerSliceCyan");
     cubeViewerSliceCyan->setLabel("Cyan");
     cubeViewerSliceCyan->setDefault(false);
     cubeViewerSliceCyan->setParent(*grpCubeViewerSlicing);
+    cubeViewerSliceCyan->setIsSecret(true);
     if (const char* hint = tooltipFor("cubeViewerSliceCyan")) cubeViewerSliceCyan->setHint(hint);
 
     auto* cubeViewerSliceBlue = d.defineBooleanParam("cubeViewerSliceBlue");
     cubeViewerSliceBlue->setLabel("Blue");
     cubeViewerSliceBlue->setDefault(false);
     cubeViewerSliceBlue->setParent(*grpCubeViewerSlicing);
+    cubeViewerSliceBlue->setIsSecret(true);
     if (const char* hint = tooltipFor("cubeViewerSliceBlue")) cubeViewerSliceBlue->setHint(hint);
 
     auto* cubeViewerSliceMagenta = d.defineBooleanParam("cubeViewerSliceMagenta");
     cubeViewerSliceMagenta->setLabel("Magenta");
     cubeViewerSliceMagenta->setDefault(false);
     cubeViewerSliceMagenta->setParent(*grpCubeViewerSlicing);
+    cubeViewerSliceMagenta->setIsSecret(true);
     if (const char* hint = tooltipFor("cubeViewerSliceMagenta")) cubeViewerSliceMagenta->setHint(hint);
 
     auto* cubeViewerNeutralRadius = d.defineDoubleParam("cubeViewerNeutralRadius");
@@ -13305,6 +13332,7 @@ class ChromaspaceFactory : public PluginFactoryHelper<ChromaspaceFactory> {
     cubeViewerNeutralRadius->setDisplayRange(0.0, 1.0);
     cubeViewerNeutralRadius->setDefault(1.0);
     cubeViewerNeutralRadius->setParent(*grpCubeViewerSlicing);
+    cubeViewerNeutralRadius->setIsSecret(true);
     if (const char* hint = tooltipFor("cubeViewerNeutralRadius")) cubeViewerNeutralRadius->setHint(hint);
 
     auto* cubeViewerLassoOperation = d.defineChoiceParam("cubeViewerLassoOperation");
@@ -13357,7 +13385,7 @@ class ChromaspaceFactory : public PluginFactoryHelper<ChromaspaceFactory> {
 
     auto* grpCubeViewerIdentityOverlay = d.defineGroupParam("grp_cube_viewer_identity_overlay");
     grpCubeViewerIdentityOverlay->setLabel("Identity Plot");
-    grpCubeViewerIdentityOverlay->setOpen(false);
+    grpCubeViewerIdentityOverlay->setOpen(true);
     grpCubeViewerIdentityOverlay->setIsSecret(true);
 
     auto* cubeViewerDrawOnImageEnabled = d.defineBooleanParam("cubeViewerDrawOnImageEnabled");
