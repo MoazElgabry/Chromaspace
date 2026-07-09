@@ -1277,6 +1277,7 @@ struct PointRenderProgramCache {
   GLint pointCrispnessLoc = -1;
   GLint glossModeLoc = -1;
   GLint occlusiveModeLoc = -1;
+  GLint whiteMixLoc = -1;
   bool initAttempted = false;
   bool available = false;
 };
@@ -1388,6 +1389,7 @@ uniform float uLayerAlphaScale;
 uniform float uPointCrispness;
 uniform float uGlossMode;
 uniform float uOcclusiveMode;
+uniform float uWhiteMix;
 varying vec4 vColor;
 float hueToRgbChannel(float p, float q, float t) {
   if (t < 0.0) t += 1.0;
@@ -1447,6 +1449,7 @@ void main() {
   }
   c = clamp(c, 0.0, 1.0);
   c = clamp(c * uBrightnessTrim, 0.0, 1.0);
+  c = mix(c, vec3(0.92, 0.94, 0.98), clamp(uWhiteMix, 0.0, 1.0));
   float layerAlpha = clamp(uLayerAlphaScale, 0.0, 1.0);
   float alpha = clamp(vColor.a * uAlphaGain * layerAlpha, 0.0, 1.0);
   if (uGlossMode > 0.5) {
@@ -1524,6 +1527,7 @@ void main() {
   cache->pointCrispnessLoc = api.getUniformLocation(program, "uPointCrispness");
   cache->glossModeLoc = api.getUniformLocation(program, "uGlossMode");
   cache->occlusiveModeLoc = api.getUniformLocation(program, "uOcclusiveMode");
+  cache->whiteMixLoc = api.getUniformLocation(program, "uWhiteMix");
   cache->available = cache->pointSizeLoc >= 0 &&
                      cache->colorSaturationLoc >= 0 &&
                      cache->brightnessTrimLoc >= 0 &&
@@ -1531,12 +1535,54 @@ void main() {
                      cache->layerAlphaScaleLoc >= 0 &&
                      cache->pointCrispnessLoc >= 0 &&
                      cache->glossModeLoc >= 0 &&
-                     cache->occlusiveModeLoc >= 0;
+                     cache->occlusiveModeLoc >= 0 &&
+                     cache->whiteMixLoc >= 0;
   if (!cache->available) {
     api.deleteProgram(program);
     *cache = PointRenderProgramCache{};
     return false;
   }
+  return true;
+}
+
+bool drawAlphaAwareWhitePointPass(PointRenderProgramCache* cache,
+                                  float pointSize,
+                                  float targetAlpha,
+                                  size_t pointCount) {
+  if (!cache || pointCount == 0 || targetAlpha <= 0.0f || !ensurePointRenderProgram(cache)) {
+    return false;
+  }
+  const ViewerGlComputeApi& renderApi = viewerGlComputeApi();
+  glEnable(GL_BLEND);
+  glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+  glEnable(GL_VERTEX_PROGRAM_POINT_SIZE);
+#ifdef GL_POINT_SPRITE
+  glEnable(GL_POINT_SPRITE);
+#ifdef GL_COORD_REPLACE
+  glTexEnvi(GL_POINT_SPRITE, GL_COORD_REPLACE, GL_TRUE);
+#endif
+#endif
+  renderApi.useProgram(cache->program);
+  renderApi.uniform1f(cache->pointSizeLoc, pointSize);
+  renderApi.uniform1f(cache->colorSaturationLoc, 1.0f);
+  renderApi.uniform1f(cache->brightnessTrimLoc, 1.0f);
+  renderApi.uniform1f(cache->alphaGainLoc, clampf(targetAlpha / 0.72f, 0.0f, 1.0f));
+  renderApi.uniform1f(cache->layerAlphaScaleLoc, 1.0f);
+  renderApi.uniform1f(cache->pointCrispnessLoc, 0.0f);
+  renderApi.uniform1f(cache->glossModeLoc, 0.0f);
+  renderApi.uniform1f(cache->occlusiveModeLoc, 0.0f);
+  renderApi.uniform1f(cache->whiteMixLoc, 1.0f);
+  glDrawArrays(GL_POINTS, 0, static_cast<GLsizei>(pointCount));
+  renderApi.uniform1f(cache->whiteMixLoc, 0.0f);
+  renderApi.useProgram(0);
+#ifdef GL_POINT_SPRITE
+#ifdef GL_COORD_REPLACE
+  glTexEnvi(GL_POINT_SPRITE, GL_COORD_REPLACE, GL_FALSE);
+#endif
+  glDisable(GL_POINT_SPRITE);
+#endif
+  glDisable(GL_VERTEX_PROGRAM_POINT_SIZE);
+  glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
   return true;
 }
 
@@ -24532,8 +24578,10 @@ void drawSecondaryPlotWindow(AppState* app,
   const bool drawAsGlossProjection = glossProjection3DMode && activePointCount > 0u;
   const bool useSquarePoints = !drawAsGlossProjection && payload.pointShape == "Square";
   const bool plainScopeStyle = payload.plotStyle != "Space";
+  const bool alphaMaskedPointCloud = window->derivedMesh.pointCloudMayContainHiddenVerts;
   const bool occlusiveInputCloud =
-      payload.sourceMode == "input" && plainScopeStyle && !drawAsGlossProjection;
+      payload.sourceMode == "input" && plainScopeStyle && !drawAsGlossProjection &&
+      !alphaMaskedPointCloud;
   const float drawCoverage =
       estimatedPointCoverage(pointSize, activePointCount, rect.w, rect.h, useSquarePoints);
   const float denseGlowSuppress =
@@ -24573,8 +24621,7 @@ void drawSecondaryPlotWindow(AppState* app,
                                 useSquarePoints) *
       (drawAsGlossProjection ? 1.0f : (plainScopeStyle ? 1.0f : 0.84f));
   if (drawAsGlossProjection) drawAlphaGain = std::max(1.12f, drawAlphaGain * 1.24f);
-  const bool canDrawUniformPointHaloPasses =
-      !window->derivedMesh.pointCloudMayContainHiddenVerts;
+  const bool canDrawUniformPointHaloPasses = !alphaMaskedPointCloud;
 
   if (!suppressPointsForEmptyImageLasso &&
       glossViewMode && !glossField2DMode &&
@@ -24648,6 +24695,7 @@ void drawSecondaryPlotWindow(AppState* app,
                           drawAsGlossProjection ? payload.glossPointCrispness : 0.0f);
       renderApi.uniform1f(pointRenderProgramCache->glossModeLoc, drawAsGlossProjection ? 1.0f : 0.0f);
       renderApi.uniform1f(pointRenderProgramCache->occlusiveModeLoc, occlusiveInputCloud ? 1.0f : 0.0f);
+      renderApi.uniform1f(pointRenderProgramCache->whiteMixLoc, 0.0f);
     }
     if (drawAsGlossProjection) {
       glEnable(GL_BLEND);
@@ -24680,18 +24728,35 @@ void drawSecondaryPlotWindow(AppState* app,
     }
     if (occlusiveInputCloud) glEnable(GL_BLEND);
     glDepthMask(GL_TRUE);
-    if (!drawAsGlossProjection && canDrawUniformPointHaloPasses) {
+    if (!drawAsGlossProjection &&
+        (canDrawUniformPointHaloPasses ||
+         (alphaMaskedPointCloud && pointRenderProgramCache &&
+          ensurePointRenderProgram(pointRenderProgramCache)))) {
       glDisable(GL_DEPTH_TEST);
-      glDisableClientState(GL_COLOR_ARRAY);
       if (!plainScopeStyle) {
-        glColor4f(0.95f, 0.96f, 1.0f, clampf(0.05f / std::sqrt(densityForView), 0.014f, 0.05f));
-        glPointSize(pointSize * clampf(0.56f / std::sqrt(densityForView), 0.30f, 0.58f));
-        glDrawArrays(GL_POINTS, 0, static_cast<GLsizei>(activePointCount));
+        const float thickeningAlpha = clampf(0.05f / std::sqrt(densityForView), 0.014f, 0.05f);
+        const float thickeningSize = pointSize * clampf(0.56f / std::sqrt(densityForView), 0.30f, 0.58f);
+        if (canDrawUniformPointHaloPasses) {
+          glDisableClientState(GL_COLOR_ARRAY);
+          glColor4f(0.95f, 0.96f, 1.0f, thickeningAlpha);
+          glPointSize(thickeningSize);
+          glDrawArrays(GL_POINTS, 0, static_cast<GLsizei>(activePointCount));
+          glEnableClientState(GL_COLOR_ARRAY);
+        } else {
+          drawAlphaAwareWhitePointPass(pointRenderProgramCache, thickeningSize, thickeningAlpha, activePointCount);
+        }
         const float haloAlpha = clampf(0.06f / densityForView, 0.012f, 0.05f);
         if (haloAlpha > 0.013f) {
-          glColor4f(0.95f, 0.96f, 1.0f, haloAlpha);
-          glPointSize(pointSize * clampf(0.52f / std::sqrt(densityForView), 0.28f, 0.55f));
-          glDrawArrays(GL_POINTS, 0, static_cast<GLsizei>(activePointCount));
+          const float haloSize = pointSize * clampf(0.52f / std::sqrt(densityForView), 0.28f, 0.55f);
+          if (canDrawUniformPointHaloPasses) {
+            glDisableClientState(GL_COLOR_ARRAY);
+            glColor4f(0.95f, 0.96f, 1.0f, haloAlpha);
+            glPointSize(haloSize);
+            glDrawArrays(GL_POINTS, 0, static_cast<GLsizei>(activePointCount));
+            glEnableClientState(GL_COLOR_ARRAY);
+          } else {
+            drawAlphaAwareWhitePointPass(pointRenderProgramCache, haloSize, haloAlpha, activePointCount);
+          }
         }
       } else if (!occlusiveInputCloud) {
         const float thickeningAlpha =
@@ -24699,27 +24764,42 @@ void drawSecondaryPlotWindow(AppState* app,
                    0.0f,
                    0.04f);
         if (thickeningAlpha > 0.006f) {
-          glColor4f(0.90f, 0.92f, 0.96f, thickeningAlpha);
-          glPointSize(pointSize * clampf((0.52f / std::sqrt(densityForView)) *
-                                             (1.0f - 0.32f * whitePassSuppress),
-                                         0.20f,
-                                         0.52f));
-          glDrawArrays(GL_POINTS, 0, static_cast<GLsizei>(activePointCount));
+          const float thickeningSize =
+              pointSize * clampf((0.52f / std::sqrt(densityForView)) *
+                                     (1.0f - 0.32f * whitePassSuppress),
+                                 0.20f,
+                                 0.52f);
+          if (canDrawUniformPointHaloPasses) {
+            glDisableClientState(GL_COLOR_ARRAY);
+            glColor4f(0.90f, 0.92f, 0.96f, thickeningAlpha);
+            glPointSize(thickeningSize);
+            glDrawArrays(GL_POINTS, 0, static_cast<GLsizei>(activePointCount));
+            glEnableClientState(GL_COLOR_ARRAY);
+          } else {
+            drawAlphaAwareWhitePointPass(pointRenderProgramCache, thickeningSize, thickeningAlpha, activePointCount);
+          }
         }
         const float haloAlpha =
             clampf((0.045f / densityForView) * (1.0f - 0.99f * whitePassSuppress),
                    0.0f,
                    0.035f);
         if (haloAlpha > 0.006f) {
-          glColor4f(0.90f, 0.92f, 0.96f, haloAlpha);
-          glPointSize(pointSize * clampf((0.46f / std::sqrt(densityForView)) *
-                                             (1.0f - 0.38f * whitePassSuppress),
-                                         0.18f,
-                                         0.46f));
-          glDrawArrays(GL_POINTS, 0, static_cast<GLsizei>(activePointCount));
+          const float haloSize =
+              pointSize * clampf((0.46f / std::sqrt(densityForView)) *
+                                     (1.0f - 0.38f * whitePassSuppress),
+                                 0.18f,
+                                 0.46f);
+          if (canDrawUniformPointHaloPasses) {
+            glDisableClientState(GL_COLOR_ARRAY);
+            glColor4f(0.90f, 0.92f, 0.96f, haloAlpha);
+            glPointSize(haloSize);
+            glDrawArrays(GL_POINTS, 0, static_cast<GLsizei>(activePointCount));
+            glEnableClientState(GL_COLOR_ARRAY);
+          } else {
+            drawAlphaAwareWhitePointPass(pointRenderProgramCache, haloSize, haloAlpha, activePointCount);
+          }
         }
       }
-      glEnableClientState(GL_COLOR_ARRAY);
       glEnable(GL_DEPTH_TEST);
     }
     glDisableClientState(GL_COLOR_ARRAY);
@@ -29930,7 +30010,9 @@ int main() {
     const float denseColorPreserve =
         denseColorPreservationForPlot(resolved.colorSaturation, resolved.pointSize, densityForView, mesh.resolution);
     const float coverageWhiteSuppress = clampf((drawCoverage - 0.010f) / 0.020f, 0.0f, 1.0f);
-    const float inputCloudWhiteSuppress = (resolved.sourceMode == "input" && plainScopeStyle) ? 0.78f : 0.0f;
+    const bool alphaMaskedPointCloud = mesh.pointCloudMayContainHiddenVerts;
+    const float inputCloudWhiteSuppress =
+        (resolved.sourceMode == "input" && plainScopeStyle && !alphaMaskedPointCloud) ? 0.78f : 0.0f;
     const float saturationWhiteSuppress = clampf((resolved.colorSaturation - 1.0f) / 1.6f, 0.0f, 1.0f);
     const float whitePassSuppress =
         clampf(std::max(std::max(denseGlowSuppress, coverageWhiteSuppress),
@@ -30022,11 +30104,13 @@ int main() {
         drawAlphaGainForPointSize(pointSize, densityForView, mesh.resolution, activePointCount, renderWidth, renderHeight, useSquarePoints) *
         (drawAsGlossProjection ? 1.0f : (plainScopeStyle ? 1.0f : 0.84f));
     if (drawAsGlossProjection) drawAlphaGain = std::max(1.12f, drawAlphaGain * 1.24f);
-    const bool canDrawUniformPointHaloPasses = !mesh.pointCloudMayContainHiddenVerts;
+    const bool canDrawUniformPointHaloPasses = !alphaMaskedPointCloud;
     const bool usePointRenderProgram =
         haveDrawablePointSource && ensurePointRenderProgram(&pointRenderProgramCache) &&
         (drawAsGlossProjection || plainScopeStyle);
-    const bool occlusiveInputCloud = resolved.sourceMode == "input" && plainScopeStyle && !drawAsGlossProjection;
+    const bool occlusiveInputCloud =
+        resolved.sourceMode == "input" && plainScopeStyle && !drawAsGlossProjection &&
+        !alphaMaskedPointCloud;
     if (useSquarePoints || usePointRenderProgram || drawAsGlossProjection) {
       glDisable(GL_POINT_SMOOTH);
     } else {
@@ -30135,6 +30219,7 @@ int main() {
       renderApi.uniform1f(pointRenderProgramCache.pointCrispnessLoc, drawAsGlossProjection ? resolved.glossPointCrispness : 0.0f);
       renderApi.uniform1f(pointRenderProgramCache.glossModeLoc, drawAsGlossProjection ? 1.0f : 0.0f);
       renderApi.uniform1f(pointRenderProgramCache.occlusiveModeLoc, occlusiveInputCloud ? 1.0f : 0.0f);
+      renderApi.uniform1f(pointRenderProgramCache.whiteMixLoc, 0.0f);
     }
     if (drawAsGlossProjection) {
       glEnable(GL_BLEND);
@@ -30220,21 +30305,37 @@ int main() {
     }
     if (occlusiveInputCloud) glEnable(GL_BLEND);
     glDepthMask(GL_TRUE);
-    if (!drawAsGlossProjection && canDrawUniformPointHaloPasses &&
+    if (!drawAsGlossProjection &&
+        (canDrawUniformPointHaloPasses ||
+         (alphaMaskedPointCloud && ensurePointRenderProgram(&pointRenderProgramCache))) &&
         activePointCount > 0 && haveDrawablePointSource) {
       glDisable(GL_DEPTH_TEST);
-      glDisableClientState(GL_COLOR_ARRAY);
       if (!plainScopeStyle) {
         // Keep Space style anchored to the familiar committed draw model and let the newer saturation
         // logic live in the baked point colors instead of runtime draw heuristics.
-        glColor4f(0.95f, 0.96f, 1.0f, clampf(0.05f / std::sqrt(densityForView), 0.014f, 0.05f));
-        glPointSize(pointSize * clampf(0.56f / std::sqrt(densityForView), 0.30f, 0.58f));
-        glDrawArrays(GL_POINTS, 0, static_cast<GLsizei>(activePointCount));
+        const float thickeningAlpha = clampf(0.05f / std::sqrt(densityForView), 0.014f, 0.05f);
+        const float thickeningSize = pointSize * clampf(0.56f / std::sqrt(densityForView), 0.30f, 0.58f);
+        if (canDrawUniformPointHaloPasses) {
+          glDisableClientState(GL_COLOR_ARRAY);
+          glColor4f(0.95f, 0.96f, 1.0f, thickeningAlpha);
+          glPointSize(thickeningSize);
+          glDrawArrays(GL_POINTS, 0, static_cast<GLsizei>(activePointCount));
+          glEnableClientState(GL_COLOR_ARRAY);
+        } else {
+          drawAlphaAwareWhitePointPass(&pointRenderProgramCache, thickeningSize, thickeningAlpha, activePointCount);
+        }
         const float haloAlpha = clampf(0.06f / densityForView, 0.012f, 0.05f);
         if (haloAlpha > 0.013f) {
-          glColor4f(0.95f, 0.96f, 1.0f, haloAlpha);
-          glPointSize(pointSize * clampf(0.52f / std::sqrt(densityForView), 0.28f, 0.55f));
-          glDrawArrays(GL_POINTS, 0, static_cast<GLsizei>(activePointCount));
+          const float haloSize = pointSize * clampf(0.52f / std::sqrt(densityForView), 0.28f, 0.55f);
+          if (canDrawUniformPointHaloPasses) {
+            glDisableClientState(GL_COLOR_ARRAY);
+            glColor4f(0.95f, 0.96f, 1.0f, haloAlpha);
+            glPointSize(haloSize);
+            glDrawArrays(GL_POINTS, 0, static_cast<GLsizei>(activePointCount));
+            glEnableClientState(GL_COLOR_ARRAY);
+          } else {
+            drawAlphaAwareWhitePointPass(&pointRenderProgramCache, haloSize, haloAlpha, activePointCount);
+          }
         }
       } else if (!occlusiveInputCloud) {
         // The white interior thickening/halo passes help sparse plots, but they quickly wash out dense large splats.
@@ -30243,22 +30344,39 @@ int main() {
             clampf((0.04f / std::sqrt(densityForView)) * (1.0f - 0.97f * whitePassSuppress),
                    0.0f, 0.04f);
         if (thickeningAlpha > 0.006f) {
-          glColor4f(0.90f, 0.92f, 0.96f, thickeningAlpha);
-          glPointSize(pointSize * clampf((0.52f / std::sqrt(densityForView)) * (1.0f - 0.32f * whitePassSuppress),
-                                         0.20f, 0.52f));
-          glDrawArrays(GL_POINTS, 0, static_cast<GLsizei>(activePointCount));
+          const float thickeningSize =
+              pointSize * clampf((0.52f / std::sqrt(densityForView)) *
+                                     (1.0f - 0.32f * whitePassSuppress),
+                                 0.20f, 0.52f);
+          if (canDrawUniformPointHaloPasses) {
+            glDisableClientState(GL_COLOR_ARRAY);
+            glColor4f(0.90f, 0.92f, 0.96f, thickeningAlpha);
+            glPointSize(thickeningSize);
+            glDrawArrays(GL_POINTS, 0, static_cast<GLsizei>(activePointCount));
+            glEnableClientState(GL_COLOR_ARRAY);
+          } else {
+            drawAlphaAwareWhitePointPass(&pointRenderProgramCache, thickeningSize, thickeningAlpha, activePointCount);
+          }
         }
         const float haloAlpha =
             clampf((0.045f / densityForView) * (1.0f - 0.99f * whitePassSuppress),
                    0.0f, 0.035f);
         if (haloAlpha > 0.006f) {
-          glColor4f(0.90f, 0.92f, 0.96f, haloAlpha);
-          glPointSize(pointSize * clampf((0.46f / std::sqrt(densityForView)) * (1.0f - 0.38f * whitePassSuppress),
-                                         0.18f, 0.46f));
-          glDrawArrays(GL_POINTS, 0, static_cast<GLsizei>(activePointCount));
+          const float haloSize =
+              pointSize * clampf((0.46f / std::sqrt(densityForView)) *
+                                     (1.0f - 0.38f * whitePassSuppress),
+                                 0.18f, 0.46f);
+          if (canDrawUniformPointHaloPasses) {
+            glDisableClientState(GL_COLOR_ARRAY);
+            glColor4f(0.90f, 0.92f, 0.96f, haloAlpha);
+            glPointSize(haloSize);
+            glDrawArrays(GL_POINTS, 0, static_cast<GLsizei>(activePointCount));
+            glEnableClientState(GL_COLOR_ARRAY);
+          } else {
+            drawAlphaAwareWhitePointPass(&pointRenderProgramCache, haloSize, haloAlpha, activePointCount);
+          }
         }
       }
-      glEnableClientState(GL_COLOR_ARRAY);
       glEnable(GL_DEPTH_TEST);
     }
     if (!suppressPointsForEmptyImageLasso &&

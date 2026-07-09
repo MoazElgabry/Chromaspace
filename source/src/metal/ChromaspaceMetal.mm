@@ -71,6 +71,24 @@ bool chooseSourceOrigin(id<MTLBuffer> src,
   return false;
 }
 
+bool chooseBufferOrigin(id<MTLBuffer> buffer,
+                        int width,
+                        int height,
+                        size_t rowBytes,
+                        int requestedOriginX,
+                        int requestedOriginY,
+                        int* outOriginX,
+                        int* outOriginY) {
+  return chooseSourceOrigin(buffer,
+                            width,
+                            height,
+                            rowBytes,
+                            requestedOriginX,
+                            requestedOriginY,
+                            outOriginX,
+                            outOriginY);
+}
+
 bool sourceRowsFitBuffer(id<MTLBuffer> src,
                          int width,
                          size_t rowBytes,
@@ -1258,13 +1276,24 @@ bool copyHostBuffers(
   id<MTLDevice> device = queue.device;
   if (device == nil) return false;
 
+  int sourceOriginX = originX;
+  int sourceOriginY = originY;
+  if (!chooseBufferOrigin(src, width, height, srcRowBytes, originX, originY, &sourceOriginX, &sourceOriginY)) {
+    return false;
+  }
+  int destinationOriginX = originX;
+  int destinationOriginY = originY;
+  if (!chooseBufferOrigin(dst, width, height, dstRowBytes, originX, originY, &destinationOriginX, &destinationOriginY)) {
+    return false;
+  }
+
   id<MTLCommandBuffer> cmd = [queue commandBuffer];
   if (cmd == nil) return false;
   id<MTLBlitCommandEncoder> blit = [cmd blitCommandEncoder];
   if (blit == nil) return false;
 
-  const size_t srcOffset = offsetForOrigin(srcRowBytes, originX, originY);
-  const size_t dstOffset = offsetForOrigin(dstRowBytes, originX, originY);
+  const size_t srcOffset = offsetForOrigin(srcRowBytes, sourceOriginX, sourceOriginY);
+  const size_t dstOffset = offsetForOrigin(dstRowBytes, destinationOriginX, destinationOriginY);
   if (!encodeCopyRows(blit, src, dst, srcOffset, dstOffset, srcRowBytes, dstRowBytes, width, height)) {
     [blit endEncoding];
     return false;
@@ -1278,7 +1307,18 @@ bool copyHostBuffers(
       [blit endEncoding];
       return false;
     }
-    const size_t overlayDstOffset = offsetForOrigin(dstRowBytes, overlayX, overlayY);
+    const int overlayDestinationX = overlayX - (originX - destinationOriginX);
+    const int overlayDestinationY = overlayY - (originY - destinationOriginY);
+    if (!sourceRangeFitsBuffer(dst,
+                               overlayWidth,
+                               overlayHeight,
+                               dstRowBytes,
+                               overlayDestinationX,
+                               overlayDestinationY)) {
+      [blit endEncoding];
+      return false;
+    }
+    const size_t overlayDstOffset = offsetForOrigin(dstRowBytes, overlayDestinationX, overlayDestinationY);
     if (!encodeCopyRows(blit, overlayBuffer, dst, 0, overlayDstOffset, overlayPackedRowBytes, dstRowBytes, overlayWidth, overlayHeight)) {
       [blit endEncoding];
       return false;
