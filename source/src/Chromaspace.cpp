@@ -7039,6 +7039,7 @@ class ChromaspaceEffect : public ImageEffect {
                                                 rows.data(),
                                                 static_cast<int>(rows.size()),
                                                 bounds.x1,
+                                                bounds.y1,
                                                 args.pMetalCmdQ,
                                                 readback,
                                                 packedRowBytes)) {

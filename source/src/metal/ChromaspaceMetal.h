@@ -185,6 +185,7 @@ bool copySourceRowsToHost(
     const int* rows,
     int rowCount,
     int originX,
+    int originY,
     void* metalCommandQueue,
     float* readbackSrc,
     size_t readbackSrcRowBytes);

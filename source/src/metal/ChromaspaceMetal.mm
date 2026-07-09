@@ -26,6 +26,75 @@ inline size_t offsetForOrigin(size_t rowBytes, int originX, int originY) {
   return static_cast<size_t>(originY) * rowBytes + static_cast<size_t>(originX) * 4u * sizeof(float);
 }
 
+bool sourceRangeFitsBuffer(id<MTLBuffer> src,
+                           int width,
+                           int height,
+                           size_t rowBytes,
+                           int originX,
+                           int originY) {
+  if (src == nil || width <= 0 || height <= 0 || rowBytes == 0 || originX < 0 || originY < 0) return false;
+  const size_t packedRowBytes = packedRowBytesForWidth(width);
+  if (packedRowBytes == 0 || rowBytes < packedRowBytes) return false;
+  const unsigned long long rowBytes64 = static_cast<unsigned long long>(rowBytes);
+  const unsigned long long packed64 = static_cast<unsigned long long>(packedRowBytes);
+  const unsigned long long x64 = static_cast<unsigned long long>(originX) * 4ull * static_cast<unsigned long long>(sizeof(float));
+  const unsigned long long y64 = static_cast<unsigned long long>(originY);
+  const unsigned long long h64 = static_cast<unsigned long long>(height - 1);
+  const unsigned long long start = y64 * rowBytes64 + x64;
+  const unsigned long long end = start + h64 * rowBytes64 + packed64;
+  return end <= static_cast<unsigned long long>(src.length);
+}
+
+bool chooseSourceOrigin(id<MTLBuffer> src,
+                        int width,
+                        int height,
+                        size_t rowBytes,
+                        int requestedOriginX,
+                        int requestedOriginY,
+                        int* outOriginX,
+                        int* outOriginY) {
+  if (!outOriginX || !outOriginY) return false;
+  // Resolve Metal buffers may be addressed either in absolute OFX coordinates
+  // or as an origin-relative image buffer. Pick the address model that fits the
+  // actual MTLBuffer length so viewer payloads fail safe instead of reading past
+  // the source allocation.
+  if (sourceRangeFitsBuffer(src, width, height, rowBytes, requestedOriginX, requestedOriginY)) {
+    *outOriginX = requestedOriginX;
+    *outOriginY = requestedOriginY;
+    return true;
+  }
+  if (sourceRangeFitsBuffer(src, width, height, rowBytes, 0, 0)) {
+    *outOriginX = 0;
+    *outOriginY = 0;
+    return true;
+  }
+  return false;
+}
+
+bool sourceRowsFitBuffer(id<MTLBuffer> src,
+                         int width,
+                         size_t rowBytes,
+                         const int* rows,
+                         int rowCount,
+                         int originX,
+                         int rowDelta) {
+  if (src == nil || width <= 0 || rowBytes == 0 || !rows || rowCount <= 0 || originX < 0) return false;
+  const size_t packedRowBytes = packedRowBytesForWidth(width);
+  if (packedRowBytes == 0 || rowBytes < packedRowBytes) return false;
+  const unsigned long long rowBytes64 = static_cast<unsigned long long>(rowBytes);
+  const unsigned long long packed64 = static_cast<unsigned long long>(packedRowBytes);
+  const unsigned long long x64 = static_cast<unsigned long long>(originX) * 4ull * static_cast<unsigned long long>(sizeof(float));
+  const unsigned long long length64 = static_cast<unsigned long long>(src.length);
+  for (int i = 0; i < rowCount; ++i) {
+    const long long row = static_cast<long long>(rows[i]) + static_cast<long long>(rowDelta);
+    if (row < 0) return false;
+    const unsigned long long start = static_cast<unsigned long long>(row) * rowBytes64 + x64;
+    const unsigned long long end = start + packed64;
+    if (end > length64) return false;
+  }
+  return true;
+}
+
 bool checkedProductToInt(int a, int b, int* out) {
   if (!out || a < 0 || b < 0) return false;
   const long long product = static_cast<long long>(a) * static_cast<long long>(b);
@@ -622,6 +691,13 @@ bool buildWholeImageCloud(const Request& request, Result* out) {
     if (queue == nil || src == nil || queue.device == nil) { out->error = "metal-unavailable"; return false; }
     PipelineBundle pipelines{};
     if (!ensurePipelines(queue.device, &pipelines, &out->error)) return false;
+    int sourceOriginX = request.originX;
+    int sourceOriginY = request.originY;
+    if (!chooseSourceOrigin(src, request.width, request.height, request.srcRowBytes,
+                            request.originX, request.originY, &sourceOriginX, &sourceOriginY)) {
+      out->error = "metal-source-range-out-of-bounds";
+      return false;
+    }
 
     const int binsPerAxis = request.preserveOverflow != 0 ? 18 : 16;
     const std::size_t occupancyCount = static_cast<std::size_t>(binsPerAxis * binsPerAxis * binsPerAxis);
@@ -643,7 +719,7 @@ bool buildWholeImageCloud(const Request& request, Result* out) {
 
     WholeImageRequestGpu gpuRequest{};
     gpuRequest.width = request.width; gpuRequest.height = request.height;
-    gpuRequest.originX = request.originX; gpuRequest.originY = request.originY;
+    gpuRequest.originX = sourceOriginX; gpuRequest.originY = sourceOriginY;
     gpuRequest.srcRowFloats = static_cast<uint32_t>(request.srcRowBytes / sizeof(float));
     gpuRequest.scaledWidth = request.scaledWidth; gpuRequest.scaledHeight = request.scaledHeight;
     gpuRequest.pointCount = request.pointCount; gpuRequest.candidateTarget = request.candidateTarget;
@@ -742,6 +818,13 @@ bool detectGrayRampLayout(const RampLayoutRequest& request, RampLayoutResult* ou
       out->error = "metal-unavailable";
       return false;
     }
+    int sourceOriginX = request.originX;
+    int sourceOriginY = request.originY;
+    if (!chooseSourceOrigin(src, request.width, request.height, request.srcRowBytes,
+                            request.originX, request.originY, &sourceOriginX, &sourceOriginY)) {
+      out->error = "metal-ramp-layout-source-range-out-of-bounds";
+      return false;
+    }
     PipelineBundle pipelines{};
     if (!ensurePipelines(queue.device, &pipelines, &out->error)) return false;
     id<MTLBuffer> scoresBuffer = [queue.device newBufferWithLength:2u * sizeof(float)
@@ -753,8 +836,8 @@ bool detectGrayRampLayout(const RampLayoutRequest& request, RampLayoutResult* ou
     RampLayoutRequestGpu gpuRequest{};
     gpuRequest.width = request.width;
     gpuRequest.height = request.height;
-    gpuRequest.originX = request.originX;
-    gpuRequest.originY = request.originY;
+    gpuRequest.originX = sourceOriginX;
+    gpuRequest.originY = sourceOriginY;
     gpuRequest.srcRowFloats = static_cast<uint32_t>(request.srcRowBytes / sizeof(float));
     for (int i = 0; i < 2; ++i) {
       gpuRequest.candidateY1[i] = request.candidateY1[i];
@@ -806,6 +889,13 @@ bool buildIdentityStripCloud(const StripRequest& request, StripResult* out) {
     id<MTLCommandQueue> queue = (__bridge id<MTLCommandQueue>)request.metalCommandQueue;
     id<MTLBuffer> src = (__bridge id<MTLBuffer>)request.srcMetalBuffer;
     if (queue == nil || src == nil || queue.device == nil) { out->error = "metal-unavailable"; return false; }
+    int sourceOriginX = request.originX;
+    int sourceOriginY = request.originY;
+    if (!chooseSourceOrigin(src, request.width, request.height, request.srcRowBytes,
+                            request.originX, request.originY, &sourceOriginX, &sourceOriginY)) {
+      out->error = "metal-strip-source-range-out-of-bounds";
+      return false;
+    }
     PipelineBundle pipelines{};
     if (!ensurePipelines(queue.device, &pipelines, &out->error)) return false;
 
@@ -828,7 +918,7 @@ bool buildIdentityStripCloud(const StripRequest& request, StripResult* out) {
 
     StripRequestGpu gpuRequest{};
     gpuRequest.width = request.width; gpuRequest.height = request.height;
-    gpuRequest.originX = request.originX; gpuRequest.originY = request.originY;
+    gpuRequest.originX = sourceOriginX; gpuRequest.originY = sourceOriginY;
     gpuRequest.srcRowFloats = static_cast<uint32_t>(request.srcRowBytes / sizeof(float));
     gpuRequest.resolution = request.resolution; gpuRequest.preserveOverflow = request.preserveOverflow;
     gpuRequest.plotDisplayLinearEnabled = request.plotDisplayLinearEnabled; gpuRequest.plotDisplayLinearTransfer = request.plotDisplayLinearTransfer;
@@ -904,6 +994,13 @@ bool buildWholeImageAndIdentityStripCloud(const Request& wholeImageRequest, cons
       out->error = "metal-unavailable";
       return false;
     }
+    int sourceOriginX = wholeImageRequest.originX;
+    int sourceOriginY = wholeImageRequest.originY;
+    if (!chooseSourceOrigin(src, wholeImageRequest.width, wholeImageRequest.height, wholeImageRequest.srcRowBytes,
+                            wholeImageRequest.originX, wholeImageRequest.originY, &sourceOriginX, &sourceOriginY)) {
+      out->error = "metal-combined-source-range-out-of-bounds";
+      return false;
+    }
 
     PipelineBundle pipelines{};
     if (!ensurePipelines(queue.device, &pipelines, &out->error)) return false;
@@ -962,8 +1059,8 @@ bool buildWholeImageAndIdentityStripCloud(const Request& wholeImageRequest, cons
     WholeImageRequestGpu wholeGpuRequest{};
     wholeGpuRequest.width = wholeImageRequest.width;
     wholeGpuRequest.height = wholeImageRequest.height;
-    wholeGpuRequest.originX = wholeImageRequest.originX;
-    wholeGpuRequest.originY = wholeImageRequest.originY;
+    wholeGpuRequest.originX = sourceOriginX;
+    wholeGpuRequest.originY = sourceOriginY;
     wholeGpuRequest.srcRowFloats = static_cast<uint32_t>(wholeImageRequest.srcRowBytes / sizeof(float));
     wholeGpuRequest.scaledWidth = wholeImageRequest.scaledWidth;
     wholeGpuRequest.scaledHeight = wholeImageRequest.scaledHeight;
@@ -1001,8 +1098,8 @@ bool buildWholeImageAndIdentityStripCloud(const Request& wholeImageRequest, cons
     StripRequestGpu stripGpuRequest{};
     stripGpuRequest.width = stripRequest.width;
     stripGpuRequest.height = stripRequest.height;
-    stripGpuRequest.originX = stripRequest.originX;
-    stripGpuRequest.originY = stripRequest.originY;
+    stripGpuRequest.originX = sourceOriginX;
+    stripGpuRequest.originY = sourceOriginY;
     stripGpuRequest.srcRowFloats = static_cast<uint32_t>(stripRequest.srcRowBytes / sizeof(float));
     stripGpuRequest.resolution = stripRequest.resolution;
     stripGpuRequest.preserveOverflow = stripRequest.preserveOverflow;
@@ -1210,6 +1307,11 @@ bool copySourceToHost(
   id<MTLCommandQueue> queue = (__bridge id<MTLCommandQueue>)metalCommandQueue;
   id<MTLBuffer> src = (__bridge id<MTLBuffer>)srcMetalBuffer;
   if (queue == nil || src == nil || queue.device == nil) return false;
+  int sourceOriginX = originX;
+  int sourceOriginY = originY;
+  if (!chooseSourceOrigin(src, width, height, srcRowBytes, originX, originY, &sourceOriginX, &sourceOriginY)) {
+    return false;
+  }
 
   const size_t readbackBytes = readbackSrcRowBytes * static_cast<size_t>(height);
   id<MTLBuffer> readbackBuffer =
@@ -1221,7 +1323,7 @@ bool copySourceToHost(
   id<MTLBlitCommandEncoder> blit = [cmd blitCommandEncoder];
   if (blit == nil) return false;
 
-  const size_t srcOffset = offsetForOrigin(srcRowBytes, originX, originY);
+  const size_t srcOffset = offsetForOrigin(srcRowBytes, sourceOriginX, sourceOriginY);
   if (!encodeCopyRows(blit, src, readbackBuffer, srcOffset, 0, srcRowBytes, readbackSrcRowBytes, width, height)) {
     [blit endEncoding];
     return false;
@@ -1242,6 +1344,7 @@ bool copySourceRowsToHost(
     const int* rows,
     int rowCount,
     int originX,
+    int originY,
     void* metalCommandQueue,
     float* readbackSrc,
     size_t readbackSrcRowBytes) {
@@ -1252,6 +1355,15 @@ bool copySourceRowsToHost(
   id<MTLCommandQueue> queue = (__bridge id<MTLCommandQueue>)metalCommandQueue;
   id<MTLBuffer> src = (__bridge id<MTLBuffer>)srcMetalBuffer;
   if (queue == nil || src == nil || queue.device == nil) return false;
+  int sourceOriginX = originX;
+  int sourceRowDelta = 0;
+  if (!sourceRowsFitBuffer(src, width, srcRowBytes, rows, rowCount, originX, 0)) {
+    if (!sourceRowsFitBuffer(src, width, srcRowBytes, rows, rowCount, 0, -originY)) {
+      return false;
+    }
+    sourceOriginX = 0;
+    sourceRowDelta = -originY;
+  }
 
   const size_t packedRowBytes = packedRowBytesForWidth(width);
   const size_t readbackBytes = readbackSrcRowBytes * static_cast<size_t>(rowCount);
@@ -1264,9 +1376,14 @@ bool copySourceRowsToHost(
   id<MTLBlitCommandEncoder> blit = [cmd blitCommandEncoder];
   if (blit == nil) return false;
 
-  const size_t originXOffset = static_cast<size_t>(originX) * 4u * sizeof(float);
+  const size_t originXOffset = static_cast<size_t>(sourceOriginX) * 4u * sizeof(float);
   for (int i = 0; i < rowCount; ++i) {
-    const size_t srcOffset = static_cast<size_t>(rows[i]) * srcRowBytes + originXOffset;
+    const int row = rows[i] + sourceRowDelta;
+    if (row < 0) {
+      [blit endEncoding];
+      return false;
+    }
+    const size_t srcOffset = static_cast<size_t>(row) * srcRowBytes + originXOffset;
     const size_t dstOffset = static_cast<size_t>(i) * readbackSrcRowBytes;
     [blit copyFromBuffer:src sourceOffset:srcOffset toBuffer:readbackBuffer destinationOffset:dstOffset size:packedRowBytes];
   }
