@@ -1293,6 +1293,8 @@ struct AnalyticalScopeComputeCache {
   GLint rangeMinLoc = -1;
   GLint invRangeLoc = -1;
   GLint excludeOverflowLoc = -1;
+  GLint channelCountLoc = -1;
+  GLint lumaMethodLoc = -1;
   bool initAttempted = false;
   bool available = false;
 };
@@ -6774,7 +6776,9 @@ bool payloadAllowsIntentionalEmptyPlot(const ResolvedPayload& payload) {
          payload.viewerState.waveformMode != 2 &&
          !payload.viewerState.waveformChannelRed &&
          !payload.viewerState.waveformChannelGreen &&
-         !payload.viewerState.waveformChannelBlue;
+         !payload.viewerState.waveformChannelBlue &&
+         (payload.viewerState.waveformMode != 1 ||
+          !payload.viewerState.waveformChannelLuma);
 }
 
 InputCloudPayload makeSyntheticIdentityReadPreviewCloud(const ResolvedPayload& payload) {
@@ -7342,6 +7346,7 @@ void appendViewerStateCommandFields(std::ostringstream& os,
      << ",\"waveformChannelRed\":" << (s.waveformChannelRed ? 1 : 0)
      << ",\"waveformChannelGreen\":" << (s.waveformChannelGreen ? 1 : 0)
      << ",\"waveformChannelBlue\":" << (s.waveformChannelBlue ? 1 : 0)
+     << ",\"waveformChannelLuma\":" << (s.waveformChannelLuma ? 1 : 0)
      << ",\"waveformShowOverflow\":" << (s.waveformShowOverflow ? 1 : 0)
      << ",\"waveformHighlightOverflow\":" << (s.waveformHighlightOverflow ? 1 : 0)
      << ",\"waveformLumaMethod\":" << s.waveformLumaMethod
@@ -7561,6 +7566,7 @@ bool parseParamsMessage(const std::string& line, ResolvedPayload* out) {
   int waveformChannelRed = 1;
   int waveformChannelGreen = 1;
   int waveformChannelBlue = 1;
+  int waveformChannelLuma = 0;
   int waveformShowOverflow = 1;
   int waveformHighlightOverflow = 1;
   int waveformLumaMethod = 0;
@@ -7585,6 +7591,7 @@ bool parseParamsMessage(const std::string& line, ResolvedPayload* out) {
   extractInt(line, "waveformChannelRed", &waveformChannelRed);
   extractInt(line, "waveformChannelGreen", &waveformChannelGreen);
   extractInt(line, "waveformChannelBlue", &waveformChannelBlue);
+  extractInt(line, "waveformChannelLuma", &waveformChannelLuma);
   extractInt(line, "waveformShowOverflow", &waveformShowOverflow);
   extractInt(line, "waveformHighlightOverflow", &waveformHighlightOverflow);
   extractInt(line, "waveformLumaMethod", &waveformLumaMethod);
@@ -7712,6 +7719,7 @@ bool parseParamsMessage(const std::string& line, ResolvedPayload* out) {
   p.viewerState.waveformChannelRed = waveformChannelRed != 0;
   p.viewerState.waveformChannelGreen = waveformChannelGreen != 0;
   p.viewerState.waveformChannelBlue = waveformChannelBlue != 0;
+  p.viewerState.waveformChannelLuma = waveformChannelLuma != 0;
   p.viewerState.waveformShowOverflow = waveformShowOverflow != 0;
   p.viewerState.waveformHighlightOverflow = waveformHighlightOverflow != 0;
   p.viewerState.waveformLumaMethod = waveformLumaMethod;
@@ -10836,14 +10844,76 @@ constexpr float kScopePlotBottom = -0.88f;
 constexpr float kScopePlotTop = 0.88f;
 constexpr float kScopePlotWidth = kScopePlotRight - kScopePlotLeft;
 constexpr float kScopePlotHeight = kScopePlotTop - kScopePlotBottom;
+constexpr int kWaveformRgbChannelCount = 3;
+constexpr int kWaveformParadeChannelCount = 4;
+constexpr int kWaveformLumaChannelIndex = 3;
+constexpr float kWaveformDefaultDotSize = 0.25f;
 
 Vec3 analyticalScopeChannelColor(int channel, bool lumaOnly) {
   if (lumaOnly) return Vec3{0.88f, 0.92f, 0.96f};
   switch (std::clamp(channel, 0, 2)) {
-    case 0: return Vec3{1.00f, 0.16f, 0.12f};
-    case 1: return Vec3{0.20f, 1.00f, 0.28f};
-    default: return Vec3{0.24f, 0.52f, 1.00f};
+    case 0: return Vec3{1.00f, 0.12f, 0.04f};
+    case 1: return Vec3{0.12f, 1.00f, 0.24f};
+    default: return Vec3{0.20f, 0.46f, 1.00f};
   }
+}
+
+float effectiveWaveformDisplaySaturation(float sliderValue) {
+  constexpr float kMinimumRgbChroma = 0.34f;
+  return kMinimumRgbChroma + (1.0f - kMinimumRgbChroma) * clampf(sliderValue, 0.0f, 1.0f);
+}
+
+Vec3 applyWaveformDisplaySaturation(Vec3 color, float sliderValue) {
+  const float luma = 0.2126f * color.x + 0.7152f * color.y + 0.0722f * color.z;
+  const float saturation = effectiveWaveformDisplaySaturation(sliderValue);
+  return Vec3{
+      clampf(luma + (color.x - luma) * saturation, 0.0f, 1.0f),
+      clampf(luma + (color.y - luma) * saturation, 0.0f, 1.0f),
+      clampf(luma + (color.z - luma) * saturation, 0.0f, 1.0f)};
+}
+
+Vec3 waveformRgbDensityColor(float red, float green, float blue, float saturation) {
+  const Vec3 redHue = analyticalScopeChannelColor(0, false);
+  const Vec3 greenHue = analyticalScopeChannelColor(1, false);
+  const Vec3 blueHue = analyticalScopeChannelColor(2, false);
+  Vec3 color{
+      redHue.x * red + greenHue.x * green + blueHue.x * blue,
+      redHue.y * red + greenHue.y * green + blueHue.y * blue,
+      redHue.z * red + greenHue.z * green + blueHue.z * blue};
+  const float peak = std::max(color.x, std::max(color.y, color.z));
+  if (peak > 1.0f) {
+    color.x /= peak;
+    color.y /= peak;
+    color.z /= peak;
+  }
+  return applyWaveformDisplaySaturation(color, saturation);
+}
+
+float waveformScopeDisplayPointSize(const MeshData& mesh,
+                                    bool paradeLumaEnabled,
+                                    double waveformDotSize,
+                                    int width,
+                                    int height,
+                                    float orthoHalfExtent) {
+  const float pixelsPerWorldX =
+      static_cast<float>(std::max(1, width)) / std::max(1e-4f, 2.0f * orthoHalfExtent);
+  const float pixelsPerWorldY =
+      static_cast<float>(std::max(1, height)) / std::max(1e-4f, 2.0f * orthoHalfExtent);
+  const int paradeLaneCount =
+      mesh.scopeMode == 1 ? (paradeLumaEnabled ? 4 : 3) : 1;
+  const float xSpacing =
+      (kScopePlotWidth * pixelsPerWorldX) /
+      static_cast<float>(std::max(1, mesh.scopeWidth * paradeLaneCount));
+  const float ySpacing =
+      (kScopePlotHeight * pixelsPerWorldY) /
+      static_cast<float>(std::max(1, mesh.scopeHeight));
+  const float sampleCellPixels =
+      std::sqrt(std::max(0.01f, xSpacing * ySpacing));
+  const float baseSize = clampf(0.34f + 1.18f * sampleCellPixels, 1.05f, 5.25f);
+  const float dotSize =
+      clampf(static_cast<float>(waveformDotSize), 0.05f, 1.5f);
+  const float dotScale = std::sqrt(dotSize / kWaveformDefaultDotSize);
+  return clampf(baseSize * dotScale, 0.35f, 8.0f);
 }
 
 Vec3 analyticalScopeOverflowColor(int channel, bool lumaOnly, bool highlighted) {
@@ -10863,7 +10933,8 @@ void reconstructWaveformDensity(std::vector<float>* density,
                                  int channelCount) {
   if (!density || width <= 0 || height <= 0 || channelCount <= 0) return;
   const size_t expected =
-      static_cast<size_t>(width) * static_cast<size_t>(height) * 3u;
+      static_cast<size_t>(width) * static_cast<size_t>(height) *
+      static_cast<size_t>(channelCount);
   if (density->size() < expected) return;
   std::vector<float> horizontal(expected, 0.0f);
   // Scope reconstruction only bridges gaps between sampled image columns.
@@ -10896,6 +10967,8 @@ bool buildAnalyticalScopeDensityCuda(const ViewerGpuCapabilities& gpuCaps,
                                      float rangeMin,
                                      float invRange,
                                      bool excludeOverflow,
+                                     int channelCount,
+                                     int lumaMethod,
                                      std::vector<float>* outDensity,
                                      std::string* reason) {
 #if defined(CHROMASPACE_VIEWER_HAS_CUDA) && !defined(__APPLE__)
@@ -10925,6 +10998,8 @@ bool buildAnalyticalScopeDensityCuda(const ViewerGpuCapabilities& gpuCaps,
   request.rangeMin = rangeMin;
   request.invRange = invRange;
   request.excludeOverflow = excludeOverflow ? 1 : 0;
+  request.channelCount = std::max(1, channelCount);
+  request.lumaMethod = std::clamp(lumaMethod, 0, 3);
   std::string error;
   if (!ChromaspaceCuda::buildScopeDensity(request, packed, outDensity, &error)) {
     if (reason) *reason = error.empty() ? std::string("cuda-runtime") : error;
@@ -10942,6 +11017,8 @@ bool buildAnalyticalScopeDensityCuda(const ViewerGpuCapabilities& gpuCaps,
   (void)rangeMin;
   (void)invRange;
   (void)excludeOverflow;
+  (void)channelCount;
+  (void)lumaMethod;
   (void)outDensity;
   if (reason) *reason = "cuda-unavailable";
   return false;
@@ -10957,6 +11034,8 @@ bool buildAnalyticalScopeDensityMetal(const ViewerGpuCapabilities& gpuCaps,
                                       float rangeMin,
                                       float invRange,
                                       bool excludeOverflow,
+                                      int channelCount,
+                                      int lumaMethod,
                                       std::vector<float>* outDensity,
                                       std::string* reason) {
 #if defined(__APPLE__)
@@ -10983,6 +11062,8 @@ bool buildAnalyticalScopeDensityMetal(const ViewerGpuCapabilities& gpuCaps,
   request.rangeMin = rangeMin;
   request.invRange = invRange;
   request.excludeOverflow = excludeOverflow ? 1 : 0;
+  request.channelCount = std::max(1, channelCount);
+  request.lumaMethod = std::clamp(lumaMethod, 0, 3);
   std::string error;
   if (!ChromaspaceMetal::buildScopeDensity(request, packed, outDensity, &error)) {
     if (reason) *reason = error.empty() ? std::string("metal-runtime") : error;
@@ -11000,6 +11081,8 @@ bool buildAnalyticalScopeDensityMetal(const ViewerGpuCapabilities& gpuCaps,
   (void)rangeMin;
   (void)invRange;
   (void)excludeOverflow;
+  (void)channelCount;
+  (void)lumaMethod;
   (void)outDensity;
   if (reason) *reason = "metal-unavailable";
   return false;
@@ -11026,8 +11109,11 @@ uniform int uHeight;
 uniform float uRangeMin;
 uniform float uInvRange;
 uniform int uExcludeOverflow;
+uniform int uChannelCount;
+uniform int uLumaMethod;
 
 void accumulate(int channel, float xNorm, float value) {
+  if (channel < 0 || channel >= max(uChannelCount, 1)) return;
   if (uExcludeOverflow != 0 && (value < 0.0 || value > 1.0)) return;
   int x = clamp(int(xNorm * float(uWidth)), 0, uWidth - 1);
   int signalBins = uWaveform != 0 ? uHeight : uWidth;
@@ -11036,6 +11122,13 @@ void accumulate(int channel, float xNorm, float value) {
       ? (channel * uWidth + x) * uHeight + y
       : channel * uWidth + y;
   atomicAdd(density[index], 1u);
+}
+
+float scopeLuma(float r, float g, float b, int method) {
+  if (method == 1) return 0.2627 * r + 0.6780 * g + 0.0593 * b;
+  if (method == 2) return 0.2990 * r + 0.5870 * g + 0.1140 * b;
+  if (method == 3) return (r + g + b) / 3.0;
+  return 0.2126 * r + 0.7152 * g + 0.0722 * b;
 }
 
 void main() {
@@ -11049,11 +11142,14 @@ void main() {
   bool lumaOnly = (uWaveform != 0 && uScopeMode == 2) ||
                   (uWaveform == 0 && uScopeMode == 1);
   if (lumaOnly) {
-    accumulate(0, xNorm, 0.2126 * r + 0.7152 * g + 0.0722 * b);
+    accumulate(0, xNorm, scopeLuma(r, g, b, uLumaMethod));
   } else {
     accumulate(0, xNorm, r);
     accumulate(1, xNorm, g);
     accumulate(2, xNorm, b);
+    if (uWaveform != 0 && uScopeMode == 1 && uChannelCount >= 4) {
+      accumulate(3, xNorm, scopeLuma(r, g, b, uLumaMethod));
+    }
   }
 }
 )GLSL";
@@ -11089,6 +11185,8 @@ void main() {
   cache->rangeMinLoc = api.getUniformLocation(cache->program, "uRangeMin");
   cache->invRangeLoc = api.getUniformLocation(cache->program, "uInvRange");
   cache->excludeOverflowLoc = api.getUniformLocation(cache->program, "uExcludeOverflow");
+  cache->channelCountLoc = api.getUniformLocation(cache->program, "uChannelCount");
+  cache->lumaMethodLoc = api.getUniformLocation(cache->program, "uLumaMethod");
   cache->available = true;
   return true;
 }
@@ -11101,6 +11199,8 @@ bool buildAnalyticalScopeDensityGlCompute(const std::vector<InputCloudSample>& s
                                           float rangeMin,
                                           float invRange,
                                           bool excludeOverflow,
+                                          int channelCount,
+                                          int lumaMethod,
                                           std::vector<float>* outDensity) {
   if (!outDensity || samples.empty() || width <= 0 || height <= 0) return false;
   static AnalyticalScopeComputeCache cache{};
@@ -11118,7 +11218,9 @@ bool buildAnalyticalScopeDensityGlCompute(const std::vector<InputCloudSample>& s
   for (const auto& sample : samples) {
     packed.insert(packed.end(), {sample.xNorm, sample.yNorm, sample.r, sample.g, sample.b});
   }
-  const size_t binCount = static_cast<size_t>(width) * static_cast<size_t>(height) * 3u;
+  const int safeChannelCount = std::max(1, channelCount);
+  const size_t binCount = static_cast<size_t>(width) * static_cast<size_t>(height) *
+                          static_cast<size_t>(safeChannelCount);
   std::vector<unsigned int> zeroBins(binCount, 0u);
   bufferApi.bindBuffer(GL_SHADER_STORAGE_BUFFER, cache.input);
   bufferApi.bufferData(GL_SHADER_STORAGE_BUFFER,
@@ -11139,6 +11241,8 @@ bool buildAnalyticalScopeDensityGlCompute(const std::vector<InputCloudSample>& s
   computeApi.uniform1f(cache.rangeMinLoc, rangeMin);
   computeApi.uniform1f(cache.invRangeLoc, invRange);
   computeApi.uniform1i(cache.excludeOverflowLoc, excludeOverflow ? 1 : 0);
+  computeApi.uniform1i(cache.channelCountLoc, safeChannelCount);
+  computeApi.uniform1i(cache.lumaMethodLoc, std::clamp(lumaMethod, 0, 3));
   computeApi.bindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, cache.input);
   computeApi.bindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, cache.density);
   computeApi.dispatchCompute(static_cast<GLuint>((samples.size() + 255u) / 256u), 1u, 1u);
@@ -11163,7 +11267,7 @@ bool validateAnalyticalScopeComputeStartup() {
   };
   std::vector<float> density;
   if (!buildAnalyticalScopeDensityGlCompute(
-          samples, true, 0, 8, 8, 0.0f, 1.0f, false, &density)) {
+          samples, true, 0, 8, 8, 0.0f, 1.0f, false, 3, 0, &density)) {
     return false;
   }
   const float total = std::accumulate(density.begin(), density.end(), 0.0f);
@@ -11201,6 +11305,12 @@ std::pair<float, float> analyticalScopeRange(const ResolvedPayload& payload,
           includeRangeValue(sample.g)) values.push_back(sample.g);
       if ((!waveform || payload.viewerState.waveformChannelBlue) &&
           includeRangeValue(sample.b)) values.push_back(sample.b);
+      if (waveform && payload.viewerState.waveformMode == 1 &&
+          payload.viewerState.waveformChannelLuma) {
+        const float value =
+            analyticalScopeLuma(sample, payload.viewerState.waveformLumaMethod);
+        if (includeRangeValue(value)) values.push_back(value);
+      }
     }
   }
   if (values.empty()) return {0.0f, 1.0f};
@@ -11341,7 +11451,9 @@ bool buildAnalyticalScopeMeshCpu(const ResolvedPayload& payload,
             : std::max(1,
                        static_cast<int>(samples.size() /
                                         static_cast<size_t>(kPositionBins)));
-    mesh.scopeDensity.assign(static_cast<size_t>(kPositionBins * kSignalBins * 3), 0.0f);
+    const bool paradeLumaEnabled = mesh.scopeMode == 1 && payload.viewerState.waveformChannelLuma;
+    const int channelCount = lumaOnly ? 1 : (paradeLumaEnabled ? 4 : 3);
+    mesh.scopeDensity.assign(static_cast<size_t>(kPositionBins * kSignalBins * channelCount), 0.0f);
     auto accumulate = [&](int channel, float xNorm, float value) {
       const int x = std::clamp(static_cast<int>(xNorm * static_cast<float>(kPositionBins)), 0, kPositionBins - 1);
       const int y = std::clamp(static_cast<int>((value - range.first) * invRange * static_cast<float>(kSignalBins)), 0, kSignalBins - 1);
@@ -11350,7 +11462,6 @@ bool buildAnalyticalScopeMeshCpu(const ResolvedPayload& payload,
     };
     std::string densityBackendReason;
     const bool metalDensityReady =
-        (!lumaOnly || payload.viewerState.waveformLumaMethod == 0) &&
         gpuCaps &&
         buildAnalyticalScopeDensityMetal(*gpuCaps,
                                          samples,
@@ -11361,11 +11472,12 @@ bool buildAnalyticalScopeMeshCpu(const ResolvedPayload& payload,
                                          range.first,
                                          invRange,
                                          true,
+                                         channelCount,
+                                         payload.viewerState.waveformLumaMethod,
                                          &mesh.scopeDensity,
                                          &densityBackendReason);
     const bool cudaDensityReady =
         !metalDensityReady &&
-        (!lumaOnly || payload.viewerState.waveformLumaMethod == 0) &&
         gpuCaps &&
         buildAnalyticalScopeDensityCuda(*gpuCaps,
                                         samples,
@@ -11376,11 +11488,12 @@ bool buildAnalyticalScopeMeshCpu(const ResolvedPayload& payload,
                                         range.first,
                                         invRange,
                                         true,
+                                        channelCount,
+                                        payload.viewerState.waveformLumaMethod,
                                         &mesh.scopeDensity,
                                         &densityBackendReason);
     const bool glDensityReady =
         !cudaDensityReady &&
-        (!lumaOnly || payload.viewerState.waveformLumaMethod == 0) &&
         buildAnalyticalScopeDensityGlCompute(samples,
                                              true,
                                              mesh.scopeMode,
@@ -11389,6 +11502,8 @@ bool buildAnalyticalScopeMeshCpu(const ResolvedPayload& payload,
                                              range.first,
                                              invRange,
                                              true,
+                                             channelCount,
+                                             payload.viewerState.waveformLumaMethod,
                                              &mesh.scopeDensity);
     const bool gpuDensityReady = metalDensityReady || cudaDensityReady || glDensityReady;
     if (metalDensityReady) {
@@ -11419,16 +11534,23 @@ bool buildAnalyticalScopeMeshCpu(const ResolvedPayload& payload,
           if (sample.b >= 0.0f && sample.b <= 1.0f) {
             accumulate(2, sample.xNorm, sample.b);
           }
+          if (paradeLumaEnabled) {
+            const float value =
+                analyticalScopeLuma(sample, payload.viewerState.waveformLumaMethod);
+            if (value >= 0.0f && value <= 1.0f) {
+              accumulate(kWaveformLumaChannelIndex, sample.xNorm, value);
+            }
+          }
         }
       }
     }
-    const int channelCount = lumaOnly ? 1 : 3;
-    const bool waveformChannels[3] = {
+    const bool waveformChannels[kWaveformParadeChannelCount] = {
         payload.viewerState.waveformChannelRed,
         payload.viewerState.waveformChannelGreen,
-        payload.viewerState.waveformChannelBlue};
+        payload.viewerState.waveformChannelBlue,
+        paradeLumaEnabled};
     const auto waveformChannelEnabled = [&](int channel) {
-      return lumaOnly || waveformChannels[std::clamp(channel, 0, 2)];
+      return lumaOnly || waveformChannels[std::clamp(channel, 0, kWaveformParadeChannelCount - 1)];
     };
     reconstructWaveformDensity(&mesh.scopeDensity,
                                kPositionBins,
@@ -11467,8 +11589,8 @@ bool buildAnalyticalScopeMeshCpu(const ResolvedPayload& payload,
     const float waveformDotSize =
         clampf(static_cast<float>(payload.viewerState.waveformDotSize), 0.05f, 1.5f);
     const float waveformCoverageAlpha =
-        waveformDotSize < 0.5f
-            ? clampf(std::pow(waveformDotSize / 0.5f, 0.72f), 0.16f, 1.0f)
+        waveformDotSize < kWaveformDefaultDotSize
+            ? clampf(std::pow(waveformDotSize / kWaveformDefaultDotSize, 0.72f), 0.16f, 1.0f)
             : 1.0f;
     auto scopeIntensity = [&](float density) {
       if (density <= 0.0f) return 0.0f;
@@ -11482,13 +11604,6 @@ bool buildAnalyticalScopeMeshCpu(const ResolvedPayload& payload,
                         pointBrightness,
                     0.0f,
                     1.0f);
-    };
-    auto saturatedWaveformColor = [&](float r, float g, float b) {
-      const float luma = 0.2126f * r + 0.7152f * g + 0.0722f * b;
-      return Vec3{
-          clampf(luma + (r - luma) * waveformSaturation, 0.0f, 1.0f),
-          clampf(luma + (g - luma) * waveformSaturation, 0.0f, 1.0f),
-          clampf(luma + (b - luma) * waveformSaturation, 0.0f, 1.0f)};
     };
     for (int x = 0; x < kPositionBins; ++x) {
       for (int y = 0; y < kSignalBins; ++y) {
@@ -11514,7 +11629,7 @@ bool buildAnalyticalScopeMeshCpu(const ResolvedPayload& payload,
                         0.96f * intensity,
                         waveformCoverageAlpha);
         } else if (mesh.scopeMode == 1) {
-          for (int channel = 0; channel < 3; ++channel) {
+          for (int channel = 0; channel < channelCount; ++channel) {
             if (!waveformChannelEnabled(channel)) continue;
             const float intensity = scopeIntensity(densityAt(channel));
             if (intensity <= 0.0f) continue;
@@ -11522,11 +11637,14 @@ bool buildAnalyticalScopeMeshCpu(const ResolvedPayload& payload,
                 kScopePlotLeft +
                 (static_cast<float>(channel) +
                  (static_cast<float>(x) + 0.5f) / kPositionBins) *
-                    (kScopePlotWidth / 3.0f);
-            const Vec3 color = saturatedWaveformColor(
-                channel == 0 ? intensity : 0.0f,
-                channel == 1 ? intensity : 0.0f,
-                channel == 2 ? intensity : 0.0f);
+                    (kScopePlotWidth / static_cast<float>(channelCount));
+            const Vec3 color =
+                channel == kWaveformLumaChannelIndex
+                    ? Vec3{0.88f * intensity, 0.92f * intensity, 0.96f * intensity}
+                    : waveformRgbDensityColor(channel == 0 ? intensity : 0.0f,
+                                               channel == 1 ? intensity : 0.0f,
+                                               channel == 2 ? intensity : 0.0f,
+                                               waveformSaturation);
             addScopePoint(plotX,
                           plotY,
                           color.x,
@@ -11545,7 +11663,7 @@ bool buildAnalyticalScopeMeshCpu(const ResolvedPayload& payload,
           const float plotX =
               kScopePlotLeft + kScopePlotWidth * (static_cast<float>(x) + 0.5f) /
                                        kPositionBins;
-          const Vec3 color = saturatedWaveformColor(red, green, blue);
+          const Vec3 color = waveformRgbDensityColor(red, green, blue, waveformSaturation);
           addScopePoint(plotX, plotY, color.x, color.y, color.z, waveformCoverageAlpha);
         }
       }
@@ -11564,7 +11682,7 @@ bool buildAnalyticalScopeMeshCpu(const ResolvedPayload& payload,
         if (mesh.scopeMode == 1 && !lumaOnly) {
           return kScopePlotLeft +
                  (static_cast<float>(channel) + clampf(xNorm, 0.0f, 1.0f)) *
-                     (kScopePlotWidth / 3.0f);
+                     (kScopePlotWidth / static_cast<float>(channelCount));
         }
         return kScopePlotLeft + kScopePlotWidth * clampf(xNorm, 0.0f, 1.0f);
       };
@@ -11586,14 +11704,19 @@ bool buildAnalyticalScopeMeshCpu(const ResolvedPayload& payload,
                         waveformCoverageAlpha);
           continue;
         }
-        const float values[3] = {sample.r, sample.g, sample.b};
-        for (int channel = 0; channel < 3; ++channel) {
+        const float values[kWaveformParadeChannelCount] = {
+            sample.r,
+            sample.g,
+            sample.b,
+            analyticalScopeLuma(sample, payload.viewerState.waveformLumaMethod)};
+        for (int channel = 0; channel < channelCount; ++channel) {
           if (!waveformChannelEnabled(channel) || !isOverflowValue(values[channel])) {
             continue;
           }
           const Vec3 color =
-              analyticalScopeOverflowColor(
-                  channel, false, payload.viewerState.waveformHighlightOverflow);
+              analyticalScopeOverflowColor(channel,
+                                           channel == kWaveformLumaChannelIndex,
+                                           payload.viewerState.waveformHighlightOverflow);
           addScopePoint(overflowPlotX(channel, sample.xNorm),
                         overflowPlotY(values[channel]),
                         color.x * overflowIntensity,
@@ -11643,6 +11766,8 @@ bool buildAnalyticalScopeMeshCpu(const ResolvedPayload& payload,
                                          range.first,
                                          invRange,
                                          true,
+                                         3,
+                                         0,
                                          &mesh.scopeDensity,
                                          &densityBackendReason);
     const bool cudaDensityReady =
@@ -11657,6 +11782,8 @@ bool buildAnalyticalScopeMeshCpu(const ResolvedPayload& payload,
                                         range.first,
                                         invRange,
                                         true,
+                                        3,
+                                        0,
                                         &mesh.scopeDensity,
                                         &densityBackendReason);
     const bool glDensityReady =
@@ -11669,6 +11796,8 @@ bool buildAnalyticalScopeMeshCpu(const ResolvedPayload& payload,
                                              range.first,
                                              invRange,
                                              true,
+                                             3,
+                                             0,
                                              &mesh.scopeDensity);
     const bool gpuDensityReady = metalDensityReady || cudaDensityReady || glDensityReady;
     if (metalDensityReady) {
@@ -12546,8 +12675,10 @@ struct PlotWindowRectNorm {
 };
 
 // Reserve only the logical-pixel height occupied by the 30 px toolbar buttons.
-// Plot-window rectangles are remapped through this inset when the viewer is
-// resized, so the toolbar cannot grow into a large normalized dead band.
+// The reservation is conditional: when Workspace Buttons are hidden, plot
+// windows reclaim this strip. Keep all workspace consumers on the helpers below
+// so clamping, layout presets, resize reflow, drag/snap, Source Signal lasso
+// placement, persistence, and mouse hit-testing stay aligned.
 constexpr float kViewerWorkspaceToolbarHeight = 42.0f;
 
 // Section: workspace window state
@@ -12625,6 +12756,7 @@ ChromaspaceViewer::ViewerRuntimeState viewerStateWithModelCapabilities(
 bool plotWindowIsDockedSourceSignal(const PlotWindowState& window);
 bool plotWindowIsSourceSignal(const PlotWindowState& window);
 bool plotWindowIsTemporarySourceSignalLassoSurface(const PlotWindowState& window);
+bool plotWindowRectLooksRestorable(const PlotWindowRectNorm& rect);
 
 const InputCloudPayload* sourceCloudForPlotWindow(const SourceCloudStore& store,
                                                   const PlotWindowState& window,
@@ -12837,10 +12969,13 @@ struct AppState {
   double rightClickMenuPressTime = -10.0;
   double rightClickMenuPressX = 0.0;
   double rightClickMenuPressY = 0.0;
+  int rightClickMenuPressWindowId = -1;
+  bool rightClickMenuPressInMenu = false;
   int pointerInteractionWindowId = -1;
   double layoutMenuX = 84.0;
   double layoutMenuY = 12.0;
   bool showWorkspaceButtons = true;
+  bool showSliceButtonInPlotWindows = true;
   std::vector<PlotWindowState> plotWindows;
   int focusedPlotWindowId = 1;
   int hoveredPlotWindowId = -1;
@@ -13040,10 +13175,27 @@ float plotWindowMinNormH(int windowHeight) {
   return std::min(0.88f, 140.0f / static_cast<float>(std::max(1, windowHeight)));
 }
 
-float plotWorkspaceTopNorm(int windowHeight) {
+struct PlotWorkspaceGeometry {
+  float topNorm = 0.0f;
+  float heightNorm = 1.0f;
+};
+
+float plotWorkspaceTopNormForToolbar(bool showWorkspaceButtons, int windowHeight) {
+  if (!showWorkspaceButtons) return 0.0f;
   return clampf(kViewerWorkspaceToolbarHeight / static_cast<float>(std::max(1, windowHeight)),
                 0.0f,
                 0.45f);
+}
+
+PlotWorkspaceGeometry plotWorkspaceGeometry(const AppState& app, int windowHeight) {
+  PlotWorkspaceGeometry geometry{};
+  geometry.topNorm = plotWorkspaceTopNormForToolbar(app.showWorkspaceButtons, windowHeight);
+  geometry.heightNorm = std::max(0.05f, 1.0f - geometry.topNorm);
+  return geometry;
+}
+
+float plotWorkspaceTopNorm(const AppState& app, int windowHeight) {
+  return plotWorkspaceGeometry(app, windowHeight).topNorm;
 }
 
 struct PlotMenuRect {
@@ -13057,13 +13209,25 @@ bool pointInPlotMenuRect(const PlotMenuRect& rect, double x, double y);
 
 float viewerMenuDrawerWidthPixels(int width) {
   const float w = static_cast<float>(std::max(1, width));
-  constexpr float kDrawerPreferredFraction = 0.44f;
+  // Workspace reservations should adapt to the available surface, but fine UI
+  // metrics stay in GLFW logical pixels. Scaling row heights, text, padding, or
+  // hit targets with fullscreen width would make the menu visually balloon.
+  constexpr float kDrawerSmallWindowFraction = 0.44f;
+  constexpr float kDrawerWideWindowFraction = 0.30f;
+  constexpr float kDrawerFractionBlendStart = 900.0f;
+  constexpr float kDrawerFractionBlendEnd = 1800.0f;
   constexpr float kDrawerComfortMin = 390.0f;
-  constexpr float kDrawerComfortMax = 760.0f;
+  constexpr float kDrawerComfortMax = 540.0f;
   const float reservedPlotWidth = std::min(320.0f, std::max(170.0f, w * 0.34f));
   const float maxWidth = std::max(168.0f, w - reservedPlotWidth);
   const float minWidth = std::min(kDrawerComfortMin, maxWidth);
-  return clampf(w * kDrawerPreferredFraction, minWidth, std::min(maxWidth, kDrawerComfortMax));
+  const float blend = clampf((w - kDrawerFractionBlendStart) /
+                                 (kDrawerFractionBlendEnd - kDrawerFractionBlendStart),
+                             0.0f,
+                             1.0f);
+  const float preferredFraction = kDrawerSmallWindowFraction +
+                                  (kDrawerWideWindowFraction - kDrawerSmallWindowFraction) * blend;
+  return clampf(w * preferredFraction, minWidth, std::min(maxWidth, kDrawerComfortMax));
 }
 
 constexpr double kViewerMenuSlideSeconds = 0.20;
@@ -13120,20 +13284,24 @@ PlotMenuRect plotWindowContentLogicalScreenRect(const AppState& app,
   return rect;
 }
 
-PlotWindowRectNorm plotWorkspaceRect(float x,
+PlotWindowRectNorm plotWorkspaceRect(const AppState& app,
+                                     float x,
                                      float y,
                                      float w,
                                      float h,
                                      int windowHeight) {
-  const float top = plotWorkspaceTopNorm(windowHeight);
-  const float availableHeight = 1.0f - top;
-  return {x, top + y * availableHeight, w, h * availableHeight};
+  const PlotWorkspaceGeometry workspace = plotWorkspaceGeometry(app, windowHeight);
+  return {x, workspace.topNorm + y * workspace.heightNorm, w, h * workspace.heightNorm};
 }
 
-PlotWindowRectNorm clampedPlotWindowRect(PlotWindowRectNorm rect, int windowWidth, int windowHeight) {
+PlotWindowRectNorm clampedPlotWindowRect(const AppState& app,
+                                         PlotWindowRectNorm rect,
+                                         int windowWidth,
+                                         int windowHeight) {
   const float minW = plotWindowMinNormW(windowWidth);
-  const float workspaceTop = plotWorkspaceTopNorm(windowHeight);
-  const float maxH = std::max(0.05f, 1.0f - workspaceTop);
+  const PlotWorkspaceGeometry workspace = plotWorkspaceGeometry(app, windowHeight);
+  const float workspaceTop = workspace.topNorm;
+  const float maxH = workspace.heightNorm;
   const float minH = std::min(plotWindowMinNormH(windowHeight), maxH);
   rect.w = clampf(rect.w, minW, 1.0f);
   rect.h = clampf(rect.h, minH, maxH);
@@ -13142,36 +13310,60 @@ PlotWindowRectNorm clampedPlotWindowRect(PlotWindowRectNorm rect, int windowWidt
   return rect;
 }
 
+PlotWindowRectNorm reflowPlotWindowRectForWorkspaceTop(PlotWindowRectNorm rect,
+                                                       float oldTop,
+                                                       float newTop) {
+  const float oldHeight = std::max(0.05f, 1.0f - oldTop);
+  const float newHeight = std::max(0.05f, 1.0f - newTop);
+  const float workspaceY = (rect.y - oldTop) / oldHeight;
+  const float workspaceH = rect.h / oldHeight;
+  rect.y = newTop + workspaceY * newHeight;
+  rect.h = workspaceH * newHeight;
+  return rect;
+}
+
 void reflowPlotWindowsForWorkspaceResize(AppState* app, int windowWidth, int windowHeight) {
   if (!app || windowWidth <= 0 || windowHeight <= 0) return;
   if (app->workspaceLayoutWindowWidth <= 0 || app->workspaceLayoutWindowHeight <= 0) {
     app->workspaceLayoutWindowWidth = windowWidth;
     app->workspaceLayoutWindowHeight = windowHeight;
-    app->workspaceLayoutTopNorm = plotWorkspaceTopNorm(windowHeight);
+    app->workspaceLayoutTopNorm = plotWorkspaceTopNorm(*app, windowHeight);
     return;
   }
-  const float newTop = plotWorkspaceTopNorm(windowHeight);
+  const float newTop = plotWorkspaceTopNorm(*app, windowHeight);
   const float oldTop = app->workspaceLayoutTopNorm >= 0.0f
                            ? clampf(app->workspaceLayoutTopNorm, 0.0f, 0.45f)
-                           : plotWorkspaceTopNorm(app->workspaceLayoutWindowHeight);
+                           : plotWorkspaceTopNorm(*app, app->workspaceLayoutWindowHeight);
   if (app->workspaceLayoutWindowWidth == windowWidth &&
       app->workspaceLayoutWindowHeight == windowHeight &&
       std::fabs(oldTop - newTop) <= 1e-6f) {
     return;
   }
 
-  const float oldHeight = std::max(0.05f, 1.0f - oldTop);
-  const float newHeight = std::max(0.05f, 1.0f - newTop);
   for (auto& window : app->plotWindows) {
-    const float workspaceY = (window.rect.y - oldTop) / oldHeight;
-    const float workspaceH = window.rect.h / oldHeight;
-    window.rect.y = newTop + workspaceY * newHeight;
-    window.rect.h = workspaceH * newHeight;
-    window.rect = clampedPlotWindowRect(window.rect, windowWidth, windowHeight);
+    window.rect = reflowPlotWindowRectForWorkspaceTop(window.rect, oldTop, newTop);
+    window.rect = clampedPlotWindowRect(*app, window.rect, windowWidth, windowHeight);
+    if (window.sourceSignalDocked && plotWindowRectLooksRestorable(window.sourceSignalRestoreRect)) {
+      window.sourceSignalRestoreRect =
+          reflowPlotWindowRectForWorkspaceTop(window.sourceSignalRestoreRect, oldTop, newTop);
+      window.sourceSignalRestoreRect =
+          clampedPlotWindowRect(*app, window.sourceSignalRestoreRect, windowWidth, windowHeight);
+    }
   }
   app->workspaceLayoutWindowWidth = windowWidth;
   app->workspaceLayoutWindowHeight = windowHeight;
   app->workspaceLayoutTopNorm = newTop;
+}
+
+bool viewerWindowGeometryUsableForWorkspace(int framebufferWidth,
+                                            int framebufferHeight,
+                                            int windowWidth,
+                                            int windowHeight) {
+  if (gWindowIconified.load() != 0) return false;
+  if (framebufferWidth <= 1 || framebufferHeight <= 1) return false;
+  // Iconify/restore can briefly report tiny logical sizes. Do not let those
+  // transient values clamp or persist the normalized plot-window layout.
+  return windowWidth >= 240 && windowHeight >= 180;
 }
 
 PlotWindowRectNorm defaultPlotWindowRectNearCursor(const AppState& app,
@@ -13182,11 +13374,11 @@ PlotWindowRectNorm defaultPlotWindowRectNearCursor(const AppState& app,
   const bool first = app.plotWindows.empty();
   PlotWindowRectNorm rect{};
   rect.w = first ? 1.0f : 0.46f;
-  rect.h = first ? 1.0f - plotWorkspaceTopNorm(windowHeight) : 0.46f;
+  rect.h = first ? plotWorkspaceGeometry(app, windowHeight).heightNorm : 0.46f;
   rect.x = first ? 0.0f : static_cast<float>(cursorX / std::max(1, windowWidth)) - rect.w * 0.5f;
-  rect.y = first ? plotWorkspaceTopNorm(windowHeight)
+  rect.y = first ? plotWorkspaceTopNorm(app, windowHeight)
                  : static_cast<float>(cursorY / std::max(1, windowHeight)) - rect.h * 0.5f;
-  return clampedPlotWindowRect(rect, windowWidth, windowHeight);
+  return clampedPlotWindowRect(app, rect, windowWidth, windowHeight);
 }
 
 bool pointInPlotWindowRect(const AppState& app,
@@ -13442,11 +13634,15 @@ bool plotWindowSupportsSlicingQuickButton(const PlotWindowState& window) {
          window.viewState.plotModel != ChromaspaceViewer::kPlotModelGlossView;
 }
 
+bool plotWindowShowsSlicingQuickButton(const AppState& app, const PlotWindowState& window) {
+  return app.showSliceButtonInPlotWindows && plotWindowSupportsSlicingQuickButton(window);
+}
+
 PlotMenuRect slicingQuickButtonRect(const AppState& app,
                                     const PlotWindowState& window,
                                     int windowWidth,
                                     int windowHeight) {
-  if (!plotWindowSupportsSlicingQuickButton(window)) return {};
+  if (!plotWindowShowsSlicingQuickButton(app, window)) return {};
   const PlotMenuRect content = plotWindowContentLogicalScreenRect(app, window, windowWidth, windowHeight);
   const float size = 34.0f;
   const float margin = 10.0f;
@@ -13463,7 +13659,7 @@ float bottomLeftControlLaneOffset(const AppState& app,
                                   const PlotWindowState& owner,
                                   int windowWidth,
                                   int windowHeight) {
-  if (!plotWindowSupportsSlicingQuickButton(owner)) return 0.0f;
+  if (!plotWindowShowsSlicingQuickButton(app, owner)) return 0.0f;
   const PlotMenuRect button = slicingQuickButtonRect(app, owner, windowWidth, windowHeight);
   return std::max(0.0f, button.x1 - button.x0 + 8.0f);
 }
@@ -13605,7 +13801,7 @@ void restoreDockedSourceSignalWindow(AppState* app,
   PlotWindowState* owner = sourceSignalDockOwnerWindow(app, sourceWindow);
   if (plotWindowRectLooksRestorable(sourceWindow->sourceSignalRestoreRect)) {
     sourceWindow->rect =
-        clampedPlotWindowRect(sourceWindow->sourceSignalRestoreRect, windowWidth, windowHeight);
+        clampedPlotWindowRect(*app, sourceWindow->sourceSignalRestoreRect, windowWidth, windowHeight);
   } else if (owner) {
     const PlotMenuRect ownerContent = plotWindowContentLogicalScreenRect(*app, *owner, windowWidth, windowHeight);
     const float left = plotWorkspaceReservedLeftPixels(*app, windowWidth);
@@ -13617,9 +13813,10 @@ void restoreDockedSourceSignalWindow(AppState* app,
     const float logicalY = std::max(ownerContent.y0 + 18.0f, ownerContent.y1 - rect.h * windowHeight - 18.0f);
     rect.x = (logicalX - left) / availableW;
     rect.y = logicalY / static_cast<float>(std::max(1, windowHeight));
-    sourceWindow->rect = clampedPlotWindowRect(rect, windowWidth, windowHeight);
+    sourceWindow->rect = clampedPlotWindowRect(*app, rect, windowWidth, windowHeight);
   } else {
-    sourceWindow->rect = clampedPlotWindowRect({0.08f, plotWorkspaceTopNorm(windowHeight) + 0.06f, 0.42f, 0.42f},
+    sourceWindow->rect = clampedPlotWindowRect(*app,
+                                               {0.08f, plotWorkspaceTopNorm(*app, windowHeight) + 0.06f, 0.42f, 0.42f},
                                                windowWidth,
                                                windowHeight);
   }
@@ -13703,10 +13900,11 @@ PlotWindowRectNorm sourceSignalLassoSurfaceRectForOwner(const AppState& app,
                                                         int windowHeight) {
   const float left = plotWorkspaceReservedLeftPixels(app, windowWidth);
   const float availableW = std::max(1.0f, static_cast<float>(windowWidth) - left);
-  const float toolbarBottom = plotWorkspaceTopNorm(windowHeight) * static_cast<float>(windowHeight);
+  const float toolbarBottom = plotWorkspaceTopNorm(app, windowHeight) * static_cast<float>(windowHeight);
   if (!owner) {
-    return clampedPlotWindowRect({0.08f,
-                                  plotWorkspaceTopNorm(windowHeight) + 0.06f,
+    return clampedPlotWindowRect(app,
+                                 {0.08f,
+                                  plotWorkspaceTopNorm(app, windowHeight) + 0.06f,
                                   0.46f,
                                   0.46f},
                                  windowWidth,
@@ -13730,7 +13928,8 @@ PlotWindowRectNorm sourceSignalLassoSurfaceRectForOwner(const AppState& app,
                            toolbarBottom + 10.0f,
                            std::max(toolbarBottom + 10.0f,
                                     static_cast<float>(windowHeight) - targetH - 10.0f));
-  return clampedPlotWindowRect({(xPx - left) / availableW,
+  return clampedPlotWindowRect(app,
+                               {(xPx - left) / availableW,
                                 yPx / static_cast<float>(std::max(1, windowHeight)),
                                 targetW / availableW,
                                 targetH / static_cast<float>(std::max(1, windowHeight))},
@@ -13960,7 +14159,8 @@ void applyPlotWindowLayout(AppState* app, int layoutIndex, int windowWidth, int 
   auto setRect = [&](int index, PlotWindowRectNorm rect) {
     if (index >= 0 && index < static_cast<int>(app->plotWindows.size())) {
       app->plotWindows[static_cast<std::size_t>(index)].rect =
-          clampedPlotWindowRect(plotWorkspaceRect(rect.x, rect.y, rect.w, rect.h, windowHeight),
+          clampedPlotWindowRect(*app,
+                                plotWorkspaceRect(*app, rect.x, rect.y, rect.w, rect.h, windowHeight),
                                 windowWidth,
                                 windowHeight);
     }
@@ -14002,7 +14202,8 @@ void applyPlotWindowLayout(AppState* app, int layoutIndex, int windowWidth, int 
   } else if (!app->plotWindows.empty()) {
     focusPlotWindow(app, app->plotWindows.back().windowId);
   }
-  logViewerEvent(std::string("Applied plot-window layout index=") + std::to_string(layoutIndex));
+  logViewerEvent(std::string("Applied plot-window layout: ") +
+                 (layoutIndex == 0 ? "Single" : std::to_string(layoutIndex)));
 }
 
 void rememberOfxImageLassoSelection(AppState* app, const ResolvedPayload& payload) {
@@ -14521,6 +14722,7 @@ enum class ViewerMenuAction {
   KeepOnTop,
   ResetOnSwitch,
   ShowWorkspaceButtons,
+  ShowSliceButtonInPlotWindows,
   ShowOverflow,
   HighlightOverflow,
   NeutralRadius,
@@ -15013,6 +15215,7 @@ bool viewerMenuActionIsCheckbox(ViewerMenuAction action) {
     case ViewerMenuAction::KeepOnTop:
     case ViewerMenuAction::ResetOnSwitch:
     case ViewerMenuAction::ShowWorkspaceButtons:
+    case ViewerMenuAction::ShowSliceButtonInPlotWindows:
     case ViewerMenuAction::WaveformShowOverflow:
     case ViewerMenuAction::WaveformHighlightOverflow:
     case ViewerMenuAction::HistogramShowOverflow:
@@ -15112,7 +15315,8 @@ std::vector<ViewerMenuRow> buildViewerMenuRows(const AppState& app) {
           channels.refreshPolicy = "reinterpret";
           channels.channelSelector = true;
           rows.push_back(channels);
-        } else {
+        }
+        if (state.waveformMode == 1 || state.waveformMode == 2) {
           appendRow(&rows,
                     "Luma Method",
                     ChromaspaceViewer::waveformLumaMethodLabel(state.waveformLumaMethod),
@@ -15141,7 +15345,7 @@ std::vector<ViewerMenuRow> buildViewerMenuRows(const AppState& app) {
                                  fixedValue(state.waveformSaturation),
                                  static_cast<int>(std::round(state.waveformSaturation * 100.0)),
                                  0,
-                                 150,
+                                 100,
                                  ViewerMenuAction::WaveformSaturation);
         appendSliderRowWithValue(&rows,
                                  "Dot Size",
@@ -15321,6 +15525,12 @@ std::vector<ViewerMenuRow> buildViewerMenuRows(const AppState& app) {
           appendRow(&rows, "Reset camera on model switch", onOffLabel(state.resetViewOnPlotSwitch), ViewerMenuAction::ResetOnSwitch, true, "none");
         }
         appendRow(&rows, "Workspace Buttons", onOffLabel(app.showWorkspaceButtons), ViewerMenuAction::ShowWorkspaceButtons, true, "none");
+        appendRow(&rows,
+                  "Show slice button in plot windows",
+                  onOffLabel(app.showSliceButtonInPlotWindows),
+                  ViewerMenuAction::ShowSliceButtonInPlotWindows,
+                  true,
+                  "none");
       }
       break;
     case ViewerMenuSection::Overflow: {
@@ -16094,6 +16304,7 @@ bool parseViewerStateJson(const std::string& json, ChromaspaceViewer::ViewerRunt
   readBool("waveformChannelRed", &s.waveformChannelRed);
   readBool("waveformChannelGreen", &s.waveformChannelGreen);
   readBool("waveformChannelBlue", &s.waveformChannelBlue);
+  readBool("waveformChannelLuma", &s.waveformChannelLuma);
   readBool("waveformShowOverflow", &s.waveformShowOverflow);
   readBool("waveformHighlightOverflow", &s.waveformHighlightOverflow);
   readInt("waveformLumaMethod", &s.waveformLumaMethod);
@@ -16157,6 +16368,7 @@ void saveViewerWorkspaceToDisk(AppState* app) {
   os << "{\"type\":\"chromaspace_viewer_workspace_v1\",\"focusedWindowId\":"
      << app->focusedPlotWindowId << ",\"nextWindowId\":" << app->nextPlotWindowId
      << ",\"showWorkspaceButtons\":" << (app->showWorkspaceButtons ? 1 : 0)
+     << ",\"showSliceButtonInPlotWindows\":" << (app->showSliceButtonInPlotWindows ? 1 : 0)
      << ",\"windowWidth\":" << app->workspaceLayoutWindowWidth
      << ",\"windowHeight\":" << app->workspaceLayoutWindowHeight
      << ",\"workspaceTopNorm\":" << std::setprecision(8) << app->workspaceLayoutTopNorm << "}\n";
@@ -16221,6 +16433,10 @@ bool loadViewerWorkspaceFromDisk(AppState* app) {
       int showWorkspaceButtons = app->showWorkspaceButtons ? 1 : 0;
       if (extractInt(line, "showWorkspaceButtons", &showWorkspaceButtons)) {
         app->showWorkspaceButtons = showWorkspaceButtons != 0;
+      }
+      int showSliceButtonInPlotWindows = app->showSliceButtonInPlotWindows ? 1 : 0;
+      if (extractInt(line, "showSliceButtonInPlotWindows", &showSliceButtonInPlotWindows)) {
+        app->showSliceButtonInPlotWindows = showSliceButtonInPlotWindows != 0;
       }
       continue;
     }
@@ -16299,7 +16515,10 @@ bool loadViewerWorkspaceFromDisk(AppState* app) {
       }
       window.sourceSignalDockOwnerWindowId = -1;
       if (plotWindowRectLooksRestorable(window.sourceSignalRestoreRect)) {
-        window.rect = window.sourceSignalRestoreRect;
+        window.rect = clampedPlotWindowRect(*app,
+                                            window.sourceSignalRestoreRect,
+                                            std::max(1, app->workspaceLayoutWindowWidth),
+                                            std::max(1, app->workspaceLayoutWindowHeight));
       }
     }
   }
@@ -16742,6 +16961,7 @@ ChromaspaceViewer::ViewerRuntimeState viewerStateFromSharedPresetValuesJson(
   readBool("waveformChannelRed", &state.waveformChannelRed);
   readBool("waveformChannelGreen", &state.waveformChannelGreen);
   readBool("waveformChannelBlue", &state.waveformChannelBlue);
+  readBool("waveformChannelLuma", &state.waveformChannelLuma);
   readBool("waveformShowOverflow", &state.waveformShowOverflow);
   readBool("waveformHighlightOverflow", &state.waveformHighlightOverflow);
   readInt("waveformLumaMethod", &state.waveformLumaMethod);
@@ -16826,6 +17046,7 @@ std::string viewerSharedPresetValuesJsonFromState(
   os << "\"waveformChannelRed\":" << (s.waveformChannelRed ? "true" : "false") << ",";
   os << "\"waveformChannelGreen\":" << (s.waveformChannelGreen ? "true" : "false") << ",";
   os << "\"waveformChannelBlue\":" << (s.waveformChannelBlue ? "true" : "false") << ",";
+  os << "\"waveformChannelLuma\":" << (s.waveformChannelLuma ? "true" : "false") << ",";
   os << "\"waveformShowOverflow\":" << (s.waveformShowOverflow ? "true" : "false") << ",";
   os << "\"waveformHighlightOverflow\":" << (s.waveformHighlightOverflow ? "true" : "false") << ",";
   os << "\"waveformLumaMethod\":" << s.waveformLumaMethod << ",";
@@ -17761,14 +17982,21 @@ void applyViewerLassoStateToResolvedPayload(const AppState& app, ResolvedPayload
 
 PlotMenuRect viewerMenuRowWindowRect(const AppState& app, int width, int height, int rowIndex);
 
-std::array<PlotMenuRect, 3> waveformChannelSelectorRects(const PlotMenuRect& rowRect) {
+int waveformChannelSelectorCount(const ChromaspaceViewer::ViewerRuntimeState& state) {
+  return state.waveformMode == 1 ? kWaveformParadeChannelCount : kWaveformRgbChannelCount;
+}
+
+std::array<PlotMenuRect, kWaveformParadeChannelCount> waveformChannelSelectorRects(
+    const PlotMenuRect& rowRect,
+    int channelCount) {
   constexpr float kSize = 17.0f;
   constexpr float kGap = 8.0f;
   const float y0 = rowRect.y0 + (kPlotMenuRowHeight - kSize) * 0.5f;
   const float right = rowRect.x1 - 14.0f;
-  std::array<PlotMenuRect, 3> rects{};
-  for (int channel = 2; channel >= 0; --channel) {
-    const float x1 = right - static_cast<float>(2 - channel) * (kSize + kGap);
+  const int count = std::clamp(channelCount, kWaveformRgbChannelCount, kWaveformParadeChannelCount);
+  std::array<PlotMenuRect, kWaveformParadeChannelCount> rects{};
+  for (int channel = count - 1; channel >= 0; --channel) {
+    const float x1 = right - static_cast<float>((count - 1) - channel) * (kSize + kGap);
     rects[static_cast<size_t>(channel)] = {x1 - kSize, y0, x1, y0 + kSize};
   }
   return rects;
@@ -17960,24 +18188,26 @@ ViewerMenuAction presetActionAtPoint(const AppState& app, const PlotMenuRect& ro
 }
 
 bool waveformChannelEnabled(const ChromaspaceViewer::ViewerRuntimeState& state, int channel) {
-  switch (std::clamp(channel, 0, 2)) {
+  switch (std::clamp(channel, 0, kWaveformParadeChannelCount - 1)) {
     case 0: return state.waveformChannelRed;
     case 1: return state.waveformChannelGreen;
-    default: return state.waveformChannelBlue;
+    case 2: return state.waveformChannelBlue;
+    default: return state.waveformChannelLuma;
   }
 }
 
 void setWaveformChannelEnabled(ChromaspaceViewer::ViewerRuntimeState* state, int channel, bool enabled) {
   if (!state) return;
-  switch (std::clamp(channel, 0, 2)) {
+  switch (std::clamp(channel, 0, kWaveformParadeChannelCount - 1)) {
     case 0: state->waveformChannelRed = enabled; break;
     case 1: state->waveformChannelGreen = enabled; break;
-    default: state->waveformChannelBlue = enabled; break;
+    case 2: state->waveformChannelBlue = enabled; break;
+    default: state->waveformChannelLuma = enabled; break;
   }
 }
 
 void setWaveformChannel(AppState* app, int channel, bool enabled) {
-  if (!app || channel < 0 || channel > 2) return;
+  if (!app || channel < 0 || channel >= waveformChannelSelectorCount(app->viewerState)) return;
   auto state = viewerStateWithModelCapabilities(app->viewerState);
   if (waveformChannelEnabled(state, channel) == enabled) return;
   setWaveformChannelEnabled(&state, channel, enabled);
@@ -17988,7 +18218,7 @@ void setWaveformChannel(AppState* app, int channel, bool enabled) {
 }
 
 void toggleWaveformChannel(AppState* app, int channel) {
-  if (!app || channel < 0 || channel > 2) return;
+  if (!app || channel < 0 || channel >= waveformChannelSelectorCount(app->viewerState)) return;
   const auto state = viewerStateWithModelCapabilities(app->viewerState);
   setWaveformChannel(app, channel, !waveformChannelEnabled(state, channel));
 }
@@ -18001,7 +18231,7 @@ void resetWaveformChannelDrag(AppState* app) {
 }
 
 bool beginWaveformChannelPointerAction(AppState* app, int channel) {
-  if (!app || channel < 0 || channel > 2) return false;
+  if (!app || channel < 0 || channel >= waveformChannelSelectorCount(app->viewerState)) return false;
   const auto state = viewerStateWithModelCapabilities(app->viewerState);
   const bool enable = !waveformChannelEnabled(state, channel);
   setWaveformChannel(app, channel, enable);
@@ -18023,8 +18253,9 @@ bool updateWaveformChannelDragAtPoint(AppState* app,
     const ViewerMenuRow& row = rows[static_cast<std::size_t>(i)];
     if (!row.channelSelector || !row.enabled) continue;
     const PlotMenuRect rowRect = viewerMenuRowWindowRect(*app, windowWidth, windowHeight, i);
-    const auto channelRects = waveformChannelSelectorRects(rowRect);
-    for (int channel = 0; channel < 3; ++channel) {
+    const int channelCount = waveformChannelSelectorCount(app->viewerState);
+    const auto channelRects = waveformChannelSelectorRects(rowRect, channelCount);
+    for (int channel = 0; channel < channelCount; ++channel) {
       if (pointInPlotMenuRect(channelRects[static_cast<std::size_t>(channel)], x, y)) {
         channelIndex = channel;
         break;
@@ -18130,6 +18361,7 @@ bool copyViewerPresetParameter(ViewerMenuAction action,
       state->waveformChannelRed = preset.waveformChannelRed;
       state->waveformChannelGreen = preset.waveformChannelGreen;
       state->waveformChannelBlue = preset.waveformChannelBlue;
+      state->waveformChannelLuma = preset.waveformChannelLuma;
       return true;
     case ViewerMenuAction::WaveformShowOverflow:
       state->waveformShowOverflow = preset.waveformShowOverflow;
@@ -18204,7 +18436,31 @@ void activateViewerMenuRow(AppState* app, const ViewerMenuRow& row) {
   if (!app || row.section || !row.enabled) return;
   if (row.slider) return;
   if (row.action == ViewerMenuAction::ShowWorkspaceButtons) {
+    const bool previousShowWorkspaceButtons = app->showWorkspaceButtons;
+    const int layoutWidth = app->workspaceLayoutWindowWidth > 0 ? app->workspaceLayoutWindowWidth : 720;
+    const int layoutHeight = app->workspaceLayoutWindowHeight > 0 ? app->workspaceLayoutWindowHeight : 600;
+    const float oldTop = app->workspaceLayoutTopNorm >= 0.0f
+                             ? clampf(app->workspaceLayoutTopNorm, 0.0f, 0.45f)
+                             : plotWorkspaceTopNormForToolbar(previousShowWorkspaceButtons, layoutHeight);
     app->showWorkspaceButtons = !app->showWorkspaceButtons;
+    app->workspaceLayoutTopNorm = oldTop;
+    reflowPlotWindowsForWorkspaceResize(app, layoutWidth, layoutHeight);
+    app->workspaceCommandRevision = std::max<uint64_t>(app->workspaceCommandRevision + 1u, 1u);
+    saveViewerWorkspaceToDisk(app);
+    return;
+  }
+  if (row.action == ViewerMenuAction::ShowSliceButtonInPlotWindows) {
+    app->showSliceButtonInPlotWindows = !app->showSliceButtonInPlotWindows;
+    if (!app->showSliceButtonInPlotWindows) {
+      for (auto& window : app->plotWindows) {
+        window.slicingDrawerOpen = false;
+      }
+      app->slicingVectorDragging = false;
+      app->slicingVectorDragFromMenu = false;
+      app->slicingVectorDragWindowId = -1;
+      app->slicingVectorLastDragIndex = -1;
+      app->slicingVectorDragEnable = false;
+    }
     app->workspaceCommandRevision = std::max<uint64_t>(app->workspaceCommandRevision + 1u, 1u);
     saveViewerWorkspaceToDisk(app);
     return;
@@ -18652,7 +18908,7 @@ void updateViewerMenuSlider(AppState* app, ViewerMenuAction action, int value, c
     }
     case ViewerMenuAction::WaveformSaturation: {
       const double next =
-          ChromaspaceViewer::clampDouble(static_cast<double>(value) / 100.0, 0.0, 1.5);
+          ChromaspaceViewer::clampDouble(static_cast<double>(value) / 100.0, 0.0, 1.0);
       changed = std::abs(state.waveformSaturation - next) > 1e-6;
       state.waveformSaturation = next;
       break;
@@ -18993,23 +19249,43 @@ bool pointInPlotMenuRect(const PlotMenuRect& rect, double x, double y) {
   return x >= rect.x0 && x <= rect.x1 && y >= rect.y0 && y <= rect.y1;
 }
 
-float viewerMenuRowHeight(const ViewerMenuRow& row) {
+bool viewerMenuRowStacksValue(const ViewerMenuRow& row, float rowWidth) {
+  if (row.spacer || row.presetActionButtons || row.note || row.slider ||
+      row.slicingVectorSelector || row.channelSelector || row.choiceItem ||
+      row.value.empty() || row.action == ViewerMenuAction::LoadUserPreset) {
+    return false;
+  }
+  const float labelInset = 14.0f;
+  const float labelWidth = approximateMenuTextWidth(row.label, 1.0f);
+  const float valueWidth = approximateMenuTextWidth(row.value, 1.0f);
+  const float sideBySideValueWidth = std::min(rowWidth * 0.55f, valueWidth);
+  const float sideBySideLabelWidth =
+      std::max(24.0f, rowWidth - labelInset - sideBySideValueWidth - 30.0f);
+  constexpr float kMinUsefulInlineLabelWidth = 116.0f;
+  const bool labelWouldClip = labelWidth > sideBySideLabelWidth;
+  const bool valueWantsWideLine = valueWidth > sideBySideValueWidth + 1.0f &&
+                                  valueWidth <= std::max(24.0f, rowWidth - labelInset - 14.0f);
+  return labelWouldClip || (sideBySideLabelWidth < kMinUsefulInlineLabelWidth && valueWantsWideLine);
+}
+
+float viewerMenuRowHeight(const ViewerMenuRow& row, float rowWidth = 0.0f) {
   if (row.spacer) return 18.0f;
   if (row.presetActionButtons) return 38.0f;
+  if (rowWidth > 0.0f && viewerMenuRowStacksValue(row, rowWidth)) return 58.0f;
   return row.note ? (kPlotMenuRowHeight * 2.25f) : kPlotMenuRowHeight;
 }
 
-float viewerMenuRowsHeight(const std::vector<ViewerMenuRow>& rows) {
+float viewerMenuRowsHeight(const std::vector<ViewerMenuRow>& rows, float rowWidth) {
   float height = 0.0f;
-  for (const ViewerMenuRow& row : rows) height += viewerMenuRowHeight(row);
+  for (const ViewerMenuRow& row : rows) height += viewerMenuRowHeight(row, rowWidth);
   return height;
 }
 
-float viewerMenuRowTopOffset(const std::vector<ViewerMenuRow>& rows, int rowIndex) {
+float viewerMenuRowTopOffset(const std::vector<ViewerMenuRow>& rows, int rowIndex, float rowWidth) {
   float offset = 0.0f;
   const int count = std::min(rowIndex, static_cast<int>(rows.size()));
   for (int i = 0; i < count; ++i) {
-    offset += viewerMenuRowHeight(rows[static_cast<std::size_t>(i)]);
+    offset += viewerMenuRowHeight(rows[static_cast<std::size_t>(i)], rowWidth);
   }
   return offset;
 }
@@ -19090,13 +19366,14 @@ int plotMenuMainIndexAt(const AppState& app, int width, int height, double x, do
   if (!pointInPlotMenuRect(rect, x, y)) return -1;
   const float rowsX0 = viewerMenuRowsX0(rect);
   if (static_cast<float>(x) < rowsX0 || static_cast<float>(x) > rect.x1 - kViewerDrawerPad) return -1;
+  const float rowWidth = std::max(1.0f, rect.x1 - kViewerDrawerPad - rowsX0);
   const float rowsY0 = viewerMenuRowsY0(app, rect);
   const float localY = static_cast<float>(y) - rowsY0 + app.viewerMenuScroll;
   if (localY < 0.0f) return -1;
   const std::vector<ViewerMenuRow> rows = buildViewerMenuRows(app);
   float top = 0.0f;
   for (int i = 0; i < static_cast<int>(rows.size()); ++i) {
-    const float bottom = top + viewerMenuRowHeight(rows[static_cast<std::size_t>(i)]);
+    const float bottom = top + viewerMenuRowHeight(rows[static_cast<std::size_t>(i)], rowWidth);
     if (localY >= top && localY < bottom) return i;
     top = bottom;
   }
@@ -19124,8 +19401,12 @@ PlotMenuRect viewerMenuRowWindowRect(const AppState& app, int width, int height,
   if (rowIndex < 0 || rowIndex >= static_cast<int>(rows.size())) return {};
   const float rowsX0 = viewerMenuRowsX0(rect);
   const float rowsY0 = viewerMenuRowsY0(app, rect);
-  const float y0 = rowsY0 + viewerMenuRowTopOffset(rows, rowIndex) - app.viewerMenuScroll;
-  return {rowsX0, y0, rect.x1 - kViewerDrawerPad, y0 + viewerMenuRowHeight(rows[static_cast<std::size_t>(rowIndex)])};
+  const float rowWidth = std::max(1.0f, rect.x1 - kViewerDrawerPad - rowsX0);
+  const float y0 = rowsY0 + viewerMenuRowTopOffset(rows, rowIndex, rowWidth) - app.viewerMenuScroll;
+  return {rowsX0,
+          y0,
+          rect.x1 - kViewerDrawerPad,
+          y0 + viewerMenuRowHeight(rows[static_cast<std::size_t>(rowIndex)], rowWidth)};
 }
 
 int viewerMenuRowIndexForAction(const AppState& app, ViewerMenuAction action) {
@@ -19616,6 +19897,9 @@ void clearPointerInteractionState(AppState* app) {
   app->orientAxisFeedbackUntil = 0.0;
   app->rollFeedbackUntil = 0.0;
   app->pointerInteractionWindowId = -1;
+  app->rightClickMenuCandidate = false;
+  app->rightClickMenuPressWindowId = -1;
+  app->rightClickMenuPressInMenu = false;
   resetGlossViewOrthoInteractionState(app);
 }
 
@@ -19726,7 +20010,7 @@ void updatePlotWindowDrag(AppState* app, int windowWidth, int windowHeight, doub
   };
   auto resizeTop = [&]() {
     const float bottom = rect.y + rect.h;
-    rect.y = clampf(rect.y + dy, plotWorkspaceTopNorm(windowHeight), bottom - minH);
+    rect.y = clampf(rect.y + dy, plotWorkspaceTopNorm(*app, windowHeight), bottom - minH);
     rect.h = bottom - rect.y;
   };
   auto resizeBottom = [&]() {
@@ -19747,7 +20031,7 @@ void updatePlotWindowDrag(AppState* app, int windowWidth, int windowHeight, doub
     case PlotWindowDragMode::ResizeBottomRight: resizeBottom(); resizeRight(); break;
     case PlotWindowDragMode::None: break;
   }
-  window->rect = clampedPlotWindowRect(rect, windowWidth, windowHeight);
+  window->rect = clampedPlotWindowRect(*app, rect, windowWidth, windowHeight);
   updatePlotWindowSnapPreview(app, windowWidth, windowHeight, x, y);
 }
 
@@ -19768,8 +20052,9 @@ void updatePlotWindowSnapPreview(AppState* app,
   const float availableW = std::max(1.0f, w - reservedLeft);
   const float nx = clampf((static_cast<float>(cursorX) - reservedLeft) / availableW, 0.0f, 1.0f);
   const float ny = static_cast<float>(cursorY) / h;
-  const float workspaceTop = plotWorkspaceTopNorm(windowHeight);
-  const float workspaceHeight = std::max(0.05f, 1.0f - workspaceTop);
+  const PlotWorkspaceGeometry workspace = plotWorkspaceGeometry(*app, windowHeight);
+  const float workspaceTop = workspace.topNorm;
+  const float workspaceHeight = workspace.heightNorm;
   const float workspaceNy = clampf((ny - workspaceTop) / workspaceHeight, 0.0f, 1.0f);
   const float edgeX = 22.0f / w;
   const float edgeY = 22.0f / (h * workspaceHeight);
@@ -19778,7 +20063,7 @@ void updatePlotWindowSnapPreview(AppState* app,
   PlotWindowRectNorm candidate = window->rect;
   bool haveCandidate = false;
   auto workspaceCandidate = [&](float x, float y, float width, float height) {
-    return plotWorkspaceRect(x, y, width, height, windowHeight);
+    return plotWorkspaceRect(*app, x, y, width, height, windowHeight);
   };
   const bool singleWindowWorkspace = app->plotWindows.size() <= 1u;
   const bool nearWorkspaceEdge = nx <= edgeX || nx >= 1.0f - edgeX ||
@@ -19821,51 +20106,125 @@ void updatePlotWindowSnapPreview(AppState* app,
     float bestDyPx = kGuideDistancePx + 1.0f;
     float snappedX = candidate.x;
     float snappedY = candidate.y;
+    float snappedW = candidate.w;
+    float snappedH = candidate.h;
     const float currentLeft = candidate.x;
     const float currentRight = candidate.x + candidate.w;
     const float currentTop = candidate.y;
     const float currentBottom = candidate.y + candidate.h;
+    const float minW = plotWindowMinNormW(windowWidth);
+    const float minH = std::min(plotWindowMinNormH(windowHeight), workspaceHeight);
+    const bool moveMode = app->plotWindowDragMode == PlotWindowDragMode::Move;
+    const bool resizeLeftMode = app->plotWindowDragMode == PlotWindowDragMode::ResizeLeft ||
+                                app->plotWindowDragMode == PlotWindowDragMode::ResizeTopLeft ||
+                                app->plotWindowDragMode == PlotWindowDragMode::ResizeBottomLeft;
+    const bool resizeRightMode = app->plotWindowDragMode == PlotWindowDragMode::ResizeRight ||
+                                 app->plotWindowDragMode == PlotWindowDragMode::ResizeTopRight ||
+                                 app->plotWindowDragMode == PlotWindowDragMode::ResizeBottomRight;
+    const bool resizeTopMode = app->plotWindowDragMode == PlotWindowDragMode::ResizeTop ||
+                               app->plotWindowDragMode == PlotWindowDragMode::ResizeTopLeft ||
+                               app->plotWindowDragMode == PlotWindowDragMode::ResizeTopRight;
+    const bool resizeBottomMode = app->plotWindowDragMode == PlotWindowDragMode::ResizeBottom ||
+                                  app->plotWindowDragMode == PlotWindowDragMode::ResizeBottomLeft ||
+                                  app->plotWindowDragMode == PlotWindowDragMode::ResizeBottomRight;
+    std::vector<float> xGuides = {0.0f, 1.0f, 0.5f, 1.0f / 3.0f, 2.0f / 3.0f};
+    std::vector<float> yGuides = {
+        workspaceTop,
+        1.0f,
+        workspaceTop + workspaceHeight * 0.5f,
+        workspaceTop + workspaceHeight / 3.0f,
+        workspaceTop + workspaceHeight * 2.0f / 3.0f};
     for (const auto& other : app->plotWindows) {
       if (other.windowId == window->windowId) continue;
-      const float xGuides[] = {other.rect.x, other.rect.x + other.rect.w};
-      const float yGuides[] = {other.rect.y, other.rect.y + other.rect.h};
-      for (const float guide : xGuides) {
-        const float leftDeltaPx = std::fabs(currentLeft - guide) * w;
+      xGuides.push_back(other.rect.x);
+      xGuides.push_back(other.rect.x + other.rect.w);
+      xGuides.push_back(other.rect.x + other.rect.w * 0.5f);
+      yGuides.push_back(other.rect.y);
+      yGuides.push_back(other.rect.y + other.rect.h);
+      yGuides.push_back(other.rect.y + other.rect.h * 0.5f);
+    }
+    for (const float guide : xGuides) {
+      if (moveMode) {
+        const float leftDeltaPx = std::fabs(currentLeft - guide) * availableW;
         if (leftDeltaPx < bestDxPx) {
           bestDxPx = leftDeltaPx;
           snappedX = guide;
+          snappedW = candidate.w;
         }
-        const float rightDeltaPx = std::fabs(currentRight - guide) * w;
+        const float rightDeltaPx = std::fabs(currentRight - guide) * availableW;
         if (rightDeltaPx < bestDxPx) {
           bestDxPx = rightDeltaPx;
           snappedX = guide - candidate.w;
+          snappedW = candidate.w;
         }
       }
-      for (const float guide : yGuides) {
+      if (resizeLeftMode) {
+        const float nextW = currentRight - guide;
+        const float leftDeltaPx = std::fabs(currentLeft - guide) * availableW;
+        if (nextW >= minW && leftDeltaPx < bestDxPx) {
+          bestDxPx = leftDeltaPx;
+          snappedX = guide;
+          snappedW = nextW;
+        }
+      }
+      if (resizeRightMode) {
+        const float nextW = guide - candidate.x;
+        const float rightDeltaPx = std::fabs(currentRight - guide) * availableW;
+        if (nextW >= minW && rightDeltaPx < bestDxPx) {
+          bestDxPx = rightDeltaPx;
+          snappedX = candidate.x;
+          snappedW = nextW;
+        }
+      }
+    }
+    for (const float guide : yGuides) {
+      if (moveMode) {
         const float topDeltaPx = std::fabs(currentTop - guide) * h;
         if (topDeltaPx < bestDyPx) {
           bestDyPx = topDeltaPx;
           snappedY = guide;
+          snappedH = candidate.h;
         }
         const float bottomDeltaPx = std::fabs(currentBottom - guide) * h;
         if (bottomDeltaPx < bestDyPx) {
           bestDyPx = bottomDeltaPx;
           snappedY = guide - candidate.h;
+          snappedH = candidate.h;
+        }
+      }
+      if (resizeTopMode) {
+        const float nextH = currentBottom - guide;
+        const float topDeltaPx = std::fabs(currentTop - guide) * h;
+        if (nextH >= minH && topDeltaPx < bestDyPx) {
+          bestDyPx = topDeltaPx;
+          snappedY = guide;
+          snappedH = nextH;
+        }
+      }
+      if (resizeBottomMode) {
+        const float nextH = guide - candidate.y;
+        const float bottomDeltaPx = std::fabs(currentBottom - guide) * h;
+        if (nextH >= minH && bottomDeltaPx < bestDyPx) {
+          bestDyPx = bottomDeltaPx;
+          snappedY = candidate.y;
+          snappedH = nextH;
         }
       }
     }
     if (bestDxPx <= kGuideDistancePx) {
       candidate.x = snappedX;
+      candidate.w = snappedW;
       haveCandidate = true;
     }
     if (bestDyPx <= kGuideDistancePx) {
       candidate.y = snappedY;
+      candidate.h = snappedH;
       haveCandidate = true;
     }
   }
 
   if (haveCandidate) {
-    app->plotWindowSnapPreviewRect = clampedPlotWindowRect(candidate, windowWidth, windowHeight);
+    app->plotWindowSnapPreviewRect = clampedPlotWindowRect(*app, candidate, windowWidth, windowHeight);
     app->plotWindowSnapPreviewId = window->windowId;
     app->plotWindowSnapPreviewVisible = true;
   }
@@ -19875,7 +20234,7 @@ void commitPlotWindowSnapPreview(AppState* app, int windowWidth, int windowHeigh
   if (!app) return;
   if (app->plotWindowSnapPreviewVisible) {
     if (PlotWindowState* window = plotWindowById(app, app->plotWindowSnapPreviewId)) {
-      window->rect = clampedPlotWindowRect(app->plotWindowSnapPreviewRect, windowWidth, windowHeight);
+      window->rect = clampedPlotWindowRect(*app, app->plotWindowSnapPreviewRect, windowWidth, windowHeight);
       sortPlotWindowsForReadableStacking(app, window->windowId);
     }
   }
@@ -21138,6 +21497,60 @@ void drawViewerLayoutGlyph(float x0, float y0, float x1, float y1, bool active, 
   }
 }
 
+void drawViewerLayoutChoiceGlyph(int layoutIndex, const PlotMenuRect& rect, bool hovered) {
+  const float alpha = hovered ? 0.90f : 0.62f;
+  const float gap = 1.5f;
+  auto drawCell = [&](float nx, float ny, float nw, float nh) {
+    const float x0 = rect.x0 + nx * (rect.x1 - rect.x0) + gap * 0.5f;
+    const float y0 = rect.y0 + ny * (rect.y1 - rect.y0) + gap * 0.5f;
+    const float x1 = rect.x0 + (nx + nw) * (rect.x1 - rect.x0) - gap * 0.5f;
+    const float y1 = rect.y0 + (ny + nh) * (rect.y1 - rect.y0) - gap * 0.5f;
+    if (x1 <= x0 || y1 <= y0) return;
+    drawPlotMenuRect(x0, y0, x1, y1, 0.10f, 0.22f, 0.28f, alpha * 0.50f);
+    drawPlotMenuRect(x0, y1 - 1.0f, x1, y1, 0.44f, 0.82f, 1.0f, alpha);
+    drawPlotMenuRect(x0, y0, x0 + 1.0f, y1, 0.44f, 0.82f, 1.0f, alpha * 0.62f);
+    drawPlotMenuRect(x1 - 1.0f, y0, x1, y1, 0.44f, 0.82f, 1.0f, alpha * 0.54f);
+    drawPlotMenuRect(x0, y0, x1, y0 + 1.0f, 0.44f, 0.82f, 1.0f, alpha * 0.42f);
+  };
+
+  switch (layoutIndex) {
+    case 1:
+      drawCell(0.0f, 0.0f, 0.5f, 1.0f);
+      drawCell(0.5f, 0.0f, 0.5f, 1.0f);
+      break;
+    case 2:
+      drawCell(0.0f, 0.0f, 1.0f / 3.0f, 1.0f);
+      drawCell(1.0f / 3.0f, 0.0f, 1.0f / 3.0f, 1.0f);
+      drawCell(2.0f / 3.0f, 0.0f, 1.0f / 3.0f, 1.0f);
+      break;
+    case 3:
+      drawCell(0.0f, 0.0f, 2.0f / 3.0f, 1.0f);
+      drawCell(2.0f / 3.0f, 0.0f, 1.0f / 3.0f, 0.5f);
+      drawCell(2.0f / 3.0f, 0.5f, 1.0f / 3.0f, 0.5f);
+      break;
+    case 4:
+      drawCell(0.0f, 0.0f, 0.5f, 0.5f);
+      drawCell(0.5f, 0.0f, 0.5f, 0.5f);
+      drawCell(0.0f, 0.5f, 0.5f, 0.5f);
+      drawCell(0.5f, 0.5f, 0.5f, 0.5f);
+      break;
+    case 5:
+      for (int row = 0; row < 2; ++row) {
+        for (int col = 0; col < 3; ++col) {
+          drawCell(static_cast<float>(col) / 3.0f,
+                   static_cast<float>(row) / 2.0f,
+                   1.0f / 3.0f,
+                   0.5f);
+        }
+      }
+      break;
+    case 0:
+    default:
+      drawCell(0.0f, 0.0f, 1.0f, 1.0f);
+      break;
+  }
+}
+
 void drawViewerMenuIconOverlay(const AppState& app,
                                int width,
                                int height,
@@ -21652,7 +22065,7 @@ void drawLayoutMenuOverlay(const AppState& app,
     return;
   }
   const char* labels[kViewerLayoutChoiceCount] = {
-      "Reset Layout", "Split 2", "Triple Columns", "Triple 2 + 1", "Quadrants", "Six Views"};
+      "Single", "Split 2", "Triple Columns", "Triple 2 + 1", "Quadrants", "Six Views"};
   const float sx = static_cast<float>(width) / static_cast<float>(windowWidth);
   const float sy = static_cast<float>(height) / static_cast<float>(windowHeight);
   auto scaleRect = [&](const PlotMenuRect& rect) -> PlotMenuRect {
@@ -21689,7 +22102,12 @@ void drawLayoutMenuOverlay(const AppState& app,
       drawPlotMenuRect(itemRect.x0, itemRect.y0, itemRect.x1, itemRect.y1,
                        0.18f, 0.30f, 0.42f, 0.62f);
     }
-    drawHudTextLine(renderer, labels[i], itemRect.x0 + 10.0f,
+    const PlotMenuRect glyphRect{itemRect.x0 + 8.0f,
+                                 itemRect.y0 + 7.0f,
+                                 itemRect.x0 + 36.0f,
+                                 itemRect.y1 - 7.0f};
+    drawViewerLayoutChoiceGlyph(i, glyphRect, hovered);
+    drawHudTextLine(renderer, labels[i], itemRect.x0 + 44.0f,
                     itemRect.y0 + (renderer.available ? 8.0f : 9.0f),
                     1.0f, hovered ? 0.98f : 0.82f, 0.88f, 0.93f, 0.98f);
   }
@@ -21775,17 +22193,17 @@ void drawPlotModelMenuOverlay(const AppState& app,
                        compactPresetRect.y0,
                        compactPresetRect.x1,
                        compactPresetRect.y1,
-                       hovered ? 0.30f : 0.20f,
-                       hovered ? 0.23f : 0.16f,
-                       hovered ? 0.06f : 0.04f,
+                       hovered ? 0.06f : 0.035f,
+                       hovered ? 0.30f : 0.18f,
+                       hovered ? 0.36f : 0.22f,
                        hasPresets ? (hovered ? 0.86f : 0.70f) : 0.30f);
       drawPlotMenuRect(compactPresetRect.x0,
                        compactPresetRect.y1 - 1.0f,
                        compactPresetRect.x1,
                        compactPresetRect.y1,
+                       0.26f,
+                       0.86f,
                        1.0f,
-                       0.78f,
-                       0.28f,
                        hasPresets ? 0.42f : 0.14f);
       drawHudTextLine(renderer,
                       fitHudText(renderer,
@@ -21796,13 +22214,13 @@ void drawPlotModelMenuOverlay(const AppState& app,
                       compactPresetRect.y0 + (renderer.available ? 6.0f : 7.0f),
                       0.82f,
                       hasPresets ? 0.92f : 0.44f,
-                      0.96f,
-                      0.84f,
-                      0.56f);
+                      0.76f,
+                      0.94f,
+                      1.0f);
       const float triCx = compactPresetRect.x1 - 12.0f;
       const float triCy = compactPresetRect.y0 + (compactPresetRect.y1 - compactPresetRect.y0) * 0.52f;
       glBegin(GL_TRIANGLES);
-      glColor4f(0.98f, 0.82f, 0.48f, hasPresets ? (hovered ? 0.95f : 0.78f) : 0.30f);
+      glColor4f(0.48f, 0.90f, 1.0f, hasPresets ? (hovered ? 0.95f : 0.78f) : 0.30f);
       glVertex2f(triCx - 4.5f, triCy + 2.5f);
       glVertex2f(triCx + 4.5f, triCy + 2.5f);
       glVertex2f(triCx, triCy - 3.0f);
@@ -21933,6 +22351,8 @@ void drawPlotModelMenuOverlay(const AppState& app,
     const float swatchX = labelX;
     const float swatchY = rr.y0 + (kPlotMenuRowHeight - swatchSize) * 0.5f;
     const float textLabelX = hasVectorSwatch ? (labelX + swatchSize + 8.0f) : labelX;
+    const bool stackedValueRow = viewerMenuRowStacksValue(row, rowWidth);
+    const float ordinaryValueWidth = hudTextWidth(renderer, row.value, textScale);
     if (row.spacer) {
       drawPlotMenuRect(rr.x0 + 14.0f,
                        rr.y0 + (rr.y1 - rr.y0) * 0.5f,
@@ -21990,7 +22410,7 @@ void drawPlotModelMenuOverlay(const AppState& app,
       }
       continue;
     }
-    if (row.action == ViewerMenuAction::LoadUserPreset) {
+    if (row.action == ViewerMenuAction::PlotModel) {
       drawPlotMenuRect(rr.x0,
                        rr.y0 + 4.0f,
                        rr.x1,
@@ -22008,11 +22428,6 @@ void drawPlotModelMenuOverlay(const AppState& app,
                        0.28f,
                        row.enabled ? 0.38f : 0.10f);
       const float valueWidthLimit = std::max(40.0f, rowWidth * 0.48f);
-      const std::string fittedLabel =
-          fitHudText(renderer, row.label, std::max(24.0f, rowWidth - valueWidthLimit - 32.0f), textScale);
-      const std::string fittedValue = fitHudText(renderer, row.value, valueWidthLimit, textScale);
-      (void)fittedLabel;
-      (void)fittedValue;
       drawHudTextLineClipped(renderer,
                              row.label,
                              textLabelX,
@@ -22038,6 +22453,54 @@ void drawPlotModelMenuOverlay(const AppState& app,
                              true);
       continue;
     }
+    if (row.action == ViewerMenuAction::LoadUserPreset) {
+      drawPlotMenuRect(rr.x0,
+                       rr.y0 + 4.0f,
+                       rr.x1,
+                       rr.y1 - 4.0f,
+                       hovered ? 0.06f : 0.035f,
+                       hovered ? 0.30f : 0.18f,
+                       hovered ? 0.36f : 0.22f,
+                       row.enabled ? (hovered ? 0.78f : 0.62f) : 0.25f);
+      drawPlotMenuRect(rr.x0,
+                       rr.y1 - 5.0f,
+                       rr.x1,
+                       rr.y1 - 4.0f,
+                       0.26f,
+                       0.86f,
+                       1.0f,
+                       row.enabled ? 0.38f : 0.10f);
+      const float valueWidthLimit = std::max(40.0f, rowWidth * 0.48f);
+      const std::string fittedLabel =
+          fitHudText(renderer, row.label, std::max(24.0f, rowWidth - valueWidthLimit - 32.0f), textScale);
+      const std::string fittedValue = fitHudText(renderer, row.value, valueWidthLimit, textScale);
+      (void)fittedLabel;
+      (void)fittedValue;
+      drawHudTextLineClipped(renderer,
+                             row.label,
+                             textLabelX,
+                             singleBaseline,
+                             std::max(24.0f, rowWidth - valueWidthLimit - 32.0f),
+                             textScale,
+                             hovered,
+                             row.enabled ? 0.94f : 0.42f,
+                             0.76f,
+                             0.94f,
+                             1.0f);
+      drawHudTextLineClipped(renderer,
+                             row.value,
+                             valueRightX - valueWidthLimit,
+                             singleBaseline,
+                             valueWidthLimit,
+                             textScale,
+                             hovered,
+                             row.enabled ? 0.92f : 0.38f,
+                             0.70f,
+                             0.94f,
+                             1.0f,
+                             true);
+      continue;
+    }
     if (hasVectorSwatch) {
       drawPlotMenuRect(swatchX, swatchY, swatchX + swatchSize, swatchY + swatchSize,
                        vectorR, vectorG, vectorB, row.enabled ? 0.92f : 0.34f);
@@ -22049,8 +22512,10 @@ void drawPlotModelMenuOverlay(const AppState& app,
           fitHudText(renderer, row.label, std::max(24.0f, rowWidth - 190.0f), textScale);
       drawHudTextLine(renderer, fittedLabel, textLabelX, singleBaseline, textScale,
                       alpha, 0.90f, 0.94f, 0.98f);
-      const auto rects = slicingVectorSelectorRects(rr, 22.0f, 8.0f);
       const PlotMenuRect rowWindowRect = viewerMenuRowWindowRect(app, windowWidth, windowHeight, i);
+      // Retina/high-DPI safety: selector hit rects live in GLFW window coordinates.
+      // Draw by scaling those exact rects into framebuffer space so chips cannot
+      // drift from pointer input when framebufferSize != windowSize.
       const auto windowRects = slicingVectorSelectorRects(rowWindowRect, 22.0f, 8.0f);
       const int hoverVector = row.enabled ? slicingVectorIndexAt(windowRects, app.hoverX, app.hoverY) : -1;
       for (int vector = 0; vector < kSlicingVectorCount; ++vector) {
@@ -22059,7 +22524,7 @@ void drawPlotModelMenuOverlay(const AppState& app,
         const bool active = slicingVectorEnabled(app.viewerState, vector);
         const bool vectorHovered = hoverVector == vector;
         const float level = active ? (vectorHovered ? 1.12f : 1.0f) : (vectorHovered ? 0.40f : 0.22f);
-        const PlotMenuRect& r = rects[static_cast<size_t>(vector)];
+        const PlotMenuRect r = scaleRect(windowRects[static_cast<size_t>(vector)]);
         drawPlotMenuRect(r.x0, r.y0, r.x1, r.y1,
                          std::min(1.0f, vr * level),
                          std::min(1.0f, vg * level),
@@ -22081,28 +22546,28 @@ void drawPlotModelMenuOverlay(const AppState& app,
           fitHudText(renderer, row.label, std::max(24.0f, rowWidth - 126.0f), textScale);
       drawHudTextLine(renderer, fittedLabel, textLabelX, singleBaseline, textScale,
                       alpha, 0.90f, 0.94f, 0.98f);
-      constexpr float cubeSize = 17.0f;
-      constexpr float cubeGap = 8.0f;
-      const float y0 = rr.y0 + (rr.y1 - rr.y0 - cubeSize) * 0.5f;
-      const float right = rr.x1 - 14.0f;
-      const bool active[3] = {
+      const int channelCount = waveformChannelSelectorCount(app.viewerState);
+      const PlotMenuRect rowWindowRect = viewerMenuRowWindowRect(app, windowWidth, windowHeight, i);
+      const auto channelWindowRects = waveformChannelSelectorRects(rowWindowRect, channelCount);
+      const bool active[kWaveformParadeChannelCount] = {
           app.viewerState.waveformChannelRed,
           app.viewerState.waveformChannelGreen,
-          app.viewerState.waveformChannelBlue};
-      const float colors[3][3] = {
-          {1.0f, 0.16f, 0.12f},
-          {0.20f, 1.0f, 0.28f},
-          {0.24f, 0.52f, 1.0f}};
-      for (int channel = 2; channel >= 0; --channel) {
-        const float x1 = right - static_cast<float>(2 - channel) * (cubeSize + cubeGap);
-        const float x0 = x1 - cubeSize;
+          app.viewerState.waveformChannelBlue,
+          app.viewerState.waveformChannelLuma};
+      const float colors[kWaveformParadeChannelCount][3] = {
+          {1.0f, 0.12f, 0.04f},
+          {0.12f, 1.0f, 0.24f},
+          {0.20f, 0.46f, 1.0f},
+          {0.88f, 0.92f, 0.96f}};
+      for (int channel = channelCount - 1; channel >= 0; --channel) {
+        const PlotMenuRect rect = scaleRect(channelWindowRects[static_cast<size_t>(channel)]);
         const float level = active[channel] ? 1.0f : 0.24f;
-        drawPlotMenuRect(x0, y0, x1, y0 + cubeSize,
+        drawPlotMenuRect(rect.x0, rect.y0, rect.x1, rect.y1,
                          colors[channel][0] * level,
                          colors[channel][1] * level,
                          colors[channel][2] * level,
                          active[channel] ? 0.94f : 0.58f);
-        drawPlotMenuRect(x0, y0 + cubeSize - 1.0f, x1, y0 + cubeSize,
+        drawPlotMenuRect(rect.x0, rect.y1 - 1.0f, rect.x1, rect.y1,
                          1.0f, 1.0f, 1.0f, active[channel] ? 0.25f : 0.08f);
       }
     } else if (row.slider) {
@@ -22238,16 +22703,16 @@ void drawPlotModelMenuOverlay(const AppState& app,
                          0.94f);
     } else {
       const float indent = textLabelX - rr.x0;
-      const float labelWidth = hudTextWidth(renderer, row.label, textScale);
-      const float valueWidth = hudTextWidth(renderer, row.value, textScale);
-      const bool splitValue =
-          !row.value.empty() && (indent + labelWidth + valueWidth + 36.0f > rowWidth);
-      if (splitValue) {
+      if (stackedValueRow) {
+        const float glyphReserve = rowHasDisplayGlyph ? 23.0f : 0.0f;
         const float maxLineWidth = std::max(24.0f, rowWidth - indent - 14.0f);
+        const float valueMaxWidth = std::max(24.0f, rowWidth - indent - 14.0f - glyphReserve);
+        const float labelBaseline = rr.y1 - (renderer.available ? 17.0f : 16.0f);
+        const float valueBaseline = rr.y0 + (renderer.available ? 15.0f : 16.0f);
         drawHudTextLineClipped(renderer,
                                row.label,
                                textLabelX,
-                               rr.y0 + (renderer.available ? 25.0f : 26.0f),
+                               labelBaseline,
                                maxLineWidth,
                                textScale,
                                hovered,
@@ -22257,9 +22722,9 @@ void drawPlotModelMenuOverlay(const AppState& app,
                                0.98f);
         drawHudTextLineClipped(renderer,
                                row.value,
-                               rr.x1 - (rowWidth - 28.0f) - 14.0f,
-                               rr.y0 + (renderer.available ? 8.0f : 9.0f),
-                               rowWidth - 28.0f,
+                               valueRightX - valueMaxWidth,
+                               valueBaseline,
+                               valueMaxWidth,
                                textScale,
                                hovered,
                                row.enabled ? 0.82f : 0.34f,
@@ -22268,7 +22733,7 @@ void drawPlotModelMenuOverlay(const AppState& app,
                                0.96f,
                                true);
       } else {
-        const float valueMaxWidth = row.value.empty() ? 0.0f : std::min(rowWidth * 0.55f, valueWidth);
+        const float valueMaxWidth = row.value.empty() ? 0.0f : std::min(rowWidth * 0.55f, ordinaryValueWidth);
         const float labelMaxWidth = row.value.empty()
                                         ? std::max(24.0f, rowWidth - indent - 14.0f)
                                         : std::max(24.0f, valueRightX - valueMaxWidth - textLabelX - 16.0f);
@@ -22299,7 +22764,7 @@ void drawPlotModelMenuOverlay(const AppState& app,
     }
     if (rowHasDisplayGlyph) {
       drawViewerDisplayGlyph(rr.x1 - 29.0f,
-                             rr.y0 + (kPlotMenuRowHeight - 12.0f) * 0.5f,
+                             stackedValueRow ? rr.y0 + 7.0f : rr.y0 + (kPlotMenuRowHeight - 12.0f) * 0.5f,
                              false,
                              row.enabled);
     }
@@ -22529,7 +22994,9 @@ void drawPlotModelMenuOverlay(const AppState& app,
   }
 
   const float activeRowsY0 = viewerMenuRowsY0(app, mainWindowRect);
-  const float contentHeight = viewerMenuRowsHeight(rows);
+  const float activeRowsX0 = viewerMenuRowsX0(mainWindowRect);
+  const float activeRowWidth = std::max(1.0f, mainWindowRect.x1 - kViewerDrawerPad - activeRowsX0);
+  const float contentHeight = viewerMenuRowsHeight(rows, activeRowWidth);
   const float visibleHeight = std::max(1.0f, mainWindowRect.y1 - activeRowsY0 - kViewerDrawerPad);
   if (contentHeight > visibleHeight + 1.0f) {
     const float scrollT = clampf(app.viewerMenuScroll / std::max(1.0f, contentHeight - visibleHeight), 0.0f, 1.0f);
@@ -22847,6 +23314,7 @@ std::string plotWindowDerivedBuildKey(const PlotWindowState& window,
      << "|waveformChannels=" << (state.waveformChannelRed ? 1 : 0)
      << (state.waveformChannelGreen ? 1 : 0)
      << (state.waveformChannelBlue ? 1 : 0)
+     << (state.waveformChannelLuma ? 1 : 0)
      << "|waveformShowOverflow=" << (state.waveformShowOverflow ? 1 : 0)
      << "|waveformOverflow=" << (state.waveformHighlightOverflow ? 1 : 0)
      << "|waveformLumaMethod=" << state.waveformLumaMethod
@@ -22887,6 +23355,11 @@ std::string plotWindowRasterDerivedBuildKey(const PlotWindowState& window,
      << "|view=" << state.stateRevision
      << "|model=" << state.plotModel
      << "|waveformMode=" << state.waveformMode
+     << "|waveformChannels=" << (state.waveformChannelRed ? 1 : 0)
+     << (state.waveformChannelGreen ? 1 : 0)
+     << (state.waveformChannelBlue ? 1 : 0)
+     << (state.waveformChannelLuma ? 1 : 0)
+     << "|waveformLumaMethod=" << state.waveformLumaMethod
      << "|histogramMode=" << state.histogramMode
      << "|scopeRange=" << state.scopeRangeMode
      << "|linear=" << (state.plotDisplayLinear ? 1 : 0)
@@ -23642,13 +24115,15 @@ void drawAnalyticalScopePlot(const PlotWindowState& window,
   glEnd();
 
   if (mesh.waveformScope && mesh.scopeMode == 1) {
+    const int paradeGuideCount = window.viewState.waveformChannelLuma ? 4 : 3;
     glColor4f(clampf(0.70f * gridColorGain, 0.0f, 1.0f),
               clampf(0.76f * gridColorGain, 0.0f, 1.0f),
               clampf(0.84f * gridColorGain, 0.0f, 1.0f),
               clampf(0.36f * gridBrightness, 0.0f, 0.86f));
     glBegin(GL_LINES);
-    for (int i = 1; i < 3; ++i) {
-      const float x = kScopePlotLeft + kScopePlotWidth * static_cast<float>(i) / 3.0f;
+    for (int i = 1; i < paradeGuideCount; ++i) {
+      const float x = kScopePlotLeft + kScopePlotWidth * static_cast<float>(i) /
+                                           static_cast<float>(paradeGuideCount);
       glVertex2f(x, kScopePlotBottom);
       glVertex2f(x, kScopePlotTop);
     }
@@ -23663,24 +24138,16 @@ void drawAnalyticalScopePlot(const PlotWindowState& window,
     // additive phosphor-style accumulation.
     glEnable(GL_POINT_SMOOTH);
     glHint(GL_POINT_SMOOTH_HINT, GL_NICEST);
-    const float horizontalSpacing =
-        static_cast<float>(width) / static_cast<float>(std::max(1, mesh.scopeWidth));
-    const float verticalSampleSpacing =
-        static_cast<float>(height) /
-        static_cast<float>(std::max(1, mesh.scopeSourceRows));
     const float scopePointSize =
         mesh.waveformScope
-            ? clampf(1.30f + 0.28f * std::sqrt(
-                                   std::max(0.0f,
-                                            horizontalSpacing * verticalSampleSpacing)),
-                     1.45f,
-                     2.45f)
+            ? waveformScopeDisplayPointSize(mesh,
+                                            window.viewState.waveformChannelLuma,
+                                            window.viewState.waveformDotSize,
+                                            width,
+                                            height,
+                                            half)
             : 1.45f;
-    const float waveformDotSize =
-        mesh.waveformScope
-            ? clampf(static_cast<float>(window.viewState.waveformDotSize), 0.05f, 1.5f)
-            : 1.0f;
-    glPointSize(clampf(scopePointSize * waveformDotSize, 0.05f, 7.0f));
+    glPointSize(scopePointSize);
     glVertexPointer(3, GL_FLOAT, 0, mesh.pointVerts.data());
     glColorPointer(4, GL_FLOAT, 0, mesh.pointColors.data());
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
@@ -23836,18 +24303,6 @@ void drawAnalyticalScopePlot(const PlotWindowState& window,
                       0.90f);
     }
   }
-  const std::string modeLabel =
-      mesh.waveformScope ? ChromaspaceViewer::waveformModeLabel(mesh.scopeMode)
-                         : ChromaspaceViewer::histogramModeLabel(mesh.scopeMode);
-  drawHudTextLineRight(renderer,
-                       modeLabel,
-                       static_cast<float>(width) - 8.0f,
-                       static_cast<float>(height) - 10.0f,
-                       labelScale,
-                       0.72f,
-                       0.74f,
-                       0.82f,
-                       0.92f);
   if (window.syncLabel == "Waiting for Resolve") {
     const std::string waiting = "Waiting for Resolve";
     drawHudTextLine(renderer,
@@ -24766,7 +25221,7 @@ void drawPlotWindowFramesOverlay(const AppState& app,
       glEnd();
       glLineWidth(1.0f);
     }
-    if (plotWindowSupportsSlicingQuickButton(window)) {
+    if (plotWindowShowsSlicingQuickButton(app, window)) {
       const PlotMenuRect buttonWindowRect =
           slicingQuickButtonRect(app, window, windowWidth, windowHeight);
       if (buttonWindowRect.x1 > buttonWindowRect.x0 && buttonWindowRect.y1 > buttonWindowRect.y0) {
@@ -26461,8 +26916,8 @@ void drawRollDirectionIndicator(int width,
   glMatrixMode(GL_MODELVIEW);
 }
 
-constexpr double kRightClickMenuMaxDurationSeconds = 0.10;
-constexpr double kRightClickMenuMaxMovePixels = 6.0;
+constexpr double kRightClickMenuMaxDurationSeconds = 0.28;
+constexpr double kRightClickMenuMaxMovePixels = 10.0;
 
 // Section: pointer and keyboard callbacks
 // Gesture ownership starts here and continues through mouseButtonCallback(),
@@ -26617,6 +27072,14 @@ void mouseButtonCallback(GLFWwindow* window, int button, int action, int mods) {
     app->rightClickMenuPressTime = glfwGetTime();
     app->rightClickMenuPressX = rightCursorX;
     app->rightClickMenuPressY = rightCursorY;
+    int windowWidth = 1, windowHeight = 1;
+    glfwGetWindowSize(window, &windowWidth, &windowHeight);
+    app->rightClickMenuPressInMenu =
+        pointerInViewerMenuUi(*app, windowWidth, windowHeight, rightCursorX, rightCursorY);
+    app->rightClickMenuPressWindowId =
+        app->rightClickMenuPressInMenu
+            ? -1
+            : plotWindowAt(*app, windowWidth, windowHeight, rightCursorX, rightCursorY);
   } else if (button == GLFW_MOUSE_BUTTON_RIGHT && action == GLFW_RELEASE) {
     const double elapsed = glfwGetTime() - app->rightClickMenuPressTime;
     const double dx = rightCursorX - app->rightClickMenuPressX;
@@ -26629,11 +27092,17 @@ void mouseButtonCallback(GLFWwindow* window, int button, int action, int mods) {
     if (quickRightClick) {
       int windowWidth = 1, windowHeight = 1;
       glfwGetWindowSize(window, &windowWidth, &windowHeight);
-      if (pointerInViewerMenuUi(*app, windowWidth, windowHeight, rightCursorX, rightCursorY)) {
+      if (app->rightClickMenuPressInMenu ||
+          pointerInViewerMenuUi(*app, windowWidth, windowHeight, rightCursorX, rightCursorY)) {
         clearPointerInteractionState(app);
         return;
       }
-      const int windowId = plotWindowAt(*app, windowWidth, windowHeight, rightCursorX, rightCursorY);
+      int windowId = plotWindowById(app, app->rightClickMenuPressWindowId)
+                         ? app->rightClickMenuPressWindowId
+                         : -1;
+      if (windowId < 0) {
+        windowId = plotWindowAt(*app, windowWidth, windowHeight, rightCursorX, rightCursorY);
+      }
       setPlotModelMenuVisible(app, false);
       app->quickPlotModelMenuVisible = false;
       app->addPlotMenuVisible = false;
@@ -26812,7 +27281,7 @@ void mouseButtonCallback(GLFWwindow* window, int button, int action, int mods) {
     }
     if (!pointerInsideViewerMenu) {
     for (auto it = app->plotWindows.rbegin(); it != app->plotWindows.rend(); ++it) {
-      if (!plotWindowSupportsSlicingQuickButton(*it) || !it->slicingDrawerOpen) continue;
+      if (!plotWindowShowsSlicingQuickButton(*app, *it) || !it->slicingDrawerOpen) continue;
       const SlicingQuickDrawerRects drawerRects =
           slicingQuickDrawerItemRects(*app, *it, windowWidth, windowHeight);
       if (!pointInPlotMenuRect(drawerRects.drawer, cursorX, cursorY)) continue;
@@ -26836,7 +27305,7 @@ void mouseButtonCallback(GLFWwindow* window, int button, int action, int mods) {
       return;
     }
     for (auto it = app->plotWindows.rbegin(); it != app->plotWindows.rend(); ++it) {
-      if (!plotWindowSupportsSlicingQuickButton(*it)) continue;
+      if (!plotWindowShowsSlicingQuickButton(*app, *it)) continue;
       if (!pointInPlotMenuRect(slicingQuickButtonRect(*app, *it, windowWidth, windowHeight),
                                cursorX,
                                cursorY)) {
@@ -27134,8 +27603,9 @@ void mouseButtonCallback(GLFWwindow* window, int button, int action, int mods) {
         if (row.channelSelector && row.enabled) {
           const PlotMenuRect rowRect =
               viewerMenuRowWindowRect(*app, windowWidth, windowHeight, mainIndex);
-          const auto channelRects = waveformChannelSelectorRects(rowRect);
-          for (int channel = 0; channel < 3; ++channel) {
+          const int channelCount = waveformChannelSelectorCount(app->viewerState);
+          const auto channelRects = waveformChannelSelectorRects(rowRect, channelCount);
+          for (int channel = 0; channel < channelCount; ++channel) {
             if (pointInPlotMenuRect(channelRects[static_cast<size_t>(channel)],
                                     cursorX,
                                     cursorY)) {
@@ -27889,7 +28359,9 @@ void scrollCallback(GLFWwindow* window, double xoffset, double yoffset) {
         }
       }
       const float rowsY0 = viewerMenuRowsY0(*app, rect);
-      const float contentHeight = viewerMenuRowsHeight(rows);
+      const float rowsX0 = viewerMenuRowsX0(rect);
+      const float rowWidth = std::max(1.0f, rect.x1 - kViewerDrawerPad - rowsX0);
+      const float contentHeight = viewerMenuRowsHeight(rows, rowWidth);
       const float visibleHeight = std::max(1.0f, rect.y1 - rowsY0 - kViewerDrawerPad);
       const float maxScroll = std::max(0.0f, contentHeight - visibleHeight);
       app->viewerMenuScroll =
@@ -29123,10 +29595,15 @@ int main() {
     glfwGetFramebufferSize(window, &width, &height);
     int windowWidth = 1, windowHeight = 1;
     glfwGetWindowSize(window, &windowWidth, &windowHeight);
+    if (!viewerWindowGeometryUsableForWorkspace(width, height, windowWidth, windowHeight)) {
+      clearPointerInteractionState(&app);
+      std::this_thread::sleep_for(std::chrono::milliseconds(16));
+      continue;
+    }
     ensureDefaultPlotWindow(&app);
     reflowPlotWindowsForWorkspaceResize(&app, windowWidth, windowHeight);
     for (auto& plotWindow : app.plotWindows) {
-      plotWindow.rect = clampedPlotWindowRect(plotWindow.rect, windowWidth, windowHeight);
+      plotWindow.rect = clampedPlotWindowRect(app, plotWindow.rect, windowWidth, windowHeight);
     }
     if (!viewerImageLassoSessionActive(app)) {
       std::vector<std::pair<int, int>> temporarySourceSignalWindowsToClose;
@@ -29143,7 +29620,7 @@ int main() {
         plotWindow.sourceSignalTemporaryLassoSurface = false;
         plotWindow.sourceSignalDockOwnerWindowId = -1;
         if (plotWindowRectLooksRestorable(plotWindow.sourceSignalRestoreRect)) {
-          plotWindow.rect = clampedPlotWindowRect(plotWindow.sourceSignalRestoreRect, windowWidth, windowHeight);
+          plotWindow.rect = clampedPlotWindowRect(app, plotWindow.sourceSignalRestoreRect, windowWidth, windowHeight);
         }
       }
       for (const auto& [windowId, ownerId] : temporarySourceSignalWindowsToClose) {

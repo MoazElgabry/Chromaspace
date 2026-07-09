@@ -5125,12 +5125,13 @@ class ChromaspaceEffect : public ImageEffect {
     readDouble("waveformGridBrightness", &state.waveformGridBrightness);
     readDouble("waveformSaturation", &state.waveformSaturation);
     readDouble("waveformDotSize", &state.waveformDotSize);
-    readBool("waveformChannelRed", &state.waveformChannelRed);
-    readBool("waveformChannelGreen", &state.waveformChannelGreen);
-    readBool("waveformChannelBlue", &state.waveformChannelBlue);
-    readBool("waveformShowOverflow", &state.waveformShowOverflow);
-    readBool("waveformHighlightOverflow", &state.waveformHighlightOverflow);
-    readInt("waveformLumaMethod", &state.waveformLumaMethod);
+  readBool("waveformChannelRed", &state.waveformChannelRed);
+  readBool("waveformChannelGreen", &state.waveformChannelGreen);
+  readBool("waveformChannelBlue", &state.waveformChannelBlue);
+  readBool("waveformChannelLuma", &state.waveformChannelLuma);
+  readBool("waveformShowOverflow", &state.waveformShowOverflow);
+  readBool("waveformHighlightOverflow", &state.waveformHighlightOverflow);
+  readInt("waveformLumaMethod", &state.waveformLumaMethod);
     readInt("histogramMode", &state.histogramMode);
     readBool("histogramShowOverflow", &state.histogramShowOverflow);
     readBool("histogramHighlightOverflow", &state.histogramHighlightOverflow);
@@ -7453,6 +7454,7 @@ class ChromaspaceEffect : public ImageEffect {
         << ",\"waveformChannelRed\":" << (viewerState.waveformChannelRed ? 1 : 0)
         << ",\"waveformChannelGreen\":" << (viewerState.waveformChannelGreen ? 1 : 0)
         << ",\"waveformChannelBlue\":" << (viewerState.waveformChannelBlue ? 1 : 0)
+        << ",\"waveformChannelLuma\":" << (viewerState.waveformChannelLuma ? 1 : 0)
         << ",\"waveformShowOverflow\":" << (viewerState.waveformShowOverflow ? 1 : 0)
         << ",\"waveformHighlightOverflow\":" << (viewerState.waveformHighlightOverflow ? 1 : 0)
         << ",\"waveformLumaMethod\":" << viewerState.waveformLumaMethod
@@ -10256,6 +10258,9 @@ class ChromaspaceEffect : public ImageEffect {
 #endif
   }
 
+  // Metal viewer payload readback is source-only by design. Resolve may provide a
+  // destination buffer scoped to args.renderWindow, while viewer clouds and Source
+  // Signal often read the full source bounds.
   CloudBuildResult buildPreviewCloudPayloadFromMetalReadback(
       Image* src,
       Image* dst,
@@ -10264,8 +10269,9 @@ class ChromaspaceEffect : public ImageEffect {
       const CloudFootprintInfo& footprint) {
 #if defined(__APPLE__)
     CloudBuildResult out{};
-    if (!src || !dst || !args.isEnabledMetalRender || args.pMetalCmdQ == nullptr ||
-        src->getPixelData() == nullptr || dst->getPixelData() == nullptr) {
+    (void)dst;
+    if (!src || !args.isEnabledMetalRender || args.pMetalCmdQ == nullptr ||
+        src->getPixelData() == nullptr) {
       return out;
     }
     const OfxRectI bounds = src->getBounds();
@@ -10273,24 +10279,20 @@ class ChromaspaceEffect : public ImageEffect {
     const int sampledHeight = bounds.y2 - bounds.y1;
     if (sampledWidth <= 0 || sampledHeight <= 0) return out;
     size_t srcRowBytes = static_cast<size_t>(std::abs(src->getRowBytes()));
-    size_t dstRowBytes = static_cast<size_t>(std::abs(dst->getRowBytes()));
     const size_t sampledPackedRowBytes = static_cast<size_t>(sampledWidth) * 4u * sizeof(float);
     if (srcRowBytes == 0) srcRowBytes = sampledPackedRowBytes;
-    if (dstRowBytes == 0) dstRowBytes = sampledPackedRowBytes;
     if (!ensureStageBuffer(static_cast<size_t>(sampledWidth) * static_cast<size_t>(sampledHeight))) return out;
     float* readback = stageSrcPtr();
     if (!readback) return out;
-    if (!ChromaspaceMetal::copyHostBuffersReadback(src->getPixelData(),
-                                                   dst->getPixelData(),
-                                                   sampledWidth,
-                                                   sampledHeight,
-                                                   srcRowBytes,
-                                                   dstRowBytes,
-                                                   bounds.x1,
-                                                   bounds.y1,
-                                                   args.pMetalCmdQ,
-                                                   readback,
-                                                   sampledPackedRowBytes)) {
+    if (!ChromaspaceMetal::copySourceToHost(src->getPixelData(),
+                                            sampledWidth,
+                                            sampledHeight,
+                                            srcRowBytes,
+                                            bounds.x1,
+                                            bounds.y1,
+                                            args.pMetalCmdQ,
+                                            readback,
+                                            sampledPackedRowBytes)) {
       return out;
     }
     out = buildPreviewInputCloudPayloadFromBuffer(readback, sampledPackedRowBytes, sampledWidth, sampledHeight, args.time, previewMode, footprint);
@@ -10494,8 +10496,9 @@ class ChromaspaceEffect : public ImageEffect {
       const std::string& glossSourceSettingsKey = std::string()) {
 #if defined(__APPLE__)
     CloudBuildResult out{};
-    if (!src || !dst || !args.isEnabledMetalRender || args.pMetalCmdQ == nullptr ||
-        src->getPixelData() == nullptr || dst->getPixelData() == nullptr) {
+    (void)dst;
+    if (!src || !args.isEnabledMetalRender || args.pMetalCmdQ == nullptr ||
+        src->getPixelData() == nullptr) {
       return out;
     }
     int fullWidth = 0;
@@ -10504,24 +10507,20 @@ class ChromaspaceEffect : public ImageEffect {
     int fullY1 = 0;
     if (!fullSourceDimensions(src, &fullWidth, &fullHeight, &fullX1, &fullY1)) return out;
     size_t srcRowBytes = static_cast<size_t>(std::abs(src->getRowBytes()));
-    size_t dstRowBytes = static_cast<size_t>(std::abs(dst->getRowBytes()));
     const size_t fullPackedRowBytes = static_cast<size_t>(fullWidth) * 4u * sizeof(float);
     if (srcRowBytes == 0) srcRowBytes = fullPackedRowBytes;
-    if (dstRowBytes == 0) dstRowBytes = fullPackedRowBytes;
     if (!ensureStageBuffer(static_cast<size_t>(fullWidth) * static_cast<size_t>(fullHeight))) return out;
     float* readback = stageSrcPtr();
     if (!readback) return out;
-    if (!ChromaspaceMetal::copyHostBuffersReadback(src->getPixelData(),
-                                                   dst->getPixelData(),
-                                                   fullWidth,
-                                                   fullHeight,
-                                                   srcRowBytes,
-                                                   dstRowBytes,
-                                                   fullX1,
-                                                   fullY1,
-                                                   args.pMetalCmdQ,
-                                                   readback,
-                                                   fullPackedRowBytes)) {
+    if (!ChromaspaceMetal::copySourceToHost(src->getPixelData(),
+                                            fullWidth,
+                                            fullHeight,
+                                            srcRowBytes,
+                                            fullX1,
+                                            fullY1,
+                                            args.pMetalCmdQ,
+                                            readback,
+                                            fullPackedRowBytes)) {
       return out;
     }
     out = buildInputCloudPayloadFromBuffer(readback, fullPackedRowBytes, fullWidth, fullHeight, args.time,
@@ -11000,8 +10999,9 @@ class ChromaspaceEffect : public ImageEffect {
       const CloudFootprintInfo& footprint) {
 #if defined(__APPLE__)
     SourceSignalBuildResult out{};
-    if (!src || !dst || !args.isEnabledMetalRender || args.pMetalCmdQ == nullptr ||
-        src->getPixelData() == nullptr || dst->getPixelData() == nullptr) {
+    (void)dst;
+    if (!src || !args.isEnabledMetalRender || args.pMetalCmdQ == nullptr ||
+        src->getPixelData() == nullptr) {
       return out;
     }
     int width = 0;
@@ -11010,24 +11010,20 @@ class ChromaspaceEffect : public ImageEffect {
     int y1 = 0;
     if (!fullSourceDimensions(src, &width, &height, &x1, &y1)) return out;
     size_t srcRowBytes = static_cast<size_t>(std::abs(src->getRowBytes()));
-    size_t dstRowBytes = static_cast<size_t>(std::abs(dst->getRowBytes()));
     const size_t packedRowBytes = static_cast<size_t>(width) * 4u * sizeof(float);
     if (srcRowBytes == 0) srcRowBytes = packedRowBytes;
-    if (dstRowBytes == 0) dstRowBytes = packedRowBytes;
     if (!ensureStageBuffer(static_cast<size_t>(width) * static_cast<size_t>(height))) return out;
     float* readback = stageSrcPtr();
     if (!readback) return out;
-    if (!ChromaspaceMetal::copyHostBuffersReadback(src->getPixelData(),
-                                                   dst->getPixelData(),
-                                                   width,
-                                                   height,
-                                                   srcRowBytes,
-                                                   dstRowBytes,
-                                                   x1,
-                                                   y1,
-                                                   args.pMetalCmdQ,
-                                                   readback,
-                                                   packedRowBytes)) {
+    if (!ChromaspaceMetal::copySourceToHost(src->getPixelData(),
+                                            width,
+                                            height,
+                                            srcRowBytes,
+                                            x1,
+                                            y1,
+                                            args.pMetalCmdQ,
+                                            readback,
+                                            packedRowBytes)) {
       return out;
     }
     return buildSourceSignalPayloadFromBuffer(readback,
@@ -11340,6 +11336,22 @@ class ChromaspaceEffect : public ImageEffect {
           return true;
         }
       } else {
+        if (!ChromaspaceMetal::copyHostBuffers(src->getPixelData(),
+                                               dst->getPixelData(),
+                                               renderWidth,
+                                               renderHeight,
+                                               srcRowBytes,
+                                               dstRowBytes,
+                                               args.renderWindow.x1,
+                                               args.renderWindow.y1,
+                                               args.pMetalCmdQ,
+                                               overlay != nullptr ? overlay->pixels.data() : nullptr,
+                                               overlay != nullptr ? overlay->x1 : 0,
+                                               overlay != nullptr ? overlay->y1 : 0,
+                                               overlay != nullptr ? overlay->width : 0,
+                                               overlay != nullptr ? overlay->height : 0)) {
+          return false;
+        }
         int fullWidth = 0;
         int fullHeight = 0;
         int fullX1 = 0;
@@ -11349,17 +11361,15 @@ class ChromaspaceEffect : public ImageEffect {
         if (!ensureStageBuffer(static_cast<size_t>(fullWidth) * static_cast<size_t>(fullHeight))) return false;
         float* readback = stageSrcPtr();
         if (!readback) return false;
-        if (ChromaspaceMetal::copyHostBuffersReadback(src->getPixelData(),
-                                                         dst->getPixelData(),
-                                                         fullWidth,
-                                                         fullHeight,
-                                                         srcRowBytes,
-                                                         dstRowBytes,
-                                                         fullX1,
-                                                         fullY1,
-                                                         args.pMetalCmdQ,
-                                                         readback,
-                                                         fullPackedRowBytes)) {
+        if (ChromaspaceMetal::copySourceToHost(src->getPixelData(),
+                                               fullWidth,
+                                               fullHeight,
+                                               srcRowBytes,
+                                               fullX1,
+                                               fullY1,
+                                               args.pMetalCmdQ,
+                                               readback,
+                                               fullPackedRowBytes)) {
           if (built != nullptr) {
             *built = buildInputCloudPayloadFromBuffer(readback, fullPackedRowBytes, fullWidth, fullHeight, args.time, previewMode);
           }

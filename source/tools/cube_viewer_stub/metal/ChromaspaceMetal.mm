@@ -150,6 +150,8 @@ struct ScopeDensityUniforms {
   float rangeMin;
   float invRange;
   int excludeOverflow;
+  int channelCount;
+  int lumaMethod;
 };
 
 struct GlossFieldAccumulateUniforms {
@@ -293,6 +295,8 @@ struct ScopeDensityUniforms {
   float rangeMin;
   float invRange;
   int excludeOverflow;
+  int channelCount;
+  int lumaMethod;
 };
 
 struct GlossFieldAccumulateUniforms {
@@ -1327,6 +1331,8 @@ void accumulateScopeDensity(device atomic_uint* density,
                             int channel,
                             float xNorm,
                             float value) {
+  int channelCount = max(u.channelCount, 1);
+  if (channel < 0 || channel >= channelCount) return;
   if (u.excludeOverflow != 0 && (value < 0.0 || value > 1.0)) return;
   int x = clamp(int(xNorm * float(u.width)), 0, max(u.width - 1, 0));
   int signalBins = u.waveform != 0 ? u.height : u.width;
@@ -1337,6 +1343,19 @@ void accumulateScopeDensity(device atomic_uint* density,
       ? (channel * u.width + x) * u.height + y
       : channel * u.width + y;
   atomic_fetch_add_explicit(&density[binIndex], 1u, memory_order_relaxed);
+}
+
+float scopeLuma(float r, float g, float b, int method) {
+  switch (method) {
+    case 1:
+      return 0.2627 * r + 0.6780 * g + 0.0593 * b;
+    case 2:
+      return 0.2990 * r + 0.5870 * g + 0.1140 * b;
+    case 3:
+      return (r + g + b) / 3.0;
+    default:
+      return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+  }
 }
 
 kernel void scopeDensityKernel(const device float* samples [[buffer(0)]],
@@ -1353,11 +1372,14 @@ kernel void scopeDensityKernel(const device float* samples [[buffer(0)]],
   bool lumaOnly = (u.waveform != 0 && u.scopeMode == 2) ||
                   (u.waveform == 0 && u.scopeMode == 1);
   if (lumaOnly) {
-    accumulateScopeDensity(density, u, 0, xNorm, 0.2126 * r + 0.7152 * g + 0.0722 * b);
+    accumulateScopeDensity(density, u, 0, xNorm, scopeLuma(r, g, b, u.lumaMethod));
   } else {
     accumulateScopeDensity(density, u, 0, xNorm, r);
     accumulateScopeDensity(density, u, 1, xNorm, g);
     accumulateScopeDensity(density, u, 2, xNorm, b);
+    if (u.waveform != 0 && u.scopeMode == 1 && u.channelCount >= 4) {
+      accumulateScopeDensity(density, u, 3, xNorm, scopeLuma(r, g, b, u.lumaMethod));
+    }
   }
 }
 
@@ -2440,13 +2462,15 @@ bool buildScopeDensity(const ScopeDensityRequest& request,
   const int pointCount = std::max(request.pointCount, 0);
   const int width = std::max(request.width, 1);
   const int height = std::max(request.height, 1);
+  const int channelCount = std::max(request.channelCount, 1);
   const size_t expectedSampleFloats = static_cast<size_t>(pointCount) * 5u;
   if (pointCount == 0 || packedSamples.size() < expectedSampleFloats) {
     if (error) *error = "Invalid Metal scope density sample buffer.";
     return false;
   }
   const size_t binCount = static_cast<size_t>(width) *
-                          static_cast<size_t>(height) * 3u;
+                          static_cast<size_t>(height) *
+                          static_cast<size_t>(channelCount);
   if (binCount == 0) {
     if (error) *error = "Invalid Metal scope density dimensions.";
     return false;
@@ -2463,6 +2487,8 @@ bool buildScopeDensity(const ScopeDensityRequest& request,
     uniforms.rangeMin = request.rangeMin;
     uniforms.invRange = request.invRange;
     uniforms.excludeOverflow = request.excludeOverflow;
+    uniforms.channelCount = channelCount;
+    uniforms.lumaMethod = std::clamp(request.lumaMethod, 0, 3);
 
     id<MTLBuffer> sampleBuffer = makeSharedBuffer(packedSamples.data(), expectedSampleFloats);
     id<MTLBuffer> densityBuffer = makeEmptySharedBuffer(static_cast<NSUInteger>(binCount * sizeof(uint32_t)));

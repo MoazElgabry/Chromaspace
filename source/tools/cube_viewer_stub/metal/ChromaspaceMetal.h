@@ -153,6 +153,8 @@ struct ScopeDensityRequest {
   float rangeMin = 0.0f;
   float invRange = 1.0f;
   int excludeOverflow = 1;
+  int channelCount = 3;
+  int lumaMethod = 0;
 };
 
 enum ModifierFlags : uint32_t {

@@ -1483,6 +1483,8 @@ inline __device__ void accumulateScopeDensity(unsigned int* density,
                                               int channel,
                                               float xNorm,
                                               float value) {
+  const int channelCount = max(request.channelCount, 1);
+  if (channel < 0 || channel >= channelCount) return;
   if (request.excludeOverflow != 0 && (value < 0.0f || value > 1.0f)) return;
   const int width = max(request.width, 1);
   const int height = max(request.height, 1);
@@ -1499,6 +1501,19 @@ inline __device__ void accumulateScopeDensity(unsigned int* density,
   atomicAdd(&density[binIndex], 1u);
 }
 
+inline __device__ float scopeLuma(float r, float g, float b, int method) {
+  switch (method) {
+    case 1:
+      return 0.2627f * r + 0.6780f * g + 0.0593f * b;
+    case 2:
+      return 0.2990f * r + 0.5870f * g + 0.1140f * b;
+    case 3:
+      return (r + g + b) / 3.0f;
+    default:
+      return 0.2126f * r + 0.7152f * g + 0.0722f * b;
+  }
+}
+
 __global__ void scopeDensityKernel(const float* samples, unsigned int* density, ScopeDensityRequest request) {
   const unsigned int index = blockIdx.x * blockDim.x + threadIdx.x;
   const unsigned int total = static_cast<unsigned int>(max(request.pointCount, 0));
@@ -1513,11 +1528,14 @@ __global__ void scopeDensityKernel(const float* samples, unsigned int* density, 
       (request.waveform == 0 && request.scopeMode == 1);
 
   if (lumaOnly) {
-    accumulateScopeDensity(density, request, 0, xNorm, 0.2126f * r + 0.7152f * g + 0.0722f * b);
+    accumulateScopeDensity(density, request, 0, xNorm, scopeLuma(r, g, b, request.lumaMethod));
   } else {
     accumulateScopeDensity(density, request, 0, xNorm, r);
     accumulateScopeDensity(density, request, 1, xNorm, g);
     accumulateScopeDensity(density, request, 2, xNorm, b);
+    if (request.waveform != 0 && request.scopeMode == 1 && request.channelCount >= 4) {
+      accumulateScopeDensity(density, request, 3, xNorm, scopeLuma(r, g, b, request.lumaMethod));
+    }
   }
 }
 
@@ -2466,7 +2484,9 @@ bool buildScopeDensity(const ScopeDensityRequest& request,
                              : static_cast<int>(packedSamples.size() / 5u);
   const int width = std::max(request.width, 1);
   const int height = std::max(request.height, 1);
-  const size_t binCount = static_cast<size_t>(width) * static_cast<size_t>(height) * 3u;
+  const int channelCount = std::max(1, request.channelCount);
+  const size_t binCount = static_cast<size_t>(width) * static_cast<size_t>(height) *
+                          static_cast<size_t>(channelCount);
   if (pointCount <= 0 || packedSamples.size() < static_cast<size_t>(pointCount) * 5u || binCount == 0u) {
     if (error) *error = "Invalid CUDA scope-density request.";
     return false;
@@ -2505,6 +2525,8 @@ bool buildScopeDensity(const ScopeDensityRequest& request,
   kernelRequest.pointCount = pointCount;
   kernelRequest.width = width;
   kernelRequest.height = height;
+  kernelRequest.channelCount = channelCount;
+  kernelRequest.lumaMethod = std::clamp(kernelRequest.lumaMethod, 0, 3);
   const unsigned int threads = 256u;
   const unsigned int blocks = static_cast<unsigned int>((static_cast<size_t>(pointCount) + threads - 1u) / threads);
   scopeDensityKernel<<<blocks, threads>>>(deviceSamples, deviceDensity, kernelRequest);

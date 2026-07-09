@@ -110,6 +110,7 @@ struct ViewerRuntimeState {
   bool waveformChannelRed = true;
   bool waveformChannelGreen = true;
   bool waveformChannelBlue = true;
+  bool waveformChannelLuma = false;
   bool waveformShowOverflow = true;
   bool waveformHighlightOverflow = true;
   int waveformLumaMethod = 0;
@@ -175,7 +176,7 @@ inline ViewerRuntimeState clampedViewerRuntimeState(ViewerRuntimeState s) {
   s.waveformSamplesPerColumn = std::max(0, std::min(192, s.waveformSamplesPerColumn));
   s.waveformPointBrightness = clampDouble(s.waveformPointBrightness, 0.1, 2.0);
   s.waveformGridBrightness = clampDouble(s.waveformGridBrightness, 0.0, 2.0);
-  s.waveformSaturation = clampDouble(s.waveformSaturation, 0.0, 1.5);
+  s.waveformSaturation = clampDouble(s.waveformSaturation, 0.0, 1.0);
   s.waveformDotSize = clampDouble(s.waveformDotSize, 0.05, 1.5);
   s.waveformLumaMethod = clampChoice(s.waveformLumaMethod, 3, 0);
   s.histogramMode = clampChoice(s.histogramMode, 1, 0);

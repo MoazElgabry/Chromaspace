@@ -167,13 +167,11 @@ bool copyHostBuffers(
     int overlayWidth,
     int overlayHeight);
 
-bool copyHostBuffersReadback(
+bool copySourceToHost(
     const void* srcMetalBuffer,
-    void* dstMetalBuffer,
     int width,
     int height,
     size_t srcRowBytes,
-    size_t dstRowBytes,
     int originX,
     int originY,
     void* metalCommandQueue,
