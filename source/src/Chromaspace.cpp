@@ -7711,6 +7711,13 @@ class ChromaspaceEffect : public ImageEffect {
     return points;
   }
 
+  std::size_t serializedViewerCloudPointCount(const std::string& points) const {
+    if (points.empty()) return 0u;
+    return static_cast<std::size_t>(
+               std::count(points.begin(), points.end(), ';')) +
+           1u;
+  }
+
   std::string buildInputCloudJson(
       const std::string& points,
       const std::string& paramHash,
@@ -7724,6 +7731,7 @@ class ChromaspaceEffect : public ImageEffect {
       uint64_t waveformContentHash = 0) {
     const uint64_t seq = gSharedCubeViewerSeqCounter.fetch_add(1, std::memory_order_relaxed);
     const uint64_t contentHash = fnv1a64(points);
+    const std::size_t pointCount = serializedViewerCloudPointCount(points);
     std::ostringstream oss;
     oss << "{\"type\":\"input_cloud\",\"seq\":" << seq
         << ",\"senderId\":\"" << jsonEscape(senderId_) << "\""
@@ -7733,8 +7741,11 @@ class ChromaspaceEffect : public ImageEffect {
         << ",\"settingsKey\":\"" << jsonEscape(settingsKey) << "\""
         << ",\"contentHash\":" << contentHash
         << ",\"transport\":\"json\""
-        << ",\"primaryPointCount\":" << primaryPointCount
-        << ",\"basePointCount\":" << basePointCount
+        << ",\"pointCount\":" << pointCount
+        << ",\"primaryPointCount\":"
+        << (primaryPointCount > 0 ? std::min(primaryPointCount, pointCount) : pointCount)
+        << ",\"basePointCount\":"
+        << (basePointCount > 0 ? std::min(basePointCount, pointCount) : pointCount)
         << ",\"waveformPointOffset\":" << waveformPointOffset
         << ",\"waveformPointCount\":" << waveformPointCount
         << ",\"waveformContentHash\":" << waveformContentHash
@@ -7986,7 +7997,12 @@ class ChromaspaceEffect : public ImageEffect {
     const uint64_t contentHash = fnv1a64Bytes(sourceBytes, sourceByteCount);
     std::shared_ptr<ViewerCloudTransportBlob> blob =
         createTransportBlobFromBytes(sourceBytes, sourceByteCount, seq);
-    if (!blob) return out;
+    if (!blob) {
+      cubeViewerDebugLog(std::string("Source Signal build failed: shared-memory allocation failed bytes=") +
+                         std::to_string(sourceByteCount) +
+                         " backend=" + backendName);
+      return out;
+    }
 
     const bool fullCoverage = footprint.coverageKind == CloudCoverageKind::Full;
     const std::string coverage = fullCoverage ? "full" : "partial-preview";
@@ -11081,6 +11097,7 @@ class ChromaspaceEffect : public ImageEffect {
         cubeViewerDebugLog("Source Signal backend selected: CPU-source/CUDA");
         return cudaSource;
       }
+      cubeViewerDebugLog("Source Signal CUDA readback failed; trying next source backend.");
     }
     if (args.isEnabledOpenCLRender && args.pOpenCLCmdQ != nullptr) {
       SourceSignalBuildResult openclSource =
@@ -11089,6 +11106,7 @@ class ChromaspaceEffect : public ImageEffect {
         cubeViewerDebugLog("Source Signal backend selected: CPU-source/OpenCL");
         return openclSource;
       }
+      cubeViewerDebugLog("Source Signal OpenCL readback failed; trying next source backend.");
     }
     if (args.isEnabledMetalRender && args.pMetalCmdQ != nullptr) {
       SourceSignalBuildResult metalSource =
@@ -11097,11 +11115,14 @@ class ChromaspaceEffect : public ImageEffect {
         cubeViewerDebugLog("Source Signal backend selected: CPU-source/Metal");
         return metalSource;
       }
+      cubeViewerDebugLog("Source Signal Metal readback failed; trying CPU image source.");
     }
     SourceSignalBuildResult cpuSource =
         buildSourceSignalPayloadFromImage(src, footprint, args.time, previewMode, sourceId, "CPU-source");
     if (cpuSource.success) {
       cubeViewerDebugLog("Source Signal backend selected: CPU-source");
+    } else {
+      cubeViewerDebugLog("Source Signal build failed: no backend produced a payload.");
     }
     return cpuSource;
   }

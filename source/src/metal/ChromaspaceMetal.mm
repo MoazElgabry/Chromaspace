@@ -345,6 +345,19 @@ struct RampLayoutRequestGpu {
   int candidateHeight[2];
 };
 
+struct CombinedPackRequestGpu {
+  int stripCount;
+  int maxPrimaryCount;
+};
+
+struct AppendSelectRequestGpu {
+  int candidateCount;
+  int extraPointCount;
+  int occupancyThreshold;
+  float radiusMin;
+  float radiusMax;
+};
+
 constant float kRgbAxisMaxRadius = 0.8164965809277260f;
 constant float kPolarMax = 0.9553166181245093f;
 constant float kChenPolarScale = 1.0467733744265997f;

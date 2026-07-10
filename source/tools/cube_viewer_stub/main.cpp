@@ -12749,6 +12749,8 @@ struct PlotWindowRectNorm {
   float h = 1.0f;
 };
 
+constexpr int kViewerLayoutChoiceCount = 6;
+
 // Reserve only the logical-pixel height occupied by the 30 px toolbar buttons.
 // The reservation is conditional: when Workspace Buttons are hidden, plot
 // windows reclaim this strip. Keep all workspace consumers on the helpers below
@@ -12791,6 +12793,12 @@ struct PlotWindowState {
   bool sourceSignalDockAnimatingToDock = false;
   bool slicingDrawerOpen = false;
   double slicingDrawerAnimStart = -10.0;
+};
+
+struct PlotLayoutSlotState {
+  bool valid = false;
+  ChromaspaceViewer::ViewerRuntimeState viewState{};
+  CameraState camera{};
 };
 
 void releasePlotWindowGpuCaches(PlotWindowState* window) {
@@ -13016,6 +13024,11 @@ struct AppState {
   std::string viewerPresetSelection;
   std::string viewerPresetNameInput;
   bool viewerPresetNameEditing = false;
+  bool layoutPresetChoiceAnchorCompact = false;
+  bool layoutPresetChoiceAnchorWorkspace = false;
+  std::string layoutPresetSelection = "Single";
+  std::string layoutPresetNameInput;
+  bool layoutPresetNameEditing = false;
   std::vector<LassoStroke> viewerLassoStrokes;
   LassoStroke viewerLassoActiveStroke;
   uint64_t viewerLassoRevision = 0;
@@ -13069,6 +13082,8 @@ struct AppState {
   int workspaceLayoutWindowWidth = 0;
   int workspaceLayoutWindowHeight = 0;
   float workspaceLayoutTopNorm = -1.0f;
+  int activeStandardLayoutIndex = 0;
+  std::array<std::vector<PlotLayoutSlotState>, kViewerLayoutChoiceCount> standardLayoutSlotMemory;
   double plotModelMenuX = 24.0;
   double plotModelMenuY = 24.0;
   int plotModelMenuHoverMain = -1;
@@ -13505,6 +13520,16 @@ void bringPlotWindowToFront(AppState* app, int id) {
   sortPlotWindowsForReadableStacking(app, id);
 }
 
+bool standardPlotLayoutNameReserved(const std::string& name);
+
+void markLayoutPresetCustom(AppState* app) {
+  if (!app) return;
+  if (!standardPlotLayoutNameReserved(app->layoutPresetSelection)) {
+    app->layoutPresetNameInput = app->layoutPresetSelection;
+  }
+  app->layoutPresetSelection = "Custom";
+}
+
 bool closePlotWindow(AppState* app, int id) {
   if (!app || app->plotWindows.size() <= 1u) return false;
   captureFocusedPlotWindowFromApp(app);
@@ -13517,6 +13542,7 @@ bool closePlotWindow(AppState* app, int id) {
   if (closedFocused && !app->plotWindows.empty()) {
     focusPlotWindow(app, app->plotWindows.back().windowId);
   }
+  markLayoutPresetCustom(app);
   logViewerEvent(std::string("Closed plot window: id=") + std::to_string(id));
   return true;
 }
@@ -14217,18 +14243,115 @@ void ensurePlotWindowCount(AppState* app, int count, int windowWidth, int window
   }
 }
 
+bool viewerNamesEqualNoCase(const std::string& a, const std::string& b);
+
+const char* standardPlotLayoutLabel(int layoutIndex) {
+  static constexpr const char* kLabels[kViewerLayoutChoiceCount] = {
+      "Single", "Split 2", "Triple Columns", "Triple 2 + 1", "Quadrants", "Six Views"};
+  return kLabels[std::clamp(layoutIndex, 0, kViewerLayoutChoiceCount - 1)];
+}
+
+int standardPlotLayoutIndexForName(const std::string& name) {
+  for (int i = 0; i < kViewerLayoutChoiceCount; ++i) {
+    if (viewerNamesEqualNoCase(name, standardPlotLayoutLabel(i))) return i;
+  }
+  return -1;
+}
+
+bool standardPlotLayoutNameReserved(const std::string& name) {
+  return viewerNamesEqualNoCase(name, "Custom") || standardPlotLayoutIndexForName(name) >= 0;
+}
+
+int standardPlotLayoutRequiredCount(int layoutIndex) {
+  switch (std::clamp(layoutIndex, 0, kViewerLayoutChoiceCount - 1)) {
+    case 1: return 2;
+    case 2: return 3;
+    case 3: return 3;
+    case 4: return 4;
+    case 5: return 6;
+    case 0:
+    default: return 1;
+  }
+}
+
+PlotWindowRectNorm standardPlotLayoutSlotRect(int layoutIndex, int slotIndex) {
+  layoutIndex = std::clamp(layoutIndex, 0, kViewerLayoutChoiceCount - 1);
+  slotIndex = std::max(0, slotIndex);
+  if (layoutIndex == 1) {
+    return {slotIndex == 0 ? 0.0f : 0.5f, 0.0f, 0.5f, 1.0f};
+  }
+  if (layoutIndex == 2) {
+    return {static_cast<float>(std::min(slotIndex, 2)) / 3.0f, 0.0f, 1.0f / 3.0f, 1.0f};
+  }
+  if (layoutIndex == 3) {
+    if (slotIndex == 0) return {0.0f, 0.0f, 2.0f / 3.0f, 1.0f};
+    return {2.0f / 3.0f, slotIndex == 1 ? 0.0f : 0.5f, 1.0f / 3.0f, 0.5f};
+  }
+  if (layoutIndex == 4) {
+    const int col = slotIndex % 2;
+    const int row = slotIndex / 2;
+    return {static_cast<float>(col) * 0.5f, static_cast<float>(row) * 0.5f, 0.5f, 0.5f};
+  }
+  if (layoutIndex == 5) {
+    const int col = slotIndex % 3;
+    const int row = slotIndex / 3;
+    return {static_cast<float>(col) / 3.0f,
+            static_cast<float>(row) / 2.0f,
+            1.0f / 3.0f,
+            0.5f};
+  }
+  return {0.0f, 0.0f, 1.0f, 1.0f};
+}
+
+void invalidatePlotWindowTransientData(PlotWindowState* window) {
+  if (!window) return;
+  releasePlotWindowGpuCaches(window);
+  window->derivedMesh = {};
+  window->overlayMesh = {};
+  window->derivedBuildKey.clear();
+  window->overlayBuildKey.clear();
+  window->derivedMeshValid = false;
+  window->overlayMeshValid = false;
+  window->fitRequested = true;
+}
+
+void captureStandardLayoutSlotMemory(AppState* app) {
+  if (!app) return;
+  captureFocusedPlotWindowFromApp(app);
+  const int layoutIndex = std::clamp(app->activeStandardLayoutIndex, 0, kViewerLayoutChoiceCount - 1);
+  const int count = std::min(standardPlotLayoutRequiredCount(layoutIndex),
+                             static_cast<int>(app->plotWindows.size()));
+  auto& slots = app->standardLayoutSlotMemory[static_cast<std::size_t>(layoutIndex)];
+  slots.resize(static_cast<std::size_t>(count));
+  for (int i = 0; i < count; ++i) {
+    const PlotWindowState& window = app->plotWindows[static_cast<std::size_t>(i)];
+    PlotLayoutSlotState slot{};
+    slot.valid = true;
+    slot.viewState = viewerStateWithModelCapabilities(window.viewState);
+    slot.camera = window.camera;
+    slots[static_cast<std::size_t>(i)] = slot;
+  }
+}
+
+void applyLayoutSlotStateToWindow(PlotWindowState* window, const PlotLayoutSlotState& slot) {
+  if (!window || !slot.valid) return;
+  const int previousModel = window->viewState.plotModel;
+  window->viewState = viewerStateWithModelCapabilities(slot.viewState);
+  window->camera = slot.camera;
+  if (window->viewState.plotModel != previousModel) invalidatePlotWindowTransientData(window);
+  window->sourceSignalDocked = false;
+  window->sourceSignalTemporaryLassoSurface = false;
+  window->sourceSignalDockOwnerWindowId = -1;
+}
+
 void applyPlotWindowLayout(AppState* app, int layoutIndex, int windowWidth, int windowHeight) {
   if (!app) return;
+  layoutIndex = std::clamp(layoutIndex, 0, kViewerLayoutChoiceCount - 1);
   const int previousFocus = app->focusedPlotWindowId;
-  const int required = layoutIndex == 1 ? 2
-                     : layoutIndex == 2 ? 3
-                     : layoutIndex == 3 ? 3
-                     : layoutIndex == 4 ? 4
-                     : layoutIndex == 5 ? 6
-                                        : 1;
+  captureStandardLayoutSlotMemory(app);
+  const int required = standardPlotLayoutRequiredCount(layoutIndex);
   ensurePlotWindowCount(app, required, windowWidth, windowHeight);
-  if (layoutIndex > 0 && static_cast<int>(app->plotWindows.size()) > required) {
-    captureFocusedPlotWindowFromApp(app);
+  if (static_cast<int>(app->plotWindows.size()) > required) {
     app->plotWindows.resize(static_cast<std::size_t>(required));
   }
   auto setRect = [&](int index, PlotWindowRectNorm rect) {
@@ -14240,45 +14363,24 @@ void applyPlotWindowLayout(AppState* app, int layoutIndex, int windowWidth, int 
                                 windowHeight);
     }
   };
-  if (layoutIndex == 1) {
-    setRect(0, {0.0f, 0.0f, 0.5f, 1.0f});
-    setRect(1, {0.5f, 0.0f, 0.5f, 1.0f});
-  } else if (layoutIndex == 2) {
-    setRect(0, {0.0f, 0.0f, 1.0f / 3.0f, 1.0f});
-    setRect(1, {1.0f / 3.0f, 0.0f, 1.0f / 3.0f, 1.0f});
-    setRect(2, {2.0f / 3.0f, 0.0f, 1.0f / 3.0f, 1.0f});
-  } else if (layoutIndex == 3) {
-    setRect(0, {0.0f, 0.0f, 2.0f / 3.0f, 1.0f});
-    setRect(1, {2.0f / 3.0f, 0.0f, 1.0f / 3.0f, 0.5f});
-    setRect(2, {2.0f / 3.0f, 0.5f, 1.0f / 3.0f, 0.5f});
-  } else if (layoutIndex == 4) {
-    setRect(0, {0.0f, 0.0f, 0.5f, 0.5f});
-    setRect(1, {0.5f, 0.0f, 0.5f, 0.5f});
-    setRect(2, {0.0f, 0.5f, 0.5f, 0.5f});
-    setRect(3, {0.5f, 0.5f, 0.5f, 0.5f});
-  } else if (layoutIndex == 5) {
-    for (int i = 0; i < 6; ++i) {
-      const int col = i % 3;
-      const int row = i / 3;
-      setRect(i, {static_cast<float>(col) / 3.0f,
-                  static_cast<float>(row) / 2.0f,
-                  1.0f / 3.0f,
-                  0.5f});
+  const auto& slots = app->standardLayoutSlotMemory[static_cast<std::size_t>(layoutIndex)];
+  for (int i = 0; i < required; ++i) {
+    if (i < static_cast<int>(slots.size()) && slots[static_cast<std::size_t>(i)].valid) {
+      applyLayoutSlotStateToWindow(&app->plotWindows[static_cast<std::size_t>(i)],
+                                   slots[static_cast<std::size_t>(i)]);
     }
-  } else {
-    setRect(0, {0.0f, 0.0f, 1.0f, 1.0f});
-    for (int i = 1; i < static_cast<int>(app->plotWindows.size()); ++i) {
-      const float offset = 0.05f * static_cast<float>((i - 1) % 5);
-      setRect(i, {0.14f + offset, 0.14f + offset, 0.56f, 0.56f});
-    }
+    setRect(i, standardPlotLayoutSlotRect(layoutIndex, i));
   }
+  app->activeStandardLayoutIndex = layoutIndex;
+  app->layoutPresetSelection = standardPlotLayoutLabel(layoutIndex);
+  app->layoutPresetNameInput.clear();
   if (plotWindowById(app, previousFocus)) {
     focusPlotWindow(app, previousFocus);
   } else if (!app->plotWindows.empty()) {
     focusPlotWindow(app, app->plotWindows.back().windowId);
   }
   logViewerEvent(std::string("Applied plot-window layout: ") +
-                 (layoutIndex == 0 ? "Single" : std::to_string(layoutIndex)));
+                 standardPlotLayoutLabel(layoutIndex));
 }
 
 void rememberOfxImageLassoSelection(AppState* app, const ResolvedPayload& payload) {
@@ -14771,7 +14873,6 @@ constexpr float kViewerMenuIconInset = 10.0f;
 constexpr float kViewerMenuCloseSize = 28.0f;
 constexpr float kViewerChoiceMenuRowHeight = 30.0f;
 constexpr float kViewerChoiceMenuPad = 7.0f;
-constexpr int kViewerLayoutChoiceCount = 6;
 constexpr float kIdentityReadMenuWidth = 260.0f;
 constexpr float kIdentityReadMenuRowHeight = 31.0f;
 constexpr int kIdentityReadMenuRowCount = 4;
@@ -14855,6 +14956,11 @@ enum class ViewerMenuAction {
   UpdateUserPreset,
   DeleteUserPreset,
   EditPresetName,
+  SaveLayoutPreset,
+  LoadLayoutPreset,
+  UpdateLayoutPreset,
+  DeleteLayoutPreset,
+  EditLayoutPresetName,
   SaveDefaults,
   RestoreDefaults,
 };
@@ -14895,6 +15001,7 @@ struct ViewerMenuRow {
   bool channelSelector = false;
   bool slicingVectorSelector = false;
   bool presetActionButtons = false;
+  bool layoutPresetActionButtons = false;
   bool spacer = false;
   int choiceValue = 0;
   int sliderMin = 0;
@@ -14925,6 +15032,14 @@ bool saveViewerDefaultPreset(const ChromaspaceViewer::ViewerRuntimeState& state)
 bool loadViewerDefaultPreset(ChromaspaceViewer::ViewerRuntimeState* out);
 bool viewerPresetNameEditableTarget(const std::string& name);
 std::string sanitizeViewerPresetName(const std::string& name, const std::string& fallback = "");
+std::vector<std::string> viewerLayoutPresetNames();
+bool viewerLayoutPresetExists();
+bool viewerLayoutPresetExists(const std::string& name);
+bool saveViewerLayoutPreset(AppState* app, const std::string& requestedName, std::string* savedName = nullptr);
+bool updateViewerLayoutPreset(AppState* app, const std::string& name);
+bool loadViewerLayoutPreset(AppState* app, const std::string& name, int windowWidth, int windowHeight);
+bool deleteViewerLayoutPreset(const std::string& name);
+bool viewerLayoutPresetNameEditableTarget(const std::string& name);
 
 std::string onOffLabel(bool value) {
   return value ? "On" : "Off";
@@ -15079,6 +15194,15 @@ void appendPresetActionButtonsRow(std::vector<ViewerMenuRow>* rows) {
   rows->push_back(row);
 }
 
+void appendLayoutPresetActionButtonsRow(std::vector<ViewerMenuRow>* rows) {
+  ViewerMenuRow row{};
+  row.action = ViewerMenuAction::None;
+  row.enabled = true;
+  row.refreshPolicy = "none";
+  row.layoutPresetActionButtons = true;
+  rows->push_back(row);
+}
+
 void appendSpacerRow(std::vector<ViewerMenuRow>* rows, const char* label = "") {
   ViewerMenuRow row{};
   row.section = true;
@@ -15160,6 +15284,7 @@ bool viewerMenuActionUsesChoiceList(ViewerMenuAction action) {
          action == ViewerMenuAction::PlotStyle ||
          action == ViewerMenuAction::PointShape ||
          action == ViewerMenuAction::LoadUserPreset ||
+         action == ViewerMenuAction::LoadLayoutPreset ||
          action == ViewerMenuAction::ChromaticityInputPrimaries ||
          action == ViewerMenuAction::ChromaticityInputTransfer ||
          action == ViewerMenuAction::ChromaticityReferenceBasis ||
@@ -15187,6 +15312,7 @@ bool viewerMenuActionCanPreviewFromCachedCloud(ViewerMenuAction action) {
          action == ViewerMenuAction::PlotStyle ||
          action == ViewerMenuAction::PointShape ||
          action == ViewerMenuAction::LoadUserPreset ||
+         action == ViewerMenuAction::LoadLayoutPreset ||
          action == ViewerMenuAction::ShowOverflow ||
          action == ViewerMenuAction::HighlightOverflow ||
          action == ViewerMenuAction::ReadGrayRamp ||
@@ -15256,6 +15382,9 @@ bool viewerMenuActionIsButton(ViewerMenuAction action) {
          action == ViewerMenuAction::SaveUserPreset ||
          action == ViewerMenuAction::UpdateUserPreset ||
          action == ViewerMenuAction::DeleteUserPreset ||
+         action == ViewerMenuAction::SaveLayoutPreset ||
+         action == ViewerMenuAction::UpdateLayoutPreset ||
+         action == ViewerMenuAction::DeleteLayoutPreset ||
          action == ViewerMenuAction::SaveDefaults ||
          action == ViewerMenuAction::RestoreDefaults;
 }
@@ -15745,19 +15874,36 @@ std::vector<ViewerMenuRow> buildViewerMenuRows(const AppState& app) {
       break;
     case ViewerMenuSection::Presets: {
       const bool hasPresets = viewerUserPresetExists();
+      const bool hasLayoutPresets = viewerLayoutPresetExists();
       std::string nameValue = app.viewerPresetNameInput.empty() ? std::string("Click to name") : app.viewerPresetNameInput;
       if (app.viewerPresetNameEditing) nameValue += "|";
+      std::string layoutNameValue =
+          app.layoutPresetNameInput.empty() ? std::string("Click to name") : app.layoutPresetNameInput;
+      if (app.layoutPresetNameEditing) layoutNameValue += "|";
       const std::string presetValue = !app.viewerPresetSelection.empty()
                                           ? app.viewerPresetSelection
                                           : (hasPresets ? std::string("Default") : std::string("No presets"));
+      const std::string layoutPresetValue =
+          !app.layoutPresetSelection.empty() ? app.layoutPresetSelection : std::string("Single");
+      appendSection(&rows, "Plot Preset");
       appendRow(&rows,
-                "Preset",
+                "Plot Preset",
                 hasPresets ? presetValue : std::string("No presets"),
                 ViewerMenuAction::LoadUserPreset,
                 hasPresets,
                 "resample");
-      appendRow(&rows, "Preset Name", nameValue, ViewerMenuAction::EditPresetName, true, "none");
+      appendRow(&rows, "Plot Preset Name", nameValue, ViewerMenuAction::EditPresetName, true, "none");
       appendPresetActionButtonsRow(&rows);
+      appendSpacerRow(&rows);
+      appendSection(&rows, "Layout Preset");
+      appendRow(&rows,
+                "Layout Preset",
+                hasLayoutPresets ? layoutPresetValue : std::string("Single"),
+                ViewerMenuAction::LoadLayoutPreset,
+                hasLayoutPresets,
+                "reinterpret");
+      appendRow(&rows, "Layout Preset Name", layoutNameValue, ViewerMenuAction::EditLayoutPresetName, true, "none");
+      appendLayoutPresetActionButtonsRow(&rows);
       appendSpacerRow(&rows);
       appendRow(&rows, "Save Defaults", "Save", ViewerMenuAction::SaveDefaults, true, "none");
       appendRow(&rows, "Restore Defaults", "Load", ViewerMenuAction::RestoreDefaults, true, "resample");
@@ -15960,6 +16106,16 @@ std::vector<ViewerChoiceMenuItem> buildViewerChoiceMenuItems(const AppState& app
                        names[static_cast<std::size_t>(i)] == app.viewerPresetSelection,
                        ViewerMenuAction::LoadUserPreset,
                        "resample"});
+    }
+  } else if (action == ViewerMenuAction::LoadLayoutPreset) {
+    const std::vector<std::string> names = viewerLayoutPresetNames();
+    items.reserve(names.size());
+    for (int i = 0; i < static_cast<int>(names.size()); ++i) {
+      items.push_back({names[static_cast<std::size_t>(i)],
+                       i,
+                       names[static_cast<std::size_t>(i)] == app.layoutPresetSelection,
+                       ViewerMenuAction::LoadLayoutPreset,
+                       "reinterpret"});
     }
   }
   return items;
@@ -17133,6 +17289,348 @@ std::string viewerSharedPresetValuesJsonFromState(
   return os.str();
 }
 
+void viewerAppendUniquePresetName(std::vector<std::string>* names, const std::string& name);
+
+struct ViewerLayoutPresetWindowData {
+  PlotWindowRectNorm rect{};
+  ChromaspaceViewer::ViewerRuntimeState viewState{};
+  CameraState camera{};
+};
+
+struct ViewerLayoutPresetData {
+  int layoutIndex = 0;
+  int focusedSlot = 0;
+  int windowWidth = 720;
+  int windowHeight = 600;
+  float workspaceTopNorm = 0.0f;
+  bool showWorkspaceButtons = true;
+  bool showSliceButtonInPlotWindows = true;
+  std::vector<ViewerLayoutPresetWindowData> windows;
+};
+
+struct ViewerLayoutPresetRecord {
+  std::string id;
+  std::string name;
+  std::string createdAtUtc;
+  std::string updatedAtUtc;
+  std::string valuesJson;
+};
+
+struct ViewerLayoutPresetStore {
+  std::vector<ViewerLayoutPresetRecord> userPresets;
+};
+
+std::filesystem::path viewerLayoutPresetFilePath() {
+  return viewerSettingsFilePath().parent_path() / "viewer_layout_presets_v1.json";
+}
+
+bool viewerLayoutPresetNameEditableTarget(const std::string& name) {
+  return !name.empty() &&
+         !viewerPresetNameReserved(name) &&
+         !standardPlotLayoutNameReserved(name);
+}
+
+std::string sanitizeViewerLayoutPresetName(const std::string& name,
+                                           const std::string& fallback = "") {
+  std::string out = sanitizeViewerPresetName(name, fallback);
+  if (standardPlotLayoutNameReserved(out) || viewerPresetNameReserved(out)) {
+    return fallback.empty() ? std::string("Layout Preset") : fallback;
+  }
+  return out;
+}
+
+std::string viewerLayoutPresetValuesJsonFromApp(AppState* app) {
+  if (!app) return "{}";
+  captureFocusedPlotWindowFromApp(app);
+  const int focusedId = app->focusedPlotWindowId;
+  int focusedSlot = 0;
+  std::ostringstream os;
+  os << "{";
+  os << "\"layoutIndex\":" << std::clamp(app->activeStandardLayoutIndex, 0, kViewerLayoutChoiceCount - 1) << ",";
+  os << "\"windowWidth\":" << std::max(1, app->workspaceLayoutWindowWidth) << ",";
+  os << "\"windowHeight\":" << std::max(1, app->workspaceLayoutWindowHeight) << ",";
+  os << "\"workspaceTopNorm\":" << std::setprecision(8) << app->workspaceLayoutTopNorm << ",";
+  os << "\"showWorkspaceButtons\":" << (app->showWorkspaceButtons ? "true" : "false") << ",";
+  os << "\"showSliceButtonInPlotWindows\":" << (app->showSliceButtonInPlotWindows ? "true" : "false") << ",";
+  os << "\"windows\":[";
+  bool first = true;
+  int slot = 0;
+  for (const auto& window : app->plotWindows) {
+    if (plotWindowIsTemporarySourceSignalLassoSurface(window)) continue;
+    if (!first) os << ",";
+    if (window.windowId == focusedId) focusedSlot = slot;
+    first = false;
+    os << "{";
+    os << "\"x\":" << std::setprecision(8) << window.rect.x << ",";
+    os << "\"y\":" << std::setprecision(8) << window.rect.y << ",";
+    os << "\"w\":" << std::setprecision(8) << window.rect.w << ",";
+    os << "\"h\":" << std::setprecision(8) << window.rect.h << ",";
+    os << "\"camQx\":" << std::setprecision(8) << window.camera.qx << ",";
+    os << "\"camQy\":" << std::setprecision(8) << window.camera.qy << ",";
+    os << "\"camQz\":" << std::setprecision(8) << window.camera.qz << ",";
+    os << "\"camQw\":" << std::setprecision(8) << window.camera.qw << ",";
+    os << "\"camDistance\":" << std::setprecision(8) << window.camera.distance << ",";
+    os << "\"camPanX\":" << std::setprecision(8) << window.camera.panX << ",";
+    os << "\"camPanY\":" << std::setprecision(8) << window.camera.panY << ",";
+    os << "\"camOrthographic\":" << (window.camera.orthographic ? "true" : "false") << ",";
+    os << "\"camOrthographicView\":" << window.camera.orthographicView << ",";
+    os << "\"values\":" << viewerSharedPresetValuesJsonFromState(window.viewState);
+    os << "}";
+    ++slot;
+  }
+  os << "],";
+  os << "\"focusedSlot\":" << focusedSlot;
+  os << "}";
+  return os.str();
+}
+
+bool viewerLayoutPresetDataFromValuesJson(const std::string& valuesJson,
+                                          ViewerLayoutPresetData* out) {
+  if (!out) return false;
+  ViewerLayoutPresetData data{};
+  int intValue = 0;
+  double doubleValue = 0.0;
+  bool boolValue = false;
+  if (viewerExtractJsonIntField(valuesJson, "layoutIndex", &intValue)) {
+    data.layoutIndex = std::clamp(intValue, 0, kViewerLayoutChoiceCount - 1);
+  }
+  if (viewerExtractJsonIntField(valuesJson, "focusedSlot", &intValue)) data.focusedSlot = std::max(0, intValue);
+  if (viewerExtractJsonIntField(valuesJson, "windowWidth", &intValue)) data.windowWidth = std::max(1, intValue);
+  if (viewerExtractJsonIntField(valuesJson, "windowHeight", &intValue)) data.windowHeight = std::max(1, intValue);
+  if (viewerExtractJsonDoubleField(valuesJson, "workspaceTopNorm", &doubleValue)) {
+    data.workspaceTopNorm = clampf(static_cast<float>(doubleValue), 0.0f, 0.45f);
+  }
+  if (viewerExtractJsonBoolField(valuesJson, "showWorkspaceButtons", &boolValue)) {
+    data.showWorkspaceButtons = boolValue;
+  }
+  if (viewerExtractJsonBoolField(valuesJson, "showSliceButtonInPlotWindows", &boolValue)) {
+    data.showSliceButtonInPlotWindows = boolValue;
+  }
+  std::string windowsJson;
+  if (!viewerExtractJsonArrayField(valuesJson, "windows", &windowsJson)) return false;
+  for (const auto& objectJson : viewerExtractJsonObjectsFromArray(windowsJson)) {
+    ViewerLayoutPresetWindowData window{};
+    if (viewerExtractJsonDoubleField(objectJson, "x", &doubleValue)) window.rect.x = static_cast<float>(doubleValue);
+    if (viewerExtractJsonDoubleField(objectJson, "y", &doubleValue)) window.rect.y = static_cast<float>(doubleValue);
+    if (viewerExtractJsonDoubleField(objectJson, "w", &doubleValue)) window.rect.w = static_cast<float>(doubleValue);
+    if (viewerExtractJsonDoubleField(objectJson, "h", &doubleValue)) window.rect.h = static_cast<float>(doubleValue);
+    if (viewerExtractJsonDoubleField(objectJson, "camQx", &doubleValue)) window.camera.qx = static_cast<float>(doubleValue);
+    if (viewerExtractJsonDoubleField(objectJson, "camQy", &doubleValue)) window.camera.qy = static_cast<float>(doubleValue);
+    if (viewerExtractJsonDoubleField(objectJson, "camQz", &doubleValue)) window.camera.qz = static_cast<float>(doubleValue);
+    if (viewerExtractJsonDoubleField(objectJson, "camQw", &doubleValue)) window.camera.qw = static_cast<float>(doubleValue);
+    if (viewerExtractJsonDoubleField(objectJson, "camDistance", &doubleValue)) window.camera.distance = static_cast<float>(doubleValue);
+    if (viewerExtractJsonDoubleField(objectJson, "camPanX", &doubleValue)) window.camera.panX = static_cast<float>(doubleValue);
+    if (viewerExtractJsonDoubleField(objectJson, "camPanY", &doubleValue)) window.camera.panY = static_cast<float>(doubleValue);
+    if (viewerExtractJsonBoolField(objectJson, "camOrthographic", &boolValue)) window.camera.orthographic = boolValue;
+    if (viewerExtractJsonIntField(objectJson, "camOrthographicView", &intValue)) window.camera.orthographicView = intValue;
+    std::string stateJson;
+    if (!viewerExtractJsonObjectField(objectJson, "values", &stateJson)) continue;
+    window.viewState = viewerStateFromSharedPresetValuesJson(stateJson);
+    window.rect.x = clampf(window.rect.x, 0.0f, 1.0f);
+    window.rect.y = clampf(window.rect.y, 0.0f, 1.0f);
+    window.rect.w = clampf(window.rect.w, 0.05f, 1.0f);
+    window.rect.h = clampf(window.rect.h, 0.05f, 1.0f);
+    data.windows.push_back(window);
+  }
+  if (data.windows.empty()) return false;
+  data.focusedSlot = std::clamp(data.focusedSlot, 0, static_cast<int>(data.windows.size()) - 1);
+  *out = std::move(data);
+  return true;
+}
+
+bool loadViewerLayoutPresetStore(ViewerLayoutPresetStore* out) {
+  if (!out) return false;
+  ViewerLayoutPresetStore store{};
+  std::string json;
+  if (!viewerReadTextFile(viewerLayoutPresetFilePath(), &json)) {
+    *out = store;
+    return false;
+  }
+  std::string arrayJson;
+  if (viewerExtractJsonArrayField(json, "layoutPresets", &arrayJson)) {
+    for (const auto& objectJson : viewerExtractJsonObjectsFromArray(arrayJson)) {
+      ViewerLayoutPresetRecord record{};
+      if (!viewerExtractJsonStringField(objectJson, "name", &record.name)) continue;
+      record.name = sanitizeViewerLayoutPresetName(record.name, "Layout Preset");
+      if (!viewerLayoutPresetNameEditableTarget(record.name)) continue;
+      if (!viewerExtractJsonObjectField(objectJson, "values", &record.valuesJson)) continue;
+      (void)viewerExtractJsonStringField(objectJson, "id", &record.id);
+      (void)viewerExtractJsonStringField(objectJson, "createdAtUtc", &record.createdAtUtc);
+      (void)viewerExtractJsonStringField(objectJson, "updatedAtUtc", &record.updatedAtUtc);
+      if (record.id.empty()) record.id = viewerMakePresetId();
+      if (record.createdAtUtc.empty()) record.createdAtUtc = viewerNowUtcIso8601();
+      if (record.updatedAtUtc.empty()) record.updatedAtUtc = record.createdAtUtc;
+      const bool duplicate =
+          std::any_of(store.userPresets.begin(), store.userPresets.end(), [&](const ViewerLayoutPresetRecord& existing) {
+            return viewerNamesEqualNoCase(existing.name, record.name);
+          });
+      if (!duplicate) store.userPresets.push_back(record);
+    }
+  }
+  *out = std::move(store);
+  return true;
+}
+
+bool saveViewerLayoutPresetStore(const ViewerLayoutPresetStore& store) {
+  const std::string now = viewerNowUtcIso8601();
+  std::ostringstream os;
+  os << "{\n";
+  os << "  \"schemaVersion\":1,\n";
+  os << "  \"updatedAtUtc\":\"" << heartbeatJsonEscape(now) << "\",\n";
+  os << "  \"layoutPresets\":[\n";
+  for (size_t i = 0; i < store.userPresets.size(); ++i) {
+    const auto& preset = store.userPresets[i];
+    os << "    {\n";
+    os << "      \"id\":\"" << heartbeatJsonEscape(preset.id) << "\",\n";
+    os << "      \"name\":\"" << heartbeatJsonEscape(preset.name) << "\",\n";
+    os << "      \"createdAtUtc\":\"" << heartbeatJsonEscape(preset.createdAtUtc) << "\",\n";
+    os << "      \"updatedAtUtc\":\"" << heartbeatJsonEscape(preset.updatedAtUtc) << "\",\n";
+    os << "      \"values\":" << preset.valuesJson << "\n";
+    os << "    }" << (i + 1 < store.userPresets.size() ? "," : "") << "\n";
+  }
+  os << "  ]\n";
+  os << "}\n";
+  return writeViewerMailboxAtomic(viewerLayoutPresetFilePath(), os.str());
+}
+
+std::vector<std::string> viewerLayoutPresetNames() {
+  std::vector<std::string> names;
+  for (int i = 0; i < kViewerLayoutChoiceCount; ++i) {
+    names.push_back(standardPlotLayoutLabel(i));
+  }
+  ViewerLayoutPresetStore store{};
+  (void)loadViewerLayoutPresetStore(&store);
+  for (const auto& preset : store.userPresets) {
+    viewerAppendUniquePresetName(&names, preset.name);
+  }
+  return names;
+}
+
+bool viewerLayoutPresetExists() {
+  return !viewerLayoutPresetNames().empty();
+}
+
+bool viewerLayoutPresetExists(const std::string& name) {
+  if (name.empty()) return false;
+  if (standardPlotLayoutIndexForName(name) >= 0) return true;
+  ViewerLayoutPresetStore store{};
+  (void)loadViewerLayoutPresetStore(&store);
+  return std::any_of(store.userPresets.begin(), store.userPresets.end(), [&](const ViewerLayoutPresetRecord& preset) {
+    return viewerNamesEqualNoCase(preset.name, name);
+  });
+}
+
+bool applyViewerLayoutPresetData(AppState* app,
+                                 const ViewerLayoutPresetData& data,
+                                 int windowWidth,
+                                 int windowHeight) {
+  if (!app || data.windows.empty()) return false;
+  captureStandardLayoutSlotMemory(app);
+  ensurePlotWindowCount(app, static_cast<int>(data.windows.size()), windowWidth, windowHeight);
+  if (app->plotWindows.size() > data.windows.size()) app->plotWindows.resize(data.windows.size());
+  app->showWorkspaceButtons = data.showWorkspaceButtons;
+  app->showSliceButtonInPlotWindows = data.showSliceButtonInPlotWindows;
+  app->workspaceLayoutWindowWidth = data.windowWidth;
+  app->workspaceLayoutWindowHeight = data.windowHeight;
+  app->workspaceLayoutTopNorm = data.workspaceTopNorm;
+  for (int i = 0; i < static_cast<int>(data.windows.size()); ++i) {
+    PlotWindowState& target = app->plotWindows[static_cast<std::size_t>(i)];
+    const ViewerLayoutPresetWindowData& source = data.windows[static_cast<std::size_t>(i)];
+    target.rect = clampedPlotWindowRect(*app, source.rect, windowWidth, windowHeight);
+    const int previousModel = target.viewState.plotModel;
+    target.viewState = viewerStateWithModelCapabilities(source.viewState);
+    target.camera = source.camera;
+    target.selected = i == data.focusedSlot;
+    target.sourceSignalDocked = false;
+    target.sourceSignalTemporaryLassoSurface = false;
+    target.sourceSignalDockOwnerWindowId = -1;
+    target.slicingDrawerOpen = false;
+    if (target.viewState.plotModel != previousModel) invalidatePlotWindowTransientData(&target);
+  }
+  app->activeStandardLayoutIndex = std::clamp(data.layoutIndex, 0, kViewerLayoutChoiceCount - 1);
+  const int focusedSlot = std::clamp(data.focusedSlot, 0, static_cast<int>(app->plotWindows.size()) - 1);
+  focusPlotWindow(app, app->plotWindows[static_cast<std::size_t>(focusedSlot)].windowId);
+  app->workspaceCommandRevision = std::max<uint64_t>(app->workspaceCommandRevision + 1u, 1u);
+  reflowPlotWindowsForWorkspaceResize(app, windowWidth, windowHeight);
+  return true;
+}
+
+bool saveViewerLayoutPreset(AppState* app, const std::string& requestedName, std::string* savedName) {
+  if (!app) return false;
+  std::string name = sanitizeViewerLayoutPresetName(requestedName, "Layout Preset");
+  ViewerLayoutPresetStore store{};
+  (void)loadViewerLayoutPresetStore(&store);
+  const std::string baseName = name;
+  int suffix = 2;
+  auto nameExists = [&](const std::string& candidate) {
+    return standardPlotLayoutNameReserved(candidate) ||
+           std::any_of(store.userPresets.begin(), store.userPresets.end(), [&](const ViewerLayoutPresetRecord& preset) {
+             return viewerNamesEqualNoCase(preset.name, candidate);
+           });
+  };
+  while (nameExists(name)) name = baseName + " " + std::to_string(suffix++);
+  ViewerLayoutPresetRecord record{};
+  record.id = viewerMakePresetId();
+  record.name = name;
+  record.createdAtUtc = viewerNowUtcIso8601();
+  record.updatedAtUtc = record.createdAtUtc;
+  record.valuesJson = viewerLayoutPresetValuesJsonFromApp(app);
+  store.userPresets.push_back(record);
+  if (!saveViewerLayoutPresetStore(store)) return false;
+  if (savedName) *savedName = name;
+  return true;
+}
+
+bool updateViewerLayoutPreset(AppState* app, const std::string& name) {
+  if (!app || !viewerLayoutPresetNameEditableTarget(name)) return false;
+  ViewerLayoutPresetStore store{};
+  (void)loadViewerLayoutPresetStore(&store);
+  for (auto& preset : store.userPresets) {
+    if (!viewerNamesEqualNoCase(preset.name, name)) continue;
+    preset.valuesJson = viewerLayoutPresetValuesJsonFromApp(app);
+    preset.updatedAtUtc = viewerNowUtcIso8601();
+    return saveViewerLayoutPresetStore(store);
+  }
+  return false;
+}
+
+bool loadViewerLayoutPreset(AppState* app, const std::string& name, int windowWidth, int windowHeight) {
+  if (!app || name.empty()) return false;
+  const int standardIndex = standardPlotLayoutIndexForName(name);
+  if (standardIndex >= 0) {
+    applyPlotWindowLayout(app, standardIndex, windowWidth, windowHeight);
+    app->layoutPresetSelection = standardPlotLayoutLabel(standardIndex);
+    app->layoutPresetNameInput.clear();
+    return true;
+  }
+  ViewerLayoutPresetStore store{};
+  (void)loadViewerLayoutPresetStore(&store);
+  for (const auto& preset : store.userPresets) {
+    if (!viewerNamesEqualNoCase(preset.name, name)) continue;
+    ViewerLayoutPresetData data{};
+    if (!viewerLayoutPresetDataFromValuesJson(preset.valuesJson, &data)) return false;
+    if (!applyViewerLayoutPresetData(app, data, windowWidth, windowHeight)) return false;
+    app->layoutPresetSelection = preset.name;
+    app->layoutPresetNameInput = preset.name;
+    return true;
+  }
+  return false;
+}
+
+bool deleteViewerLayoutPreset(const std::string& name) {
+  if (!viewerLayoutPresetNameEditableTarget(name)) return false;
+  ViewerLayoutPresetStore store{};
+  (void)loadViewerLayoutPresetStore(&store);
+  const auto oldSize = store.userPresets.size();
+  store.userPresets.erase(std::remove_if(store.userPresets.begin(),
+                                         store.userPresets.end(),
+                                         [&](const ViewerLayoutPresetRecord& preset) {
+                                           return viewerNamesEqualNoCase(preset.name, name);
+                                         }),
+                          store.userPresets.end());
+  return store.userPresets.size() != oldSize && saveViewerLayoutPresetStore(store);
+}
+
 struct ViewerSharedPresetRecord {
   std::string id;
   std::string name;
@@ -18245,6 +18743,19 @@ bool presetActionAvailable(const AppState& app, ViewerMenuAction action) {
   }
 }
 
+bool layoutPresetActionAvailable(const AppState& app, ViewerMenuAction action) {
+  const bool selectedPreset = viewerLayoutPresetExists(app.layoutPresetSelection);
+  switch (action) {
+    case ViewerMenuAction::SaveLayoutPreset:
+      return !sanitizeViewerLayoutPresetName(app.layoutPresetNameInput).empty();
+    case ViewerMenuAction::UpdateLayoutPreset:
+    case ViewerMenuAction::DeleteLayoutPreset:
+      return selectedPreset && viewerLayoutPresetNameEditableTarget(app.layoutPresetSelection);
+    default:
+      return false;
+  }
+}
+
 ViewerMenuAction presetActionAtPoint(const AppState& app, const PlotMenuRect& rowRect, double x, double y) {
   constexpr ViewerMenuAction actions[3] = {
       ViewerMenuAction::SaveUserPreset,
@@ -18255,6 +18766,23 @@ ViewerMenuAction presetActionAtPoint(const AppState& app, const PlotMenuRect& ro
     const ViewerMenuAction action = actions[i];
     const PlotMenuRect& rect = rects[static_cast<size_t>(i)];
     if (presetActionAvailable(app, action) &&
+        x >= rect.x0 && x <= rect.x1 && y >= rect.y0 && y <= rect.y1) {
+      return action;
+    }
+  }
+  return ViewerMenuAction::None;
+}
+
+ViewerMenuAction layoutPresetActionAtPoint(const AppState& app, const PlotMenuRect& rowRect, double x, double y) {
+  constexpr ViewerMenuAction actions[3] = {
+      ViewerMenuAction::SaveLayoutPreset,
+      ViewerMenuAction::UpdateLayoutPreset,
+      ViewerMenuAction::DeleteLayoutPreset};
+  const auto rects = presetActionButtonRects(rowRect);
+  for (int i = 0; i < 3; ++i) {
+    const ViewerMenuAction action = actions[i];
+    const PlotMenuRect& rect = rects[static_cast<size_t>(i)];
+    if (layoutPresetActionAvailable(app, action) &&
         x >= rect.x0 && x <= rect.x1 && y >= rect.y0 && y <= rect.y1) {
       return action;
     }
@@ -18786,6 +19314,7 @@ void activateViewerMenuRow(AppState* app, const ViewerMenuRow& row) {
       break;
     case ViewerMenuAction::EditPresetName:
       app->viewerPresetNameEditing = true;
+      app->layoutPresetNameEditing = false;
       app->viewerMenuChoiceAction = static_cast<int>(ViewerMenuAction::None);
       if (app->viewerPresetNameInput.empty() && viewerPresetNameEditableTarget(app->viewerPresetSelection)) {
         app->viewerPresetNameInput = app->viewerPresetSelection;
@@ -18820,6 +19349,50 @@ void activateViewerMenuRow(AppState* app, const ViewerMenuRow& row) {
         const std::vector<std::string> names = viewerUserPresetNames();
         app->viewerPresetSelection = names.empty() ? std::string() : names.front();
         app->viewerPresetNameInput = viewerPresetNameEditableTarget(app->viewerPresetSelection) ? app->viewerPresetSelection : std::string();
+      }
+      return;
+    case ViewerMenuAction::EditLayoutPresetName:
+      app->layoutPresetNameEditing = true;
+      app->viewerPresetNameEditing = false;
+      app->viewerMenuChoiceAction = static_cast<int>(ViewerMenuAction::None);
+      if (app->layoutPresetNameInput.empty() && viewerLayoutPresetNameEditableTarget(app->layoutPresetSelection)) {
+        app->layoutPresetNameInput = app->layoutPresetSelection;
+      }
+      return;
+    case ViewerMenuAction::SaveLayoutPreset: {
+      std::string savedName;
+      if (saveViewerLayoutPreset(app, app->layoutPresetNameInput, &savedName)) {
+        app->layoutPresetSelection = savedName;
+        app->layoutPresetNameInput = savedName;
+      }
+      return;
+    }
+    case ViewerMenuAction::LoadLayoutPreset: {
+      const std::vector<std::string> names = viewerLayoutPresetNames();
+      if (!row.choiceItem || row.choiceValue < 0 || row.choiceValue >= static_cast<int>(names.size())) return;
+      const std::string presetName = names[static_cast<std::size_t>(row.choiceValue)];
+      if (!loadViewerLayoutPreset(app,
+                                  presetName,
+                                  std::max(1, app->workspaceLayoutWindowWidth),
+                                  std::max(1, app->workspaceLayoutWindowHeight))) {
+        return;
+      }
+      app->layoutPresetSelection = presetName;
+      app->layoutPresetNameInput =
+          viewerLayoutPresetNameEditableTarget(presetName) ? presetName : std::string();
+      app->viewerMenuChoiceAction = static_cast<int>(ViewerMenuAction::None);
+      app->viewerMenuHoverChoice = -1;
+      app->viewerChoiceMenuScroll = 0.0f;
+      queueViewerStateCommand(*app, row.refreshPolicy);
+      return;
+    }
+    case ViewerMenuAction::UpdateLayoutPreset:
+      (void)updateViewerLayoutPreset(app, app->layoutPresetSelection);
+      return;
+    case ViewerMenuAction::DeleteLayoutPreset:
+      if (deleteViewerLayoutPreset(app->layoutPresetSelection)) {
+        app->layoutPresetSelection = standardPlotLayoutLabel(app->activeStandardLayoutIndex);
+        app->layoutPresetNameInput.clear();
       }
       return;
     case ViewerMenuAction::SaveDefaults:
@@ -19274,6 +19847,12 @@ int layoutMenuIndexAt(const AppState& app, int width, int height, double x, doub
   return (index >= 0 && index < kViewerLayoutChoiceCount) ? index : -1;
 }
 
+bool pointInViewerWorkspaceLayoutPresetSelector(const AppState& app,
+                                                int width,
+                                                int height,
+                                                double x,
+                                                double y);
+
 bool pointerInViewerMenuUi(const AppState& app, int width, int height, double x, double y) {
   if (app.quickPlotModelMenuVisible &&
       pointInPlotMenuRect(quickPlotModelMenuRect(app, width, height), x, y)) {
@@ -19298,6 +19877,14 @@ bool pointerInViewerMenuUi(const AppState& app, int width, int height, double x,
   if (app.layoutMenuVisible &&
       pointInPlotMenuRect(layoutMenuRect(app, width, height), x, y)) {
     return true;
+  }
+  if (!app.plotModelMenuVisible &&
+      viewerMenuActionFromInt(app.viewerMenuChoiceAction) == ViewerMenuAction::LoadLayoutPreset) {
+    const PlotMenuRect choice = viewerChoiceMenuWindowRect(app, width, height);
+    if (choice.x1 > choice.x0 && choice.y1 > choice.y0 && pointInPlotMenuRect(choice, x, y)) {
+      return true;
+    }
+    if (pointInViewerWorkspaceLayoutPresetSelector(app, width, height, x, y)) return true;
   }
   if (!app.plotModelMenuVisible) return false;
   if (pointInPlotMenuRect(plotMenuMainRect(app, width, height), x, y)) return true;
@@ -19325,9 +19912,10 @@ bool pointInPlotMenuRect(const PlotMenuRect& rect, double x, double y) {
 }
 
 bool viewerMenuRowStacksValue(const ViewerMenuRow& row, float rowWidth) {
-  if (row.spacer || row.presetActionButtons || row.note || row.slider ||
+  if (row.spacer || row.presetActionButtons || row.layoutPresetActionButtons || row.note || row.slider ||
       row.slicingVectorSelector || row.channelSelector || row.choiceItem ||
-      row.value.empty() || row.action == ViewerMenuAction::LoadUserPreset) {
+      row.value.empty() || row.action == ViewerMenuAction::LoadUserPreset ||
+      row.action == ViewerMenuAction::LoadLayoutPreset) {
     return false;
   }
   const float labelInset = 14.0f;
@@ -19345,7 +19933,7 @@ bool viewerMenuRowStacksValue(const ViewerMenuRow& row, float rowWidth) {
 
 float viewerMenuRowHeight(const ViewerMenuRow& row, float rowWidth = 0.0f) {
   if (row.spacer) return 18.0f;
-  if (row.presetActionButtons) return 38.0f;
+  if (row.presetActionButtons || row.layoutPresetActionButtons) return 38.0f;
   if (rowWidth > 0.0f && viewerMenuRowStacksValue(row, rowWidth)) return 58.0f;
   return row.note ? (kPlotMenuRowHeight * 2.25f) : kPlotMenuRowHeight;
 }
@@ -19378,6 +19966,11 @@ std::string currentViewerPresetLabel(const AppState& app) {
   return viewerUserPresetExists() ? std::string("Default") : std::string("No presets");
 }
 
+std::string currentLayoutPresetLabel(const AppState& app) {
+  if (!app.layoutPresetSelection.empty()) return app.layoutPresetSelection;
+  return standardPlotLayoutLabel(app.activeStandardLayoutIndex);
+}
+
 PlotMenuRect viewerMenuCompactPresetWindowRect(const AppState& app, int width, int height) {
   if (!app.plotModelMenuVisible) return {};
   const PlotMenuRect rect = plotMenuMainRect(app, width, height);
@@ -19397,12 +19990,59 @@ PlotMenuRect viewerMenuCompactPresetWindowRect(const AppState& app, int width, i
           y0 + selectorHeight};
 }
 
+PlotMenuRect viewerMenuCompactLayoutPresetWindowRect(const AppState& app, int width, int height) {
+  PlotMenuRect preset = viewerMenuCompactPresetWindowRect(app, width, height);
+  if (preset.x1 <= preset.x0 || preset.y1 <= preset.y0) return {};
+  const PlotMenuRect drawer = plotMenuMainRect(app, width, height);
+  const float selectorHeight = preset.y1 - preset.y0;
+  float y0 = preset.y1 + 6.0f;
+  const float maxY0 = drawer.y1 - kViewerDrawerPad - selectorHeight;
+  if (y0 > maxY0) {
+    y0 = preset.y0 - 6.0f - selectorHeight;
+  }
+  y0 = clampf(y0,
+              drawer.y0 + kViewerDrawerHeaderHeight + kViewerDrawerPad,
+              std::max(drawer.y0 + kViewerDrawerHeaderHeight + kViewerDrawerPad, maxY0));
+  return {preset.x0, y0, preset.x1, y0 + selectorHeight};
+}
+
 bool pointInViewerMenuCompactPresetSelector(const AppState& app,
                                             int width,
                                             int height,
                                             double x,
                                             double y) {
   const PlotMenuRect rect = viewerMenuCompactPresetWindowRect(app, width, height);
+  return rect.x1 > rect.x0 && rect.y1 > rect.y0 &&
+         x >= rect.x0 && x <= rect.x1 && y >= rect.y0 && y <= rect.y1;
+}
+
+bool pointInViewerMenuCompactLayoutPresetSelector(const AppState& app,
+                                                  int width,
+                                                  int height,
+                                                  double x,
+                                                  double y) {
+  const PlotMenuRect rect = viewerMenuCompactLayoutPresetWindowRect(app, width, height);
+  return rect.x1 > rect.x0 && rect.y1 > rect.y0 &&
+         x >= rect.x0 && x <= rect.x1 && y >= rect.y0 && y <= rect.y1;
+}
+
+PlotMenuRect viewerWorkspaceLayoutPresetWindowRect(int width, int height) {
+  (void)height;
+  const float x0 = kViewerMenuIconInset + (kViewerMenuIconSize + 7.0f) * 3.0f;
+  const float x1 = std::min(static_cast<float>(std::max(1, width)) - 10.0f, x0 + 148.0f);
+  return {x0,
+          kViewerMenuIconInset,
+          std::max(x0 + kViewerMenuIconSize, x1),
+          kViewerMenuIconInset + kViewerMenuIconSize};
+}
+
+bool pointInViewerWorkspaceLayoutPresetSelector(const AppState& app,
+                                                int width,
+                                                int height,
+                                                double x,
+                                                double y) {
+  if (!app.showWorkspaceButtons || app.plotModelMenuVisible) return false;
+  const PlotMenuRect rect = viewerWorkspaceLayoutPresetWindowRect(width, height);
   return rect.x1 > rect.x0 && rect.y1 > rect.y0 &&
          x >= rect.x0 && x <= rect.x1 && y >= rect.y0 && y <= rect.y1;
 }
@@ -19786,8 +20426,20 @@ PlotMenuRect viewerChoiceMenuWindowRect(const AppState& app, int width, int heig
       action == ViewerMenuAction::LoadUserPreset &&
       app.plotModelMenuVisible &&
       (app.viewerPresetChoiceAnchorCompact || rowIndex < 0);
+  const bool anchoredToCompactLayoutPreset =
+      action == ViewerMenuAction::LoadLayoutPreset &&
+      app.plotModelMenuVisible &&
+      (app.layoutPresetChoiceAnchorCompact || rowIndex < 0);
+  const bool anchoredToWorkspaceLayoutPreset =
+      action == ViewerMenuAction::LoadLayoutPreset &&
+      app.layoutPresetChoiceAnchorWorkspace &&
+      !app.plotModelMenuVisible;
   if (anchoredToCompactPreset) {
     rowRect = viewerMenuCompactPresetWindowRect(app, width, height);
+  } else if (anchoredToCompactLayoutPreset) {
+    rowRect = viewerMenuCompactLayoutPresetWindowRect(app, width, height);
+  } else if (anchoredToWorkspaceLayoutPreset) {
+    rowRect = viewerWorkspaceLayoutPresetWindowRect(width, height);
   } else if (rowIndex >= 0) {
     rowRect = viewerMenuRowWindowRect(app, width, height, rowIndex);
   } else {
@@ -19808,10 +20460,19 @@ PlotMenuRect viewerChoiceMenuWindowRect(const AppState& app, int width, int heig
   const float availableHeight = std::max(kViewerChoiceMenuPad * 2.0f + kViewerChoiceMenuRowHeight,
                                          maxY - minY);
   const float menuHeight = std::min(naturalHeight, availableHeight);
-  float y0 = anchoredToCompactPreset ? rowRect.y1 + 6.0f : rowRect.y1 + 4.0f;
+  float y0 = (anchoredToCompactPreset || anchoredToCompactLayoutPreset || anchoredToWorkspaceLayoutPreset)
+                 ? rowRect.y1 + 6.0f
+                 : rowRect.y1 + 4.0f;
   if (y0 + menuHeight > maxY) y0 = rowRect.y0 - 4.0f - menuHeight;
   y0 = clampf(y0, minY, std::max(minY, maxY - menuHeight));
-  if (anchoredToCompactPreset) {
+  if (anchoredToWorkspaceLayoutPreset) {
+    const float x0Workspace = clampf(rowRect.x0, 8.0f, std::max(8.0f, static_cast<float>(width) - menuWidth - 8.0f));
+    const float y0Workspace = clampf(rowRect.y1 + 6.0f,
+                                     8.0f,
+                                     std::max(8.0f, static_cast<float>(height) - menuHeight - 8.0f));
+    return {x0Workspace, y0Workspace, x0Workspace + menuWidth, y0Workspace + menuHeight};
+  }
+  if (anchoredToCompactPreset || anchoredToCompactLayoutPreset) {
     const float compactX0 = drawer.x0 + kViewerDrawerPad;
     const float compactX1 = std::min(drawer.x1 - kViewerDrawerPad, compactX0 + menuWidth);
     return {compactX0, y0, compactX1, y0 + menuHeight};
@@ -20480,6 +21141,19 @@ void keyCallback(GLFWwindow* window, int key, int, int action, int) {
     }
     return;
   }
+  if (app->layoutPresetNameEditing) {
+    if (action == GLFW_PRESS || action == GLFW_REPEAT) {
+      if (key == GLFW_KEY_BACKSPACE) {
+        if (!app->layoutPresetNameInput.empty()) app->layoutPresetNameInput.pop_back();
+      } else if (key == GLFW_KEY_ENTER || key == GLFW_KEY_KP_ENTER) {
+        app->layoutPresetNameInput = sanitizeViewerLayoutPresetName(app->layoutPresetNameInput);
+        app->layoutPresetNameEditing = false;
+      } else if (key == GLFW_KEY_ESCAPE) {
+        app->layoutPresetNameEditing = false;
+      }
+    }
+    return;
+  }
   if (action == GLFW_PRESS && key == GLFW_KEY_Z && app->ctrlHeld &&
       !app->shiftHeld && !app->altHeld && !app->superHeld) {
     if (undoActiveViewerLassoStroke(app)) {
@@ -20490,7 +21164,8 @@ void keyCallback(GLFWwindow* window, int key, int, int action, int) {
   }
   if (action == GLFW_PRESS && key == GLFW_KEY_ESCAPE &&
       (app->plotModelMenuVisible || app->quickPlotModelMenuVisible || app->addPlotMenuVisible ||
-       app->layoutMenuVisible)) {
+       app->layoutMenuVisible ||
+       viewerMenuActionFromInt(app->viewerMenuChoiceAction) == ViewerMenuAction::LoadLayoutPreset)) {
     setPlotModelMenuVisible(app, false);
     app->quickPlotModelMenuVisible = false;
     app->addPlotMenuVisible = false;
@@ -20504,6 +21179,8 @@ void keyCallback(GLFWwindow* window, int key, int, int action, int) {
     app->viewerMenuHoverChoice = -1;
     app->viewerMenuDraggingSlider = false;
     app->viewerMenuChoiceAction = static_cast<int>(ViewerMenuAction::None);
+    app->layoutPresetChoiceAnchorWorkspace = false;
+    app->layoutPresetChoiceAnchorCompact = false;
     app->viewerChoiceMenuScroll = 0.0f;
     clearPointerInteractionState(app);
     return;
@@ -20676,10 +21353,13 @@ void keyCallback(GLFWwindow* window, int key, int, int action, int) {
 
 void charCallback(GLFWwindow* window, unsigned int codepoint) {
   AppState* app = reinterpret_cast<AppState*>(glfwGetWindowUserPointer(window));
-  if (!app || !app->viewerPresetNameEditing) return;
+  if (!app || (!app->viewerPresetNameEditing && !app->layoutPresetNameEditing)) return;
   if (codepoint < 32 || codepoint > 126) return;
-  if (app->viewerPresetNameInput.size() >= 64) return;
-  app->viewerPresetNameInput.push_back(static_cast<char>(codepoint));
+  std::string* target = app->viewerPresetNameEditing
+                            ? &app->viewerPresetNameInput
+                            : &app->layoutPresetNameInput;
+  if (target->size() >= 64) return;
+  target->push_back(static_cast<char>(codepoint));
 }
 
 void tryActivateViewerOnHover(GLFWwindow* window, AppState* app) {
@@ -21630,7 +22310,8 @@ void drawViewerMenuIconOverlay(const AppState& app,
                                int width,
                                int height,
                                int windowWidth,
-                               int windowHeight) {
+                               int windowHeight,
+                               const HudTextRenderer& renderer) {
   if (!app.showWorkspaceButtons || app.plotModelMenuVisible ||
       width <= 0 || height <= 0 || windowWidth <= 0 || windowHeight <= 0) {
     return;
@@ -21649,9 +22330,13 @@ void drawViewerMenuIconOverlay(const AppState& app,
   const PlotMenuRect addRect = scaleRect(addWindowRect);
   const PlotMenuRect layoutWindowRect = viewerLayoutIconWindowRect(windowWidth, windowHeight);
   const PlotMenuRect layoutRect = scaleRect(layoutWindowRect);
+  const PlotMenuRect layoutPresetWindowRect = viewerWorkspaceLayoutPresetWindowRect(windowWidth, windowHeight);
+  const PlotMenuRect layoutPresetRect = scaleRect(layoutPresetWindowRect);
   const bool hovered = pointInPlotMenuRect(iconWindowRect, app.hoverX, app.hoverY);
   const bool addHovered = pointInPlotMenuRect(addWindowRect, app.hoverX, app.hoverY);
   const bool layoutHovered = pointInPlotMenuRect(layoutWindowRect, app.hoverX, app.hoverY);
+  const bool layoutPresetHovered =
+      pointInViewerWorkspaceLayoutPresetSelector(app, windowWidth, windowHeight, app.hoverX, app.hoverY);
 
   glMatrixMode(GL_PROJECTION);
   glPushMatrix();
@@ -21671,6 +22356,45 @@ void drawViewerMenuIconOverlay(const AppState& app,
                         layoutRect.y1,
                         app.layoutMenuVisible,
                         layoutHovered);
+  if (layoutPresetWindowRect.x1 > layoutPresetWindowRect.x0 &&
+      layoutPresetWindowRect.y1 > layoutPresetWindowRect.y0) {
+    const bool active =
+        viewerMenuActionFromInt(app.viewerMenuChoiceAction) == ViewerMenuAction::LoadLayoutPreset &&
+        app.layoutPresetChoiceAnchorWorkspace;
+    drawPlotMenuRect(layoutPresetRect.x0,
+                     layoutPresetRect.y0,
+                     layoutPresetRect.x1,
+                     layoutPresetRect.y1,
+                     active ? 0.08f : (layoutPresetHovered ? 0.06f : 0.030f),
+                     active ? 0.20f : (layoutPresetHovered ? 0.16f : 0.060f),
+                     active ? 0.25f : (layoutPresetHovered ? 0.20f : 0.075f),
+                     active ? 0.86f : (layoutPresetHovered ? 0.72f : 0.50f));
+    drawPlotMenuRect(layoutPresetRect.x0,
+                     layoutPresetRect.y1 - 1.0f,
+                     layoutPresetRect.x1,
+                     layoutPresetRect.y1,
+                     0.30f,
+                     0.86f,
+                     1.0f,
+                     active || layoutPresetHovered ? 0.38f : 0.20f);
+    const PlotMenuRect glyphRect{layoutPresetRect.x0 + 7.0f,
+                                 layoutPresetRect.y0 + 7.0f,
+                                 layoutPresetRect.x0 + 28.0f,
+                                 layoutPresetRect.y1 - 7.0f};
+    drawViewerLayoutChoiceGlyph(app.activeStandardLayoutIndex, glyphRect, active || layoutPresetHovered);
+    drawHudTextLine(renderer,
+                    fitHudText(renderer,
+                               currentLayoutPresetLabel(app),
+                               std::max(18.0f, layoutPresetRect.x1 - layoutPresetRect.x0 - 42.0f),
+                               0.78f),
+                    layoutPresetRect.x0 + 34.0f,
+                    layoutPresetRect.y0 + (renderer.available ? 8.0f : 9.0f),
+                    0.78f,
+                    0.78f,
+                    0.92f,
+                    0.98f,
+                    0.96f);
+  }
   glDisable(GL_BLEND);
   glEnable(GL_DEPTH_TEST);
   glPopMatrix();
@@ -22194,6 +22918,108 @@ void drawLayoutMenuOverlay(const AppState& app,
   glMatrixMode(GL_MODELVIEW);
 }
 
+void drawWorkspaceChoiceMenuOverlay(const AppState& app,
+                                    int width,
+                                    int height,
+                                    int windowWidth,
+                                    int windowHeight,
+                                    const HudTextRenderer& renderer) {
+  if (app.plotModelMenuVisible ||
+      viewerMenuActionFromInt(app.viewerMenuChoiceAction) != ViewerMenuAction::LoadLayoutPreset ||
+      width <= 0 || height <= 0 || windowWidth <= 0 || windowHeight <= 0) {
+    return;
+  }
+  const std::vector<ViewerChoiceMenuItem> choiceItems = buildViewerChoiceMenuItems(app);
+  if (choiceItems.empty()) return;
+  const PlotMenuRect choiceWindowRect = viewerChoiceMenuWindowRect(app, windowWidth, windowHeight);
+  if (choiceWindowRect.x1 <= choiceWindowRect.x0 || choiceWindowRect.y1 <= choiceWindowRect.y0) return;
+  const float sx = static_cast<float>(width) / static_cast<float>(windowWidth);
+  const float sy = static_cast<float>(height) / static_cast<float>(windowHeight);
+  auto scaleRect = [&](const PlotMenuRect& rect) -> PlotMenuRect {
+    return {rect.x0 * sx,
+            static_cast<float>(height) - rect.y1 * sy,
+            rect.x1 * sx,
+            static_cast<float>(height) - rect.y0 * sy};
+  };
+  const PlotMenuRect choiceRect = scaleRect(choiceWindowRect);
+  const float choiceScroll = clampf(app.viewerChoiceMenuScroll,
+                                    0.0f,
+                                    viewerChoiceMenuMaxScroll(app, windowWidth, windowHeight));
+  glMatrixMode(GL_PROJECTION);
+  glPushMatrix();
+  glLoadIdentity();
+  glOrtho(0.0, static_cast<double>(width), 0.0, static_cast<double>(height), -1.0, 1.0);
+  glMatrixMode(GL_MODELVIEW);
+  glPushMatrix();
+  glLoadIdentity();
+  glDisable(GL_DEPTH_TEST);
+  glEnable(GL_BLEND);
+  glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+  drawPlotMenuRect(choiceRect.x0, choiceRect.y0, choiceRect.x1, choiceRect.y1,
+                   0.018f, 0.021f, 0.028f, 0.96f);
+  drawPlotMenuRect(choiceRect.x0, choiceRect.y1 - 1.0f, choiceRect.x1, choiceRect.y1,
+                   0.75f, 0.82f, 0.92f, 0.22f);
+  drawPlotMenuRect(choiceRect.x0, choiceRect.y0, choiceRect.x1, choiceRect.y0 + 1.0f,
+                   0.75f, 0.82f, 0.92f, 0.14f);
+  drawPlotMenuRect(choiceRect.x0, choiceRect.y0, choiceRect.x0 + 1.0f, choiceRect.y1,
+                   0.75f, 0.82f, 0.92f, 0.18f);
+  drawPlotMenuRect(choiceRect.x1 - 1.0f, choiceRect.y0, choiceRect.x1, choiceRect.y1,
+                   0.75f, 0.82f, 0.92f, 0.18f);
+  const float textScale = 1.0f;
+  for (int i = 0; i < static_cast<int>(choiceItems.size()); ++i) {
+    const float itemY0 = choiceWindowRect.y0 + kViewerChoiceMenuPad +
+                         static_cast<float>(i) * kViewerChoiceMenuRowHeight - choiceScroll;
+    if (itemY0 + kViewerChoiceMenuRowHeight < choiceWindowRect.y0 + kViewerChoiceMenuPad ||
+        itemY0 > choiceWindowRect.y1 - kViewerChoiceMenuPad) {
+      continue;
+    }
+    const PlotMenuRect itemRect = scaleRect({choiceWindowRect.x0 + kViewerChoiceMenuPad,
+                                             itemY0,
+                                             choiceWindowRect.x1 - kViewerChoiceMenuPad,
+                                             itemY0 + kViewerChoiceMenuRowHeight});
+    const bool hovered = app.viewerMenuHoverChoice == i;
+    const bool selected = choiceItems[static_cast<std::size_t>(i)].selected;
+    if (hovered) {
+      drawPlotMenuRect(itemRect.x0, itemRect.y0, itemRect.x1, itemRect.y1,
+                       0.18f, 0.30f, 0.42f, 0.62f);
+    }
+    if (selected) {
+      drawPlotMenuRect(itemRect.x0 + 4.0f, itemRect.y0 + 5.0f,
+                       itemRect.x0 + 7.0f, itemRect.y1 - 5.0f,
+                       0.42f, 0.78f, 1.0f, 0.86f);
+    }
+    const PlotMenuRect glyphRect{itemRect.x0 + (selected ? 15.0f : 11.0f),
+                                 itemRect.y0 + 7.0f,
+                                 itemRect.x0 + (selected ? 37.0f : 33.0f),
+                                 itemRect.y1 - 7.0f};
+    const int standardIndex = standardPlotLayoutIndexForName(choiceItems[static_cast<std::size_t>(i)].label);
+    if (standardIndex >= 0) {
+      drawViewerLayoutChoiceGlyph(standardIndex, glyphRect, hovered || selected);
+    }
+    const float labelX = itemRect.x0 + (standardIndex >= 0 ? 42.0f : (selected ? 14.0f : 10.0f));
+    const std::string fittedLabel =
+        fitHudText(renderer,
+                   choiceItems[static_cast<std::size_t>(i)].label,
+                   std::max(24.0f, itemRect.x1 - labelX - 8.0f),
+                   textScale);
+    drawHudTextLine(renderer,
+                    fittedLabel,
+                    labelX,
+                    itemRect.y0 + (renderer.available ? 9.0f : 10.0f),
+                    textScale,
+                    selected ? 0.98f : 0.88f,
+                    0.90f,
+                    0.94f,
+                    0.98f);
+  }
+  glDisable(GL_BLEND);
+  glEnable(GL_DEPTH_TEST);
+  glPopMatrix();
+  glMatrixMode(GL_PROJECTION);
+  glPopMatrix();
+  glMatrixMode(GL_MODELVIEW);
+}
+
 void drawPlotModelMenuOverlay(const AppState& app,
                               const ResolvedPayload& payload,
                               int width,
@@ -22202,10 +23028,11 @@ void drawPlotModelMenuOverlay(const AppState& app,
                               int windowHeight,
                               const HudTextRenderer& renderer) {
   if (width <= 0 || height <= 0 || windowWidth <= 0 || windowHeight <= 0) return;
-  drawViewerMenuIconOverlay(app, width, height, windowWidth, windowHeight);
+  drawViewerMenuIconOverlay(app, width, height, windowWidth, windowHeight, renderer);
   drawQuickPlotModelMenuOverlay(app, width, height, windowWidth, windowHeight, renderer);
   drawAddPlotMenuOverlay(app, width, height, windowWidth, windowHeight, renderer);
   drawLayoutMenuOverlay(app, width, height, windowWidth, windowHeight, renderer);
+  drawWorkspaceChoiceMenuOverlay(app, width, height, windowWidth, windowHeight, renderer);
   if (!app.plotModelMenuVisible) return;
   const float menuSlide = plotModelMenuSlideProgress(app);
   if (menuSlide <= 0.001f) return;
@@ -22299,6 +23126,58 @@ void drawPlotModelMenuOverlay(const AppState& app,
       glVertex2f(triCx - 4.5f, triCy + 2.5f);
       glVertex2f(triCx + 4.5f, triCy + 2.5f);
       glVertex2f(triCx, triCy - 3.0f);
+      glEnd();
+    }
+  }
+  {
+    const PlotMenuRect compactLayoutWindowRect =
+        viewerMenuCompactLayoutPresetWindowRect(app, windowWidth, windowHeight);
+    const PlotMenuRect compactLayoutRect = scaleRect(compactLayoutWindowRect);
+    if (compactLayoutWindowRect.x1 > compactLayoutWindowRect.x0 &&
+        compactLayoutWindowRect.y1 > compactLayoutWindowRect.y0) {
+      const bool hasPresets = viewerLayoutPresetExists();
+      const bool hovered = hasPresets && pointInViewerMenuCompactLayoutPresetSelector(
+                                           app, windowWidth, windowHeight, app.hoverX, app.hoverY);
+      drawPlotMenuRect(compactLayoutRect.x0,
+                       compactLayoutRect.y0,
+                       compactLayoutRect.x1,
+                       compactLayoutRect.y1,
+                       hovered ? 0.055f : 0.030f,
+                       hovered ? 0.18f : 0.095f,
+                       hovered ? 0.25f : 0.13f,
+                       hasPresets ? (hovered ? 0.84f : 0.66f) : 0.30f);
+      drawPlotMenuRect(compactLayoutRect.x0,
+                       compactLayoutRect.y1 - 1.0f,
+                       compactLayoutRect.x1,
+                       compactLayoutRect.y1,
+                       0.30f,
+                       0.86f,
+                       1.0f,
+                       hasPresets ? 0.36f : 0.12f);
+      const PlotMenuRect glyphRect{compactLayoutRect.x0 + 7.0f,
+                                   compactLayoutRect.y0 + 6.0f,
+                                   compactLayoutRect.x0 + 27.0f,
+                                   compactLayoutRect.y1 - 6.0f};
+      drawViewerLayoutChoiceGlyph(app.activeStandardLayoutIndex, glyphRect, hovered);
+      drawHudTextLine(renderer,
+                      fitHudText(renderer,
+                                 currentLayoutPresetLabel(app),
+                                 std::max(20.0f, compactLayoutRect.x1 - compactLayoutRect.x0 - 48.0f),
+                                 0.78f),
+                      compactLayoutRect.x0 + 32.0f,
+                      compactLayoutRect.y0 + (renderer.available ? 6.0f : 7.0f),
+                      0.78f,
+                      hasPresets ? 0.78f : 0.40f,
+                      0.90f,
+                      0.98f,
+                      1.0f);
+      const float triCx = compactLayoutRect.x1 - 11.0f;
+      const float triCy = compactLayoutRect.y0 + (compactLayoutRect.y1 - compactLayoutRect.y0) * 0.52f;
+      glBegin(GL_TRIANGLES);
+      glColor4f(0.48f, 0.90f, 1.0f, hasPresets ? (hovered ? 0.95f : 0.76f) : 0.30f);
+      glVertex2f(triCx - 4.0f, triCy + 2.2f);
+      glVertex2f(triCx + 4.0f, triCy + 2.2f);
+      glVertex2f(triCx, triCy - 2.8f);
       glEnd();
     }
   }
@@ -22485,6 +23364,52 @@ void drawPlotModelMenuOverlay(const AppState& app,
       }
       continue;
     }
+    if (row.layoutPresetActionButtons) {
+      const PlotMenuRect rowWindowRect = viewerMenuRowWindowRect(app, windowWidth, windowHeight, i);
+      const auto buttonWindowRects = presetActionButtonRects(rowWindowRect);
+      constexpr ViewerMenuAction actions[3] = {
+          ViewerMenuAction::SaveLayoutPreset,
+          ViewerMenuAction::UpdateLayoutPreset,
+          ViewerMenuAction::DeleteLayoutPreset};
+      constexpr const char* labels[3] = {"Save", "Update", "Delete"};
+      const ViewerMenuAction hoverAction = layoutPresetActionAtPoint(app, rowWindowRect, app.hoverX, app.hoverY);
+      for (int button = 0; button < 3; ++button) {
+        const ViewerMenuAction buttonAction = actions[button];
+        const bool available = layoutPresetActionAvailable(app, buttonAction);
+        const bool buttonHovered = available && hoverAction == buttonAction;
+        const bool danger = buttonAction == ViewerMenuAction::DeleteLayoutPreset;
+        const PlotMenuRect buttonRect = scaleRect(buttonWindowRects[static_cast<size_t>(button)]);
+        drawPlotMenuRect(buttonRect.x0,
+                         buttonRect.y0,
+                         buttonRect.x1,
+                         buttonRect.y1,
+                         danger ? (buttonHovered ? 0.42f : 0.26f) : (buttonHovered ? 0.20f : 0.10f),
+                         danger ? (buttonHovered ? 0.12f : 0.07f) : (buttonHovered ? 0.30f : 0.17f),
+                         danger ? (buttonHovered ? 0.12f : 0.08f) : (buttonHovered ? 0.42f : 0.24f),
+                         available ? (buttonHovered ? 0.88f : 0.70f) : 0.28f);
+        drawPlotMenuRect(buttonRect.x0,
+                         buttonRect.y1 - 1.0f,
+                         buttonRect.x1,
+                         buttonRect.y1,
+                         danger ? 1.0f : 0.48f,
+                         danger ? 0.42f : 0.90f,
+                         danger ? 0.38f : 1.0f,
+                         available ? 0.22f : 0.08f);
+        const std::string fittedButtonLabel =
+            fitHudText(renderer, labels[button], std::max(20.0f, buttonRect.x1 - buttonRect.x0 - 12.0f), textScale);
+        const float labelWidth = hudTextWidth(renderer, fittedButtonLabel, textScale);
+        drawHudTextLine(renderer,
+                        fittedButtonLabel,
+                        buttonRect.x0 + std::max(5.0f, (buttonRect.x1 - buttonRect.x0 - labelWidth) * 0.5f),
+                        buttonRect.y0 + (renderer.available ? 9.0f : 10.0f),
+                        textScale,
+                        available ? 0.92f : 0.40f,
+                        danger ? 0.98f : 0.82f,
+                        danger ? 0.74f : 0.94f,
+                        danger ? 0.70f : 0.98f);
+      }
+      continue;
+    }
     if (row.action == ViewerMenuAction::PlotModel) {
       drawPlotMenuRect(rr.x0,
                        rr.y0 + 4.0f,
@@ -22556,6 +23481,51 @@ void drawPlotModelMenuOverlay(const AppState& app,
                              textLabelX,
                              singleBaseline,
                              std::max(24.0f, rowWidth - valueWidthLimit - 32.0f),
+                             textScale,
+                             hovered,
+                             row.enabled ? 0.94f : 0.42f,
+                             0.76f,
+                             0.94f,
+                             1.0f);
+      drawHudTextLineClipped(renderer,
+                             row.value,
+                             valueRightX - valueWidthLimit,
+                             singleBaseline,
+                             valueWidthLimit,
+                             textScale,
+                             hovered,
+                             row.enabled ? 0.92f : 0.38f,
+                             0.70f,
+                             0.94f,
+                             1.0f,
+                             true);
+      continue;
+    }
+    if (row.action == ViewerMenuAction::LoadLayoutPreset) {
+      drawPlotMenuRect(rr.x0,
+                       rr.y0 + 4.0f,
+                       rr.x1,
+                       rr.y1 - 4.0f,
+                       hovered ? 0.055f : 0.030f,
+                       hovered ? 0.18f : 0.095f,
+                       hovered ? 0.25f : 0.13f,
+                       row.enabled ? (hovered ? 0.78f : 0.62f) : 0.25f);
+      drawPlotMenuRect(rr.x0,
+                       rr.y1 - 5.0f,
+                       rr.x1,
+                       rr.y1 - 4.0f,
+                       0.30f,
+                       0.86f,
+                       1.0f,
+                       row.enabled ? 0.38f : 0.10f);
+      const PlotMenuRect glyphRect{rr.x0 + 12.0f, rr.y0 + 12.0f, rr.x0 + 34.0f, rr.y1 - 12.0f};
+      drawViewerLayoutChoiceGlyph(app.activeStandardLayoutIndex, glyphRect, hovered);
+      const float valueWidthLimit = std::max(40.0f, rowWidth * 0.48f);
+      drawHudTextLineClipped(renderer,
+                             row.label,
+                             textLabelX + 26.0f,
+                             singleBaseline,
+                             std::max(24.0f, rowWidth - valueWidthLimit - 58.0f),
                              textScale,
                              hovered,
                              row.enabled ? 0.94f : 0.42f,
@@ -23621,7 +24591,7 @@ bool rebuildPlotWindowDerivedMeshIfNeeded(PlotWindowState* window,
         return true;
       }
     }
-    if (deriveMode == SourceDeriveMode::Raster) {
+    if (deriveMode == SourceDeriveMode::Raster && rasterAvailable) {
       cloud = nullptr;
     }
   }
@@ -27268,6 +28238,23 @@ void mouseButtonCallback(GLFWwindow* window, int button, int action, int mods) {
     double cursorX = app->hoverX;
     double cursorY = app->hoverY;
     glfwGetCursorPos(window, &cursorX, &cursorY);
+    if (viewerMenuActionFromInt(app->viewerMenuChoiceAction) == ViewerMenuAction::LoadLayoutPreset) {
+      const int choiceIndex = viewerChoiceMenuIndexAt(*app, windowWidth, windowHeight, cursorX, cursorY);
+      if (choiceIndex >= 0) {
+        const std::vector<ViewerChoiceMenuItem> items = buildViewerChoiceMenuItems(*app);
+        if (choiceIndex < static_cast<int>(items.size())) {
+          activateViewerChoiceMenuItem(app, items[static_cast<std::size_t>(choiceIndex)]);
+        }
+        app->viewerMenuHoverChoice = -1;
+        clearPointerInteractionState(app);
+        return;
+      }
+      if (!pointInViewerWorkspaceLayoutPresetSelector(*app, windowWidth, windowHeight, cursorX, cursorY)) {
+        app->viewerMenuChoiceAction = static_cast<int>(ViewerMenuAction::None);
+        app->layoutPresetChoiceAnchorWorkspace = false;
+        app->viewerChoiceMenuScroll = 0.0f;
+      }
+    }
     if (app->showWorkspaceButtons &&
         pointInPlotMenuRect(viewerMenuIconWindowRect(windowWidth, windowHeight), cursorX, cursorY)) {
       setPlotModelMenuVisible(app, true);
@@ -27282,6 +28269,7 @@ void mouseButtonCallback(GLFWwindow* window, int button, int action, int mods) {
       app->viewerMenuHoverTab = -1;
       app->viewerMenuHoverChoice = -1;
       app->viewerMenuChoiceAction = static_cast<int>(ViewerMenuAction::None);
+      app->layoutPresetChoiceAnchorWorkspace = false;
       app->viewerChoiceMenuScroll = 0.0f;
       if (coercedViewerMenuSection(*app) == ViewerMenuSection::Identity) {
         requestResolveDrawInstanceScan(app, "identity-tab-open", true);
@@ -27322,6 +28310,24 @@ void mouseButtonCallback(GLFWwindow* window, int button, int action, int mods) {
       app->plotModelMenuHoverSub = -1;
       app->viewerMenuHoverTab = -1;
       app->viewerMenuHoverChoice = -1;
+      clearPointerInteractionState(app);
+      return;
+    }
+    if (pointInViewerWorkspaceLayoutPresetSelector(*app, windowWidth, windowHeight, cursorX, cursorY)) {
+      const bool alreadyOpen =
+          viewerMenuActionFromInt(app->viewerMenuChoiceAction) == ViewerMenuAction::LoadLayoutPreset &&
+          app->layoutPresetChoiceAnchorWorkspace;
+      app->viewerMenuChoiceAction =
+          alreadyOpen ? static_cast<int>(ViewerMenuAction::None)
+                      : static_cast<int>(ViewerMenuAction::LoadLayoutPreset);
+      app->layoutPresetChoiceAnchorWorkspace = !alreadyOpen;
+      app->layoutPresetChoiceAnchorCompact = false;
+      app->viewerPresetChoiceAnchorCompact = false;
+      app->viewerChoiceMenuScroll = 0.0f;
+      app->viewerMenuHoverChoice = -1;
+      app->quickPlotModelMenuVisible = false;
+      app->addPlotMenuVisible = false;
+      app->layoutMenuVisible = false;
       clearPointerInteractionState(app);
       return;
     }
@@ -27479,6 +28485,7 @@ void mouseButtonCallback(GLFWwindow* window, int button, int action, int mods) {
                     windowHeight,
                     app->addPlotMenuX,
                     app->addPlotMenuY);
+      markLayoutPresetCustom(app);
       queueViewerStateCommand(*app, "reinterpret");
       app->addPlotMenuVisible = false;
       app->addPlotMenuHover = -1;
@@ -27494,6 +28501,7 @@ void mouseButtonCallback(GLFWwindow* window, int button, int action, int mods) {
                       windowHeight,
                       app->addPlotMenuX,
                       app->addPlotMenuY);
+        markLayoutPresetCustom(app);
         queueViewerStateCommand(*app, "reinterpret");
         app->addPlotMenuVisible = false;
         app->addPlotMenuHover = -1;
@@ -27631,6 +28639,23 @@ void mouseButtonCallback(GLFWwindow* window, int button, int action, int mods) {
         clearPointerInteractionState(app);
         return;
       }
+      if (pointInViewerMenuCompactLayoutPresetSelector(*app, windowWidth, windowHeight, cursorX, cursorY) &&
+          viewerLayoutPresetExists()) {
+        const bool alreadyOpen =
+            viewerMenuActionFromInt(app->viewerMenuChoiceAction) == ViewerMenuAction::LoadLayoutPreset;
+        app->viewerMenuChoiceAction =
+            alreadyOpen ? static_cast<int>(ViewerMenuAction::None)
+                        : static_cast<int>(ViewerMenuAction::LoadLayoutPreset);
+        app->layoutPresetChoiceAnchorCompact = !alreadyOpen;
+        app->layoutPresetChoiceAnchorWorkspace = false;
+        app->viewerPresetChoiceAnchorCompact = false;
+        app->viewerChoiceMenuScroll = 0.0f;
+        app->viewerMenuHoverChoice = -1;
+        app->plotModelMenuHoverMain = -1;
+        app->plotModelMenuHoverSub = -1;
+        clearPointerInteractionState(app);
+        return;
+      }
       const int tabIndex = viewerMenuTabIndexAt(*app, windowWidth, windowHeight, cursorX, cursorY);
       if (tabIndex >= 0) {
         const std::vector<ViewerMenuTab> tabs = buildViewerMenuTabs(*app);
@@ -27689,6 +28714,26 @@ void mouseButtonCallback(GLFWwindow* window, int button, int action, int mods) {
           clearPointerInteractionState(app);
           return;
         }
+        if (row.layoutPresetActionButtons) {
+          const PlotMenuRect rowRect =
+              viewerMenuRowWindowRect(*app, windowWidth, windowHeight, mainIndex);
+          const ViewerMenuAction presetAction =
+              layoutPresetActionAtPoint(*app, rowRect, cursorX, cursorY);
+          if (presetAction != ViewerMenuAction::None) {
+            ViewerMenuRow buttonRow{};
+            buttonRow.action = presetAction;
+            buttonRow.enabled = true;
+            buttonRow.refreshPolicy = "none";
+            activateViewerMenuRow(app, buttonRow);
+          }
+          app->viewerMenuLastClick = -10.0;
+          app->viewerMenuLastClickRow = -1;
+          app->viewerMenuLastClickAction =
+              static_cast<int>(ViewerMenuAction::None);
+          app->plotModelMenuHoverMain = mainIndex;
+          clearPointerInteractionState(app);
+          return;
+        }
         if (row.slicingVectorSelector && row.enabled) {
           const PlotMenuRect rowRect =
               viewerMenuRowWindowRect(*app, windowWidth, windowHeight, mainIndex);
@@ -27733,6 +28778,10 @@ void mouseButtonCallback(GLFWwindow* window, int button, int action, int mods) {
         const double now = glfwGetTime();
         if (row.action == ViewerMenuAction::LoadUserPreset) {
           app->viewerPresetChoiceAnchorCompact = false;
+        }
+        if (row.action == ViewerMenuAction::LoadLayoutPreset) {
+          app->layoutPresetChoiceAnchorCompact = false;
+          app->layoutPresetChoiceAnchorWorkspace = false;
         }
         const bool doubleClick =
             (now - app->viewerMenuLastClick) < 0.32 &&
@@ -27781,6 +28830,7 @@ void mouseButtonCallback(GLFWwindow* window, int button, int action, int mods) {
     glfwGetCursorPos(window, &cursorX, &cursorY);
     commitPlotWindowSnapPreview(app, windowWidth, windowHeight);
     sortPlotWindowsForReadableStacking(app, app->plotWindowDragId);
+    markLayoutPresetCustom(app);
     app->plotWindowDragMode = PlotWindowDragMode::None;
     app->plotWindowDragId = -1;
     finishDeferredPlotModelMenuDismiss(app);
@@ -27948,6 +28998,18 @@ void cursorPosCallback(GLFWwindow* window, double xpos, double ypos) {
       return;
     }
   }
+  if (!app->plotModelMenuVisible &&
+      viewerMenuActionFromInt(app->viewerMenuChoiceAction) == ViewerMenuAction::LoadLayoutPreset) {
+    int windowWidth = 1, windowHeight = 1;
+    glfwGetWindowSize(window, &windowWidth, &windowHeight);
+    app->viewerMenuHoverChoice = viewerChoiceMenuIndexAt(*app, windowWidth, windowHeight, xpos, ypos);
+    if ((app->viewerMenuHoverChoice >= 0 ||
+         pointInViewerWorkspaceLayoutPresetSelector(*app, windowWidth, windowHeight, xpos, ypos)) &&
+        !menuGestureActive) {
+      clearPointerInteractionState(app);
+      return;
+    }
+  }
   if (app->plotModelMenuVisible) {
     int windowWidth = 1, windowHeight = 1;
     glfwGetWindowSize(window, &windowWidth, &windowHeight);
@@ -27981,6 +29043,13 @@ void cursorPosCallback(GLFWwindow* window, double xpos, double ypos) {
       return;
     }
     if (pointInViewerMenuCompactPresetSelector(*app, windowWidth, windowHeight, xpos, ypos)) {
+      app->viewerMenuHoverTab = -1;
+      app->plotModelMenuHoverMain = -1;
+      app->plotModelMenuHoverSub = -1;
+      clearPointerInteractionState(app);
+      return;
+    }
+    if (pointInViewerMenuCompactLayoutPresetSelector(*app, windowWidth, windowHeight, xpos, ypos)) {
       app->viewerMenuHoverTab = -1;
       app->plotModelMenuHoverMain = -1;
       app->plotModelMenuHoverSub = -1;
@@ -28418,6 +29487,26 @@ void scrollCallback(GLFWwindow* window, double xoffset, double yoffset) {
     scrollDelta = xoffset;
   }
 #endif
+  if (!app->plotModelMenuVisible &&
+      viewerMenuActionFromInt(app->viewerMenuChoiceAction) == ViewerMenuAction::LoadLayoutPreset) {
+    int windowWidth = 1, windowHeight = 1;
+    glfwGetWindowSize(window, &windowWidth, &windowHeight);
+    double cursorX = app->hoverX;
+    double cursorY = app->hoverY;
+    glfwGetCursorPos(window, &cursorX, &cursorY);
+    const PlotMenuRect choiceRect = viewerChoiceMenuWindowRect(*app, windowWidth, windowHeight);
+    if (choiceRect.x1 > choiceRect.x0 && choiceRect.y1 > choiceRect.y0 &&
+        pointInPlotMenuRect(choiceRect, cursorX, cursorY)) {
+      const float maxChoiceScroll = viewerChoiceMenuMaxScroll(*app, windowWidth, windowHeight);
+      app->viewerChoiceMenuScroll =
+          clampf(app->viewerChoiceMenuScroll - static_cast<float>(scrollDelta) * kViewerChoiceMenuRowHeight * 1.5f,
+                 0.0f,
+                 maxChoiceScroll);
+      app->viewerMenuHoverChoice = viewerChoiceMenuIndexAt(*app, windowWidth, windowHeight, cursorX, cursorY);
+      clearPointerInteractionState(app);
+      return;
+    }
+  }
   if (app->plotModelMenuVisible) {
     int windowWidth = 1, windowHeight = 1;
     glfwGetWindowSize(window, &windowWidth, &windowHeight);

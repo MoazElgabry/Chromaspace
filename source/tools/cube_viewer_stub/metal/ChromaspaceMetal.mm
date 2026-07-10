@@ -1518,9 +1518,9 @@ kernel void glossFieldBlurKernel(const device float* src [[buffer(0)]],
     for (int ox = -1; ox <= 1; ++ox) {
       int xx = x + ox;
       if (xx < 0 || xx >= u.gridWidth) continue;
-      float kernel = (ox == 0 && oy == 0) ? 0.30 : ((ox == 0 || oy == 0) ? 0.13 : 0.08);
-      accum += src[uint(yy * u.gridWidth + xx)] * kernel;
-      weight += kernel;
+      float tapWeight = (ox == 0 && oy == 0) ? 0.30 : ((ox == 0 || oy == 0) ? 0.13 : 0.08);
+      accum += src[uint(yy * u.gridWidth + xx)] * tapWeight;
+      weight += tapWeight;
     }
   }
   dst[index] = weight > 1e-6 ? (accum / weight) : 0.0;
