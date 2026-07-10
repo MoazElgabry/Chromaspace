@@ -209,6 +209,25 @@ std::string viewerExecutableDir() {
 #endif
 }
 
+std::string viewerCurrentWorkingDir() {
+  std::error_code ec;
+  const std::filesystem::path cwd = std::filesystem::current_path(ec);
+  return ec ? std::string("<unknown>") : cwd.string();
+}
+
+unsigned long viewerProcessId() {
+#if defined(_WIN32)
+  return static_cast<unsigned long>(GetCurrentProcessId());
+#else
+  return static_cast<unsigned long>(::getpid());
+#endif
+}
+
+std::string viewerEnvFlagLabel(const char* name) {
+  const char* env = std::getenv(name);
+  return (env && env[0] != '\0') ? std::string(env) : std::string("<unset>");
+}
+
 bool nativeShiftModifierPressed();
 bool nativeControlModifierPressed();
 bool nativeAltModifierPressed();
@@ -400,6 +419,18 @@ bool glossViewCudaFieldPathEnabled() {
 bool glossViewMetalFieldPathEnabled() {
   // Metal Gloss View is enabled by default again, but can still be disabled explicitly for diagnosis.
   return !viewerEnvFlagEnabled("CHROMASPACE_DISABLE_GLOSS_VIEW_METAL_FIELD", false);
+}
+
+bool viewerMetalStartupSelfTestEnabled() {
+#if defined(__APPLE__)
+  // Launch stability first: probing the queue is enough for capability reporting.
+  // The optional dispatch self-test is kept behind diagnostics/env because some
+  // Mac drivers are less forgiving of early Metal work while Resolve is spawning
+  // the external Retina viewer. Runtime Metal Gloss still falls back if it fails.
+  return viewerDiagnosticsEnabled() || viewerEnvFlagEnabled("CHROMASPACE_METAL_STARTUP_SELFTEST", false);
+#else
+  return false;
+#endif
 }
 
 void logViewerDiagnostic(bool enabled, const std::string& msg) {
@@ -1341,6 +1372,11 @@ std::string currentGlVersionString() {
   return version != nullptr ? reinterpret_cast<const char*>(version) : std::string();
 }
 
+std::string currentGlString(GLenum name) {
+  const GLubyte* value = glGetString(name);
+  return value != nullptr ? reinterpret_cast<const char*>(value) : std::string();
+}
+
 std::string readShaderLog(GLuint handle, bool program, const ViewerGlComputeApi& api) {
   GLint logLength = 0;
   if (program) {
@@ -1556,12 +1592,6 @@ bool drawAlphaAwareWhitePointPass(PointRenderProgramCache* cache,
   glEnable(GL_BLEND);
   glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
   glEnable(GL_VERTEX_PROGRAM_POINT_SIZE);
-#ifdef GL_POINT_SPRITE
-  glEnable(GL_POINT_SPRITE);
-#ifdef GL_COORD_REPLACE
-  glTexEnvi(GL_POINT_SPRITE, GL_COORD_REPLACE, GL_TRUE);
-#endif
-#endif
   renderApi.useProgram(cache->program);
   renderApi.uniform1f(cache->pointSizeLoc, pointSize);
   renderApi.uniform1f(cache->colorSaturationLoc, 1.0f);
@@ -1575,12 +1605,6 @@ bool drawAlphaAwareWhitePointPass(PointRenderProgramCache* cache,
   glDrawArrays(GL_POINTS, 0, static_cast<GLsizei>(pointCount));
   renderApi.uniform1f(cache->whiteMixLoc, 0.0f);
   renderApi.useProgram(0);
-#ifdef GL_POINT_SPRITE
-#ifdef GL_COORD_REPLACE
-  glTexEnvi(GL_POINT_SPRITE, GL_COORD_REPLACE, GL_FALSE);
-#endif
-  glDisable(GL_POINT_SPRITE);
-#endif
   glDisable(GL_VERTEX_PROGRAM_POINT_SIZE);
   glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
   return true;
@@ -1606,9 +1630,14 @@ ViewerGpuCapabilities detectViewerGpuCapabilities(bool allowCudaProbe = true) {
   caps.metalQueueReady = metalProbe.queueReady;
   caps.metalDeviceName = metalProbe.deviceName != nullptr ? metalProbe.deviceName : "";
   if (caps.metalQueueReady && inputRequested && glossViewMetalFieldPathEnabled()) {
-    std::string startupReason;
-    caps.metalGlossFieldStartupValidated = runViewerMetalGlossFieldStartupSelfTest(&startupReason);
-    caps.metalGlossFieldStartupReason = startupReason;
+    if (viewerMetalStartupSelfTestEnabled()) {
+      std::string startupReason;
+      caps.metalGlossFieldStartupValidated = runViewerMetalGlossFieldStartupSelfTest(&startupReason);
+      caps.metalGlossFieldStartupReason = startupReason;
+    } else {
+      caps.metalGlossFieldStartupValidated = true;
+      caps.metalGlossFieldStartupReason = "deferred-startup-self-test";
+    }
   }
   caps.overlayComputeEnabled = caps.metalQueueReady && overlayRequested;
   caps.inputComputeEnabled = caps.metalQueueReady && inputRequested;
@@ -24678,10 +24707,11 @@ void drawSecondaryPlotWindow(AppState* app,
     if (usePointRenderProgram) {
       const ViewerGlComputeApi& renderApi = viewerGlComputeApi();
       glEnable(GL_VERTEX_PROGRAM_POINT_SIZE);
+      const bool pointSpriteForGloss = drawAsGlossProjection;
 #ifdef GL_POINT_SPRITE
-      glEnable(GL_POINT_SPRITE);
+      if (pointSpriteForGloss) glEnable(GL_POINT_SPRITE);
 #ifdef GL_COORD_REPLACE
-      glTexEnvi(GL_POINT_SPRITE, GL_COORD_REPLACE, GL_TRUE);
+      if (pointSpriteForGloss) glTexEnvi(GL_POINT_SPRITE, GL_COORD_REPLACE, GL_TRUE);
 #endif
 #endif
       renderApi.useProgram(pointRenderProgramCache->program);
@@ -24720,9 +24750,9 @@ void drawSecondaryPlotWindow(AppState* app,
       renderApi.useProgram(0);
 #ifdef GL_POINT_SPRITE
 #ifdef GL_COORD_REPLACE
-      glTexEnvi(GL_POINT_SPRITE, GL_COORD_REPLACE, GL_FALSE);
+      if (drawAsGlossProjection) glTexEnvi(GL_POINT_SPRITE, GL_COORD_REPLACE, GL_FALSE);
 #endif
-      glDisable(GL_POINT_SPRITE);
+      if (drawAsGlossProjection) glDisable(GL_POINT_SPRITE);
 #endif
       glDisable(GL_VERTEX_PROGRAM_POINT_SIZE);
     }
@@ -28719,7 +28749,19 @@ int main() {
   std::signal(SIGINT, onSignal);
   std::signal(SIGTERM, onSignal);
   glfwSetErrorCallback(glfwErrorCallback);
-  logViewerEvent(std::string("Viewer startup ok ") + kViewerVersionString);
+  logViewerEvent(std::string("Viewer startup begin version=") + kViewerVersionString +
+                 " pid=" + std::to_string(viewerProcessId()) +
+                 " log=" + viewerLogPath() +
+                 " exeDir=" + viewerExecutableDir() +
+                 " cwd=" + viewerCurrentWorkingDir() +
+                 " pipe=" + pipeName());
+  logViewerEvent(std::string("Viewer env sourceDerive=") + viewerEnvString("CHROMASPACE_SOURCE_DERIVE_MODE", "raster") +
+                 " rasterGpu=" + viewerEnvFlagLabel("CHROMASPACE_RASTER_GPU") +
+                 " overlayCompute=" + viewerEnvFlagLabel("CHROMASPACE_OVERLAY_COMPUTE") +
+                 " inputCompute=" + viewerEnvFlagLabel("CHROMASPACE_INPUT_COMPUTE") +
+                 " disableMetalGloss=" + viewerEnvFlagLabel("CHROMASPACE_DISABLE_GLOSS_VIEW_METAL_FIELD") +
+                 " metalStartupSelfTest=" + viewerEnvFlagLabel("CHROMASPACE_METAL_STARTUP_SELFTEST") +
+                 " diagnostics=" + viewerEnvFlagLabel("CHROMASPACE_DIAGNOSTICS"));
 
 #if defined(_WIN32)
   HANDLE singletonMutex = acquireViewerSingletonMutex();
@@ -28774,6 +28816,22 @@ int main() {
     return 1;
   }
   logViewerEvent("Viewer window created.");
+  {
+    int winW = 0, winH = 0, fbW = 0, fbH = 0;
+    float scaleX = 0.0f, scaleY = 0.0f;
+    glfwGetWindowSize(window, &winW, &winH);
+    glfwGetFramebufferSize(window, &fbW, &fbH);
+    glfwGetWindowContentScale(window, &scaleX, &scaleY);
+    std::ostringstream os;
+    os << "Viewer initial geometry window=" << winW << "x" << winH
+       << " framebuffer=" << fbW << "x" << fbH
+       << " ratio=" << std::fixed << std::setprecision(3)
+       << (winW > 0 ? static_cast<double>(fbW) / static_cast<double>(winW) : 0.0)
+       << "x"
+       << (winH > 0 ? static_cast<double>(fbH) / static_cast<double>(winH) : 0.0)
+       << " contentScale=" << scaleX << "x" << scaleY;
+    logViewerEvent(os.str());
+  }
 
 #if defined(_WIN32)
   applyWindowsWindowIcon(window);
@@ -28781,6 +28839,10 @@ int main() {
   glfwMakeContextCurrent(window);
   logViewerEvent("OpenGL context made current.");
   glfwSwapInterval(1);
+  logViewerEvent(std::string("OpenGL strings vendor=\"") + currentGlString(GL_VENDOR) +
+                 "\" renderer=\"" + currentGlString(GL_RENDERER) +
+                 "\" version=\"" + currentGlString(GL_VERSION) + "\"");
+  logViewerEvent("Detecting viewer GPU capabilities...");
   ViewerGpuCapabilities gpuCaps = detectViewerGpuCapabilities(false);
   {
     const bool parityChecks = viewerParityChecksEnabled();
@@ -28827,6 +28889,16 @@ int main() {
   } else {
     ensureDefaultPlotWindow(&app);
     captureFocusedPlotWindowFromApp(&app);
+  }
+  {
+    std::ostringstream os;
+    os << "Viewer state ready settingsLoaded=" << (app.viewerSettingsLoadedFromDisk ? "1" : "0")
+       << " plotWindows=" << app.plotWindows.size()
+       << " focused=" << app.focusedPlotWindowId
+       << " showWorkspaceButtons=" << (app.showWorkspaceButtons ? "1" : "0")
+       << " showSliceButton=" << (app.showSliceButtonInPlotWindows ? "1" : "0")
+       << " sourceDerive=" << sourceDeriveModeLabel(sourceDeriveMode());
+    logViewerEvent(os.str());
   }
   app.diagTransitions = viewerDiagnosticsEnabled();
   app.parityChecks = viewerParityChecksEnabled();
@@ -30204,10 +30276,11 @@ int main() {
     if (usePointRenderProgram) {
       const ViewerGlComputeApi& renderApi = viewerGlComputeApi();
       glEnable(GL_VERTEX_PROGRAM_POINT_SIZE);
+      const bool pointSpriteForGloss = drawAsGlossProjection;
 #ifdef GL_POINT_SPRITE
-      glEnable(GL_POINT_SPRITE);
+      if (pointSpriteForGloss) glEnable(GL_POINT_SPRITE);
 #ifdef GL_COORD_REPLACE
-      glTexEnvi(GL_POINT_SPRITE, GL_COORD_REPLACE, GL_TRUE);
+      if (pointSpriteForGloss) glTexEnvi(GL_POINT_SPRITE, GL_COORD_REPLACE, GL_TRUE);
 #endif
 #endif
       renderApi.useProgram(pointRenderProgramCache.program);
@@ -30296,9 +30369,9 @@ int main() {
       renderApi.useProgram(0);
 #ifdef GL_POINT_SPRITE
 #ifdef GL_COORD_REPLACE
-      glTexEnvi(GL_POINT_SPRITE, GL_COORD_REPLACE, GL_FALSE);
+      if (drawAsGlossProjection) glTexEnvi(GL_POINT_SPRITE, GL_COORD_REPLACE, GL_FALSE);
 #endif
-      glDisable(GL_POINT_SPRITE);
+      if (drawAsGlossProjection) glDisable(GL_POINT_SPRITE);
 #endif
       glDisable(GL_VERTEX_PROGRAM_POINT_SIZE);
       if (!occlusiveInputCloud) glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
@@ -30674,7 +30747,14 @@ int main() {
     glfwSwapBuffers(window);
     if (!firstFramePresented) {
       firstFramePresented = true;
-      logViewerEvent("First viewer frame presented.");
+      std::ostringstream os;
+      os << "First viewer frame presented window=" << windowWidth << "x" << windowHeight
+         << " framebuffer=" << width << "x" << height
+         << " primaryRect=" << primaryRenderRect.w << "x" << primaryRenderRect.h
+         << " plots=" << app.plotWindows.size()
+         << " backend=" << app.gpuCaps.activeBackendLabel
+         << " sourceDerive=" << sourceDeriveModeLabel(sourceDeriveMode());
+      logViewerEvent(os.str());
 #if defined(CHROMASPACE_VIEWER_HAS_CUDA) && !defined(__APPLE__)
       cudaWarmupStarted = true;
       cudaWarmupThread = std::thread([&]() {

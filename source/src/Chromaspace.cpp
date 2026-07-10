@@ -204,6 +204,25 @@ bool fileExistsForLaunch(const std::string& p) {
 #endif
 }
 
+unsigned long chromaspaceProcessId() {
+#if defined(_WIN32)
+  return static_cast<unsigned long>(GetCurrentProcessId());
+#else
+  return static_cast<unsigned long>(::getpid());
+#endif
+}
+
+std::string chromaspaceCurrentWorkingDir() {
+  std::error_code ec;
+  const std::filesystem::path cwd = std::filesystem::current_path(ec);
+  return ec ? std::string("<unknown>") : cwd.string();
+}
+
+std::string chromaspaceEnvLabel(const char* name) {
+  const char* env = std::getenv(name);
+  return (env && env[0] != '\0') ? std::string(env) : std::string("<unset>");
+}
+
 std::string findBundleRootFromModule(const std::string& modulePath) {
   std::string current = parentDir(modulePath);
   while (!current.empty()) {
@@ -12508,6 +12527,9 @@ class ChromaspaceEffect : public ImageEffect {
   // Opening a session means "ensure a usable viewer exists, then mark this OFX instance as active."
   // Reuse is preferred over relaunch so repeated connect/refresh actions stay within the single-viewer rule.
   void openCubeViewerSession(double time) {
+    cubeViewerDebugLog(std::string("Open viewer session requested sender=") + senderId_ +
+                       " pluginPid=" + std::to_string(chromaspaceProcessId()) +
+                       " log=" + cubeViewerLogPath());
     startIoWorker();
     startStatusThread();
     ViewerProbeResult existing = probeViewer();
@@ -12651,6 +12673,24 @@ class ChromaspaceEffect : public ImageEffect {
   // then falls back to cwd/PATH-style candidates for workshop and local build workflows.
   bool launchViewerProcess() {
     const auto candidates = viewerExecutableCandidates();
+    const std::string modulePath = pluginModulePath();
+    const std::string moduleDir = parentDir(modulePath);
+    const std::string bundleRoot = findBundleRootFromModule(modulePath);
+    {
+      std::ostringstream os;
+      os << "Viewer launch context pluginPid=" << chromaspaceProcessId()
+         << " version=" << kPluginVersionLabel
+         << " log=" << cubeViewerLogPath()
+         << " module=" << (modulePath.empty() ? std::string("<unknown>") : modulePath)
+         << " moduleDir=" << (moduleDir.empty() ? std::string("<unknown>") : moduleDir)
+         << " bundleRoot=" << (bundleRoot.empty() ? std::string("<none>") : bundleRoot)
+         << " cwd=" << chromaspaceCurrentWorkingDir()
+         << " exeOverride=" << chromaspaceEnvLabel("CHROMASPACE_EXE")
+         << " debug=" << chromaspaceEnvLabel("CHROMASPACE_DEBUG_LOG")
+         << " diagnostics=" << chromaspaceEnvLabel("CHROMASPACE_DIAGNOSTICS")
+         << " candidates=" << candidates.size();
+      cubeViewerDebugLog(os.str());
+    }
     std::ostringstream attempted;
 #if defined(_WIN32)
     for (const auto& candidate : candidates) {
@@ -12676,9 +12716,11 @@ class ChromaspaceEffect : public ImageEffect {
           &si,
           &pi);
       if (ok == TRUE) {
+        const DWORD launchedPid = pi.dwProcessId;
         CloseHandle(pi.hThread);
         CloseHandle(pi.hProcess);
-        cubeViewerDebugLog(std::string("CreateProcess succeeded: ") + candidate);
+        cubeViewerDebugLog(std::string("CreateProcess succeeded: ") + candidate +
+                           " pid=" + std::to_string(static_cast<unsigned long>(launchedPid)));
         return true;
       }
       attempted << (attempted.tellp() > 0 ? "; " : "") << candidate << " (err=" << GetLastError() << ")";
@@ -12699,7 +12741,8 @@ class ChromaspaceEffect : public ImageEffect {
       char* const argv[] = {const_cast<char*>(exe.c_str()), nullptr};
       const int spawnErr = posix_spawn(&pid, exe.c_str(), nullptr, nullptr, argv, environ);
       if (spawnErr == 0) {
-        cubeViewerDebugLog(std::string("posix_spawn succeeded: ") + candidate);
+        cubeViewerDebugLog(std::string("posix_spawn succeeded: ") + candidate +
+                           " pid=" + std::to_string(static_cast<unsigned long>(pid)));
         return true;
       }
       attempted << (attempted.tellp() > 0 ? "; " : "") << candidate << " (err=" << spawnErr << ")";
