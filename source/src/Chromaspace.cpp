@@ -1781,6 +1781,7 @@ std::string viewerRuntimeStateJson(const ChromaspaceViewer::ViewerRuntimeState& 
      << ",\"sourceMaxProxyLongEdge\":" << s.sourceMaxProxyLongEdge
      << ",\"sourceUseNativeWhenAvailable\":" << (s.sourceUseNativeWhenAvailable ? 1 : 0)
      << ",\"sourceSyncSelections\":" << (s.sourceSyncSelections ? 1 : 0)
+     << ",\"sourceSyncCommonPlotSettings\":" << (s.sourceSyncCommonPlotSettings ? 1 : 0)
      << ",\"volumeSliceLassoRegion\":" << (s.volumeSliceLassoRegion ? 1 : 0)
      << ",\"readIdentityPlot\":" << (s.readIdentityPlot ? 1 : 0)
      << ",\"isolateIdentityData\":" << (s.isolateIdentityData ? 1 : 0)
@@ -5074,6 +5075,7 @@ class ChromaspaceEffect : public ImageEffect {
     readInt("sourceMaxProxyLongEdge", &state.sourceMaxProxyLongEdge);
     readBool("sourceUseNativeWhenAvailable", &state.sourceUseNativeWhenAvailable);
     readBool("sourceSyncSelections", &state.sourceSyncSelections);
+    readBool("sourceSyncCommonPlotSettings", &state.sourceSyncCommonPlotSettings);
     readInt("quality", &state.quality);
     readInt("scale", &state.scale);
     readInt("sampling", &state.sampling);
@@ -7447,6 +7449,7 @@ class ChromaspaceEffect : public ImageEffect {
         << ",\"sourceMaxProxyLongEdge\":" << viewerState.sourceMaxProxyLongEdge
         << ",\"sourceUseNativeWhenAvailable\":" << (viewerState.sourceUseNativeWhenAvailable ? 1 : 0)
         << ",\"sourceSyncSelections\":" << (viewerState.sourceSyncSelections ? 1 : 0)
+        << ",\"sourceSyncCommonPlotSettings\":" << (viewerState.sourceSyncCommonPlotSettings ? 1 : 0)
         << ",\"quality\":\"" << qualityLabelForIndex(qualityIndex) << "\""
         << ",\"sampling\":\"" << samplingModeLabelForIndex(samplingMode) << "\""
         << ",\"occupancyFill\":" << (occupancyFill ? 1 : 0)

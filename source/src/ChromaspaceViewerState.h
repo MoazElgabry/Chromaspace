@@ -123,6 +123,7 @@ struct ViewerRuntimeState {
   int sourceMaxProxyLongEdge = 2048;
   bool sourceUseNativeWhenAvailable = true;
   bool sourceSyncSelections = false;
+  bool sourceSyncCommonPlotSettings = false;
 };
 
 inline int clampChoice(int value, int hi, int fallback = 0) {
