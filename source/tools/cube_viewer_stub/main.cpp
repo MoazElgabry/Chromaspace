@@ -13003,6 +13003,7 @@ struct AppState {
   int viewerMenuSection = 0;
   int viewerMenuHoverTab = -1;
   int viewerSettingsSubtab = 0;
+  int viewerFontSize = 0;
   int viewerSettingsHoverSubtab = -1;
   int viewerMenuHoverChoice = -1;
   bool viewerMenuDraggingSlider = false;
@@ -13028,6 +13029,10 @@ struct AppState {
   std::string viewerPresetSelection;
   std::string viewerPresetNameInput;
   bool viewerPresetNameEditing = false;
+  int pendingPresetDeleteAction = 0;
+  std::string pendingPresetDeleteName;
+  double presetActionFeedbackStart = -10.0;
+  int presetActionFeedbackAction = 0;
   bool layoutPresetChoiceAnchorCompact = false;
   bool layoutPresetChoiceAnchorWorkspace = false;
   bool layoutPresetChoiceAnchorCursor = false;
@@ -13311,9 +13316,91 @@ struct PlotMenuRect {
 };
 
 bool pointInPlotMenuRect(const PlotMenuRect& rect, double x, double y);
+PlotMenuRect plotMenuMainRect(const AppState& app, int width, int height);
+float viewerMenuRowsX0(const PlotMenuRect& rect);
+float viewerMenuRowsY0(const AppState& app, const PlotMenuRect& rect);
 
-float viewerMenuDrawerWidthPixels(int width) {
+int clampViewerFontSize(int size) {
+  return std::clamp(size, 0, 2);
+}
+
+const char* viewerFontSizeLabel(int size) {
+  switch (clampViewerFontSize(size)) {
+    case 1: return "Medium";
+    case 2: return "Large";
+    case 0:
+    default: return "Small";
+  }
+}
+
+float viewerFontScaleForSize(int size) {
+  switch (clampViewerFontSize(size)) {
+    case 1: return 1.12f;
+    case 2: return 1.25f;
+    case 0:
+    default: return 1.0f;
+  }
+}
+
+struct ViewerUiMetrics {
+  float textScale = 1.0f;
+  float rowHeight = 42.0f;
+  float stackedRowHeight = 58.0f;
+  float actionButtonRowHeight = 38.0f;
+  float choiceRowHeight = 30.0f;
+  float drawerTabHeight = 32.0f;
+  float settingsSubtabHeight = 30.0f;
+  float compactSelectorHeight = 24.0f;
+  float titleTextScale = 1.0f;
+  float titleExtraHeight = 0.0f;
+  float drawerComfortMin = 390.0f;
+  float drawerComfortMax = 540.0f;
+};
+
+ViewerUiMetrics viewerUiMetricsForFontSize(int size) {
+  ViewerUiMetrics m{};
+  const int clamped = clampViewerFontSize(size);
+  m.textScale = viewerFontScaleForSize(clamped);
+  m.rowHeight = clamped == 0 ? 42.0f : (clamped == 1 ? 47.0f : 52.0f);
+  m.stackedRowHeight = clamped == 0 ? 58.0f : (clamped == 1 ? 64.0f : 71.0f);
+  m.actionButtonRowHeight = clamped == 0 ? 38.0f : (clamped == 1 ? 42.0f : 45.0f);
+  m.choiceRowHeight = clamped == 0 ? 30.0f : (clamped == 1 ? 34.0f : 38.0f);
+  m.drawerTabHeight = clamped == 0 ? 32.0f : (clamped == 1 ? 36.0f : 40.0f);
+  m.settingsSubtabHeight = clamped == 0 ? 30.0f : (clamped == 1 ? 34.0f : 38.0f);
+  m.compactSelectorHeight = clamped == 0 ? 24.0f : (clamped == 1 ? 28.0f : 32.0f);
+  m.titleTextScale = m.textScale;
+  m.titleExtraHeight = clamped == 0 ? 0.0f : (clamped == 1 ? 3.0f : 6.0f);
+  m.drawerComfortMin = clamped == 0 ? 390.0f : (clamped == 1 ? 430.0f : 470.0f);
+  m.drawerComfortMax = clamped == 0 ? 540.0f : (clamped == 1 ? 590.0f : 640.0f);
+  return m;
+}
+
+ViewerUiMetrics viewerUiMetrics(const AppState& app) {
+  return viewerUiMetricsForFontSize(app.viewerFontSize);
+}
+
+float viewerChoiceTextBaselineOffset(const ViewerUiMetrics& metrics, bool rendererAvailable) {
+  if (metrics.textScale <= 1.01f) return rendererAvailable ? 8.0f : 9.0f;
+  return std::max(8.0f, metrics.choiceRowHeight * 0.5f - 6.0f * metrics.textScale);
+}
+
+float viewerRowTextBaselineOffset(const ViewerUiMetrics& metrics, bool rendererAvailable) {
+  if (metrics.textScale <= 1.01f) return rendererAvailable ? 14.0f : 15.0f;
+  return std::max(14.0f, metrics.rowHeight * 0.5f - 6.0f * metrics.textScale);
+}
+
+float viewerCompactTextBaselineOffset(const ViewerUiMetrics& metrics,
+                                      float controlHeight,
+                                      float textScale,
+                                      bool rendererAvailable,
+                                      float smallBaseline) {
+  if (metrics.textScale <= 1.01f) return rendererAvailable ? smallBaseline : smallBaseline + 1.0f;
+  return std::max(smallBaseline, controlHeight * 0.5f - 6.0f * textScale);
+}
+
+float viewerMenuDrawerWidthPixels(int width, int fontSize) {
   const float w = static_cast<float>(std::max(1, width));
+  const ViewerUiMetrics metrics = viewerUiMetricsForFontSize(fontSize);
   // Workspace reservations should adapt to the available surface, but fine UI
   // metrics stay in GLFW logical pixels. Scaling row heights, text, padding, or
   // hit targets with fullscreen width would make the menu visually balloon.
@@ -13321,18 +13408,16 @@ float viewerMenuDrawerWidthPixels(int width) {
   constexpr float kDrawerWideWindowFraction = 0.30f;
   constexpr float kDrawerFractionBlendStart = 900.0f;
   constexpr float kDrawerFractionBlendEnd = 1800.0f;
-  constexpr float kDrawerComfortMin = 390.0f;
-  constexpr float kDrawerComfortMax = 540.0f;
   const float reservedPlotWidth = std::min(320.0f, std::max(170.0f, w * 0.34f));
   const float maxWidth = std::max(168.0f, w - reservedPlotWidth);
-  const float minWidth = std::min(kDrawerComfortMin, maxWidth);
+  const float minWidth = std::min(metrics.drawerComfortMin, maxWidth);
   const float blend = clampf((w - kDrawerFractionBlendStart) /
                                  (kDrawerFractionBlendEnd - kDrawerFractionBlendStart),
                              0.0f,
                              1.0f);
   const float preferredFraction = kDrawerSmallWindowFraction +
                                   (kDrawerWideWindowFraction - kDrawerSmallWindowFraction) * blend;
-  return clampf(w * preferredFraction, minWidth, std::min(maxWidth, kDrawerComfortMax));
+  return clampf(w * preferredFraction, minWidth, std::min(maxWidth, metrics.drawerComfortMax));
 }
 
 constexpr double kViewerMenuSlideSeconds = 0.20;
@@ -13353,7 +13438,7 @@ float plotModelMenuSlideProgress(const AppState& app) {
 }
 
 float plotWorkspaceReservedLeftPixels(const AppState& app, int windowWidth) {
-  return viewerMenuDrawerWidthPixels(windowWidth) * plotModelMenuSlideProgress(app);
+  return viewerMenuDrawerWidthPixels(windowWidth, app.viewerFontSize) * plotModelMenuSlideProgress(app);
 }
 
 PlotMenuRect plotWindowLogicalScreenRect(const AppState& app,
@@ -13372,10 +13457,11 @@ PlotMenuRect plotWindowLogicalScreenRect(const AppState& app,
           y0 + std::max(1.0f, window.rect.h * h)};
 }
 
-float plotWindowTitleBarLogicalHeight(const PlotMenuRect& screenRect) {
+float plotWindowTitleBarLogicalHeight(const AppState& app, const PlotMenuRect& screenRect) {
   const float windowH = std::max(1.0f, screenRect.y1 - screenRect.y0);
-  const float target = 24.0f;
-  if (windowH < 88.0f) return clampf(windowH * 0.24f, 12.0f, 20.0f);
+  const ViewerUiMetrics metrics = viewerUiMetrics(app);
+  const float target = 24.0f + metrics.titleExtraHeight;
+  if (windowH < 88.0f) return clampf(windowH * 0.24f, 12.0f, std::min(20.0f + metrics.titleExtraHeight, windowH * 0.34f));
   return clampf(target, 20.0f, std::max(20.0f, windowH * 0.22f));
 }
 
@@ -13384,7 +13470,7 @@ PlotMenuRect plotWindowContentLogicalScreenRect(const AppState& app,
                                                 int windowWidth,
                                                 int windowHeight) {
   PlotMenuRect rect = plotWindowLogicalScreenRect(app, window, windowWidth, windowHeight);
-  const float titleH = plotWindowTitleBarLogicalHeight(rect);
+  const float titleH = plotWindowTitleBarLogicalHeight(app, rect);
   rect.y0 = std::min(rect.y1 - 1.0f, rect.y0 + titleH);
   return rect;
 }
@@ -15075,6 +15161,7 @@ enum class ViewerMenuAction {
   Saturation,
   KeepOnTop,
   ResetOnSwitch,
+  FontSize,
   ShowWorkspaceButtons,
   ShowSliceButtonInPlotWindows,
   ShowOverflow,
@@ -15204,7 +15291,10 @@ bool viewerUserPresetExists(const std::string& name);
 bool saveViewerUserPreset(const ChromaspaceViewer::ViewerRuntimeState& state,
                           const std::string& requestedName,
                           std::string* savedName = nullptr);
-bool updateViewerUserPreset(const std::string& name, const ChromaspaceViewer::ViewerRuntimeState& state);
+bool updateViewerUserPreset(const std::string& name,
+                            const std::string& requestedName,
+                            const ChromaspaceViewer::ViewerRuntimeState& state,
+                            std::string* savedName = nullptr);
 bool loadViewerUserPreset(const std::string& name, ChromaspaceViewer::ViewerRuntimeState* out);
 bool deleteViewerUserPreset(const std::string& name);
 bool saveViewerDefaultPreset(const ChromaspaceViewer::ViewerRuntimeState& state);
@@ -15215,7 +15305,10 @@ std::vector<std::string> viewerLayoutPresetNames();
 bool viewerLayoutPresetExists();
 bool viewerLayoutPresetExists(const std::string& name);
 bool saveViewerLayoutPreset(AppState* app, const std::string& requestedName, std::string* savedName = nullptr);
-bool updateViewerLayoutPreset(AppState* app, const std::string& name);
+bool updateViewerLayoutPreset(AppState* app,
+                              const std::string& name,
+                              const std::string& requestedName,
+                              std::string* savedName = nullptr);
 bool loadViewerLayoutPreset(AppState* app, const std::string& name, int windowWidth, int windowHeight);
 bool deleteViewerLayoutPreset(const std::string& name);
 bool viewerLayoutPresetNameEditableTarget(const std::string& name);
@@ -15462,6 +15555,7 @@ bool viewerMenuActionUsesChoiceList(ViewerMenuAction action) {
          action == ViewerMenuAction::Sampling ||
          action == ViewerMenuAction::PlotStyle ||
          action == ViewerMenuAction::PointShape ||
+         action == ViewerMenuAction::FontSize ||
          action == ViewerMenuAction::LoadUserPreset ||
          action == ViewerMenuAction::LoadLayoutPreset ||
          action == ViewerMenuAction::ChromaticityInputPrimaries ||
@@ -15567,6 +15661,17 @@ bool viewerMenuActionIsButton(ViewerMenuAction action) {
          action == ViewerMenuAction::DeleteLayoutPreset ||
          action == ViewerMenuAction::SaveDefaults ||
          action == ViewerMenuAction::RestoreDefaults;
+}
+
+bool viewerMenuActionIsPresetDelete(ViewerMenuAction action) {
+  return action == ViewerMenuAction::DeleteUserPreset ||
+         action == ViewerMenuAction::DeleteLayoutPreset;
+}
+
+bool viewerMenuActionIsLayoutPresetAction(ViewerMenuAction action) {
+  return action == ViewerMenuAction::SaveLayoutPreset ||
+         action == ViewerMenuAction::UpdateLayoutPreset ||
+         action == ViewerMenuAction::DeleteLayoutPreset;
 }
 
 bool viewerMenuActionIsCheckbox(ViewerMenuAction action) {
@@ -15900,6 +16005,7 @@ std::vector<ViewerMenuRow> buildViewerMenuRows(const AppState& app) {
         if (plotModelDescriptor(state.plotModel).supportsCamera3D) {
           appendRow(&rows, "Reset camera on model switch", onOffLabel(state.resetViewOnPlotSwitch), ViewerMenuAction::ResetOnSwitch, true, "none");
         }
+        appendRow(&rows, "Font Size", viewerFontSizeLabel(app.viewerFontSize), ViewerMenuAction::FontSize, true, "none");
         appendRow(&rows, "Workspace Buttons", onOffLabel(app.showWorkspaceButtons), ViewerMenuAction::ShowWorkspaceButtons, true, "none");
         appendRow(&rows,
                   "Show slice button in plot windows",
@@ -16183,6 +16289,15 @@ std::vector<ViewerChoiceMenuItem> buildViewerChoiceMenuItems(const AppState& app
                        i == state.pointShape,
                        ViewerMenuAction::PointShape,
                        "reinterpret"});
+    }
+  } else if (action == ViewerMenuAction::FontSize) {
+    items.reserve(3);
+    for (int i = 0; i < 3; ++i) {
+      items.push_back({viewerFontSizeLabel(i),
+                       i,
+                       i == clampViewerFontSize(app.viewerFontSize),
+                       ViewerMenuAction::FontSize,
+                       "none"});
     }
   } else if (action == ViewerMenuAction::WaveformMode) {
     items.reserve(3);
@@ -16788,6 +16903,7 @@ void saveViewerWorkspaceToDisk(AppState* app) {
      << app->focusedPlotWindowId << ",\"nextWindowId\":" << app->nextPlotWindowId
      << ",\"showWorkspaceButtons\":" << (app->showWorkspaceButtons ? 1 : 0)
      << ",\"showSliceButtonInPlotWindows\":" << (app->showSliceButtonInPlotWindows ? 1 : 0)
+     << ",\"viewerFontSize\":" << clampViewerFontSize(app->viewerFontSize)
      << ",\"windowWidth\":" << app->workspaceLayoutWindowWidth
      << ",\"windowHeight\":" << app->workspaceLayoutWindowHeight
      << ",\"windowPosX\":" << app->workspaceWindowPosX
@@ -16881,6 +16997,10 @@ bool loadViewerWorkspaceFromDisk(AppState* app) {
       int showSliceButtonInPlotWindows = app->showSliceButtonInPlotWindows ? 1 : 0;
       if (extractInt(line, "showSliceButtonInPlotWindows", &showSliceButtonInPlotWindows)) {
         app->showSliceButtonInPlotWindows = showSliceButtonInPlotWindows != 0;
+      }
+      int viewerFontSize = app->viewerFontSize;
+      if (extractInt(line, "viewerFontSize", &viewerFontSize)) {
+        app->viewerFontSize = clampViewerFontSize(viewerFontSize);
       }
       continue;
     }
@@ -17821,15 +17941,35 @@ bool saveViewerLayoutPreset(AppState* app, const std::string& requestedName, std
   return true;
 }
 
-bool updateViewerLayoutPreset(AppState* app, const std::string& name) {
+bool updateViewerLayoutPreset(AppState* app,
+                              const std::string& name,
+                              const std::string& requestedName,
+                              std::string* savedName) {
   if (!app || !viewerLayoutPresetNameEditableTarget(name)) return false;
   ViewerLayoutPresetStore store{};
   (void)loadViewerLayoutPresetStore(&store);
   for (auto& preset : store.userPresets) {
     if (!viewerNamesEqualNoCase(preset.name, name)) continue;
+    std::string newName = sanitizeViewerLayoutPresetName(requestedName, name);
+    if (standardPlotLayoutNameReserved(newName)) newName = name;
+    const std::string baseName = newName;
+    int suffix = 2;
+    auto nameExists = [&](const std::string& candidate) {
+      return standardPlotLayoutNameReserved(candidate) ||
+             std::any_of(store.userPresets.begin(), store.userPresets.end(), [&](const ViewerLayoutPresetRecord& other) {
+               return !viewerNamesEqualNoCase(other.name, name) &&
+                      viewerNamesEqualNoCase(other.name, candidate);
+             });
+    };
+    while (!viewerNamesEqualNoCase(newName, name) && nameExists(newName)) {
+      newName = baseName + " " + std::to_string(suffix++);
+    }
+    preset.name = newName;
     preset.valuesJson = viewerLayoutPresetValuesJsonFromApp(app);
     preset.updatedAtUtc = viewerNowUtcIso8601();
-    return saveViewerLayoutPresetStore(store);
+    if (!saveViewerLayoutPresetStore(store)) return false;
+    if (savedName) *savedName = preset.name;
+    return true;
   }
   return false;
 }
@@ -18028,15 +18168,33 @@ bool saveViewerSharedUserPreset(const ChromaspaceViewer::ViewerRuntimeState& sta
 }
 
 bool updateViewerSharedUserPreset(const std::string& name,
-                                  const ChromaspaceViewer::ViewerRuntimeState& state) {
+                                  const std::string& requestedName,
+                                  const ChromaspaceViewer::ViewerRuntimeState& state,
+                                  std::string* savedName) {
   if (!viewerPresetNameEditableTarget(name)) return false;
   ViewerSharedPresetStore store{};
   (void)loadViewerSharedPresetStore(&store);
   for (auto& preset : store.userPresets) {
     if (viewerNamesEqualNoCase(preset.name, name)) {
+      std::string newName = sanitizeViewerPresetName(requestedName, name);
+      if (viewerPresetNameReserved(newName)) newName = name;
+      const std::string baseName = newName;
+      int suffix = 2;
+      auto nameExists = [&](const std::string& candidate) {
+        return std::any_of(store.userPresets.begin(), store.userPresets.end(), [&](const ViewerSharedPresetRecord& other) {
+          return !viewerNamesEqualNoCase(other.name, name) &&
+                 viewerNamesEqualNoCase(other.name, candidate);
+        });
+      };
+      while (!viewerNamesEqualNoCase(newName, name) && nameExists(newName)) {
+        newName = baseName + " " + std::to_string(suffix++);
+      }
+      preset.name = newName;
       preset.valuesJson = viewerSharedPresetValuesJsonFromState(state, &preset.valuesJson);
       preset.updatedAtUtc = viewerNowUtcIso8601();
-      return saveViewerSharedPresetStore(store);
+      if (!saveViewerSharedPresetStore(store)) return false;
+      if (savedName) *savedName = preset.name;
+      return true;
     }
   }
   return false;
@@ -18159,10 +18317,32 @@ bool saveViewerUserPreset(const ChromaspaceViewer::ViewerRuntimeState& state,
   return saveViewerSharedUserPreset(state, nextViewerPresetName(), savedName);
 }
 
-bool updateViewerUserPreset(const std::string& name, const ChromaspaceViewer::ViewerRuntimeState& state) {
+bool updateViewerUserPreset(const std::string& name,
+                            const std::string& requestedName,
+                            const ChromaspaceViewer::ViewerRuntimeState& state,
+                            std::string* savedName) {
   if (!viewerPresetNameEditableTarget(name)) return false;
-  if (updateViewerSharedUserPreset(name, state)) return true;
-  return writeViewerPresetToPath(viewerUserPresetFilePath(name), state);
+  if (updateViewerSharedUserPreset(name, requestedName, state, savedName)) return true;
+  std::string newName = sanitizeViewerPresetName(requestedName, name);
+  if (viewerPresetNameReserved(newName)) newName = name;
+  const std::vector<std::string> names = viewerUserPresetNames();
+  const std::string baseName = newName;
+  int suffix = 2;
+  while (!viewerNamesEqualNoCase(newName, name) &&
+         std::any_of(names.begin(), names.end(), [&](const std::string& existing) {
+           return viewerNamesEqualNoCase(existing, newName);
+         })) {
+    newName = baseName + " " + std::to_string(suffix++);
+  }
+  const std::filesystem::path oldPath = viewerUserPresetFilePath(name);
+  const std::filesystem::path newPath = viewerUserPresetFilePath(newName);
+  if (!writeViewerPresetToPath(newPath, state)) return false;
+  if (!viewerNamesEqualNoCase(newName, name)) {
+    std::error_code ec;
+    std::filesystem::remove(oldPath, ec);
+  }
+  if (savedName) *savedName = newName;
+  return true;
 }
 
 bool loadViewerUserPreset(const std::string& name, ChromaspaceViewer::ViewerRuntimeState* out) {
@@ -18798,7 +18978,7 @@ std::array<PlotMenuRect, kWaveformParadeChannelCount> waveformChannelSelectorRec
     int channelCount) {
   constexpr float kSize = 17.0f;
   constexpr float kGap = 8.0f;
-  const float y0 = rowRect.y0 + (kPlotMenuRowHeight - kSize) * 0.5f;
+  const float y0 = rowRect.y0 + (rowRect.y1 - rowRect.y0 - kSize) * 0.5f;
   const float right = rowRect.x1 - 14.0f;
   const int count = std::clamp(channelCount, kWaveformRgbChannelCount, kWaveformParadeChannelCount);
   std::array<PlotMenuRect, kWaveformParadeChannelCount> rects{};
@@ -19022,6 +19202,104 @@ ViewerMenuAction layoutPresetActionAtPoint(const AppState& app, const PlotMenuRe
     }
   }
   return ViewerMenuAction::None;
+}
+
+void triggerPresetActionFeedback(AppState* app, ViewerMenuAction action) {
+  if (!app) return;
+  app->presetActionFeedbackStart = glfwGetTime();
+  app->presetActionFeedbackAction = static_cast<int>(action);
+}
+
+void clearPendingPresetDelete(AppState* app) {
+  if (!app) return;
+  app->pendingPresetDeleteAction = static_cast<int>(ViewerMenuAction::None);
+  app->pendingPresetDeleteName.clear();
+}
+
+bool presetDeleteConfirmationVisible(const AppState& app) {
+  const ViewerMenuAction action = viewerMenuActionFromInt(app.pendingPresetDeleteAction);
+  return viewerMenuActionIsPresetDelete(action) && !app.pendingPresetDeleteName.empty();
+}
+
+void beginPresetDeleteConfirmation(AppState* app, ViewerMenuAction action) {
+  if (!app || !viewerMenuActionIsPresetDelete(action)) return;
+  app->viewerPresetNameEditing = false;
+  app->layoutPresetNameEditing = false;
+  app->viewerMenuChoiceAction = static_cast<int>(ViewerMenuAction::None);
+  app->viewerMenuHoverChoice = -1;
+  app->viewerChoiceMenuScroll = 0.0f;
+  app->pendingPresetDeleteAction = static_cast<int>(action);
+  app->pendingPresetDeleteName = viewerMenuActionIsLayoutPresetAction(action)
+                                     ? app->layoutPresetSelection
+                                     : app->viewerPresetSelection;
+}
+
+PlotMenuRect presetDeleteConfirmationWindowRect(const AppState& app, int width, int height) {
+  if (!presetDeleteConfirmationVisible(app)) return {};
+  const PlotMenuRect drawer = plotMenuMainRect(app, width, height);
+  const float rowsX0 = viewerMenuRowsX0(drawer);
+  const float rowsY0 = viewerMenuRowsY0(app, drawer);
+  const float x1 = drawer.x1 - kViewerDrawerPad;
+  const float panelW = std::min(std::max(260.0f, x1 - rowsX0), 360.0f);
+  const float x0 = clampf(rowsX0 + 8.0f,
+                          drawer.x0 + kViewerDrawerPad,
+                          std::max(drawer.x0 + kViewerDrawerPad, drawer.x1 - panelW - kViewerDrawerPad));
+  const float panelH = 116.0f;
+  const float y0 = clampf(rowsY0 + 8.0f,
+                          drawer.y0 + kViewerDrawerHeaderHeight + kViewerDrawerPad,
+                          std::max(drawer.y0 + kViewerDrawerHeaderHeight + kViewerDrawerPad,
+                                   drawer.y1 - panelH - kViewerDrawerPad));
+  return {x0, y0, x0 + panelW, y0 + panelH};
+}
+
+std::array<PlotMenuRect, 2> presetDeleteConfirmationButtonRects(const PlotMenuRect& panel) {
+  constexpr float kGap = 10.0f;
+  const float buttonH = 28.0f;
+  const float buttonW = std::max(78.0f, (panel.x1 - panel.x0 - 34.0f - kGap) * 0.5f);
+  const float y0 = panel.y1 - 14.0f - buttonH;
+  const float cancelX0 = panel.x0 + 12.0f;
+  const float deleteX0 = std::min(panel.x1 - 12.0f - buttonW, cancelX0 + buttonW + kGap);
+  return {PlotMenuRect{cancelX0, y0, cancelX0 + buttonW, y0 + buttonH},
+          PlotMenuRect{deleteX0, y0, deleteX0 + buttonW, y0 + buttonH}};
+}
+
+int presetDeleteConfirmationButtonAtPoint(const AppState& app,
+                                          int width,
+                                          int height,
+                                          double x,
+                                          double y) {
+  const PlotMenuRect panel = presetDeleteConfirmationWindowRect(app, width, height);
+  if (panel.x1 <= panel.x0 || panel.y1 <= panel.y0) return -1;
+  const auto buttons = presetDeleteConfirmationButtonRects(panel);
+  for (int i = 0; i < static_cast<int>(buttons.size()); ++i) {
+    if (pointInPlotMenuRect(buttons[static_cast<std::size_t>(i)], x, y)) return i;
+  }
+  return pointInPlotMenuRect(panel, x, y) ? -2 : -1;
+}
+
+bool performConfirmedPresetDelete(AppState* app) {
+  if (!app || !presetDeleteConfirmationVisible(*app)) return false;
+  const ViewerMenuAction action = viewerMenuActionFromInt(app->pendingPresetDeleteAction);
+  const std::string name = app->pendingPresetDeleteName;
+  if (action == ViewerMenuAction::DeleteUserPreset) {
+    if (!deleteViewerUserPreset(name)) return false;
+    const std::vector<std::string> names = viewerUserPresetNames();
+    app->viewerPresetSelection = names.empty() ? std::string() : names.front();
+    app->viewerPresetNameInput =
+        viewerPresetNameEditableTarget(app->viewerPresetSelection) ? app->viewerPresetSelection : std::string();
+    clearPendingPresetDelete(app);
+    triggerPresetActionFeedback(app, action);
+    return true;
+  }
+  if (action == ViewerMenuAction::DeleteLayoutPreset) {
+    if (!deleteViewerLayoutPreset(name)) return false;
+    app->layoutPresetSelection = standardPlotLayoutLabel(app->activeStandardLayoutIndex);
+    app->layoutPresetNameInput.clear();
+    clearPendingPresetDelete(app);
+    triggerPresetActionFeedback(app, action);
+    return true;
+  }
+  return false;
 }
 
 bool waveformChannelEnabled(const ChromaspaceViewer::ViewerRuntimeState& state, int channel) {
@@ -19315,6 +19593,15 @@ void activateViewerMenuRow(AppState* app, const ViewerMenuRow& row) {
     saveViewerWorkspaceToDisk(app);
     return;
   }
+  if (row.action == ViewerMenuAction::FontSize && row.choiceItem) {
+    app->viewerFontSize = clampViewerFontSize(row.choiceValue);
+    app->viewerMenuChoiceAction = static_cast<int>(ViewerMenuAction::None);
+    app->viewerMenuHoverChoice = -1;
+    app->viewerChoiceMenuScroll = 0.0f;
+    app->workspaceCommandRevision = std::max<uint64_t>(app->workspaceCommandRevision + 1u, 1u);
+    saveViewerWorkspaceToDisk(app);
+    return;
+  }
   const bool cachedPreviewAction = viewerMenuActionCanPreviewFromCachedCloud(row.action);
   if (!row.choiceItem && viewerMenuActionUsesChoiceList(row.action)) {
     const int action = static_cast<int>(row.action);
@@ -19576,6 +19863,8 @@ void activateViewerMenuRow(AppState* app, const ViewerMenuRow& row) {
       if (saveViewerUserPreset(state, app->viewerPresetNameInput, &savedName)) {
         app->viewerPresetSelection = savedName;
         app->viewerPresetNameInput = savedName;
+        clearPendingPresetDelete(app);
+        triggerPresetActionFeedback(app, row.action);
       }
       return;
     }
@@ -19592,15 +19881,18 @@ void activateViewerMenuRow(AppState* app, const ViewerMenuRow& row) {
       state.stateRevision = std::max<uint64_t>(app->viewerState.stateRevision + 1, state.stateRevision + 1);
       break;
     }
-    case ViewerMenuAction::UpdateUserPreset:
-      (void)updateViewerUserPreset(app->viewerPresetSelection, state);
-      return;
-    case ViewerMenuAction::DeleteUserPreset:
-      if (deleteViewerUserPreset(app->viewerPresetSelection)) {
-        const std::vector<std::string> names = viewerUserPresetNames();
-        app->viewerPresetSelection = names.empty() ? std::string() : names.front();
-        app->viewerPresetNameInput = viewerPresetNameEditableTarget(app->viewerPresetSelection) ? app->viewerPresetSelection : std::string();
+    case ViewerMenuAction::UpdateUserPreset: {
+      std::string savedName;
+      if (updateViewerUserPreset(app->viewerPresetSelection, app->viewerPresetNameInput, state, &savedName)) {
+        app->viewerPresetSelection = savedName.empty() ? app->viewerPresetSelection : savedName;
+        app->viewerPresetNameInput = app->viewerPresetSelection;
+        clearPendingPresetDelete(app);
+        triggerPresetActionFeedback(app, row.action);
       }
+      return;
+    }
+    case ViewerMenuAction::DeleteUserPreset:
+      beginPresetDeleteConfirmation(app, row.action);
       return;
     case ViewerMenuAction::EditLayoutPresetName:
       app->layoutPresetNameEditing = true;
@@ -19615,6 +19907,8 @@ void activateViewerMenuRow(AppState* app, const ViewerMenuRow& row) {
       if (saveViewerLayoutPreset(app, app->layoutPresetNameInput, &savedName)) {
         app->layoutPresetSelection = savedName;
         app->layoutPresetNameInput = savedName;
+        clearPendingPresetDelete(app);
+        triggerPresetActionFeedback(app, row.action);
       }
       return;
     }
@@ -19640,18 +19934,24 @@ void activateViewerMenuRow(AppState* app, const ViewerMenuRow& row) {
       queueViewerStateCommand(*app, row.refreshPolicy);
       return;
     }
-    case ViewerMenuAction::UpdateLayoutPreset:
-      (void)updateViewerLayoutPreset(app, app->layoutPresetSelection);
-      return;
-    case ViewerMenuAction::DeleteLayoutPreset:
-      if (deleteViewerLayoutPreset(app->layoutPresetSelection)) {
-        app->layoutPresetSelection = standardPlotLayoutLabel(app->activeStandardLayoutIndex);
-        app->layoutPresetNameInput.clear();
+    case ViewerMenuAction::UpdateLayoutPreset: {
+      std::string savedName;
+      if (updateViewerLayoutPreset(app, app->layoutPresetSelection, app->layoutPresetNameInput, &savedName)) {
+        app->layoutPresetSelection = savedName.empty() ? app->layoutPresetSelection : savedName;
+        app->layoutPresetNameInput = app->layoutPresetSelection;
+        clearPendingPresetDelete(app);
+        triggerPresetActionFeedback(app, row.action);
       }
       return;
+    }
+    case ViewerMenuAction::DeleteLayoutPreset:
+      beginPresetDeleteConfirmation(app, row.action);
+      return;
     case ViewerMenuAction::SaveDefaults:
-      (void)saveViewerDefaultPreset(state);
-      app->viewerPresetSelection = "Default";
+      if (saveViewerDefaultPreset(state)) {
+        app->viewerPresetSelection = "Default";
+        triggerPresetActionFeedback(app, row.action);
+      }
       return;
     case ViewerMenuAction::RestoreDefaults: {
       ChromaspaceViewer::ViewerRuntimeState preset{};
@@ -19737,7 +20037,7 @@ PlotMenuRect viewerMenuSliderTrackWindowRect(const PlotMenuRect& rowRect) {
   const float sliderX0 = rowRect.x0 + clampf(rowWidth * 0.44f, 112.0f, 170.0f);
   const float valueColumnWidth = viewerMenuSliderValueColumnWidth(rowWidth);
   const float sliderX1 = std::max(sliderX0 + 54.0f, rowRect.x1 - valueColumnWidth - 2.0f);
-  const float sliderY = rowRect.y0 + 21.0f;
+  const float sliderY = rowRect.y0 + (rowRect.y1 - rowRect.y0) * 0.5f;
   return {sliderX0, sliderY - 7.0f, sliderX1, sliderY + 7.0f};
 }
 
@@ -19899,9 +20199,8 @@ void toggleViewerLassoFromIdentityPopover(AppState* app) {
 }
 
 PlotMenuRect plotMenuMainRect(const AppState& app, int width, int height) {
-  (void)app;
   const float h = static_cast<float>(height);
-  const float menuWidth = viewerMenuDrawerWidthPixels(width);
+  const float menuWidth = viewerMenuDrawerWidthPixels(width, app.viewerFontSize);
   return {0.0f, 0.0f, menuWidth, h};
 }
 
@@ -20004,11 +20303,15 @@ float viewerChoiceMenuNaturalWidth(const std::vector<ViewerChoiceMenuItem>& item
 PlotMenuRect quickPlotModelMenuRect(const AppState& app, int width, int height) {
   const float w = static_cast<float>(width);
   const float h = static_cast<float>(height);
+  const ViewerUiMetrics metrics = viewerUiMetrics(app);
   const float menuWidth =
-      clampFloatingMenuWidth(plotModelTopMenuNaturalWidth("Plot Model"), 168.0f, 300.0f, width);
+      clampFloatingMenuWidth(plotModelTopMenuNaturalWidth("Plot Model") * metrics.textScale,
+                             168.0f,
+                             300.0f * metrics.textScale,
+                             width);
   const float headerHeight = 24.0f;
   const float menuHeight = kPlotMenuPad * 2.0f + headerHeight +
-                           kViewerChoiceMenuRowHeight * static_cast<float>(kPlotModelTopMenuEntryCount);
+                           metrics.choiceRowHeight * static_cast<float>(kPlotModelTopMenuEntryCount);
   const float x0 = clampf(static_cast<float>(app.quickPlotModelMenuX),
                           8.0f,
                           std::max(8.0f, w - menuWidth - 8.0f));
@@ -20021,11 +20324,15 @@ PlotMenuRect quickPlotModelMenuRect(const AppState& app, int width, int height) 
 PlotMenuRect addPlotMenuRect(const AppState& app, int width, int height) {
   const float w = static_cast<float>(width);
   const float h = static_cast<float>(height);
+  const ViewerUiMetrics metrics = viewerUiMetrics(app);
   const float menuWidth =
-      clampFloatingMenuWidth(plotModelTopMenuNaturalWidth("Add Plot"), 168.0f, 300.0f, width);
+      clampFloatingMenuWidth(plotModelTopMenuNaturalWidth("Add Plot") * metrics.textScale,
+                             168.0f,
+                             300.0f * metrics.textScale,
+                             width);
   const float headerHeight = 24.0f;
   const float menuHeight = kPlotMenuPad * 2.0f + headerHeight +
-                           kViewerChoiceMenuRowHeight * static_cast<float>(kPlotModelTopMenuEntryCount);
+                           metrics.choiceRowHeight * static_cast<float>(kPlotModelTopMenuEntryCount);
   const float x0 = clampf(static_cast<float>(app.addPlotMenuX),
                           8.0f,
                           std::max(8.0f, w - menuWidth - 8.0f));
@@ -20038,9 +20345,10 @@ PlotMenuRect addPlotMenuRect(const AppState& app, int width, int height) {
 PlotMenuRect layoutMenuRect(const AppState& app, int width, int height) {
   const float w = static_cast<float>(width);
   const float h = static_cast<float>(height);
-  const float menuWidth = std::min(240.0f, std::max(180.0f, w - 16.0f));
+  const ViewerUiMetrics metrics = viewerUiMetrics(app);
+  const float menuWidth = std::min(240.0f * metrics.textScale, std::max(180.0f, w - 16.0f));
   const float menuHeight =
-      kPlotMenuPad * 2.0f + 24.0f + kViewerChoiceMenuRowHeight * static_cast<float>(kViewerLayoutChoiceCount);
+      kPlotMenuPad * 2.0f + 24.0f + metrics.choiceRowHeight * static_cast<float>(kViewerLayoutChoiceCount);
   const float x0 = clampf(static_cast<float>(app.layoutMenuX), 8.0f, std::max(8.0f, w - menuWidth - 8.0f));
   const float y0 = clampf(static_cast<float>(app.layoutMenuY), 8.0f, std::max(8.0f, h - menuHeight - 8.0f));
   return {x0, y0, std::min(w - 8.0f, x0 + menuWidth), std::min(h - 8.0f, y0 + menuHeight)};
@@ -20049,71 +20357,91 @@ PlotMenuRect layoutMenuRect(const AppState& app, int width, int height) {
 int quickPlotModelMenuIndexAt(const AppState& app, int width, int height, double x, double y) {
   const PlotMenuRect rect = quickPlotModelMenuRect(app, width, height);
   if (!pointInPlotMenuRect(rect, x, y)) return -1;
+  const ViewerUiMetrics metrics = viewerUiMetrics(app);
   const float localY = static_cast<float>(y) - rect.y0 - kPlotMenuPad - 24.0f;
   if (localY < 0.0f) return -1;
-  const int index = static_cast<int>(localY / kViewerChoiceMenuRowHeight);
+  const int index = static_cast<int>(localY / metrics.choiceRowHeight);
   return (index >= 0 && index < kPlotModelTopMenuEntryCount) ? index : -1;
 }
 
 int addPlotMenuIndexAt(const AppState& app, int width, int height, double x, double y) {
   const PlotMenuRect rect = addPlotMenuRect(app, width, height);
   if (!pointInPlotMenuRect(rect, x, y)) return -1;
+  const ViewerUiMetrics metrics = viewerUiMetrics(app);
   const float localY = static_cast<float>(y) - rect.y0 - kPlotMenuPad - 24.0f;
   if (localY < 0.0f) return -1;
-  const int index = static_cast<int>(localY / kViewerChoiceMenuRowHeight);
+  const int index = static_cast<int>(localY / metrics.choiceRowHeight);
   return (index >= 0 && index < kPlotModelTopMenuEntryCount) ? index : -1;
 }
 
 PlotMenuRect plotModelColorSubmenuRect(const PlotMenuRect& parentRect,
                                        int width,
                                        int height,
-                                       float rowsOffset) {
+                                       float rowsOffset,
+                                       float rowHeight) {
   const float submenuWidth =
       clampFloatingMenuWidth(plotModelColorSubmenuNaturalWidth(), 132.0f, 220.0f, width);
   const float submenuHeight = kPlotMenuPad * 2.0f +
-                              kViewerChoiceMenuRowHeight *
+                              rowHeight *
                                   static_cast<float>(kPlotModelColorSubmenuEntryCount);
   float x0 = parentRect.x1 + kPlotMenuGap;
   if (x0 + submenuWidth > static_cast<float>(width) - 8.0f) {
     x0 = parentRect.x0 - kPlotMenuGap - submenuWidth;
   }
   float y0 = parentRect.y0 + rowsOffset +
-             static_cast<float>(kPlotModelColorSubmenuTopIndex) * kViewerChoiceMenuRowHeight;
+             static_cast<float>(kPlotModelColorSubmenuTopIndex) * rowHeight;
   y0 = clampf(y0, 8.0f, std::max(8.0f, static_cast<float>(height) - submenuHeight - 8.0f));
   return {x0, y0, x0 + submenuWidth, y0 + submenuHeight};
 }
 
-int plotModelColorSubmenuModelAt(const PlotMenuRect& submenuRect, double x, double y) {
+int plotModelColorSubmenuModelAt(const PlotMenuRect& submenuRect, double x, double y, float rowHeight) {
   if (!pointInPlotMenuRect(submenuRect, x, y)) return -1;
   const float localY = static_cast<float>(y) - submenuRect.y0 - kPlotMenuPad;
   if (localY < 0.0f) return -1;
-  const int index = static_cast<int>(localY / kViewerChoiceMenuRowHeight);
+  const int index = static_cast<int>(localY / rowHeight);
   if (index < 0 || index >= kPlotModelColorSubmenuEntryCount) return -1;
   return kPlotModelColorSubmenuEntries[index].plotModel;
 }
 
 PlotMenuRect quickPlotModelColorSubmenuRect(const AppState& app, int width, int height) {
-  return plotModelColorSubmenuRect(quickPlotModelMenuRect(app, width, height), width, height, kPlotMenuPad + 24.0f);
+  const ViewerUiMetrics metrics = viewerUiMetrics(app);
+  return plotModelColorSubmenuRect(quickPlotModelMenuRect(app, width, height),
+                                   width,
+                                   height,
+                                   kPlotMenuPad + 24.0f,
+                                   metrics.choiceRowHeight);
 }
 
 PlotMenuRect addPlotModelColorSubmenuRect(const AppState& app, int width, int height) {
-  return plotModelColorSubmenuRect(addPlotMenuRect(app, width, height), width, height, kPlotMenuPad + 24.0f);
+  const ViewerUiMetrics metrics = viewerUiMetrics(app);
+  return plotModelColorSubmenuRect(addPlotMenuRect(app, width, height),
+                                   width,
+                                   height,
+                                   kPlotMenuPad + 24.0f,
+                                   metrics.choiceRowHeight);
 }
 
 int quickPlotModelColorSubmenuModelAt(const AppState& app, int width, int height, double x, double y) {
-  return plotModelColorSubmenuModelAt(quickPlotModelColorSubmenuRect(app, width, height), x, y);
+  return plotModelColorSubmenuModelAt(quickPlotModelColorSubmenuRect(app, width, height),
+                                      x,
+                                      y,
+                                      viewerUiMetrics(app).choiceRowHeight);
 }
 
 int addPlotModelColorSubmenuModelAt(const AppState& app, int width, int height, double x, double y) {
-  return plotModelColorSubmenuModelAt(addPlotModelColorSubmenuRect(app, width, height), x, y);
+  return plotModelColorSubmenuModelAt(addPlotModelColorSubmenuRect(app, width, height),
+                                      x,
+                                      y,
+                                      viewerUiMetrics(app).choiceRowHeight);
 }
 
 int layoutMenuIndexAt(const AppState& app, int width, int height, double x, double y) {
   const PlotMenuRect rect = layoutMenuRect(app, width, height);
   if (!pointInPlotMenuRect(rect, x, y)) return -1;
+  const ViewerUiMetrics metrics = viewerUiMetrics(app);
   const float localY = static_cast<float>(y) - rect.y0 - kPlotMenuPad - 24.0f;
   if (localY < 0.0f) return -1;
-  const int index = static_cast<int>(localY / kViewerChoiceMenuRowHeight);
+  const int index = static_cast<int>(localY / metrics.choiceRowHeight);
   return (index >= 0 && index < kViewerLayoutChoiceCount) ? index : -1;
 }
 
@@ -20130,7 +20458,7 @@ bool pointerInViewerMenuUi(const AppState& app, int width, int height, double x,
   }
   if (app.quickPlotModelMenuVisible &&
       (app.quickPlotModelMenuHover == kPlotModelColorSubmenuTopIndex ||
-       plotModelColorSubmenuModelAt(quickPlotModelColorSubmenuRect(app, width, height), x, y) >= 0) &&
+       quickPlotModelColorSubmenuModelAt(app, width, height, x, y) >= 0) &&
       pointInPlotMenuRect(quickPlotModelColorSubmenuRect(app, width, height), x, y)) {
     return true;
   }
@@ -20140,7 +20468,7 @@ bool pointerInViewerMenuUi(const AppState& app, int width, int height, double x,
   }
   if (app.addPlotMenuVisible &&
       (app.addPlotMenuHover == kPlotModelColorSubmenuTopIndex ||
-       plotModelColorSubmenuModelAt(addPlotModelColorSubmenuRect(app, width, height), x, y) >= 0) &&
+       addPlotModelColorSubmenuModelAt(app, width, height, x, y) >= 0) &&
       pointInPlotMenuRect(addPlotModelColorSubmenuRect(app, width, height), x, y)) {
     return true;
   }
@@ -20181,7 +20509,7 @@ bool pointInPlotMenuRect(const PlotMenuRect& rect, double x, double y) {
   return x >= rect.x0 && x <= rect.x1 && y >= rect.y0 && y <= rect.y1;
 }
 
-bool viewerMenuRowStacksValue(const ViewerMenuRow& row, float rowWidth) {
+bool viewerMenuRowStacksValue(const ViewerMenuRow& row, float rowWidth, const ViewerUiMetrics& metrics) {
   if (row.spacer || row.presetActionButtons || row.layoutPresetActionButtons || row.note || row.slider ||
       row.slicingVectorSelector || row.channelSelector || row.choiceItem ||
       row.value.empty() || row.action == ViewerMenuAction::LoadUserPreset ||
@@ -20189,36 +20517,41 @@ bool viewerMenuRowStacksValue(const ViewerMenuRow& row, float rowWidth) {
     return false;
   }
   const float labelInset = 14.0f;
-  const float labelWidth = approximateMenuTextWidth(row.label, 1.0f);
-  const float valueWidth = approximateMenuTextWidth(row.value, 1.0f);
+  const float labelWidth = approximateMenuTextWidth(row.label, metrics.textScale);
+  const float valueWidth = approximateMenuTextWidth(row.value, metrics.textScale);
   const float sideBySideValueWidth = std::min(rowWidth * 0.55f, valueWidth);
   const float sideBySideLabelWidth =
       std::max(24.0f, rowWidth - labelInset - sideBySideValueWidth - 30.0f);
-  constexpr float kMinUsefulInlineLabelWidth = 116.0f;
+  const float kMinUsefulInlineLabelWidth = 116.0f * metrics.textScale;
   const bool labelWouldClip = labelWidth > sideBySideLabelWidth;
   const bool valueWantsWideLine = valueWidth > sideBySideValueWidth + 1.0f &&
                                   valueWidth <= std::max(24.0f, rowWidth - labelInset - 14.0f);
   return labelWouldClip || (sideBySideLabelWidth < kMinUsefulInlineLabelWidth && valueWantsWideLine);
 }
 
-float viewerMenuRowHeight(const ViewerMenuRow& row, float rowWidth = 0.0f) {
+float viewerMenuRowHeight(const ViewerMenuRow& row, float rowWidth, const ViewerUiMetrics& metrics) {
   if (row.spacer) return 18.0f;
-  if (row.presetActionButtons || row.layoutPresetActionButtons) return 38.0f;
-  if (rowWidth > 0.0f && viewerMenuRowStacksValue(row, rowWidth)) return 58.0f;
-  return row.note ? (kPlotMenuRowHeight * 2.25f) : kPlotMenuRowHeight;
+  if (row.presetActionButtons || row.layoutPresetActionButtons) return metrics.actionButtonRowHeight;
+  if (rowWidth > 0.0f && viewerMenuRowStacksValue(row, rowWidth, metrics)) return metrics.stackedRowHeight;
+  return row.note ? (metrics.rowHeight * 2.25f) : metrics.rowHeight;
 }
 
-float viewerMenuRowsHeight(const std::vector<ViewerMenuRow>& rows, float rowWidth) {
+float viewerMenuRowsHeight(const std::vector<ViewerMenuRow>& rows,
+                           float rowWidth,
+                           const ViewerUiMetrics& metrics) {
   float height = 0.0f;
-  for (const ViewerMenuRow& row : rows) height += viewerMenuRowHeight(row, rowWidth);
+  for (const ViewerMenuRow& row : rows) height += viewerMenuRowHeight(row, rowWidth, metrics);
   return height;
 }
 
-float viewerMenuRowTopOffset(const std::vector<ViewerMenuRow>& rows, int rowIndex, float rowWidth) {
+float viewerMenuRowTopOffset(const std::vector<ViewerMenuRow>& rows,
+                             int rowIndex,
+                             float rowWidth,
+                             const ViewerUiMetrics& metrics) {
   float offset = 0.0f;
   const int count = std::min(rowIndex, static_cast<int>(rows.size()));
   for (int i = 0; i < count; ++i) {
-    offset += viewerMenuRowHeight(rows[static_cast<std::size_t>(i)], rowWidth);
+    offset += viewerMenuRowHeight(rows[static_cast<std::size_t>(i)], rowWidth, metrics);
   }
   return offset;
 }
@@ -20243,13 +20576,14 @@ std::string currentLayoutPresetLabel(const AppState& app) {
 
 PlotMenuRect viewerMenuCompactPresetWindowRect(const AppState& app, int width, int height) {
   if (!app.plotModelMenuVisible) return {};
+  const ViewerUiMetrics metrics = viewerUiMetrics(app);
   const PlotMenuRect rect = plotMenuMainRect(app, width, height);
   const std::vector<ViewerMenuTab> tabs = buildViewerMenuTabs(app);
   const float x0 = rect.x0 + kViewerDrawerPad;
   const float tabsY0 = rect.y0 + kViewerDrawerHeaderHeight + kViewerDrawerPad;
   const float naturalY0 =
-      tabsY0 + static_cast<float>(tabs.size()) * kViewerDrawerTabHeight + 8.0f;
-  const float selectorHeight = 24.0f;
+      tabsY0 + static_cast<float>(tabs.size()) * metrics.drawerTabHeight + 8.0f;
+  const float selectorHeight = metrics.compactSelectorHeight;
   const float y0 = clampf(naturalY0,
                           rect.y0 + kViewerDrawerHeaderHeight + kViewerDrawerPad,
                           std::max(rect.y0 + kViewerDrawerHeaderHeight + kViewerDrawerPad,
@@ -20298,10 +20632,11 @@ bool pointInViewerMenuCompactLayoutPresetSelector(const AppState& app,
 
 PlotMenuRect viewerWorkspaceLayoutPresetWindowRect(const AppState& app, int width, int height) {
   (void)height;
+  const ViewerUiMetrics metrics = viewerUiMetrics(app);
   const float x0 = viewerWorkspaceToolbarLeftPixels(app, width) + (kViewerMenuIconSize + 7.0f) * 2.0f;
   const float maxX = static_cast<float>(std::max(1, width)) - 10.0f;
   if (x0 + kViewerMenuIconSize > maxX) return {};
-  const float x1 = std::min(maxX, x0 + 148.0f);
+  const float x1 = std::min(maxX, x0 + 148.0f * metrics.textScale);
   return {x0,
           kViewerMenuIconInset,
           std::max(x0 + kViewerMenuIconSize, x1),
@@ -20322,7 +20657,7 @@ bool pointInViewerWorkspaceLayoutPresetSelector(const AppState& app,
 float viewerMenuRowsY0(const AppState& app, const PlotMenuRect& rect) {
   float y0 = rect.y0 + kViewerDrawerHeaderHeight + kViewerDrawerPad;
   if (viewerSettingsSubtabsVisible(app)) {
-    y0 += kViewerSettingsSubtabHeight + kViewerSettingsSubtabGap;
+    y0 += viewerUiMetrics(app).settingsSubtabHeight + kViewerSettingsSubtabGap;
   }
   return y0;
 }
@@ -20330,6 +20665,7 @@ float viewerMenuRowsY0(const AppState& app, const PlotMenuRect& rect) {
 PlotMenuRect viewerSettingsSubtabWindowRect(const AppState& app, int width, int height, int index) {
   (void)height;
   if (!viewerSettingsSubtabsVisible(app) || index < 0 || index > 1) return {};
+  const ViewerUiMetrics metrics = viewerUiMetrics(app);
   const PlotMenuRect rect = plotMenuMainRect(app, width, height);
   const float x0 = viewerMenuRowsX0(rect);
   const float x1 = rect.x1 - kViewerDrawerPad;
@@ -20337,7 +20673,7 @@ PlotMenuRect viewerSettingsSubtabWindowRect(const AppState& app, int width, int 
   const float tabWidth = std::max(70.0f, (x1 - x0 - tabGap) * 0.5f);
   const float tabX0 = x0 + static_cast<float>(index) * (tabWidth + tabGap);
   const float tabY0 = rect.y0 + kViewerDrawerHeaderHeight + kViewerDrawerPad;
-  return {tabX0, tabY0, std::min(x1, tabX0 + tabWidth), tabY0 + kViewerSettingsSubtabHeight};
+  return {tabX0, tabY0, std::min(x1, tabX0 + tabWidth), tabY0 + metrics.settingsSubtabHeight};
 }
 
 int viewerSettingsSubtabIndexAt(const AppState& app, int width, int height, double x, double y) {
@@ -20348,6 +20684,14 @@ int viewerSettingsSubtabIndexAt(const AppState& app, int width, int height, doub
   return -1;
 }
 
+bool pointInViewerMenuRowsViewport(const AppState& app, int width, int height, double x, double y) {
+  const PlotMenuRect rect = plotMenuMainRect(app, width, height);
+  const float rowsX0 = viewerMenuRowsX0(rect);
+  const float rowsY0 = viewerMenuRowsY0(app, rect);
+  return x >= rowsX0 && x <= rect.x1 - kViewerDrawerPad &&
+         y >= rowsY0 && y <= rect.y1 - kViewerDrawerPad;
+}
+
 int plotMenuMainIndexAt(const AppState& app, int width, int height, double x, double y) {
   const PlotMenuRect rect = plotMenuMainRect(app, width, height);
   if (!pointInPlotMenuRect(rect, x, y)) return -1;
@@ -20355,12 +20699,14 @@ int plotMenuMainIndexAt(const AppState& app, int width, int height, double x, do
   if (static_cast<float>(x) < rowsX0 || static_cast<float>(x) > rect.x1 - kViewerDrawerPad) return -1;
   const float rowWidth = std::max(1.0f, rect.x1 - kViewerDrawerPad - rowsX0);
   const float rowsY0 = viewerMenuRowsY0(app, rect);
+  if (!pointInViewerMenuRowsViewport(app, width, height, x, y)) return -1;
   const float localY = static_cast<float>(y) - rowsY0 + app.viewerMenuScroll;
   if (localY < 0.0f) return -1;
   const std::vector<ViewerMenuRow> rows = buildViewerMenuRows(app);
+  const ViewerUiMetrics metrics = viewerUiMetrics(app);
   float top = 0.0f;
   for (int i = 0; i < static_cast<int>(rows.size()); ++i) {
-    const float bottom = top + viewerMenuRowHeight(rows[static_cast<std::size_t>(i)], rowWidth);
+    const float bottom = top + viewerMenuRowHeight(rows[static_cast<std::size_t>(i)], rowWidth, metrics);
     if (localY >= top && localY < bottom) return i;
     top = bottom;
   }
@@ -20373,11 +20719,12 @@ int viewerMenuTabIndexAt(const AppState& app, int width, int height, double x, d
   const float tabsX0 = rect.x0 + kViewerDrawerPad;
   const float tabsX1 = tabsX0 + kViewerDrawerTabRailWidth;
   const float tabsY0 = rect.y0 + kViewerDrawerHeaderHeight + kViewerDrawerPad;
+  const ViewerUiMetrics metrics = viewerUiMetrics(app);
   if (static_cast<float>(x) < tabsX0 || static_cast<float>(x) > tabsX1 ||
       static_cast<float>(y) < tabsY0 || static_cast<float>(y) > rect.y1 - kViewerDrawerPad) {
     return -1;
   }
-  const int index = static_cast<int>((static_cast<float>(y) - tabsY0) / kViewerDrawerTabHeight);
+  const int index = static_cast<int>((static_cast<float>(y) - tabsY0) / metrics.drawerTabHeight);
   const int count = static_cast<int>(buildViewerMenuTabs(app).size());
   return (index >= 0 && index < count) ? index : -1;
 }
@@ -20389,11 +20736,12 @@ PlotMenuRect viewerMenuRowWindowRect(const AppState& app, int width, int height,
   const float rowsX0 = viewerMenuRowsX0(rect);
   const float rowsY0 = viewerMenuRowsY0(app, rect);
   const float rowWidth = std::max(1.0f, rect.x1 - kViewerDrawerPad - rowsX0);
-  const float y0 = rowsY0 + viewerMenuRowTopOffset(rows, rowIndex, rowWidth) - app.viewerMenuScroll;
+  const ViewerUiMetrics metrics = viewerUiMetrics(app);
+  const float y0 = rowsY0 + viewerMenuRowTopOffset(rows, rowIndex, rowWidth, metrics) - app.viewerMenuScroll;
   return {rowsX0,
           y0,
           rect.x1 - kViewerDrawerPad,
-          y0 + viewerMenuRowHeight(rows[static_cast<std::size_t>(rowIndex)], rowWidth)};
+          y0 + viewerMenuRowHeight(rows[static_cast<std::size_t>(rowIndex)], rowWidth, metrics)};
 }
 
 int viewerMenuRowIndexForAction(const AppState& app, ViewerMenuAction action) {
@@ -20690,6 +21038,7 @@ float updateViewerMenuPopoverFade(bool visible, float* alpha, double* lastTime) 
 PlotMenuRect viewerChoiceMenuWindowRect(const AppState& app, int width, int height) {
   const std::vector<ViewerChoiceMenuItem> items = buildViewerChoiceMenuItems(app);
   if (items.empty()) return {};
+  const ViewerUiMetrics metrics = viewerUiMetrics(app);
   const ViewerMenuAction action = viewerMenuActionFromInt(app.viewerMenuChoiceAction);
   const int rowIndex = viewerMenuRowIndexForAction(app, action);
   const PlotMenuRect drawer = plotMenuMainRect(app, width, height);
@@ -20731,14 +21080,17 @@ PlotMenuRect viewerChoiceMenuWindowRect(const AppState& app, int width, int heig
   const float availableWidth = std::max(1.0f, rowsX1 - rowsX0);
   const float menuWidth =
       std::min(availableWidth,
-               clampFloatingMenuWidth(viewerChoiceMenuNaturalWidth(items), 128.0f, 360.0f, width));
+               clampFloatingMenuWidth(viewerChoiceMenuNaturalWidth(items) * metrics.textScale,
+                                      128.0f,
+                                      360.0f * metrics.textScale,
+                                      width));
   const float naturalHeight =
-      kViewerChoiceMenuPad * 2.0f + kViewerChoiceMenuRowHeight * static_cast<float>(items.size());
+      kViewerChoiceMenuPad * 2.0f + metrics.choiceRowHeight * static_cast<float>(items.size());
   const float x1 = rowsX1;
   const float x0 = x1 - menuWidth;
   const float minY = drawer.y0 + kViewerDrawerHeaderHeight + kViewerDrawerPad;
   const float maxY = drawer.y1 - kViewerDrawerPad;
-  const float availableHeight = std::max(kViewerChoiceMenuPad * 2.0f + kViewerChoiceMenuRowHeight,
+  const float availableHeight = std::max(kViewerChoiceMenuPad * 2.0f + metrics.choiceRowHeight,
                                          maxY - minY);
   const float menuHeight = std::min(naturalHeight, availableHeight);
   float y0 = (anchoredToCompactPreset || anchoredToCompactLayoutPreset ||
@@ -20772,22 +21124,28 @@ PlotMenuRect viewerChoiceMenuWindowRect(const AppState& app, int width, int heig
 }
 
 PlotMenuRect viewerChoicePlotModelColorSubmenuRect(const AppState& app, int width, int height) {
+  const ViewerUiMetrics metrics = viewerUiMetrics(app);
   return plotModelColorSubmenuRect(viewerChoiceMenuWindowRect(app, width, height),
                                    width,
                                    height,
-                                   kViewerChoiceMenuPad);
+                                   kViewerChoiceMenuPad,
+                                   metrics.choiceRowHeight);
 }
 
 int viewerChoicePlotModelColorSubmenuModelAt(const AppState& app, int width, int height, double x, double y) {
   if (viewerMenuActionFromInt(app.viewerMenuChoiceAction) != ViewerMenuAction::PlotModel) return -1;
-  return plotModelColorSubmenuModelAt(viewerChoicePlotModelColorSubmenuRect(app, width, height), x, y);
+  return plotModelColorSubmenuModelAt(viewerChoicePlotModelColorSubmenuRect(app, width, height),
+                                      x,
+                                      y,
+                                      viewerUiMetrics(app).choiceRowHeight);
 }
 
 float viewerChoiceMenuMaxScroll(const AppState& app, int width, int height) {
   const std::vector<ViewerChoiceMenuItem> items = buildViewerChoiceMenuItems(app);
   if (items.empty()) return 0.0f;
+  const ViewerUiMetrics metrics = viewerUiMetrics(app);
   const PlotMenuRect rect = viewerChoiceMenuWindowRect(app, width, height);
-  const float contentHeight = kViewerChoiceMenuRowHeight * static_cast<float>(items.size());
+  const float contentHeight = metrics.choiceRowHeight * static_cast<float>(items.size());
   const float visibleHeight = std::max(1.0f, rect.y1 - rect.y0 - kViewerChoiceMenuPad * 2.0f);
   return std::max(0.0f, contentHeight - visibleHeight);
 }
@@ -20795,12 +21153,13 @@ float viewerChoiceMenuMaxScroll(const AppState& app, int width, int height) {
 int viewerChoiceMenuIndexAt(const AppState& app, int width, int height, double x, double y) {
   const std::vector<ViewerChoiceMenuItem> items = buildViewerChoiceMenuItems(app);
   if (items.empty()) return -1;
+  const ViewerUiMetrics metrics = viewerUiMetrics(app);
   const PlotMenuRect rect = viewerChoiceMenuWindowRect(app, width, height);
   if (!pointInPlotMenuRect(rect, x, y)) return -1;
   const float scroll = clampf(app.viewerChoiceMenuScroll, 0.0f, viewerChoiceMenuMaxScroll(app, width, height));
   const float localY = static_cast<float>(y) - rect.y0 - kViewerChoiceMenuPad + scroll;
   if (localY < 0.0f) return -1;
-  const int index = static_cast<int>(localY / kViewerChoiceMenuRowHeight);
+  const int index = static_cast<int>(localY / metrics.choiceRowHeight);
   return (index >= 0 && index < static_cast<int>(items.size())) ? index : -1;
 }
 
@@ -22432,14 +22791,37 @@ void drawHudTextLineClipped(const HudTextRenderer& renderer,
   const float offset = phase <= (excess + pause)
                            ? std::min(excess, phase)
                            : std::max(0.0f, 2.0f * (excess + pause) - phase);
-  const GLint clipX = static_cast<GLint>(std::floor(x));
-  const GLint clipY = static_cast<GLint>(std::floor(baselineY - 7.0f));
-  const GLsizei clipW = static_cast<GLsizei>(std::ceil(maxWidth));
-  const GLsizei clipH = 22;
+  const float ascent = renderer.available
+                           ? static_cast<float>(std::max(1, renderer.atlas.ascent)) * scale
+                           : 14.0f * scale;
+  const float descent = renderer.available
+                            ? static_cast<float>(std::max(0, renderer.atlas.descent)) * scale
+                            : 4.0f * scale;
+  const float clipPad = std::max(2.0f, std::ceil(1.5f * scale));
+  GLint clipX0 = static_cast<GLint>(std::floor(x));
+  GLint clipY0 = static_cast<GLint>(std::floor(baselineY - descent - clipPad));
+  GLint clipX1 = static_cast<GLint>(std::ceil(x + maxWidth));
+  GLint clipY1 = static_cast<GLint>(std::ceil(baselineY + ascent + clipPad));
+  GLboolean previousScissorEnabled = glIsEnabled(GL_SCISSOR_TEST);
+  GLint previousScissor[4] = {0, 0, 0, 0};
+  if (previousScissorEnabled) {
+    glGetIntegerv(GL_SCISSOR_BOX, previousScissor);
+    clipX0 = std::max(clipX0, previousScissor[0]);
+    clipY0 = std::max(clipY0, previousScissor[1]);
+    clipX1 = std::min(clipX1, previousScissor[0] + previousScissor[2]);
+    clipY1 = std::min(clipY1, previousScissor[1] + previousScissor[3]);
+  }
+  const GLsizei clipW = static_cast<GLsizei>(std::max(0, clipX1 - clipX0));
+  const GLsizei clipH = static_cast<GLsizei>(std::max(0, clipY1 - clipY0));
+  if (clipW <= 0 || clipH <= 0) return;
   glEnable(GL_SCISSOR_TEST);
-  glScissor(clipX, clipY, std::max<GLsizei>(1, clipW), clipH);
+  glScissor(clipX0, clipY0, clipW, clipH);
   drawHudTextLine(renderer, text, x - offset, baselineY, scale, alpha, r, g, b);
-  glDisable(GL_SCISSOR_TEST);
+  if (previousScissorEnabled) {
+    glScissor(previousScissor[0], previousScissor[1], previousScissor[2], previousScissor[3]);
+  } else {
+    glDisable(GL_SCISSOR_TEST);
+  }
 }
 
 void drawHudBackdrop(float x0, float y0, float x1, float y1, float alpha) {
@@ -22464,6 +22846,27 @@ void drawPlotMenuRect(float x0, float y0, float x1, float y1, float r, float g, 
   glVertex2f(x1, y1);
   glVertex2f(x0, y1);
   glEnd();
+}
+
+void drawPresetActionFeedbackBar(const AppState& app,
+                                 const PlotMenuRect& rowRect,
+                                 bool layoutPresetRow) {
+  const ViewerMenuAction action = viewerMenuActionFromInt(app.presetActionFeedbackAction);
+  if (action == ViewerMenuAction::None ||
+      viewerMenuActionIsLayoutPresetAction(action) != layoutPresetRow) {
+    return;
+  }
+  const float elapsed = static_cast<float>(glfwGetTime() - app.presetActionFeedbackStart);
+  constexpr float kDuration = 0.46f;
+  if (elapsed < 0.0f || elapsed > kDuration) return;
+  const float t = clampf(elapsed / kDuration, 0.0f, 1.0f);
+  const float eased = 1.0f - (1.0f - t) * (1.0f - t);
+  const float x0 = rowRect.x0 + 10.0f;
+  const float x1 = rowRect.x1 - 10.0f;
+  const float y0 = rowRect.y0 + 2.5f;
+  const float y1 = y0 + 3.0f;
+  drawPlotMenuRect(x0, y0, x1, y1, 0.08f, 0.30f, 0.16f, 0.38f * (1.0f - t));
+  drawPlotMenuRect(x0, y0, x0 + (x1 - x0) * eased, y1, 0.25f, 1.0f, 0.48f, 0.82f * (1.0f - 0.25f * t));
 }
 
 void drawViewerDisplayGlyph(float x0, float y0, bool selected, bool enabled = true) {
@@ -22682,14 +23085,22 @@ void drawViewerMenuIconOverlay(const AppState& app,
                                  layoutPresetRect.y1 - 7.0f};
     const int selectedLayoutIndex = standardPlotLayoutIndexForName(currentLayoutPresetLabel(app));
     drawViewerLayoutChoiceGlyph(selectedLayoutIndex, glyphRect, active || layoutPresetHovered);
+    const ViewerUiMetrics metrics = viewerUiMetrics(app);
+    const float labelScale = 0.78f * metrics.textScale;
+    const float labelBaseline =
+        layoutPresetRect.y0 + viewerCompactTextBaselineOffset(metrics,
+                                                              layoutPresetRect.y1 - layoutPresetRect.y0,
+                                                              labelScale,
+                                                              renderer.available,
+                                                              8.0f);
     drawHudTextLine(renderer,
                     fitHudText(renderer,
                                currentLayoutPresetLabel(app),
                                std::max(18.0f, layoutPresetRect.x1 - layoutPresetRect.x0 - 42.0f),
-                               0.78f),
+                               labelScale),
                     layoutPresetRect.x0 + 34.0f,
-                    layoutPresetRect.y0 + (renderer.available ? 8.0f : 9.0f),
-                    0.78f,
+                    labelBaseline,
+                    labelScale,
                     0.78f,
                     0.92f,
                     0.98f,
@@ -22874,6 +23285,7 @@ void drawQuickPlotModelMenuOverlay(const AppState& app,
   };
   const PlotMenuRect menuWindowRect = quickPlotModelMenuRect(app, windowWidth, windowHeight);
   const PlotMenuRect menuRect = scaleRect(menuWindowRect);
+  const ViewerUiMetrics metrics = viewerUiMetrics(app);
 
   glMatrixMode(GL_PROJECTION);
   glPushMatrix();
@@ -22892,7 +23304,7 @@ void drawQuickPlotModelMenuOverlay(const AppState& app,
   drawPlotMenuRect(menuRect.x0, menuRect.y0, menuRect.x0 + 1.0f, menuRect.y1, 0.75f, 0.82f, 0.92f, 0.18f);
   drawPlotMenuRect(menuRect.x1 - 1.0f, menuRect.y0, menuRect.x1, menuRect.y1, 0.75f, 0.82f, 0.92f, 0.16f);
 
-  const float textScale = 1.0f;
+  const float textScale = metrics.textScale;
   drawHudTextLine(renderer,
                   "Plot Model",
                   menuRect.x0 + 12.0f,
@@ -22917,11 +23329,11 @@ void drawQuickPlotModelMenuOverlay(const AppState& app,
   for (int i = 0; i < kPlotModelTopMenuEntryCount; ++i) {
     const PlotModelMenuEntry& entry = kPlotModelTopMenuEntries[i];
     const float itemY0 = menuWindowRect.y0 + kPlotMenuPad +
-                         static_cast<float>(i) * kViewerChoiceMenuRowHeight + 24.0f;
+                         static_cast<float>(i) * metrics.choiceRowHeight + 24.0f;
     const PlotMenuRect itemRect = scaleRect({menuWindowRect.x0 + kPlotMenuPad,
                                              itemY0,
                                              menuWindowRect.x1 - kPlotMenuPad,
-                                             itemY0 + kViewerChoiceMenuRowHeight});
+                                             itemY0 + metrics.choiceRowHeight});
     const bool selected = entry.submenu ? plotModelIsColorModel(app.viewerState.plotModel)
                                         : entry.plotModel == app.viewerState.plotModel;
     const bool hovered = i == app.quickPlotModelMenuHover;
@@ -22942,7 +23354,7 @@ void drawQuickPlotModelMenuOverlay(const AppState& app,
     drawHudTextLine(renderer,
                     entry.label,
                     itemRect.x0 + (selected ? 14.0f : 10.0f),
-                    itemRect.y0 + (renderer.available ? 8.0f : 9.0f),
+                    itemRect.y0 + viewerChoiceTextBaselineOffset(metrics, renderer.available),
                     textScale,
                     selected ? 0.98f : 0.82f,
                     0.88f,
@@ -22952,7 +23364,7 @@ void drawQuickPlotModelMenuOverlay(const AppState& app,
       drawHudTextLineRight(renderer,
                            ">",
                            itemRect.x1 - 10.0f,
-                           itemRect.y0 + (renderer.available ? 8.0f : 9.0f),
+                           itemRect.y0 + viewerChoiceTextBaselineOffset(metrics, renderer.available),
                            textScale,
                            hovered ? 0.96f : 0.70f,
                            0.88f,
@@ -22974,11 +23386,11 @@ void drawQuickPlotModelMenuOverlay(const AppState& app,
     for (int i = 0; i < kPlotModelColorSubmenuEntryCount; ++i) {
       const PlotModelMenuEntry& entry = kPlotModelColorSubmenuEntries[i];
       const float itemY0 = colorSubmenuWindowRect.y0 + kPlotMenuPad +
-                           static_cast<float>(i) * kViewerChoiceMenuRowHeight;
+                           static_cast<float>(i) * metrics.choiceRowHeight;
       const PlotMenuRect itemRect = scaleRect({colorSubmenuWindowRect.x0 + kPlotMenuPad,
                                                itemY0,
                                                colorSubmenuWindowRect.x1 - kPlotMenuPad,
-                                               itemY0 + kViewerChoiceMenuRowHeight});
+                                               itemY0 + metrics.choiceRowHeight});
       const bool hovered = hoveredModel == entry.plotModel;
       const bool selected = app.viewerState.plotModel == entry.plotModel;
       if (hovered) {
@@ -22998,7 +23410,7 @@ void drawQuickPlotModelMenuOverlay(const AppState& app,
       drawHudTextLine(renderer,
                       entry.label,
                       itemRect.x0 + (selected ? 14.0f : 10.0f),
-                      itemRect.y0 + (renderer.available ? 8.0f : 9.0f),
+                      itemRect.y0 + viewerChoiceTextBaselineOffset(metrics, renderer.available),
                       textScale,
                       selected ? 0.98f : 0.82f,
                       0.88f,
@@ -23035,6 +23447,7 @@ void drawAddPlotMenuOverlay(const AppState& app,
   };
   const PlotMenuRect menuWindowRect = addPlotMenuRect(app, windowWidth, windowHeight);
   const PlotMenuRect menuRect = scaleRect(menuWindowRect);
+  const ViewerUiMetrics metrics = viewerUiMetrics(app);
 
   glMatrixMode(GL_PROJECTION);
   glPushMatrix();
@@ -23053,7 +23466,7 @@ void drawAddPlotMenuOverlay(const AppState& app,
   drawPlotMenuRect(menuRect.x0, menuRect.y0, menuRect.x0 + 1.0f, menuRect.y1, 0.75f, 0.82f, 0.92f, 0.18f);
   drawPlotMenuRect(menuRect.x1 - 1.0f, menuRect.y0, menuRect.x1, menuRect.y1, 0.75f, 0.82f, 0.92f, 0.16f);
 
-  const float textScale = 1.0f;
+  const float textScale = metrics.textScale;
   drawHudTextLine(renderer,
                   "Add Plot",
                   menuRect.x0 + 12.0f,
@@ -23078,11 +23491,11 @@ void drawAddPlotMenuOverlay(const AppState& app,
   for (int i = 0; i < kPlotModelTopMenuEntryCount; ++i) {
     const PlotModelMenuEntry& entry = kPlotModelTopMenuEntries[i];
     const float itemY0 = menuWindowRect.y0 + kPlotMenuPad +
-                         static_cast<float>(i) * kViewerChoiceMenuRowHeight + 24.0f;
+                         static_cast<float>(i) * metrics.choiceRowHeight + 24.0f;
     const PlotMenuRect itemRect = scaleRect({menuWindowRect.x0 + kPlotMenuPad,
                                              itemY0,
                                              menuWindowRect.x1 - kPlotMenuPad,
-                                             itemY0 + kViewerChoiceMenuRowHeight});
+                                             itemY0 + metrics.choiceRowHeight});
     const bool hovered = i == app.addPlotMenuHover;
     if (hovered) {
       drawPlotMenuRect(itemRect.x0, itemRect.y0, itemRect.x1, itemRect.y1,
@@ -23091,7 +23504,7 @@ void drawAddPlotMenuOverlay(const AppState& app,
     drawHudTextLine(renderer,
                     entry.label,
                     itemRect.x0 + 10.0f,
-                    itemRect.y0 + (renderer.available ? 8.0f : 9.0f),
+                    itemRect.y0 + viewerChoiceTextBaselineOffset(metrics, renderer.available),
                     textScale,
                     hovered ? 0.98f : 0.82f,
                     0.88f,
@@ -23101,7 +23514,7 @@ void drawAddPlotMenuOverlay(const AppState& app,
       drawHudTextLineRight(renderer,
                            ">",
                            itemRect.x1 - 10.0f,
-                           itemRect.y0 + (renderer.available ? 8.0f : 9.0f),
+                           itemRect.y0 + viewerChoiceTextBaselineOffset(metrics, renderer.available),
                            textScale,
                            hovered ? 0.96f : 0.70f,
                            0.88f,
@@ -23123,11 +23536,11 @@ void drawAddPlotMenuOverlay(const AppState& app,
     for (int i = 0; i < kPlotModelColorSubmenuEntryCount; ++i) {
       const PlotModelMenuEntry& entry = kPlotModelColorSubmenuEntries[i];
       const float itemY0 = colorSubmenuWindowRect.y0 + kPlotMenuPad +
-                           static_cast<float>(i) * kViewerChoiceMenuRowHeight;
+                           static_cast<float>(i) * metrics.choiceRowHeight;
       const PlotMenuRect itemRect = scaleRect({colorSubmenuWindowRect.x0 + kPlotMenuPad,
                                                itemY0,
                                                colorSubmenuWindowRect.x1 - kPlotMenuPad,
-                                               itemY0 + kViewerChoiceMenuRowHeight});
+                                               itemY0 + metrics.choiceRowHeight});
       const bool hovered = hoveredModel == entry.plotModel;
       if (hovered) {
         drawPlotMenuRect(itemRect.x0, itemRect.y0, itemRect.x1, itemRect.y1,
@@ -23136,7 +23549,7 @@ void drawAddPlotMenuOverlay(const AppState& app,
       drawHudTextLine(renderer,
                       entry.label,
                       itemRect.x0 + 10.0f,
-                      itemRect.y0 + (renderer.available ? 8.0f : 9.0f),
+                      itemRect.y0 + viewerChoiceTextBaselineOffset(metrics, renderer.available),
                       textScale,
                       hovered ? 0.98f : 0.82f,
                       0.88f,
@@ -23175,6 +23588,8 @@ void drawLayoutMenuOverlay(const AppState& app,
   };
   const PlotMenuRect menuWindowRect = layoutMenuRect(app, windowWidth, windowHeight);
   const PlotMenuRect menuRect = scaleRect(menuWindowRect);
+  const ViewerUiMetrics metrics = viewerUiMetrics(app);
+  const float textScale = metrics.textScale;
   glMatrixMode(GL_PROJECTION);
   glPushMatrix();
   glLoadIdentity();
@@ -23188,14 +23603,14 @@ void drawLayoutMenuOverlay(const AppState& app,
   drawPlotMenuRect(menuRect.x0, menuRect.y0, menuRect.x1, menuRect.y1, 0.012f, 0.014f, 0.019f, 0.94f);
   drawPlotMenuRect(menuRect.x0, menuRect.y1 - 1.0f, menuRect.x1, menuRect.y1, 0.75f, 0.82f, 0.92f, 0.20f);
   drawHudTextLine(renderer, "Arrange Plots", menuRect.x0 + 12.0f, menuRect.y1 - 20.0f,
-                  1.0f, 0.96f, 0.92f, 0.96f, 1.0f);
+                  textScale, 0.96f, 0.92f, 0.96f, 1.0f);
   for (int i = 0; i < kViewerLayoutChoiceCount; ++i) {
     const float itemY0 = menuWindowRect.y0 + kPlotMenuPad +
-                         static_cast<float>(i) * kViewerChoiceMenuRowHeight + 24.0f;
+                         static_cast<float>(i) * metrics.choiceRowHeight + 24.0f;
     const PlotMenuRect itemRect = scaleRect({menuWindowRect.x0 + kPlotMenuPad,
                                              itemY0,
                                              menuWindowRect.x1 - kPlotMenuPad,
-                                             itemY0 + kViewerChoiceMenuRowHeight});
+                                             itemY0 + metrics.choiceRowHeight});
     const bool hovered = i == app.layoutMenuHover;
     if (hovered) {
       drawPlotMenuRect(itemRect.x0, itemRect.y0, itemRect.x1, itemRect.y1,
@@ -23207,8 +23622,8 @@ void drawLayoutMenuOverlay(const AppState& app,
                                  itemRect.y1 - 7.0f};
     drawViewerLayoutChoiceGlyph(i, glyphRect, hovered);
     drawHudTextLine(renderer, labels[i], itemRect.x0 + 44.0f,
-                    itemRect.y0 + (renderer.available ? 8.0f : 9.0f),
-                    1.0f, hovered ? 0.98f : 0.82f, 0.88f, 0.93f, 0.98f);
+                    itemRect.y0 + viewerChoiceTextBaselineOffset(metrics, renderer.available),
+                    textScale, hovered ? 0.98f : 0.82f, 0.88f, 0.93f, 0.98f);
   }
   glDisable(GL_BLEND);
   glEnable(GL_DEPTH_TEST);
@@ -23242,6 +23657,7 @@ void drawWorkspaceChoiceMenuOverlay(const AppState& app,
             static_cast<float>(height) - rect.y0 * sy};
   };
   const PlotMenuRect choiceRect = scaleRect(choiceWindowRect);
+  const ViewerUiMetrics metrics = viewerUiMetrics(app);
   const float choiceScroll = clampf(app.viewerChoiceMenuScroll,
                                     0.0f,
                                     viewerChoiceMenuMaxScroll(app, windowWidth, windowHeight));
@@ -23265,18 +23681,18 @@ void drawWorkspaceChoiceMenuOverlay(const AppState& app,
                    0.75f, 0.82f, 0.92f, 0.18f);
   drawPlotMenuRect(choiceRect.x1 - 1.0f, choiceRect.y0, choiceRect.x1, choiceRect.y1,
                    0.75f, 0.82f, 0.92f, 0.18f);
-  const float textScale = 1.0f;
+  const float textScale = metrics.textScale;
   for (int i = 0; i < static_cast<int>(choiceItems.size()); ++i) {
     const float itemY0 = choiceWindowRect.y0 + kViewerChoiceMenuPad +
-                         static_cast<float>(i) * kViewerChoiceMenuRowHeight - choiceScroll;
-    if (itemY0 + kViewerChoiceMenuRowHeight < choiceWindowRect.y0 + kViewerChoiceMenuPad ||
+                         static_cast<float>(i) * metrics.choiceRowHeight - choiceScroll;
+    if (itemY0 + metrics.choiceRowHeight < choiceWindowRect.y0 + kViewerChoiceMenuPad ||
         itemY0 > choiceWindowRect.y1 - kViewerChoiceMenuPad) {
       continue;
     }
     const PlotMenuRect itemRect = scaleRect({choiceWindowRect.x0 + kViewerChoiceMenuPad,
                                              itemY0,
                                              choiceWindowRect.x1 - kViewerChoiceMenuPad,
-                                             itemY0 + kViewerChoiceMenuRowHeight});
+                                             itemY0 + metrics.choiceRowHeight});
     const bool hovered = app.viewerMenuHoverChoice == i;
     const bool selected = choiceItems[static_cast<std::size_t>(i)].selected;
     if (hovered) {
@@ -23303,7 +23719,7 @@ void drawWorkspaceChoiceMenuOverlay(const AppState& app,
     drawHudTextLine(renderer,
                     fittedLabel,
                     labelX,
-                    itemRect.y0 + (renderer.available ? 9.0f : 10.0f),
+                    itemRect.y0 + viewerChoiceTextBaselineOffset(metrics, renderer.available),
                     textScale,
                     selected ? 0.98f : 0.88f,
                     0.90f,
@@ -23350,6 +23766,7 @@ void drawPlotModelMenuOverlay(const AppState& app,
   const std::vector<ViewerMenuRow> rows = buildViewerMenuRows(app);
   const std::vector<ViewerMenuTab> tabs = buildViewerMenuTabs(app);
   const ViewerMenuSection activeSection = coercedViewerMenuSection(app);
+  const ViewerUiMetrics metrics = viewerUiMetrics(app);
 
   glMatrixMode(GL_PROJECTION);
   glPushMatrix();
@@ -23369,7 +23786,7 @@ void drawPlotModelMenuOverlay(const AppState& app,
   drawPlotMenuRect(mainRect.x0, mainRect.y0, mainRect.x0 + 1.0f, mainRect.y1, 0.75f, 0.82f, 0.92f, 0.18f);
   drawPlotMenuRect(mainRect.x1 - 1.0f, mainRect.y0, mainRect.x1, mainRect.y1, 0.75f, 0.82f, 0.92f, 0.16f);
 
-  const float textScale = 1.0f;
+  const float textScale = metrics.textScale;
   drawHudTextLine(renderer,
                   "Viewer Menu",
                   mainRect.x0 + 14.0f,
@@ -23409,10 +23826,14 @@ void drawPlotModelMenuOverlay(const AppState& app,
                       fitHudText(renderer,
                                  currentViewerPresetLabel(app),
                                  std::max(24.0f, compactPresetRect.x1 - compactPresetRect.x0 - 34.0f),
-                                 0.82f),
+                                 0.82f * textScale),
                       compactPresetRect.x0 + 8.0f,
-                      compactPresetRect.y0 + (renderer.available ? 6.0f : 7.0f),
-                      0.82f,
+                      compactPresetRect.y0 + viewerCompactTextBaselineOffset(metrics,
+                                                                             compactPresetRect.y1 - compactPresetRect.y0,
+                                                                             0.82f * textScale,
+                                                                             renderer.available,
+                                                                             6.0f),
+                      0.82f * textScale,
                       hasPresets ? 0.92f : 0.44f,
                       0.76f,
                       0.94f,
@@ -23462,10 +23883,14 @@ void drawPlotModelMenuOverlay(const AppState& app,
                       fitHudText(renderer,
                                  currentLayoutPresetLabel(app),
                                  std::max(20.0f, compactLayoutRect.x1 - compactLayoutRect.x0 - 48.0f),
-                                 0.78f),
+                                 0.78f * textScale),
                       compactLayoutRect.x0 + 32.0f,
-                      compactLayoutRect.y0 + (renderer.available ? 6.0f : 7.0f),
-                      0.78f,
+                      compactLayoutRect.y0 + viewerCompactTextBaselineOffset(metrics,
+                                                                             compactLayoutRect.y1 - compactLayoutRect.y0,
+                                                                             0.78f * textScale,
+                                                                             renderer.available,
+                                                                             6.0f),
+                      0.78f * textScale,
                       hasPresets ? 0.78f : 0.40f,
                       0.90f,
                       0.98f,
@@ -23505,7 +23930,7 @@ void drawPlotModelMenuOverlay(const AppState& app,
                        syncLabel,
                        mainRect.x1 - 14.0f,
                        mainRect.y1 - 48.0f,
-                       0.82f,
+                       0.82f * textScale,
                        waitingForResolve ? 0.98f : (refining ? 0.72f : 0.60f),
                        waitingForResolve ? 0.72f : (refining ? 0.82f : 0.82f),
                        waitingForResolve ? 0.42f : (refining ? 0.98f : 0.88f),
@@ -23514,11 +23939,11 @@ void drawPlotModelMenuOverlay(const AppState& app,
   for (int i = 0; i < static_cast<int>(tabs.size()); ++i) {
     const float tabX0 = mainWindowRect.x0 + kViewerDrawerPad;
     const float tabY0 = mainWindowRect.y0 + kViewerDrawerHeaderHeight + kViewerDrawerPad +
-                        static_cast<float>(i) * kViewerDrawerTabHeight;
+                        static_cast<float>(i) * metrics.drawerTabHeight;
     const PlotMenuRect tabRect = scaleRect({tabX0,
                                             tabY0,
                                             tabX0 + kViewerDrawerTabRailWidth,
-                                            tabY0 + kViewerDrawerTabHeight - 3.0f});
+                                            tabY0 + metrics.drawerTabHeight - 3.0f});
     const bool active = tabs[static_cast<std::size_t>(i)].section == activeSection;
     const bool hovered = app.viewerMenuHoverTab == i;
     drawPlotMenuRect(tabRect.x0, tabRect.y0, tabRect.x1, tabRect.y1,
@@ -23529,7 +23954,11 @@ void drawPlotModelMenuOverlay(const AppState& app,
     drawHudTextLine(renderer,
                     tabs[static_cast<std::size_t>(i)].label,
                     tabRect.x0 + 10.0f,
-                    tabRect.y0 + (renderer.available ? 10.0f : 11.0f),
+                    tabRect.y0 + viewerCompactTextBaselineOffset(metrics,
+                                                                 tabRect.y1 - tabRect.y0,
+                                                                 textScale,
+                                                                 renderer.available,
+                                                                 10.0f),
                     textScale,
                     active ? 0.98f : 0.72f,
                     0.88f,
@@ -23567,7 +23996,11 @@ void drawPlotModelMenuOverlay(const AppState& app,
       drawHudTextLine(renderer,
                       fittedLabel,
                       subtabRect.x0 + 9.0f,
-                      subtabRect.y0 + (renderer.available ? 9.0f : 10.0f),
+                      subtabRect.y0 + viewerCompactTextBaselineOffset(metrics,
+                                                                      subtabRect.y1 - subtabRect.y0,
+                                                                      textScale,
+                                                                      renderer.available,
+                                                                      9.0f),
                       textScale,
                       active ? 0.98f : 0.72f,
                       0.88f,
@@ -23576,7 +24009,23 @@ void drawPlotModelMenuOverlay(const AppState& app,
     }
   }
 
+  const PlotMenuRect rowsClipWindowRect{viewerMenuRowsX0(mainWindowRect),
+                                        viewerMenuRowsY0(app, mainWindowRect),
+                                        mainWindowRect.x1 - kViewerDrawerPad,
+                                        mainWindowRect.y1 - kViewerDrawerPad};
+  const PlotMenuRect rowsClipRect = scaleRect(rowsClipWindowRect);
+  const bool rowsClipEnabled =
+      rowsClipRect.x1 > rowsClipRect.x0 + 1.0f && rowsClipRect.y1 > rowsClipRect.y0 + 1.0f;
+  if (rowsClipEnabled) {
+    glEnable(GL_SCISSOR_TEST);
+    glScissor(static_cast<GLint>(std::floor(rowsClipRect.x0)),
+              static_cast<GLint>(std::floor(rowsClipRect.y0)),
+              static_cast<GLsizei>(std::ceil(rowsClipRect.x1 - rowsClipRect.x0)),
+              static_cast<GLsizei>(std::ceil(rowsClipRect.y1 - rowsClipRect.y0)));
+  }
+
   for (int i = 0; i < static_cast<int>(rows.size()); ++i) {
+    if (!rowsClipEnabled) break;
     const PlotMenuRect rr = scaleRect(viewerMenuRowWindowRect(app, windowWidth, windowHeight, i));
     if (rr.y1 < mainRect.y0 + 8.0f || rr.y0 > mainRect.y1 - kViewerDrawerHeaderHeight) continue;
     const ViewerMenuRow& row = rows[static_cast<std::size_t>(i)];
@@ -23597,14 +24046,14 @@ void drawPlotModelMenuOverlay(const AppState& app,
          WorkshopColor::overlayPrimariesChoiceEnabled(app.viewerState.chromaticityOverlayPrimaries) &&
          primariesChoiceIsDisplayReferred(app.viewerState.chromaticityOverlayPrimaries - 1));
     const float valueRightX = rr.x1 - 14.0f - (rowHasDisplayGlyph ? 23.0f : 0.0f);
-    const float singleBaseline = rr.y0 + (renderer.available ? 15.0f : 16.0f);
+    const float singleBaseline = rr.y0 + viewerRowTextBaselineOffset(metrics, renderer.available);
     float vectorR = 0.0f, vectorG = 0.0f, vectorB = 0.0f;
     const bool hasVectorSwatch = viewerMenuActionVectorColor(row.action, &vectorR, &vectorG, &vectorB);
     const float swatchSize = renderer.available ? 10.0f : 8.0f;
     const float swatchX = labelX;
-    const float swatchY = rr.y0 + (kPlotMenuRowHeight - swatchSize) * 0.5f;
+    const float swatchY = rr.y0 + (rr.y1 - rr.y0 - swatchSize) * 0.5f;
     const float textLabelX = hasVectorSwatch ? (labelX + swatchSize + 8.0f) : labelX;
-    const bool stackedValueRow = viewerMenuRowStacksValue(row, rowWidth);
+    const bool stackedValueRow = viewerMenuRowStacksValue(row, rowWidth, metrics);
     const float ordinaryValueWidth = hudTextWidth(renderer, row.value, textScale);
     if (row.spacer) {
       drawPlotMenuRect(rr.x0 + 14.0f,
@@ -23661,6 +24110,7 @@ void drawPlotModelMenuOverlay(const AppState& app,
                         danger ? 0.74f : 0.96f,
                         danger ? 0.70f : 0.98f);
       }
+      drawPresetActionFeedbackBar(app, rr, false);
       continue;
     }
     if (row.layoutPresetActionButtons) {
@@ -23707,6 +24157,7 @@ void drawPlotModelMenuOverlay(const AppState& app,
                         danger ? 0.74f : 0.94f,
                         danger ? 0.70f : 0.98f);
       }
+      drawPresetActionFeedbackBar(app, rr, true);
       continue;
     }
     if (row.action == ViewerMenuAction::PlotModel) {
@@ -23972,7 +24423,7 @@ void drawPlotModelMenuOverlay(const AppState& app,
     } else if (viewerMenuActionIsCheckbox(row.action)) {
       const float checkboxSize = renderer.available ? 15.0f : 13.0f;
       const float checkboxX = rr.x1 - checkboxSize - 14.0f;
-      const float checkboxY = rr.y0 + (kPlotMenuRowHeight - checkboxSize) * 0.5f;
+      const float checkboxY = rr.y0 + (rr.y1 - rr.y0 - checkboxSize) * 0.5f;
       drawHudTextLineClipped(renderer,
                              row.label,
                              textLabelX,
@@ -24109,9 +24560,99 @@ void drawPlotModelMenuOverlay(const AppState& app,
     }
     if (rowHasDisplayGlyph) {
       drawViewerDisplayGlyph(rr.x1 - 29.0f,
-                             stackedValueRow ? rr.y0 + 7.0f : rr.y0 + (kPlotMenuRowHeight - 12.0f) * 0.5f,
+                             stackedValueRow ? rr.y0 + 7.0f : rr.y0 + (rr.y1 - rr.y0 - 12.0f) * 0.5f,
                              false,
                              row.enabled);
+    }
+  }
+  if (rowsClipEnabled) {
+    glDisable(GL_SCISSOR_TEST);
+  }
+
+  if (presetDeleteConfirmationVisible(app)) {
+    const PlotMenuRect panelWindowRect = presetDeleteConfirmationWindowRect(app, windowWidth, windowHeight);
+    const PlotMenuRect panelRect = scaleRect(panelWindowRect);
+    if (panelWindowRect.x1 > panelWindowRect.x0 && panelWindowRect.y1 > panelWindowRect.y0) {
+      const ViewerMenuAction pendingAction = viewerMenuActionFromInt(app.pendingPresetDeleteAction);
+      const bool layoutDelete = viewerMenuActionIsLayoutPresetAction(pendingAction);
+      const int hoverButton =
+          presetDeleteConfirmationButtonAtPoint(app, windowWidth, windowHeight, app.hoverX, app.hoverY);
+      drawPlotMenuRect(panelRect.x0, panelRect.y0, panelRect.x1, panelRect.y1,
+                       0.030f, 0.035f, 0.042f, 0.97f);
+      drawPlotMenuRect(panelRect.x0, panelRect.y1 - 2.0f, panelRect.x1, panelRect.y1,
+                       1.0f, 0.32f, 0.26f, 0.48f);
+      drawPlotMenuRect(panelRect.x0, panelRect.y0, panelRect.x1, panelRect.y0 + 1.0f,
+                       0.74f, 0.82f, 0.92f, 0.18f);
+      drawPlotMenuRect(panelRect.x0, panelRect.y0, panelRect.x0 + 1.0f, panelRect.y1,
+                       0.74f, 0.82f, 0.92f, 0.16f);
+      drawPlotMenuRect(panelRect.x1 - 1.0f, panelRect.y0, panelRect.x1, panelRect.y1,
+                       0.74f, 0.82f, 0.92f, 0.16f);
+      const std::string title = layoutDelete ? "Delete layout preset?" : "Delete plot preset?";
+      drawHudTextLine(renderer,
+                      title,
+                      panelRect.x0 + 14.0f,
+                      panelRect.y0 + 18.0f * textScale,
+                      textScale,
+                      0.96f,
+                      0.98f,
+                      0.88f,
+                      0.86f);
+      drawHudTextLineClipped(renderer,
+                             app.pendingPresetDeleteName,
+                             panelRect.x0 + 14.0f,
+                             panelRect.y0 + 42.0f * textScale,
+                             std::max(48.0f, panelRect.x1 - panelRect.x0 - 28.0f),
+                             0.86f * textScale,
+                             false,
+                             0.82f,
+                             0.84f,
+                             0.90f,
+                             0.96f);
+      drawHudTextLine(renderer,
+                      "This cannot be undone.",
+                      panelRect.x0 + 14.0f,
+                      panelRect.y0 + 62.0f * textScale,
+                      0.78f * textScale,
+                      0.64f,
+                      0.82f,
+                      0.86f,
+                      0.90f);
+      const auto buttonWindowRects = presetDeleteConfirmationButtonRects(panelWindowRect);
+      const char* buttonLabels[2] = {"Cancel", "Delete"};
+      for (int button = 0; button < 2; ++button) {
+        const bool isDelete = button == 1;
+        const bool hovered = hoverButton == button;
+        const PlotMenuRect buttonRect = scaleRect(buttonWindowRects[static_cast<std::size_t>(button)]);
+        drawPlotMenuRect(buttonRect.x0, buttonRect.y0, buttonRect.x1, buttonRect.y1,
+                         isDelete ? (hovered ? 0.46f : 0.31f) : (hovered ? 0.18f : 0.10f),
+                         isDelete ? (hovered ? 0.10f : 0.07f) : (hovered ? 0.28f : 0.18f),
+                         isDelete ? (hovered ? 0.08f : 0.06f) : (hovered ? 0.36f : 0.25f),
+                         hovered ? 0.92f : 0.78f);
+        drawPlotMenuRect(buttonRect.x0, buttonRect.y1 - 1.0f, buttonRect.x1, buttonRect.y1,
+                         isDelete ? 1.0f : 0.70f,
+                         isDelete ? 0.38f : 0.86f,
+                         isDelete ? 0.34f : 1.0f,
+                         hovered ? 0.32f : 0.20f);
+        const float buttonScale = 0.86f * textScale;
+        const std::string label = fitHudText(renderer,
+                                             buttonLabels[button],
+                                             std::max(18.0f, buttonRect.x1 - buttonRect.x0 - 12.0f),
+                                             buttonScale);
+        const float labelW = hudTextWidth(renderer, label, buttonScale);
+        drawHudTextLine(renderer,
+                        label,
+                        buttonRect.x0 + std::max(5.0f, (buttonRect.x1 - buttonRect.x0 - labelW) * 0.5f),
+                        buttonRect.y0 + viewerCompactTextBaselineOffset(metrics,
+                                                                        buttonRect.y1 - buttonRect.y0,
+                                                                        buttonScale,
+                                                                        renderer.available,
+                                                                        8.0f),
+                        buttonScale,
+                        0.94f,
+                        isDelete ? 0.98f : 0.88f,
+                        isDelete ? 0.76f : 0.94f,
+                        isDelete ? 0.72f : 1.0f);
+      }
     }
   }
 
@@ -24341,7 +24882,7 @@ void drawPlotModelMenuOverlay(const AppState& app,
   const float activeRowsY0 = viewerMenuRowsY0(app, mainWindowRect);
   const float activeRowsX0 = viewerMenuRowsX0(mainWindowRect);
   const float activeRowWidth = std::max(1.0f, mainWindowRect.x1 - kViewerDrawerPad - activeRowsX0);
-  const float contentHeight = viewerMenuRowsHeight(rows, activeRowWidth);
+  const float contentHeight = viewerMenuRowsHeight(rows, activeRowWidth, metrics);
   const float visibleHeight = std::max(1.0f, mainWindowRect.y1 - activeRowsY0 - kViewerDrawerPad);
   if (contentHeight > visibleHeight + 1.0f) {
     const float scrollT = clampf(app.viewerMenuScroll / std::max(1.0f, contentHeight - visibleHeight), 0.0f, 1.0f);
@@ -24375,15 +24916,15 @@ void drawPlotModelMenuOverlay(const AppState& app,
                        0.75f, 0.82f, 0.92f, 0.18f);
       for (int i = 0; i < static_cast<int>(choiceItems.size()); ++i) {
         const float itemY0 = choiceWindowRect.y0 + kViewerChoiceMenuPad +
-                             static_cast<float>(i) * kViewerChoiceMenuRowHeight - choiceScroll;
-        if (itemY0 + kViewerChoiceMenuRowHeight < choiceWindowRect.y0 + kViewerChoiceMenuPad ||
+                             static_cast<float>(i) * metrics.choiceRowHeight - choiceScroll;
+        if (itemY0 + metrics.choiceRowHeight < choiceWindowRect.y0 + kViewerChoiceMenuPad ||
             itemY0 > choiceWindowRect.y1 - kViewerChoiceMenuPad) {
           continue;
         }
         const PlotMenuRect itemRect = scaleRect({choiceWindowRect.x0 + kViewerChoiceMenuPad,
                                                  itemY0,
                                                  choiceWindowRect.x1 - kViewerChoiceMenuPad,
-                                                 itemY0 + kViewerChoiceMenuRowHeight});
+                                                 itemY0 + metrics.choiceRowHeight});
         const bool groupHeader = choiceItems[static_cast<std::size_t>(i)].groupHeader;
         const bool hovered = app.viewerMenuHoverChoice == i;
         const bool selected = choiceItems[static_cast<std::size_t>(i)].selected;
@@ -24407,7 +24948,7 @@ void drawPlotModelMenuOverlay(const AppState& app,
         drawHudTextLine(renderer,
                         fittedLabel,
                         labelX,
-                        itemRect.y0 + (renderer.available ? 9.0f : 10.0f),
+                        itemRect.y0 + viewerChoiceTextBaselineOffset(metrics, renderer.available),
                         textScale,
                         selected ? 0.98f : 0.88f,
                         0.90f,
@@ -24417,14 +24958,14 @@ void drawPlotModelMenuOverlay(const AppState& app,
           const float labelWidth = hudTextWidth(renderer, fittedLabel, textScale);
           const float glyphX = std::min(labelX + labelWidth + 7.0f, itemRect.x1 - 18.0f);
           drawViewerDisplayGlyph(glyphX,
-                                 itemRect.y0 + (kViewerChoiceMenuRowHeight - 12.0f) * 0.5f,
+                                 itemRect.y0 + (itemRect.y1 - itemRect.y0 - 12.0f) * 0.5f,
                                  selected);
         }
         if (groupHeader) {
           drawHudTextLineRight(renderer,
                                ">",
                                itemRect.x1 - 10.0f,
-                               itemRect.y0 + (renderer.available ? 9.0f : 10.0f),
+                               itemRect.y0 + viewerChoiceTextBaselineOffset(metrics, renderer.available),
                                textScale,
                                hovered ? 0.96f : 0.70f,
                                0.88f,
@@ -24448,11 +24989,11 @@ void drawPlotModelMenuOverlay(const AppState& app,
           for (int submenuIndex = 0; submenuIndex < kPlotModelColorSubmenuEntryCount; ++submenuIndex) {
             const PlotModelMenuEntry& entry = kPlotModelColorSubmenuEntries[submenuIndex];
             const float itemY0 = colorSubmenuWindowRect.y0 + kPlotMenuPad +
-                                 static_cast<float>(submenuIndex) * kViewerChoiceMenuRowHeight;
+                                 static_cast<float>(submenuIndex) * metrics.choiceRowHeight;
             const PlotMenuRect itemRect = scaleRect({colorSubmenuWindowRect.x0 + kViewerChoiceMenuPad,
                                                      itemY0,
                                                      colorSubmenuWindowRect.x1 - kViewerChoiceMenuPad,
-                                                     itemY0 + kViewerChoiceMenuRowHeight});
+                                                     itemY0 + metrics.choiceRowHeight});
             const bool hovered = hoveredModel == entry.plotModel;
             const bool selected = app.viewerState.plotModel == entry.plotModel;
             if (hovered) {
@@ -24472,7 +25013,7 @@ void drawPlotModelMenuOverlay(const AppState& app,
             drawHudTextLine(renderer,
                             entry.label,
                             itemRect.x0 + (selected ? 14.0f : 10.0f),
-                            itemRect.y0 + (renderer.available ? 9.0f : 10.0f),
+                            itemRect.y0 + viewerChoiceTextBaselineOffset(metrics, renderer.available),
                             textScale,
                             selected ? 0.98f : 0.88f,
                             0.90f,
@@ -24483,7 +25024,7 @@ void drawPlotModelMenuOverlay(const AppState& app,
       }
       const float maxChoiceScroll = viewerChoiceMenuMaxScroll(app, windowWidth, windowHeight);
       if (maxChoiceScroll > 0.5f) {
-        const float contentHeight = kViewerChoiceMenuRowHeight * static_cast<float>(choiceItems.size());
+        const float contentHeight = metrics.choiceRowHeight * static_cast<float>(choiceItems.size());
         const float visibleHeight = std::max(1.0f, choiceWindowRect.y1 - choiceWindowRect.y0 - kViewerChoiceMenuPad * 2.0f);
         const float scrollT = clampf(choiceScroll / maxChoiceScroll, 0.0f, 1.0f);
         const PlotMenuRect trackRect = scaleRect({choiceWindowRect.x1 - 7.0f,
@@ -26275,10 +26816,26 @@ void drawPlotWindowTitleBar(const AppState& app,
   drawPlotMenuRect(x0, y1 - titleH, x1, y1, 0.018f, 0.026f, 0.034f, alpha);
   drawPlotMenuRect(x0, y1 - titleH, x1, y1 - titleH + 1.0f, 0.24f, 0.42f, 0.56f, alpha * 0.62f);
 
-  const float scale = renderer.available ? clampf(titleH / 27.0f, 0.66f, 0.88f) : 1.0f;
-  const float baselineY = y1 - titleH * 0.62f;
+  const ViewerUiMetrics metrics = viewerUiMetrics(app);
+  const float titleMaxScale = std::max(0.66f, titleH / 20.0f);
+  const float scale = renderer.available
+                          ? clampf(0.88f * metrics.titleTextScale, 0.66f, std::min(1.18f, titleMaxScale))
+                          : metrics.titleTextScale;
+  const float titleCenterY = y1 - titleH * 0.5f;
+  const float ascent = renderer.available
+                           ? static_cast<float>(std::max(1, renderer.atlas.ascent)) * scale
+                           : 14.0f * scale;
+  const float descent = renderer.available
+                            ? static_cast<float>(std::max(0, renderer.atlas.descent)) * scale
+                            : 4.0f * scale;
+  const float titlePad = std::max(2.0f, 1.5f * scale);
+  const float centeredBaseline = titleCenterY - (ascent - descent) * 0.5f;
+  const float minBaseline = y1 - titleH + titlePad + descent;
+  const float maxBaseline = y1 - titlePad - ascent;
+  const float baselineY =
+      minBaseline <= maxBaseline ? clampf(centeredBaseline, minBaseline, maxBaseline) : centeredBaseline;
   const float pad = 8.0f;
-  const float moveGripReserve = reserveMoveGrip ? 34.0f : 0.0f;
+  const float moveGripReserve = reserveMoveGrip ? 34.0f * metrics.titleTextScale : 0.0f;
   const float closeReserve = app.plotWindows.size() > 1u ? std::max(24.0f, titleH + 6.0f) : 0.0f;
   const float leftX = x0 + pad + moveGripReserve;
   const float rightX = x1 - pad - closeReserve;
@@ -26289,12 +26846,12 @@ void drawPlotWindowTitleBar(const AppState& app,
                             " | " + window.syncLabel;
   const std::string metadata = plotWindowTitleMetadata(app, window);
   float metadataMax = 0.0f;
-  if (!metadata.empty() && available > 170.0f) {
+  if (!metadata.empty() && available > 170.0f * scale) {
     metadataMax = std::min(hudTextWidth(renderer, metadata, scale), available * 0.44f);
   }
-  const float gap = metadataMax > 0.0f ? 12.0f : 0.0f;
+  const float gap = metadataMax > 0.0f ? 12.0f * scale : 0.0f;
   float titleMax = available - metadataMax - gap;
-  if (titleMax < 76.0f && metadataMax > 0.0f) {
+  if (titleMax < 76.0f * scale && metadataMax > 0.0f) {
     metadataMax = 0.0f;
     titleMax = available;
   }
@@ -26534,7 +27091,7 @@ void drawPlotWindowFramesOverlay(const AppState& app,
     drawPlotMenuRect(x0, y0, x1, y0 + 1.5f, 0.62f, 0.82f, 1.0f, a * 0.72f);
     drawPlotMenuRect(x0, y0, x0 + 1.5f, y1, 0.62f, 0.82f, 1.0f, a * 0.72f);
     drawPlotMenuRect(x1 - 1.5f, y0, x1, y1, 0.62f, 0.82f, 1.0f, a * 0.68f);
-    const float titleH = plotWindowTitleBarLogicalHeight(screenRect) * sy;
+    const float titleH = plotWindowTitleBarLogicalHeight(app, screenRect) * sy;
     PlotWindowDragMode interactionMode = PlotWindowDragMode::None;
     if (app.plotWindowDragId == window.windowId &&
         app.plotWindowDragMode != PlotWindowDragMode::None) {
@@ -28383,6 +28940,7 @@ bool updateSlicingVectorDragAtPoint(AppState* app,
   if (!app || !app->slicingVectorDragging) return false;
   int vectorIndex = -1;
   if (app->slicingVectorDragFromMenu) {
+    if (!pointInViewerMenuRowsViewport(*app, windowWidth, windowHeight, x, y)) return true;
     const std::vector<ViewerMenuRow> rows = buildViewerMenuRows(*app);
     for (int i = 0; i < static_cast<int>(rows.size()); ++i) {
       if (!rows[static_cast<std::size_t>(i)].slicingVectorSelector) continue;
@@ -28452,6 +29010,7 @@ bool pointInActivePresetNameEditor(const AppState& app,
                                                   ? ViewerMenuAction::EditLayoutPresetName
                                                   : ViewerMenuAction::None);
   if (activeAction == ViewerMenuAction::None) return false;
+  if (!pointInViewerMenuRowsViewport(app, windowWidth, windowHeight, x, y)) return false;
   const std::vector<ViewerMenuRow> rows = buildViewerMenuRows(app);
   for (int i = 0; i < static_cast<int>(rows.size()); ++i) {
     if (rows[static_cast<std::size_t>(i)].action != activeAction) continue;
@@ -28496,6 +29055,20 @@ void mouseButtonCallback(GLFWwindow* window, int button, int action, int mods) {
     glfwGetCursorPos(window, &cursorX, &cursorY);
     if (button == GLFW_MOUSE_BUTTON_LEFT) {
       releasePresetNameEditingOnOutsideClick(app, windowWidth, windowHeight, cursorX, cursorY);
+      if (app->plotModelMenuVisible && presetDeleteConfirmationVisible(*app)) {
+        const int confirmHit =
+            presetDeleteConfirmationButtonAtPoint(*app, windowWidth, windowHeight, cursorX, cursorY);
+        if (confirmHit == 1) {
+          (void)performConfirmedPresetDelete(app);
+        } else if (confirmHit == 0 || confirmHit == -1) {
+          clearPendingPresetDelete(app);
+        }
+        app->viewerMenuLastClick = -10.0;
+        app->viewerMenuLastClickRow = -1;
+        app->viewerMenuLastClickAction = static_cast<int>(ViewerMenuAction::None);
+        clearPointerInteractionState(app);
+        return;
+      }
     }
     const bool pointerInMenu = pointerInViewerMenuUi(*app, windowWidth, windowHeight, cursorX, cursorY);
     app->pointerInteractionWindowId =
@@ -29846,8 +30419,9 @@ void scrollCallback(GLFWwindow* window, double xoffset, double yoffset) {
     if (choiceRect.x1 > choiceRect.x0 && choiceRect.y1 > choiceRect.y0 &&
         pointInPlotMenuRect(choiceRect, cursorX, cursorY)) {
       const float maxChoiceScroll = viewerChoiceMenuMaxScroll(*app, windowWidth, windowHeight);
+      const ViewerUiMetrics metrics = viewerUiMetrics(*app);
       app->viewerChoiceMenuScroll =
-          clampf(app->viewerChoiceMenuScroll - static_cast<float>(scrollDelta) * kViewerChoiceMenuRowHeight * 1.5f,
+          clampf(app->viewerChoiceMenuScroll - static_cast<float>(scrollDelta) * metrics.choiceRowHeight * 1.5f,
                  0.0f,
                  maxChoiceScroll);
       app->viewerMenuHoverChoice = viewerChoiceMenuIndexAt(*app, windowWidth, windowHeight, cursorX, cursorY);
@@ -29861,6 +30435,7 @@ void scrollCallback(GLFWwindow* window, double xoffset, double yoffset) {
     double cursorX = app->hoverX;
     double cursorY = app->hoverY;
     glfwGetCursorPos(window, &cursorX, &cursorY);
+    const ViewerUiMetrics metrics = viewerUiMetrics(*app);
     const PlotMenuRect choiceRect = viewerChoiceMenuWindowRect(*app, windowWidth, windowHeight);
     const bool inChoice = choiceRect.x1 > choiceRect.x0 && choiceRect.y1 > choiceRect.y0 &&
                           pointInPlotMenuRect(choiceRect, cursorX, cursorY);
@@ -29869,7 +30444,7 @@ void scrollCallback(GLFWwindow* window, double xoffset, double yoffset) {
     if (inChoice && !buildViewerChoiceMenuItems(*app).empty()) {
       const float maxChoiceScroll = viewerChoiceMenuMaxScroll(*app, windowWidth, windowHeight);
       app->viewerChoiceMenuScroll =
-          clampf(app->viewerChoiceMenuScroll - static_cast<float>(scrollDelta) * kViewerChoiceMenuRowHeight * 1.5f,
+          clampf(app->viewerChoiceMenuScroll - static_cast<float>(scrollDelta) * metrics.choiceRowHeight * 1.5f,
                  0.0f,
                  maxChoiceScroll);
       app->viewerMenuHoverChoice = viewerChoiceMenuIndexAt(*app, windowWidth, windowHeight, cursorX, cursorY);
@@ -29908,11 +30483,11 @@ void scrollCallback(GLFWwindow* window, double xoffset, double yoffset) {
       const float rowsY0 = viewerMenuRowsY0(*app, rect);
       const float rowsX0 = viewerMenuRowsX0(rect);
       const float rowWidth = std::max(1.0f, rect.x1 - kViewerDrawerPad - rowsX0);
-      const float contentHeight = viewerMenuRowsHeight(rows, rowWidth);
+      const float contentHeight = viewerMenuRowsHeight(rows, rowWidth, metrics);
       const float visibleHeight = std::max(1.0f, rect.y1 - rowsY0 - kViewerDrawerPad);
       const float maxScroll = std::max(0.0f, contentHeight - visibleHeight);
       app->viewerMenuScroll =
-          clampf(app->viewerMenuScroll - static_cast<float>(scrollDelta) * kPlotMenuRowHeight * 1.5f,
+          clampf(app->viewerMenuScroll - static_cast<float>(scrollDelta) * metrics.rowHeight * 1.5f,
                  0.0f,
                  maxScroll);
       app->viewerMenuHoverChoice = viewerChoiceMenuIndexAt(*app, windowWidth, windowHeight, cursorX, cursorY);
