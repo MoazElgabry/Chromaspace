@@ -49,6 +49,7 @@ extern char **environ;
 #endif
 
 #if defined(__APPLE__)
+#include <CoreFoundation/CoreFoundation.h>
 #include <OpenGL/gl.h>
 #else
 #include <GL/gl.h>
@@ -543,9 +544,35 @@ struct ViewerCloudCandidate {
   uint32_t tie = 0;
 };
 
+#if defined(CHROMASPACE_HAS_CUDA)
+struct CudaIpcExportSlot {
+  void* devicePtr = nullptr;
+  std::size_t byteSize = 0;
+  int width = 0;
+  int height = 0;
+  std::uint64_t generation = 0;
+
+  ~CudaIpcExportSlot() {
+    if (devicePtr != nullptr) {
+      cudaFree(devicePtr);
+      devicePtr = nullptr;
+    }
+  }
+};
+#endif
+
 struct ViewerCloudTransportBlob {
   std::string name;
+  std::string transport = "shm";
+  std::filesystem::path filePath;
   std::size_t byteSize = 0;
+#if defined(CHROMASPACE_HAS_CUDA)
+  void* cudaDevicePtr = nullptr;
+  std::shared_ptr<CudaIpcExportSlot> cudaExportSlot;
+#endif
+#if defined(__APPLE__)
+  void* retainedIOSurface = nullptr;
+#endif
 #if defined(_WIN32)
   HANDLE mappingHandle = nullptr;
 #else
@@ -565,6 +592,22 @@ struct ViewerCloudTransportBlob {
     }
     if (!name.empty()) {
       shm_unlink(name.c_str());
+    }
+    if (!filePath.empty()) {
+      std::error_code ec;
+      std::filesystem::remove(filePath, ec);
+    }
+#if defined(__APPLE__)
+    if (retainedIOSurface != nullptr) {
+      CFRelease(static_cast<CFTypeRef>(retainedIOSurface));
+      retainedIOSurface = nullptr;
+    }
+#endif
+#endif
+#if defined(CHROMASPACE_HAS_CUDA)
+    if (cudaDevicePtr != nullptr && !cudaExportSlot) {
+      cudaFree(cudaDevicePtr);
+      cudaDevicePtr = nullptr;
     }
 #endif
   }
@@ -1632,6 +1675,18 @@ uint64_t fnv1a64Bytes(const void* data, std::size_t byteCount) {
     hash *= 1099511628211ull;
   }
   return hash;
+}
+
+std::string hexEncodeBytes(const void* data, std::size_t byteCount) {
+  static constexpr char kHex[] = "0123456789abcdef";
+  const auto* bytes = reinterpret_cast<const unsigned char*>(data);
+  std::string out;
+  out.reserve(byteCount * 2u);
+  for (std::size_t i = 0; i < byteCount; ++i) {
+    out.push_back(kHex[(bytes[i] >> 4) & 0x0f]);
+    out.push_back(kHex[bytes[i] & 0x0f]);
+  }
+  return out;
 }
 
 uint16_t floatToHalfBits(float value) {
@@ -3227,6 +3282,89 @@ class ChromaspaceEffect : public ImageEffect {
     const int qualityIndex = currentViewerRuntimeState().quality;
     const auto cloudNow = std::chrono::steady_clock::now();
 
+    if (sourceSignalOnlyPublicationEnabled()) {
+      // Raster-first viewer publication: the modern viewer derives plots from
+      // Source Signal GPU/IPC surfaces. Legacy input_cloud packets remain a
+      // fallback/debug lane (`CHROMASPACE_LEGACY_CLOUD_PUBLISH=1`) instead of
+      // being built and sent beside every resident source update.
+      const bool cudaSourceResidencyRequired =
+          args.isEnabledCudaRender && args.pCudaStream != nullptr &&
+          !sourceSignalCudaCpuFallbackEnabled();
+      CloudFootprintInfo sourceSignalFootprint{};
+      Image* sourceSignalImage = src.get();
+      std::unique_ptr<Image> fetchedSourceSignalImage;
+      bool sourceSignalFootprintValid =
+          sourceSignalImage &&
+          currentSourceFootprint(args.time, sourceSignalImage->getBounds(), false, &sourceSignalFootprint);
+      if (authoritativeRequested &&
+          (!sourceSignalFootprintValid ||
+           sourceSignalFootprint.coverageKind != CloudCoverageKind::Full) &&
+          srcClip_ != nullptr) {
+        const OfxRectD rod = srcClip_->getRegionOfDefinition(args.time);
+        fetchedSourceSignalImage.reset(srcClip_->fetchImage(args.time, rod));
+        if (fetchedSourceSignalImage &&
+            authoritativeImageMatchesLiveWindow(src.get(), fetchedSourceSignalImage.get(), args, "source-signal-full-fetch")) {
+          CloudFootprintInfo fetchedFootprint{};
+          if (currentSourceFootprint(args.time, fetchedSourceSignalImage->getBounds(), true, &fetchedFootprint)) {
+            sourceSignalImage = fetchedSourceSignalImage.get();
+            sourceSignalFootprint = fetchedFootprint;
+            sourceSignalFootprintValid = true;
+          }
+        }
+      }
+      if (sourceSignalFootprintValid &&
+          sourceSignalFootprint.fullWidth > 0 &&
+          sourceSignalFootprint.fullHeight > 0) {
+        if (sourceSignalFootprint.coverageKind == CloudCoverageKind::Full) {
+          sourceSignalFootprint.authoritative = true;
+        }
+        SourceSignalBuildResult sourceSignalBuilt =
+            buildViewerSourceSignalPayload(sourceSignalImage,
+                                           dst.get(),
+                                           args,
+                                           previewMode,
+                                           sourceId,
+                                           sourceSignalFootprint);
+        if (sourceSignalBuilt.success) {
+          enqueueSourceSignalMessage(
+              sourceSignalBuilt.payload,
+              firstHandoff ? "first-handoff/source-raster-only" : "steady-state/source-raster-only",
+              sourceSignalBuilt.fastBlob);
+          deferredLatestCloudRefresh_.store(false, std::memory_order_relaxed);
+          deferredAuthoritativeCloudRefresh_.store(false, std::memory_order_relaxed);
+          authoritativeOnlyCloudRefresh_.store(false, std::memory_order_relaxed);
+          lastCloudTime_ = args.time;
+          lastCloudBuiltAt_ = cloudNow;
+          lastCloudSourceId_ = sourceId;
+          lastCloudSettingsKey_ = settingsKey;
+          if (sourceSignalFootprint.authoritative) {
+            lastAuthoritativeCloudBuiltAt_ = cloudNow;
+            lastAuthoritativeCloudSourceId_ = sourceId;
+            lastAuthoritativeCloudSettingsKey_ = settingsKey;
+          }
+          cubeViewerInputCloudRefreshPending_ = false;
+          setStatusLabel("Updating");
+          cubeViewerDebugLog(std::string("Source Signal raster-only publication selected; skipped legacy input_cloud. backend=") +
+                             sourceSignalBuilt.backendName);
+          return;
+        }
+        if (cudaSourceResidencyRequired) {
+          cubeViewerDebugLog(
+              "Source Signal raster-only CUDA publication failed; legacy input_cloud fallback suppressed "
+              "(set CHROMASPACE_CUDA_SOURCE_CPU_FALLBACK=1 for diagnostic CUDA staging).");
+          return;
+        }
+        cubeViewerDebugLog("Source Signal raster-only publication failed; falling back to legacy input_cloud build.");
+      } else {
+        if (cudaSourceResidencyRequired) {
+          cubeViewerDebugLog(
+              "Source Signal raster-only CUDA publication had no valid source footprint; legacy input_cloud fallback suppressed.");
+          return;
+        }
+        cubeViewerDebugLog("Source Signal raster-only publication had no valid source footprint; falling back to legacy input_cloud build.");
+      }
+    }
+
     if (useConservativeCloudPath) {
       // Identity/ramp readback must sample the live callback source. In Fusion, a second
       // full-ROD fetch can resolve to a different upstream image than the MediaOut-fed
@@ -4140,6 +4278,10 @@ class ChromaspaceEffect : public ImageEffect {
   PendingMessage pendingCloud_;
   PendingMessage pendingSourceSignal_;
   std::deque<std::pair<std::chrono::steady_clock::time_point, std::shared_ptr<ViewerCloudTransportBlob>>> sentCloudBlobs_;
+#if defined(CHROMASPACE_HAS_CUDA)
+  std::vector<std::shared_ptr<CudaIpcExportSlot>> cudaIpcExportSlots_;
+  std::uint64_t cudaIpcExportGeneration_ = 0;
+#endif
   std::atomic<bool> cloudQueuedOrInFlight_{false};
   std::atomic<bool> deferredLatestCloudRefresh_{false};
   std::atomic<bool> deferredAuthoritativeCloudRefresh_{false};
@@ -4939,10 +5081,16 @@ class ChromaspaceEffect : public ImageEffect {
     state.circularHsv = getBoolValue("cubeViewerCircularHsv", time, state.circularHsv);
     state.normConeNormalized = getBoolValue("cubeViewerNormConeNormalized", time, state.normConeNormalized);
     state.plotDisplayLinear = getBoolValue("cubeViewerPlotDisplayLinear", time, state.plotDisplayLinear);
-    state.plotDisplayLinearTransfer =
-        getChoiceValue("cubeViewerPlotDisplayLinearTransfer",
-                       time,
-                       plotLinearTransferChoiceIndex(WorkshopColor::TransferFunctionId::Gamma24));
+    {
+      const int hostTransferChoice =
+          getChoiceValue("cubeViewerPlotDisplayLinearTransfer",
+                         time,
+                         plotLinearTransferChoiceIndex(WorkshopColor::TransferFunctionId::Gamma24));
+      const WorkshopColor::TransferFunctionId transferId =
+          plotLinearTransferIdFromChoice(hostTransferChoice);
+      state.plotDisplayLinearTransfer =
+          WorkshopColor::transferFunctionChoiceIndex(transferId);
+    }
     state.liveUpdate = getBoolValue("cubeViewerLive", time, state.liveUpdate);
     state.updateMode = getChoiceValue("cubeViewerUpdateMode", time, state.updateMode);
     state.quality = getChoiceValue("cubeViewerQuality", time, state.quality);
@@ -5554,11 +5702,11 @@ class ChromaspaceEffect : public ImageEffect {
   int currentPlotDisplayLinearTransferChoice(double time) const {
     (void)time;
     return std::clamp(currentViewerRuntimeState().plotDisplayLinearTransfer,
-                      0, static_cast<int>(plotLinearTransferChoices().size()) - 1);
+                      0, static_cast<int>(WorkshopColor::transferFunctionCount()) - 1);
   }
 
   WorkshopColor::TransferFunctionId currentPlotDisplayLinearTransferId(double time) const {
-    return plotLinearTransferIdFromChoice(currentPlotDisplayLinearTransferChoice(time));
+    return WorkshopColor::transferFunctionIdFromChoiceIndex(currentPlotDisplayLinearTransferChoice(time));
   }
 
   bool currentDrawOnImageMode(double time) {
@@ -7639,8 +7787,10 @@ class ChromaspaceEffect : public ImageEffect {
   std::shared_ptr<ViewerCloudTransportBlob> createTransportBlobFromBytes(
       const void* data,
       std::size_t byteSize,
-      uint64_t seq) {
+      uint64_t seq,
+      std::string* failureReason = nullptr) {
     if (!data || byteSize == 0) return {};
+    if (failureReason) failureReason->clear();
     const std::string baseName = buildCloudTransportName(seq);
     auto blob = std::make_shared<ViewerCloudTransportBlob>();
     blob->byteSize = byteSize;
@@ -7652,10 +7802,16 @@ class ChromaspaceEffect : public ImageEffect {
                                               static_cast<DWORD>(byteSize & 0xffffffffu),
                                               baseName.c_str());
     if (mapping == nullptr) {
+      if (failureReason) {
+        *failureReason = "CreateFileMapping failed error=" + std::to_string(GetLastError());
+      }
       return {};
     }
     void* mapped = MapViewOfFile(mapping, FILE_MAP_ALL_ACCESS, 0, 0, byteSize);
     if (!mapped) {
+      if (failureReason) {
+        *failureReason = "MapViewOfFile failed error=" + std::to_string(GetLastError());
+      }
       CloseHandle(mapping);
       return {};
     }
@@ -7666,6 +7822,7 @@ class ChromaspaceEffect : public ImageEffect {
 #else
     int fd = -1;
     std::string chosenName;
+    std::string shmFailureReason;
     for (int attempt = 0; attempt < 8; ++attempt) {
       std::ostringstream nameBuilder;
       nameBuilder << baseName;
@@ -7673,24 +7830,95 @@ class ChromaspaceEffect : public ImageEffect {
       chosenName = nameBuilder.str();
       fd = shm_open(chosenName.c_str(), O_CREAT | O_EXCL | O_RDWR, 0600);
       if (fd >= 0) break;
-      if (errno != EEXIST) return {};
+      if (errno != EEXIST) {
+        shmFailureReason = std::string("shm_open failed name=") + chosenName +
+                           " errno=" + std::to_string(errno) +
+                           " " + std::strerror(errno);
+        break;
+      }
     }
-    if (fd < 0) return {};
-    if (ftruncate(fd, static_cast<off_t>(byteSize)) != 0) {
+    if (fd < 0) {
+      if (shmFailureReason.empty()) {
+        shmFailureReason = "shm_open failed: all candidate names already exist";
+      }
+    } else if (ftruncate(fd, static_cast<off_t>(byteSize)) != 0) {
+      shmFailureReason = std::string("ftruncate failed bytes=") + std::to_string(byteSize) +
+                         " errno=" + std::to_string(errno) +
+                         " " + std::strerror(errno);
       ::close(fd);
       shm_unlink(chosenName.c_str());
+      fd = -1;
+    } else {
+      void* mapped = mmap(nullptr, byteSize, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+      if (mapped == MAP_FAILED) {
+        shmFailureReason = std::string("mmap failed bytes=") + std::to_string(byteSize) +
+                           " errno=" + std::to_string(errno) +
+                           " " + std::strerror(errno);
+        ::close(fd);
+        shm_unlink(chosenName.c_str());
+        fd = -1;
+      } else {
+        std::memcpy(mapped, data, byteSize);
+        munmap(mapped, byteSize);
+        blob->name = chosenName;
+        blob->fd = fd;
+        return blob;
+      }
+    }
+
+    const std::filesystem::path dir = std::filesystem::temp_directory_path();
+    std::filesystem::path path;
+    for (int attempt = 0; attempt < 32; ++attempt) {
+      std::ostringstream filename;
+      filename << "chromaspace_transport_" << std::hex << std::nouppercase
+               << fnv1a64(senderId_) << "_" << seq << "_" << static_cast<long>(::getpid());
+      if (attempt > 0) filename << "_" << attempt;
+      filename << ".bin";
+      path = dir / filename.str();
+      fd = ::open(path.string().c_str(), O_CREAT | O_EXCL | O_RDWR, 0600);
+      if (fd >= 0) break;
+      if (errno != EEXIST) {
+        if (failureReason) {
+          *failureReason = shmFailureReason + "; file open failed path=" + path.string() +
+                           " errno=" + std::to_string(errno) + " " + std::strerror(errno);
+        }
+        return {};
+      }
+    }
+    if (fd < 0) {
+      if (failureReason) {
+        *failureReason = shmFailureReason + "; file open failed: all candidate names already exist";
+      }
+      return {};
+    }
+    if (ftruncate(fd, static_cast<off_t>(byteSize)) != 0) {
+      if (failureReason) {
+        *failureReason = shmFailureReason + "; file ftruncate failed bytes=" + std::to_string(byteSize) +
+                         " errno=" + std::to_string(errno) + " " + std::strerror(errno);
+      }
+      ::close(fd);
+      std::error_code ec;
+      std::filesystem::remove(path, ec);
       return {};
     }
     void* mapped = mmap(nullptr, byteSize, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     if (mapped == MAP_FAILED) {
+      if (failureReason) {
+        *failureReason = shmFailureReason + "; file mmap failed bytes=" + std::to_string(byteSize) +
+                         " errno=" + std::to_string(errno) +
+                         " " + std::strerror(errno);
+      }
       ::close(fd);
-      shm_unlink(chosenName.c_str());
+      std::error_code ec;
+      std::filesystem::remove(path, ec);
       return {};
     }
     std::memcpy(mapped, data, byteSize);
     munmap(mapped, byteSize);
-    blob->name = chosenName;
+    blob->transport = "mmap_file";
+    blob->filePath = path;
     blob->fd = fd;
+    if (failureReason && !shmFailureReason.empty()) *failureReason = shmFailureReason;
 #endif
     return blob;
   }
@@ -7777,9 +8005,22 @@ class ChromaspaceEffect : public ImageEffect {
     if (outTransportMode) *outTransportMode = "json";
     if (shouldUseFastCloudTransport(samples.size())) {
       std::shared_ptr<ViewerCloudTransportBlob> blob = createCloudTransportBlob(samples, seq);
+      std::string transportFailureReason;
+      if (!blob && !samples.empty()) {
+        blob = createTransportBlobFromBytes(samples.data(),
+                                            samples.size() * sizeof(ViewerCloudSample),
+                                            seq,
+                                            &transportFailureReason);
+        if (!blob && !transportFailureReason.empty()) {
+          cubeViewerDebugLog(std::string("Input cloud binary transport failed bytes=") +
+                             std::to_string(samples.size() * sizeof(ViewerCloudSample)) +
+                             " reason=" + transportFailureReason +
+                             "; falling back to JSON");
+        }
+      }
       if (blob) {
         if (outBlob) *outBlob = blob;
-        if (outTransportMode) *outTransportMode = "shm";
+        if (outTransportMode) *outTransportMode = blob->transport;
         std::ostringstream oss;
         oss << "{\"type\":\"input_cloud\",\"seq\":" << seq
             << ",\"senderId\":\"" << jsonEscape(senderId_) << "\""
@@ -7788,7 +8029,7 @@ class ChromaspaceEffect : public ImageEffect {
             << ",\"paramHash\":\"" << jsonEscape(paramHash) << "\""
             << ",\"settingsKey\":\"" << jsonEscape(settingsKey) << "\""
             << ",\"contentHash\":" << contentHash
-            << ",\"transport\":\"shm\""
+            << ",\"transport\":\"" << jsonEscape(blob->transport) << "\""
             << ",\"pointCount\":" << samples.size()
             << ",\"primaryPointCount\":"
             << (primaryPointCount > 0 ? std::min(primaryPointCount, samples.size()) : samples.size())
@@ -7801,6 +8042,7 @@ class ChromaspaceEffect : public ImageEffect {
             << ",\"waveformContentHash\":" << waveformContentHash
             << ",\"pointStride\":" << sizeof(ViewerCloudSample)
             << ",\"shmName\":\"" << jsonEscape(blob->name) << "\""
+            << ",\"filePath\":\"" << jsonEscape(blob->filePath.string()) << "\""
             << ",\"shmSize\":" << blob->byteSize
             << "}\n";
         return oss.str();
@@ -7884,6 +8126,43 @@ class ChromaspaceEffect : public ImageEffect {
     return os.str();
   }
 
+  bool sourceSignalProxyDimensions(int sampledWidth,
+                                   int sampledHeight,
+                                   const CloudFootprintInfo& footprint,
+                                   bool previewMode,
+                                   int* proxyWidth,
+                                   int* proxyHeight,
+                                   int* proxyLongEdge,
+                                   bool* nativeTier) const {
+    if (!proxyWidth || !proxyHeight || !proxyLongEdge || !nativeTier ||
+        sampledWidth <= 0 || sampledHeight <= 0) {
+      return false;
+    }
+    const int sourceWidth = footprint.fullWidth > 0 ? footprint.fullWidth : sampledWidth;
+    const int sourceHeight = footprint.fullHeight > 0 ? footprint.fullHeight : sampledHeight;
+    bool localNativeTier = false;
+    const auto viewerState = currentViewerRuntimeState();
+    const int targetLongEdge =
+        sourceSignalTargetLongEdge(viewerState, sourceWidth, sourceHeight, previewMode, &localNativeTier);
+    if (targetLongEdge <= 0) return false;
+    const int sampledLongEdge = std::max(sampledWidth, sampledHeight);
+    const int requestedProxyLongEdge = std::min(sampledLongEdge, targetLongEdge);
+    int w = sampledWidth;
+    int h = sampledHeight;
+    if (sampledLongEdge > requestedProxyLongEdge) {
+      const double scale =
+          static_cast<double>(requestedProxyLongEdge) / static_cast<double>(sampledLongEdge);
+      w = std::max(1, static_cast<int>(std::lround(static_cast<double>(sampledWidth) * scale)));
+      h = std::max(1, static_cast<int>(std::lround(static_cast<double>(sampledHeight) * scale)));
+      localNativeTier = false;
+    }
+    *proxyWidth = w;
+    *proxyHeight = h;
+    *proxyLongEdge = requestedProxyLongEdge;
+    *nativeTier = localNativeTier;
+    return true;
+  }
+
   bool sourceSignalUsesRgba32f() const {
     const char* env = std::getenv("CHROMASPACE_SOURCE_SIGNAL_FORMAT");
     if (!env || env[0] == '\0') return false;
@@ -7892,6 +8171,444 @@ class ChromaspaceEffect : public ImageEffect {
                    [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
     return value == "rgba32f" || value == "float32" || value == "32f";
   }
+
+  bool sourceSignalOnlyPublicationEnabled() const {
+    const char* env = std::getenv("CHROMASPACE_LEGACY_CLOUD_PUBLISH");
+    if (!env || env[0] == '\0') return true;
+    std::string value(env);
+    std::transform(value.begin(), value.end(), value.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return !(value == "1" || value == "true" || value == "on" || value == "yes" ||
+             value == "legacy" || value == "cloud");
+  }
+
+  bool sourceSignalCudaCpuFallbackEnabled() const {
+    const char* env = std::getenv("CHROMASPACE_CUDA_SOURCE_CPU_FALLBACK");
+    if (!env || env[0] == '\0') return false;
+    std::string value(env);
+    std::transform(value.begin(), value.end(), value.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return value == "1" || value == "true" || value == "on" || value == "yes";
+  }
+
+  bool sourceSignalMetalCpuFallbackEnabled() const {
+    const char* env = std::getenv("CHROMASPACE_METAL_SOURCE_CPU_FALLBACK");
+    if (!env || env[0] == '\0') return false;
+    std::string value(env);
+    std::transform(value.begin(), value.end(), value.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return value == "1" || value == "true" || value == "on" || value == "yes";
+  }
+
+  bool cudaLegacyInputCloudCpuStagingAllowed() const {
+    // Legacy input_cloud packets serialize CPU-readable point samples. In CUDA
+    // raster-first sessions they are diagnostic-only, so the legacy-publish
+    // switch selects the old channel but does not by itself permit device-to-host
+    // staging. Source Signal IPC remains the default full-residency path.
+    return sourceSignalCudaCpuFallbackEnabled();
+  }
+
+  bool cudaLegacyInputCloudCpuStagingSuppressed(const RenderArguments& args) const {
+    return args.isEnabledCudaRender && args.pCudaStream != nullptr &&
+           !cudaLegacyInputCloudCpuStagingAllowed();
+  }
+
+#if defined(CHROMASPACE_HAS_CUDA) && defined(CHROMASPACE_PLUGIN_HAS_CUDA_KERNELS)
+  std::shared_ptr<CudaIpcExportSlot> acquireCudaIpcExportSlot(std::size_t byteSize,
+                                                              int width,
+                                                              int height,
+                                                              std::string* reason) {
+    if (byteSize == 0 || width <= 0 || height <= 0) {
+      if (reason) *reason = "invalid-cuda-ipc-export-slot-request";
+      return {};
+    }
+    std::lock_guard<std::mutex> lock(ioMutex_);
+    for (auto& slot : cudaIpcExportSlots_) {
+      if (!slot || slot.use_count() != 1) continue;
+      if (slot->devicePtr && slot->byteSize >= byteSize &&
+          slot->width == width && slot->height == height) {
+        ++slot->generation;
+        return slot;
+      }
+    }
+    auto slot = std::make_shared<CudaIpcExportSlot>();
+    const cudaError_t allocStatus = cudaMalloc(&slot->devicePtr, byteSize);
+    if (allocStatus != cudaSuccess || !slot->devicePtr) {
+      if (reason) {
+        *reason = std::string("cuda-ipc-export-slot-allocation failed: ") +
+                  cudaGetErrorString(allocStatus);
+      }
+      return {};
+    }
+    slot->byteSize = byteSize;
+    slot->width = width;
+    slot->height = height;
+    slot->generation = ++cudaIpcExportGeneration_;
+    cudaIpcExportSlots_.push_back(slot);
+    return slot;
+  }
+#endif
+
+  SourceSignalBuildResult buildSourceSignalPayloadFromPreparedProxy(
+      const float* proxyRgba32f,
+      size_t proxyRowBytes,
+      int proxyWidth,
+      int proxyHeight,
+      int sampledWidthForMetadata,
+      int sampledHeightForMetadata,
+      const CloudFootprintInfo& footprint,
+      double time,
+      const std::string& sourceId,
+      const std::string& backendName,
+      bool nativeTier,
+      int proxyLongEdge) {
+    (void)time;
+    SourceSignalBuildResult out{};
+    if (!proxyRgba32f || proxyWidth <= 0 || proxyHeight <= 0 ||
+        sampledWidthForMetadata <= 0 || sampledHeightForMetadata <= 0 ||
+        sourceId.empty() || proxyLongEdge <= 0) {
+      return out;
+    }
+    const size_t packedProxyRowBytes = static_cast<size_t>(proxyWidth) * 4u * sizeof(float);
+    if (proxyRowBytes == 0) proxyRowBytes = packedProxyRowBytes;
+    if (proxyRowBytes < packedProxyRowBytes) return out;
+
+    const int sourceWidth = footprint.fullWidth > 0 ? footprint.fullWidth : sampledWidthForMetadata;
+    const int sourceHeight = footprint.fullHeight > 0 ? footprint.fullHeight : sampledHeightForMetadata;
+    const std::size_t pixelCount =
+        static_cast<std::size_t>(proxyWidth) * static_cast<std::size_t>(proxyHeight);
+    const bool rgba32f = sourceSignalUsesRgba32f();
+    const std::size_t scalarBytes = rgba32f ? sizeof(float) : sizeof(uint16_t);
+    if (pixelCount == 0 || pixelCount > (std::numeric_limits<std::size_t>::max() / (4u * scalarBytes))) {
+      return out;
+    }
+
+    std::vector<uint16_t> rgba16f;
+    std::vector<float> rgba32;
+    if (rgba32f) {
+      rgba32.assign(pixelCount * 4u, 0.0f);
+    } else {
+      rgba16f.assign(pixelCount * 4u, 0);
+    }
+    for (int y = 0; y < proxyHeight; ++y) {
+      const char* rowBytes = reinterpret_cast<const char*>(proxyRgba32f) +
+                             static_cast<size_t>(y) * proxyRowBytes;
+      const float* row = reinterpret_cast<const float*>(rowBytes);
+      for (int x = 0; x < proxyWidth; ++x) {
+        const std::size_t dst =
+            (static_cast<std::size_t>(y) * static_cast<std::size_t>(proxyWidth) +
+             static_cast<std::size_t>(x)) *
+            4u;
+        const float* src = row + static_cast<size_t>(x) * 4u;
+        for (int c = 0; c < 4; ++c) {
+          const float value = std::isfinite(src[c]) ? src[c] : (c == 3 ? 1.0f : 0.0f);
+          if (rgba32f) {
+            rgba32[dst + static_cast<std::size_t>(c)] = value;
+          } else {
+            rgba16f[dst + static_cast<std::size_t>(c)] = floatToHalfBits(value);
+          }
+        }
+      }
+    }
+
+    const uint64_t seq = gSharedCubeViewerSeqCounter.fetch_add(1, std::memory_order_relaxed);
+    const void* sourceBytes = rgba32f ? static_cast<const void*>(rgba32.data())
+                                      : static_cast<const void*>(rgba16f.data());
+    const std::size_t sourceByteCount =
+        rgba32f ? rgba32.size() * sizeof(float) : rgba16f.size() * sizeof(uint16_t);
+    const uint64_t contentHash = fnv1a64Bytes(sourceBytes, sourceByteCount);
+    std::string failureReason;
+    std::shared_ptr<ViewerCloudTransportBlob> blob =
+        createTransportBlobFromBytes(sourceBytes, sourceByteCount, seq, &failureReason);
+    if (!blob) {
+      cubeViewerDebugLog(std::string("Source Signal prepared proxy transport failed bytes=") +
+                         std::to_string(sourceByteCount) +
+                         " proxy=" + std::to_string(proxyWidth) + "x" + std::to_string(proxyHeight) +
+                         " backend=" + backendName +
+                         " reason=" + (failureReason.empty() ? "unknown" : failureReason));
+      return out;
+    }
+
+    const bool fullCoverage = footprint.coverageKind == CloudCoverageKind::Full;
+    const std::string coverage = fullCoverage ? "full" : "partial-preview";
+    const int readResolution = clampOverlayCubeSize(currentIdentityReadResolution(time));
+    int stripHeight = 0;
+    int cubeY1 = 0;
+    int cubeY2 = 0;
+    int rampY1 = 0;
+    int rampY2 = 0;
+    const OfxRectI fullBounds{footprint.fullX1,
+                              footprint.fullY1,
+                              footprint.fullX1 + sourceWidth,
+                              footprint.fullY1 + sourceHeight};
+    const bool hasPublishedStrip =
+        currentPublishedGeneratedIdentityStripLayout(fullBounds,
+                                                     readResolution,
+                                                     &stripHeight,
+                                                     &cubeY1,
+                                                     &cubeY2,
+                                                     &rampY1,
+                                                     &rampY2);
+
+    std::ostringstream os;
+    os << "{\"type\":\"source_signal\",\"seq\":" << seq
+       << ",\"senderId\":\"" << jsonEscape(senderId_) << "\""
+       << ",\"sourceWidth\":" << sourceWidth
+       << ",\"sourceHeight\":" << sourceHeight
+       << ",\"proxyWidth\":" << proxyWidth
+       << ",\"proxyHeight\":" << proxyHeight
+       << ",\"sampledX1\":" << footprint.sampledX1
+       << ",\"sampledY1\":" << footprint.sampledY1
+       << ",\"sampledWidth\":" << sampledWidthForMetadata
+       << ",\"sampledHeight\":" << sampledHeightForMetadata
+       << ",\"pixelFormat\":\"" << (rgba32f ? "rgba32f" : "rgba16f") << "\""
+       << ",\"transport\":\"" << jsonEscape(blob->transport) << "\""
+       << ",\"coverage\":\"" << coverage << "\""
+       << ",\"tier\":\"" << jsonEscape(sourceSignalTierLabel(nativeTier, proxyLongEdge)) << "\""
+       << ",\"backend\":\"" << jsonEscape(backendName) << "\""
+       << ",\"contentHash\":" << contentHash
+       << ",\"shmName\":\"" << jsonEscape(blob->name) << "\""
+       << ",\"filePath\":\"" << jsonEscape(blob->filePath.string()) << "\""
+       << ",\"shmSize\":" << blob->byteSize
+       << ",\"identityStrip\":{\"present\":" << (hasPublishedStrip ? 1 : 0)
+       << ",\"resolution\":" << readResolution
+       << ",\"drawCube\":" << gSharedGeneratedIdentityStripDrawCube.load(std::memory_order_relaxed)
+       << ",\"drawRamp\":" << gSharedGeneratedIdentityStripDrawRamp.load(std::memory_order_relaxed)
+       << ",\"stripHeight\":" << stripHeight
+       << ",\"cubeY1\":" << cubeY1
+       << ",\"cubeY2\":" << cubeY2
+       << ",\"rampY1\":" << rampY1
+       << ",\"rampY2\":" << rampY2
+       << "}}\n";
+    out.payload = os.str();
+    out.fastBlob = std::move(blob);
+    out.backendName = backendName;
+    out.contentHash = contentHash;
+    out.sourceWidth = sourceWidth;
+    out.sourceHeight = sourceHeight;
+    out.proxyWidth = proxyWidth;
+    out.proxyHeight = proxyHeight;
+    out.coverageKind = footprint.coverageKind;
+    out.nativeTier = nativeTier;
+    out.success = true;
+    return out;
+  }
+
+#if defined(__APPLE__)
+  SourceSignalBuildResult buildSourceSignalPayloadFromSharedSurface(
+      const ChromaspaceMetal::SharedSourceSignalSurface& surface,
+      int sampledWidthForMetadata,
+      int sampledHeightForMetadata,
+      const CloudFootprintInfo& footprint,
+      double time,
+      const std::string& sourceId,
+      const std::string& backendName,
+      bool nativeTier,
+      int proxyLongEdge) {
+    (void)time;
+    SourceSignalBuildResult out{};
+    if (surface.surfaceId == 0 || surface.width <= 0 || surface.height <= 0 ||
+        sampledWidthForMetadata <= 0 || sampledHeightForMetadata <= 0 ||
+        sourceId.empty() || proxyLongEdge <= 0 || surface.retainedSurface == nullptr) {
+      return out;
+    }
+
+    const int sourceWidth = footprint.fullWidth > 0 ? footprint.fullWidth : sampledWidthForMetadata;
+    const int sourceHeight = footprint.fullHeight > 0 ? footprint.fullHeight : sampledHeightForMetadata;
+    const uint64_t seq = gSharedCubeViewerSeqCounter.fetch_add(1, std::memory_order_relaxed);
+    std::ostringstream hashKey;
+    hashKey << sourceId << "|seq=" << seq
+            << "|surface=" << surface.surfaceId
+            << "|source=" << sourceWidth << "x" << sourceHeight
+            << "|proxy=" << surface.width << "x" << surface.height
+            << "|format=" << surface.pixelFormat;
+    const uint64_t contentHash = fnv1a64(hashKey.str());
+
+    auto blob = std::make_shared<ViewerCloudTransportBlob>();
+    blob->transport = "iosurface_metal";
+    blob->byteSize = surface.byteSize;
+    blob->retainedIOSurface = surface.retainedSurface;
+
+    const bool fullCoverage = footprint.coverageKind == CloudCoverageKind::Full;
+    const std::string coverage = fullCoverage ? "full" : "partial-preview";
+    const int readResolution = clampOverlayCubeSize(currentIdentityReadResolution(time));
+    int stripHeight = 0;
+    int cubeY1 = 0;
+    int cubeY2 = 0;
+    int rampY1 = 0;
+    int rampY2 = 0;
+    const OfxRectI fullBounds{footprint.fullX1,
+                              footprint.fullY1,
+                              footprint.fullX1 + sourceWidth,
+                              footprint.fullY1 + sourceHeight};
+    const bool hasPublishedStrip =
+        currentPublishedGeneratedIdentityStripLayout(fullBounds,
+                                                     readResolution,
+                                                     &stripHeight,
+                                                     &cubeY1,
+                                                     &cubeY2,
+                                                     &rampY1,
+                                                     &rampY2);
+
+    const char* pixelFormat = surface.pixelFormat == 1 ? "rgba32f" : "rgba16f";
+    std::ostringstream os;
+    os << "{\"type\":\"source_signal\",\"seq\":" << seq
+       << ",\"senderId\":\"" << jsonEscape(senderId_) << "\""
+       << ",\"sourceWidth\":" << sourceWidth
+       << ",\"sourceHeight\":" << sourceHeight
+       << ",\"proxyWidth\":" << surface.width
+       << ",\"proxyHeight\":" << surface.height
+       << ",\"sampledX1\":" << footprint.sampledX1
+       << ",\"sampledY1\":" << footprint.sampledY1
+       << ",\"sampledWidth\":" << sampledWidthForMetadata
+       << ",\"sampledHeight\":" << sampledHeightForMetadata
+       << ",\"pixelFormat\":\"" << pixelFormat << "\""
+       << ",\"transport\":\"iosurface_metal\""
+       << ",\"surfaceId\":" << surface.surfaceId
+       << ",\"surfaceWidth\":" << surface.width
+       << ",\"surfaceHeight\":" << surface.height
+       << ",\"surfacePixelFormat\":" << surface.pixelFormat
+       << ",\"coverage\":\"" << coverage << "\""
+       << ",\"tier\":\"" << jsonEscape(sourceSignalTierLabel(nativeTier, proxyLongEdge)) << "\""
+       << ",\"backend\":\"" << jsonEscape(backendName) << "\""
+       << ",\"contentHash\":" << contentHash
+       << ",\"shmSize\":" << surface.byteSize
+       << ",\"identityStrip\":{\"present\":" << (hasPublishedStrip ? 1 : 0)
+       << ",\"resolution\":" << readResolution
+       << ",\"drawCube\":" << gSharedGeneratedIdentityStripDrawCube.load(std::memory_order_relaxed)
+       << ",\"drawRamp\":" << gSharedGeneratedIdentityStripDrawRamp.load(std::memory_order_relaxed)
+       << ",\"stripHeight\":" << stripHeight
+       << ",\"cubeY1\":" << cubeY1
+       << ",\"cubeY2\":" << cubeY2
+       << ",\"rampY1\":" << rampY1
+       << ",\"rampY2\":" << rampY2
+       << "}}\n";
+    out.payload = os.str();
+    out.fastBlob = std::move(blob);
+    out.backendName = backendName;
+    out.contentHash = contentHash;
+    out.sourceWidth = sourceWidth;
+    out.sourceHeight = sourceHeight;
+    out.proxyWidth = surface.width;
+    out.proxyHeight = surface.height;
+    out.coverageKind = footprint.coverageKind;
+    out.nativeTier = nativeTier;
+    out.success = true;
+    return out;
+  }
+#endif
+
+#if defined(CHROMASPACE_HAS_CUDA) && defined(CHROMASPACE_PLUGIN_HAS_CUDA_KERNELS)
+  SourceSignalBuildResult buildSourceSignalPayloadFromCudaIpcProxy(
+      ChromaspaceCloudCuda::SourceProxyResult* proxy,
+      std::shared_ptr<CudaIpcExportSlot> exportSlot,
+      int proxyWidth,
+      int proxyHeight,
+      int sampledWidthForMetadata,
+      int sampledHeightForMetadata,
+      const CloudFootprintInfo& footprint,
+      double time,
+      const std::string& sourceId,
+      const std::string& backendName,
+      bool nativeTier,
+      int proxyLongEdge) {
+    SourceSignalBuildResult out{};
+    if (!proxy || !proxy->success || proxy->hasIpcHandle == 0 || !proxy->devicePtr ||
+        proxy->byteSize == 0 || proxyWidth <= 0 || proxyHeight <= 0 ||
+        sampledWidthForMetadata <= 0 || sampledHeightForMetadata <= 0 ||
+        sourceId.empty() || proxyLongEdge <= 0) {
+      return out;
+    }
+
+    const int sourceWidth = footprint.fullWidth > 0 ? footprint.fullWidth : sampledWidthForMetadata;
+    const int sourceHeight = footprint.fullHeight > 0 ? footprint.fullHeight : sampledHeightForMetadata;
+    const uint64_t seq = gSharedCubeViewerSeqCounter.fetch_add(1, std::memory_order_relaxed);
+    const std::string handleHex = hexEncodeBytes(&proxy->ipcHandle, sizeof(proxy->ipcHandle));
+    std::ostringstream hashKey;
+    hashKey << sourceId << "|seq=" << seq
+            << "|cudaIpc=" << handleHex
+            << "|source=" << sourceWidth << "x" << sourceHeight
+            << "|proxy=" << proxyWidth << "x" << proxyHeight
+            << "|bytes=" << proxy->byteSize;
+    const uint64_t contentHash = fnv1a64(hashKey.str());
+
+    auto blob = std::make_shared<ViewerCloudTransportBlob>();
+    blob->transport = "cuda_ipc";
+    blob->byteSize = proxy->byteSize;
+    if (exportSlot) {
+      blob->cudaExportSlot = std::move(exportSlot);
+      blob->cudaDevicePtr = blob->cudaExportSlot->devicePtr;
+    } else {
+      blob->cudaDevicePtr = proxy->devicePtr;
+      proxy->devicePtr = nullptr;
+    }
+
+    const bool fullCoverage = footprint.coverageKind == CloudCoverageKind::Full;
+    const std::string coverage = fullCoverage ? "full" : "partial-preview";
+    const int readResolution = clampOverlayCubeSize(currentIdentityReadResolution(time));
+    int stripHeight = 0;
+    int cubeY1 = 0;
+    int cubeY2 = 0;
+    int rampY1 = 0;
+    int rampY2 = 0;
+    const OfxRectI fullBounds{footprint.fullX1,
+                              footprint.fullY1,
+                              footprint.fullX1 + sourceWidth,
+                              footprint.fullY1 + sourceHeight};
+    const bool hasPublishedStrip =
+        currentPublishedGeneratedIdentityStripLayout(fullBounds,
+                                                     readResolution,
+                                                     &stripHeight,
+                                                     &cubeY1,
+                                                     &cubeY2,
+                                                     &rampY1,
+                                                     &rampY2);
+
+    std::ostringstream os;
+    os << "{\"type\":\"source_signal\",\"seq\":" << seq
+       << ",\"senderId\":\"" << jsonEscape(senderId_) << "\""
+       << ",\"sourceWidth\":" << sourceWidth
+       << ",\"sourceHeight\":" << sourceHeight
+       << ",\"proxyWidth\":" << proxyWidth
+       << ",\"proxyHeight\":" << proxyHeight
+       << ",\"sampledX1\":" << footprint.sampledX1
+       << ",\"sampledY1\":" << footprint.sampledY1
+       << ",\"sampledWidth\":" << sampledWidthForMetadata
+       << ",\"sampledHeight\":" << sampledHeightForMetadata
+       << ",\"pixelFormat\":\"rgba32f\""
+       << ",\"transport\":\"cuda_ipc\""
+       << ",\"cudaIpcHandle\":\"" << handleHex << "\""
+       << ",\"cudaIpcByteSize\":" << proxy->byteSize
+       << ",\"cudaIpcRowBytes\":" << proxy->rowBytes
+       << ",\"coverage\":\"" << coverage << "\""
+       << ",\"tier\":\"" << jsonEscape(sourceSignalTierLabel(nativeTier, proxyLongEdge)) << "\""
+       << ",\"backend\":\"" << jsonEscape(backendName) << "\""
+       << ",\"contentHash\":" << contentHash
+       << ",\"shmSize\":" << proxy->byteSize
+       << ",\"identityStrip\":{\"present\":" << (hasPublishedStrip ? 1 : 0)
+       << ",\"resolution\":" << readResolution
+       << ",\"drawCube\":" << gSharedGeneratedIdentityStripDrawCube.load(std::memory_order_relaxed)
+       << ",\"drawRamp\":" << gSharedGeneratedIdentityStripDrawRamp.load(std::memory_order_relaxed)
+       << ",\"stripHeight\":" << stripHeight
+       << ",\"cubeY1\":" << cubeY1
+       << ",\"cubeY2\":" << cubeY2
+       << ",\"rampY1\":" << rampY1
+       << ",\"rampY2\":" << rampY2
+       << "}}\n";
+    out.payload = os.str();
+    out.fastBlob = std::move(blob);
+    out.backendName = backendName;
+    out.contentHash = contentHash;
+    out.sourceWidth = sourceWidth;
+    out.sourceHeight = sourceHeight;
+    out.proxyWidth = proxyWidth;
+    out.proxyHeight = proxyHeight;
+    out.coverageKind = footprint.coverageKind;
+    out.nativeTier = nativeTier;
+    out.success = true;
+    return out;
+  }
+#endif
 
   template <typename FetchPixelFn>
   SourceSignalBuildResult buildSourceSignalPayloadFromPixelFetcher(
@@ -7914,29 +8631,34 @@ class ChromaspaceEffect : public ImageEffect {
         sourceSignalTargetLongEdge(viewerState, sourceWidth, sourceHeight, previewMode, &nativeTier);
     if (targetLongEdge <= 0) return out;
     const int sampledLongEdge = std::max(sampledWidth, sampledHeight);
-    const int proxyLongEdge = std::min(sampledLongEdge, targetLongEdge);
-    int proxyWidth = sampledWidth;
-    int proxyHeight = sampledHeight;
-    if (sampledLongEdge > proxyLongEdge) {
-      const double scale = static_cast<double>(proxyLongEdge) / static_cast<double>(sampledLongEdge);
-      proxyWidth = std::max(1, static_cast<int>(std::lround(static_cast<double>(sampledWidth) * scale)));
-      proxyHeight = std::max(1, static_cast<int>(std::lround(static_cast<double>(sampledHeight) * scale)));
-      nativeTier = false;
-    }
-    const std::size_t pixelCount =
-        static_cast<std::size_t>(proxyWidth) * static_cast<std::size_t>(proxyHeight);
-    const bool rgba32f = sourceSignalUsesRgba32f();
-    const std::size_t scalarBytes = rgba32f ? sizeof(float) : sizeof(uint16_t);
-    if (pixelCount == 0 || pixelCount > (std::numeric_limits<std::size_t>::max() / (4u * scalarBytes))) {
-      return out;
-    }
-    std::vector<uint16_t> rgba16f;
-    std::vector<float> rgba32;
-    if (rgba32f) {
-      rgba32.assign(pixelCount * 4u, 0.0f);
-    } else {
-      rgba16f.assign(pixelCount * 4u, 0);
-    }
+    const int requestedProxyLongEdge = std::min(sampledLongEdge, targetLongEdge);
+    int attemptProxyLongEdge = requestedProxyLongEdge;
+    std::string lastFailureReason;
+    for (;;) {
+      bool attemptNativeTier = nativeTier;
+      const int proxyLongEdge = attemptProxyLongEdge;
+      int proxyWidth = sampledWidth;
+      int proxyHeight = sampledHeight;
+      if (sampledLongEdge > proxyLongEdge) {
+        const double scale = static_cast<double>(proxyLongEdge) / static_cast<double>(sampledLongEdge);
+        proxyWidth = std::max(1, static_cast<int>(std::lround(static_cast<double>(sampledWidth) * scale)));
+        proxyHeight = std::max(1, static_cast<int>(std::lround(static_cast<double>(sampledHeight) * scale)));
+        attemptNativeTier = false;
+      }
+      const std::size_t pixelCount =
+          static_cast<std::size_t>(proxyWidth) * static_cast<std::size_t>(proxyHeight);
+      const bool rgba32f = sourceSignalUsesRgba32f();
+      const std::size_t scalarBytes = rgba32f ? sizeof(float) : sizeof(uint16_t);
+      if (pixelCount == 0 || pixelCount > (std::numeric_limits<std::size_t>::max() / (4u * scalarBytes))) {
+        return out;
+      }
+      std::vector<uint16_t> rgba16f;
+      std::vector<float> rgba32;
+      if (rgba32f) {
+        rgba32.assign(pixelCount * 4u, 0.0f);
+      } else {
+        rgba16f.assign(pixelCount * 4u, 0);
+      }
 
     auto readPixel = [&](int x, int y, std::array<float, 4>* rgba) -> bool {
       if (!rgba) return false;
@@ -7999,11 +8721,26 @@ class ChromaspaceEffect : public ImageEffect {
         rgba32f ? rgba32.size() * sizeof(float) : rgba16f.size() * sizeof(uint16_t);
     const uint64_t contentHash = fnv1a64Bytes(sourceBytes, sourceByteCount);
     std::shared_ptr<ViewerCloudTransportBlob> blob =
-        createTransportBlobFromBytes(sourceBytes, sourceByteCount, seq);
+        createTransportBlobFromBytes(sourceBytes, sourceByteCount, seq, &lastFailureReason);
     if (!blob) {
+      const int nextProxyLongEdge =
+          attemptProxyLongEdge > 1024 ? std::max(1024, attemptProxyLongEdge / 2)
+                                      : (attemptProxyLongEdge > 512 ? 512 : 0);
+      if (nextProxyLongEdge > 0 && nextProxyLongEdge < attemptProxyLongEdge) {
+        cubeViewerDebugLog(std::string("Source Signal shared-memory allocation failed bytes=") +
+                           std::to_string(sourceByteCount) +
+                           " proxy=" + std::to_string(proxyWidth) + "x" + std::to_string(proxyHeight) +
+                           " backend=" + backendName +
+                           " reason=" + (lastFailureReason.empty() ? "unknown" : lastFailureReason) +
+                           "; retrying proxyLongEdge=" + std::to_string(nextProxyLongEdge));
+        attemptProxyLongEdge = nextProxyLongEdge;
+        continue;
+      }
       cubeViewerDebugLog(std::string("Source Signal build failed: shared-memory allocation failed bytes=") +
                          std::to_string(sourceByteCount) +
-                         " backend=" + backendName);
+                         " proxy=" + std::to_string(proxyWidth) + "x" + std::to_string(proxyHeight) +
+                         " backend=" + backendName +
+                         " reason=" + (lastFailureReason.empty() ? "unknown" : lastFailureReason));
       return out;
     }
 
@@ -8039,12 +8776,13 @@ class ChromaspaceEffect : public ImageEffect {
        << ",\"sampledWidth\":" << sampledWidth
        << ",\"sampledHeight\":" << sampledHeight
        << ",\"pixelFormat\":\"" << (rgba32f ? "rgba32f" : "rgba16f") << "\""
-       << ",\"transport\":\"shm\""
+       << ",\"transport\":\"" << jsonEscape(blob->transport) << "\""
        << ",\"coverage\":\"" << coverage << "\""
-       << ",\"tier\":\"" << jsonEscape(sourceSignalTierLabel(nativeTier, proxyLongEdge)) << "\""
+       << ",\"tier\":\"" << jsonEscape(sourceSignalTierLabel(attemptNativeTier, proxyLongEdge)) << "\""
        << ",\"backend\":\"" << jsonEscape(backendName) << "\""
        << ",\"contentHash\":" << contentHash
        << ",\"shmName\":\"" << jsonEscape(blob->name) << "\""
+       << ",\"filePath\":\"" << jsonEscape(blob->filePath.string()) << "\""
        << ",\"shmSize\":" << blob->byteSize
        << ",\"identityStrip\":{\"present\":" << (hasPublishedStrip ? 1 : 0)
        << ",\"resolution\":" << readResolution
@@ -8065,8 +8803,10 @@ class ChromaspaceEffect : public ImageEffect {
     out.proxyWidth = proxyWidth;
     out.proxyHeight = proxyHeight;
     out.coverageKind = footprint.coverageKind;
-    out.nativeTier = nativeTier;
+    out.nativeTier = attemptNativeTier;
     out.success = true;
+    return out;
+    }
     return out;
   }
 
@@ -8379,6 +9119,13 @@ class ChromaspaceEffect : public ImageEffect {
       if (reason) *reason = "invalid-source";
       return false;
     }
+    if (!cudaLegacyInputCloudCpuStagingAllowed()) {
+      if (reason) *reason = "cuda-legacy-input-cloud-staging-disabled";
+      cubeViewerDebugLog(
+          "Legacy input_cloud CUDA sample-kernel path suppressed "
+          "(set CHROMASPACE_CUDA_SOURCE_CPU_FALLBACK=1 for diagnostic staging).");
+      return false;
+    }
 
     const int scaledWidth = std::max(1, static_cast<int>(std::lround(static_cast<double>(request.width) * request.scaleFactor)));
     const int scaledHeight = std::max(1, static_cast<int>(std::lround(static_cast<double>(request.height) * request.scaleFactor)));
@@ -8545,6 +9292,13 @@ class ChromaspaceEffect : public ImageEffect {
     }
     if (!args.isEnabledCudaRender || args.pCudaStream == nullptr || src->getPixelData() == nullptr) {
       if (reason) *reason = "cuda-unavailable";
+      return false;
+    }
+    if (!cudaLegacyInputCloudCpuStagingAllowed()) {
+      if (reason) *reason = "cuda-legacy-strip-staging-disabled";
+      cubeViewerDebugLog(
+          "Legacy identity-strip input_cloud CUDA sample-kernel path suppressed "
+          "(set CHROMASPACE_CUDA_SOURCE_CPU_FALLBACK=1 for diagnostic staging).");
       return false;
     }
     const OfxRectI bounds = src->getBounds();
@@ -10204,6 +10958,12 @@ class ChromaspaceEffect : public ImageEffect {
 #if defined(CHROMASPACE_HAS_CUDA)
     CloudBuildResult out{};
     if (!args.isEnabledCudaRender || args.pCudaStream == nullptr || !src) return out;
+    if (!cudaLegacyInputCloudCpuStagingAllowed()) {
+      cubeViewerDebugLog(
+          "Legacy preview input_cloud CUDA readback suppressed "
+          "(set CHROMASPACE_CUDA_SOURCE_CPU_FALLBACK=1 for diagnostic staging).");
+      return out;
+    }
     const void* srcRaw = src->getPixelData();
     if (!srcRaw) return out;
     const OfxRectI bounds = src->getBounds();
@@ -10356,6 +11116,12 @@ class ChromaspaceEffect : public ImageEffect {
     if (!src) return {};
     const bool stableSamplingMode = currentGlossViewPlotMode(args.time);
     const bool effectivePreviewMode = stableSamplingMode ? false : previewMode;
+    if (cudaLegacyInputCloudCpuStagingSuppressed(args)) {
+      cubeViewerDebugLog(
+          "Legacy preview input_cloud CUDA staging suppressed; Source Signal IPC is the CUDA-resident path "
+          "(set CHROMASPACE_CUDA_SOURCE_CPU_FALLBACK=1 for diagnostics).");
+      return {};
+    }
     if (args.isEnabledCudaRender && args.pCudaStream != nullptr) {
       CloudBuildResult cudaPreview = buildPreviewCloudPayloadFromCudaReadback(src, args, effectivePreviewMode, footprint);
       if (cudaPreview.success) return cudaPreview;
@@ -10382,6 +11148,12 @@ class ChromaspaceEffect : public ImageEffect {
 #if defined(CHROMASPACE_HAS_CUDA)
     CloudBuildResult out{};
     if (!args.isEnabledCudaRender || args.pCudaStream == nullptr || !src) return out;
+    if (!cudaLegacyInputCloudCpuStagingAllowed()) {
+      cubeViewerDebugLog(
+          "Legacy input_cloud CUDA readback suppressed "
+          "(set CHROMASPACE_CUDA_SOURCE_CPU_FALLBACK=1 for diagnostic staging).");
+      return out;
+    }
     const void* srcRaw = src->getPixelData();
     if (!srcRaw) return out;
     int fullWidth = 0;
@@ -10430,6 +11202,12 @@ class ChromaspaceEffect : public ImageEffect {
 #if defined(CHROMASPACE_HAS_CUDA)
     CloudBuildResult out{};
     if (!args.isEnabledCudaRender || args.pCudaStream == nullptr || !src) return out;
+    if (!cudaLegacyInputCloudCpuStagingAllowed()) {
+      cubeViewerDebugLog(
+          "Legacy identity-strip input_cloud CUDA readback suppressed "
+          "(set CHROMASPACE_CUDA_SOURCE_CPU_FALLBACK=1 for diagnostic staging).");
+      return out;
+    }
     const void* srcRaw = src->getPixelData();
     if (!srcRaw) return out;
     int fullWidth = 0;
@@ -10604,6 +11382,12 @@ class ChromaspaceEffect : public ImageEffect {
         currentVolumeSlicingMode(args.time) == VolumeSlicingMode::LassoRegion;
     const LassoRegionState imageLassoState = imageLassoActive ? currentLassoRegionState(args.time) : LassoRegionState{};
     const LassoRegionState* gpuLassoState = imageLassoActive ? &imageLassoState : nullptr;
+    if (cudaLegacyInputCloudCpuStagingSuppressed(args)) {
+      cubeViewerDebugLog(
+          "Legacy input_cloud CUDA path suppressed before sample generation; Source Signal IPC is the CUDA-resident path "
+          "(set CHROMASPACE_CUDA_SOURCE_CPU_FALLBACK=1 for diagnostics).");
+      return {};
+    }
 #if defined(CHROMASPACE_PLUGIN_HAS_CUDA_KERNELS)
     if (useInstance1Requested &&
         args.isEnabledCudaRender && args.pCudaStream != nullptr && src->getPixelData() != nullptr) {
@@ -10888,7 +11672,7 @@ class ChromaspaceEffect : public ImageEffect {
     return cpuBuilt;
   }
 
-  SourceSignalBuildResult buildSourceSignalPayloadFromCudaReadback(
+  SourceSignalBuildResult buildSourceSignalPayloadFromCudaResidentOrFallback(
       Image* src,
       const RenderArguments& args,
       bool previewMode,
@@ -10897,6 +11681,7 @@ class ChromaspaceEffect : public ImageEffect {
 #if defined(CHROMASPACE_HAS_CUDA)
     SourceSignalBuildResult out{};
     if (!args.isEnabledCudaRender || args.pCudaStream == nullptr || !src) return out;
+    const bool allowCudaCpuFallback = sourceSignalCudaCpuFallbackEnabled();
     const void* srcRaw = src->getPixelData();
     if (!srcRaw) return out;
     int width = 0;
@@ -10907,13 +11692,157 @@ class ChromaspaceEffect : public ImageEffect {
     size_t srcRowBytes = static_cast<size_t>(std::abs(src->getRowBytes()));
     const size_t packedRowBytes = static_cast<size_t>(width) * 4u * sizeof(float);
     if (srcRowBytes == 0) srcRowBytes = packedRowBytes;
-    if (!ensureStageBuffer(static_cast<size_t>(width) * static_cast<size_t>(height))) return out;
-    float* readback = stageSrcPtr();
-    if (!readback) return out;
     const size_t offset =
         static_cast<size_t>(y1) * srcRowBytes + static_cast<size_t>(x1) * 4u * sizeof(float);
     const char* srcBytes = reinterpret_cast<const char*>(srcRaw) + offset;
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(args.pCudaStream);
+#if defined(CHROMASPACE_PLUGIN_HAS_CUDA_KERNELS)
+    {
+      const int sourceWidth = footprint.fullWidth > 0 ? footprint.fullWidth : width;
+      const int sourceHeight = footprint.fullHeight > 0 ? footprint.fullHeight : height;
+      bool nativeTier = false;
+      const auto viewerState = currentViewerRuntimeState();
+      const int targetLongEdge =
+          sourceSignalTargetLongEdge(viewerState, sourceWidth, sourceHeight, previewMode, &nativeTier);
+      const int sampledLongEdge = std::max(width, height);
+      int attemptProxyLongEdge = std::min(sampledLongEdge, targetLongEdge);
+      auto nextResidentProxyLongEdge = [](int currentLongEdge) {
+        return currentLongEdge > 1024 ? std::max(1024, currentLongEdge / 2)
+                                      : (currentLongEdge > 512 ? 512 : 0);
+      };
+      while (attemptProxyLongEdge > 0) {
+        bool attemptNativeTier = nativeTier;
+        int proxyWidth = width;
+        int proxyHeight = height;
+        if (sampledLongEdge > attemptProxyLongEdge) {
+          const double scale =
+              static_cast<double>(attemptProxyLongEdge) / static_cast<double>(sampledLongEdge);
+          proxyWidth = std::max(1, static_cast<int>(std::lround(static_cast<double>(width) * scale)));
+          proxyHeight = std::max(1, static_cast<int>(std::lround(static_cast<double>(height) * scale)));
+          attemptNativeTier = false;
+        }
+        const std::size_t proxyByteSize =
+            static_cast<std::size_t>(proxyWidth) *
+            static_cast<std::size_t>(proxyHeight) * 4u * sizeof(float);
+        std::string slotReason;
+        std::shared_ptr<CudaIpcExportSlot> exportSlot =
+            acquireCudaIpcExportSlot(proxyByteSize, proxyWidth, proxyHeight, &slotReason);
+        if (!exportSlot) {
+          cubeViewerDebugLog(std::string("Source Signal CUDA IPC export slot unavailable proxy=") +
+                             std::to_string(proxyWidth) + "x" + std::to_string(proxyHeight) +
+                             (slotReason.empty() ? std::string(".") : std::string(": ") + slotReason));
+          if (!allowCudaCpuFallback) {
+            const int nextProxyLongEdge = nextResidentProxyLongEdge(attemptProxyLongEdge);
+            if (nextProxyLongEdge > 0 && nextProxyLongEdge < attemptProxyLongEdge) {
+              attemptProxyLongEdge = nextProxyLongEdge;
+              continue;
+            }
+            return out;
+          }
+          break;
+        }
+
+        ChromaspaceCloudCuda::SourceProxyRequest proxyRequest{};
+        proxyRequest.srcBase = reinterpret_cast<const float*>(srcBytes);
+        proxyRequest.srcRowBytes = srcRowBytes;
+        proxyRequest.outputDevicePtr = exportSlot->devicePtr;
+        proxyRequest.outputByteSize = exportSlot->byteSize;
+        proxyRequest.sampledWidth = width;
+        proxyRequest.sampledHeight = height;
+        proxyRequest.proxyWidth = proxyWidth;
+        proxyRequest.proxyHeight = proxyHeight;
+        proxyRequest.stream = stream;
+        proxyRequest.exportIpc = 1;
+        proxyRequest.readback = 0;
+        ChromaspaceCloudCuda::SourceProxyResult ipcProxyResult{};
+        if (ChromaspaceCloudCuda::buildSourceSignalProxy(proxyRequest, &ipcProxyResult) &&
+            ipcProxyResult.success && ipcProxyResult.hasIpcHandle != 0) {
+          SourceSignalBuildResult ipcPayload =
+              buildSourceSignalPayloadFromCudaIpcProxy(&ipcProxyResult,
+                                                       exportSlot,
+                                                       proxyWidth,
+                                                       proxyHeight,
+                                                       width,
+                                                       height,
+                                                       footprint,
+                                                       args.time,
+                                                       sourceId,
+                                                       "GPU-ipc/CUDA",
+                                                       attemptNativeTier,
+                                                       attemptProxyLongEdge);
+          if (ipcPayload.success) return ipcPayload;
+          if (!exportSlot && ipcProxyResult.devicePtr) {
+            cudaFree(ipcProxyResult.devicePtr);
+            ipcProxyResult.devicePtr = nullptr;
+          }
+          cubeViewerDebugLog(std::string("Source Signal CUDA IPC payload creation failed proxy=") +
+                             std::to_string(proxyWidth) + "x" + std::to_string(proxyHeight) + ".");
+        } else if (!ipcProxyResult.error.empty()) {
+          cubeViewerDebugLog(std::string("Source Signal CUDA IPC export unavailable proxy=") +
+                             std::to_string(proxyWidth) + "x" + std::to_string(proxyHeight) +
+                             ": " + ipcProxyResult.error);
+        }
+
+        if (!allowCudaCpuFallback) {
+          const int nextProxyLongEdge = nextResidentProxyLongEdge(attemptProxyLongEdge);
+          if (nextProxyLongEdge > 0 && nextProxyLongEdge < attemptProxyLongEdge) {
+            cubeViewerDebugLog(std::string("Source Signal CUDA resident IPC retry proxy=") +
+                               std::to_string(proxyWidth) + "x" + std::to_string(proxyHeight) +
+                               " nextLongEdge=" + std::to_string(nextProxyLongEdge));
+            attemptProxyLongEdge = nextProxyLongEdge;
+            continue;
+          }
+          cubeViewerDebugLog(
+              "Source Signal CUDA residency required; CPU proxy/full-readback fallback suppressed "
+              "(set CHROMASPACE_CUDA_SOURCE_CPU_FALLBACK=1 for diagnostic staging).");
+          return out;
+        }
+
+        proxyRequest.exportIpc = 0;
+        proxyRequest.readback = 1;
+        ChromaspaceCloudCuda::SourceProxyResult proxyReadbackResult{};
+        if (ChromaspaceCloudCuda::buildSourceSignalProxy(proxyRequest, &proxyReadbackResult) &&
+            proxyReadbackResult.success) {
+          SourceSignalBuildResult proxyPayload =
+              buildSourceSignalPayloadFromPreparedProxy(proxyReadbackResult.rgba32f.data(),
+                                                        proxyReadbackResult.rowBytes,
+                                                        proxyWidth,
+                                                        proxyHeight,
+                                                        width,
+                                                        height,
+                                                        footprint,
+                                                        args.time,
+                                                        sourceId,
+                                                        "GPU-proxy/CUDA",
+                                                        attemptNativeTier,
+                                                        attemptProxyLongEdge);
+          if (proxyPayload.success) return proxyPayload;
+          const int nextProxyLongEdge = nextResidentProxyLongEdge(attemptProxyLongEdge);
+          if (nextProxyLongEdge > 0 && nextProxyLongEdge < attemptProxyLongEdge) {
+            cubeViewerDebugLog(std::string("Source Signal CUDA proxy transport retry proxy=") +
+                               std::to_string(proxyWidth) + "x" + std::to_string(proxyHeight) +
+                               " nextLongEdge=" + std::to_string(nextProxyLongEdge));
+            attemptProxyLongEdge = nextProxyLongEdge;
+            continue;
+          }
+          break;
+        }
+        cubeViewerDebugLog(std::string("Source Signal CUDA proxy path unavailable: ") +
+                           (proxyReadbackResult.error.empty() ? "unknown" : proxyReadbackResult.error));
+        break;
+      }
+      cubeViewerDebugLog("Source Signal CUDA path falling back to full-source readback.");
+    }
+#endif
+    if (!allowCudaCpuFallback) {
+      cubeViewerDebugLog(
+          "Source Signal CUDA residency required; full-source CPU readback suppressed "
+          "(set CHROMASPACE_CUDA_SOURCE_CPU_FALLBACK=1 for diagnostics).");
+      return out;
+    }
+    if (!ensureStageBuffer(static_cast<size_t>(width) * static_cast<size_t>(height))) return out;
+    float* readback = stageSrcPtr();
+    if (!readback) return out;
     if (cudaMemcpy2DAsync(readback,
                           packedRowBytes,
                           srcBytes,
@@ -11043,6 +11972,7 @@ class ChromaspaceEffect : public ImageEffect {
         src->getPixelData() == nullptr) {
       return out;
     }
+    const bool allowMetalCpuFallback = sourceSignalMetalCpuFallbackEnabled();
     int width = 0;
     int height = 0;
     int x1 = 0;
@@ -11051,6 +11981,114 @@ class ChromaspaceEffect : public ImageEffect {
     size_t srcRowBytes = static_cast<size_t>(std::abs(src->getRowBytes()));
     const size_t packedRowBytes = static_cast<size_t>(width) * 4u * sizeof(float);
     if (srcRowBytes == 0) srcRowBytes = packedRowBytes;
+    int proxyWidth = 0;
+    int proxyHeight = 0;
+    int proxyLongEdge = 0;
+    bool nativeTier = false;
+    if (sourceSignalProxyDimensions(width,
+                                    height,
+                                    footprint,
+                                    previewMode,
+                                    &proxyWidth,
+                                    &proxyHeight,
+                                    &proxyLongEdge,
+                                    &nativeTier)) {
+      ChromaspaceMetal::SharedSourceSignalSurface surface{};
+      std::string surfaceError;
+      const int surfacePixelFormat = sourceSignalUsesRgba32f() ? 1 : 0;
+      if (ChromaspaceMetal::copySourceProxyToIOSurface(src->getPixelData(),
+                                                       width,
+                                                       height,
+                                                       srcRowBytes,
+                                                       x1,
+                                                       y1,
+                                                       proxyWidth,
+                                                       proxyHeight,
+                                                       surfacePixelFormat,
+                                                       args.pMetalCmdQ,
+                                                       &surface,
+                                                       &surfaceError)) {
+        SourceSignalBuildResult surfacePayload =
+            buildSourceSignalPayloadFromSharedSurface(surface,
+                                                      width,
+                                                      height,
+                                                      footprint,
+                                                      args.time,
+                                                      sourceId,
+                                                      "GPU-surface/Metal",
+                                                      nativeTier,
+                                                      proxyLongEdge);
+        if (surfacePayload.success) return surfacePayload;
+        if (surface.retainedSurface) {
+          CFRelease(static_cast<CFTypeRef>(surface.retainedSurface));
+          surface.retainedSurface = nullptr;
+        }
+        if (!allowMetalCpuFallback) {
+          cubeViewerDebugLog(
+              "Source Signal Metal IOSurface payload failed; suppressed GPU-proxy/CPU-source fallback "
+              "(set CHROMASPACE_METAL_SOURCE_CPU_FALLBACK=1 for diagnostics).");
+          return out;
+        }
+        cubeViewerDebugLog("Source Signal Metal IOSurface payload failed; falling back to proxy readback for diagnostics.");
+      } else {
+        if (!allowMetalCpuFallback) {
+          cubeViewerDebugLog(std::string("Source Signal Metal IOSurface generation failed: ") +
+                             (surfaceError.empty() ? "unknown" : surfaceError) +
+                             "; suppressed GPU-proxy/CPU-source fallback "
+                             "(set CHROMASPACE_METAL_SOURCE_CPU_FALLBACK=1 for diagnostics).");
+          return out;
+        }
+        cubeViewerDebugLog(std::string("Source Signal Metal IOSurface generation failed: ") +
+                           (surfaceError.empty() ? "unknown" : surfaceError) +
+                           "; falling back to proxy readback for diagnostics.");
+      }
+      const size_t proxyPackedRowBytes = static_cast<size_t>(proxyWidth) * 4u * sizeof(float);
+      if (ensureStageBuffer(static_cast<size_t>(proxyWidth) * static_cast<size_t>(proxyHeight))) {
+        float* proxyReadback = stageSrcPtr();
+        std::string metalProxyError;
+        if (proxyReadback &&
+            ChromaspaceMetal::copySourceProxyToHost(src->getPixelData(),
+                                                    width,
+                                                    height,
+                                                    srcRowBytes,
+                                                    x1,
+                                                    y1,
+                                                    proxyWidth,
+                                                    proxyHeight,
+                                                    args.pMetalCmdQ,
+                                                    proxyReadback,
+                                                    proxyPackedRowBytes,
+                                                    &metalProxyError)) {
+          SourceSignalBuildResult proxy =
+              buildSourceSignalPayloadFromPreparedProxy(proxyReadback,
+                                                        proxyPackedRowBytes,
+                                                        proxyWidth,
+                                                        proxyHeight,
+                                                        width,
+                                                        height,
+                                                        footprint,
+                                                        args.time,
+                                                        sourceId,
+                                                        "GPU-proxy/Metal",
+                                                        nativeTier,
+                                                        proxyLongEdge);
+          if (proxy.success) return proxy;
+          cubeViewerDebugLog("Source Signal Metal GPU proxy payload failed; falling back to full CPU readback for diagnostics.");
+        } else {
+          cubeViewerDebugLog(std::string("Source Signal Metal GPU proxy generation failed: ") +
+                             (metalProxyError.empty() ? "unknown" : metalProxyError) +
+                             "; falling back to full CPU readback for diagnostics.");
+        }
+      } else {
+        cubeViewerDebugLog("Source Signal Metal GPU proxy staging allocation failed; falling back to full CPU readback for diagnostics.");
+      }
+    }
+    if (!allowMetalCpuFallback) {
+      cubeViewerDebugLog(
+          "Source Signal Metal residency required; suppressed full CPU-source readback "
+          "(set CHROMASPACE_METAL_SOURCE_CPU_FALLBACK=1 for diagnostics).");
+      return out;
+    }
     if (!ensureStageBuffer(static_cast<size_t>(width) * static_cast<size_t>(height))) return out;
     float* readback = stageSrcPtr();
     if (!readback) return out;
@@ -11095,12 +12133,18 @@ class ChromaspaceEffect : public ImageEffect {
     if (!src) return {};
     if (args.isEnabledCudaRender && args.pCudaStream != nullptr) {
       SourceSignalBuildResult cudaSource =
-          buildSourceSignalPayloadFromCudaReadback(src, args, previewMode, sourceId, footprint);
+          buildSourceSignalPayloadFromCudaResidentOrFallback(src, args, previewMode, sourceId, footprint);
       if (cudaSource.success) {
-        cubeViewerDebugLog("Source Signal backend selected: CPU-source/CUDA");
+        cubeViewerDebugLog("Source Signal backend selected: " + cudaSource.backendName);
         return cudaSource;
       }
-      cubeViewerDebugLog("Source Signal CUDA readback failed; trying next source backend.");
+      if (!sourceSignalCudaCpuFallbackEnabled()) {
+        cubeViewerDebugLog(
+            "Source Signal CUDA residency required; suppressed OpenCL/Metal/CPU source backend fallback "
+            "(set CHROMASPACE_CUDA_SOURCE_CPU_FALLBACK=1 for diagnostics).");
+        return {};
+      }
+      cubeViewerDebugLog("Source Signal CUDA resident/fallback path failed; trying next source backend.");
     }
     if (args.isEnabledOpenCLRender && args.pOpenCLCmdQ != nullptr) {
       SourceSignalBuildResult openclSource =
@@ -11115,10 +12159,16 @@ class ChromaspaceEffect : public ImageEffect {
       SourceSignalBuildResult metalSource =
           buildSourceSignalPayloadFromMetalReadback(src, dst, args, previewMode, sourceId, footprint);
       if (metalSource.success) {
-        cubeViewerDebugLog("Source Signal backend selected: CPU-source/Metal");
+        cubeViewerDebugLog("Source Signal backend selected: " + metalSource.backendName);
         return metalSource;
       }
-      cubeViewerDebugLog("Source Signal Metal readback failed; trying CPU image source.");
+      if (!sourceSignalMetalCpuFallbackEnabled()) {
+        cubeViewerDebugLog(
+            "Source Signal Metal residency required; suppressed CPU image source backend fallback "
+            "(set CHROMASPACE_METAL_SOURCE_CPU_FALLBACK=1 for diagnostics).");
+        return {};
+      }
+      cubeViewerDebugLog("Source Signal Metal resident/fallback path failed; trying CPU image source for diagnostics.");
     }
     SourceSignalBuildResult cpuSource =
         buildSourceSignalPayloadFromImage(src, footprint, args.time, previewMode, sourceId, "CPU-source");
@@ -11153,6 +12203,12 @@ class ChromaspaceEffect : public ImageEffect {
       CloudBuildResult* built,
       const OverlayStripData* overlay) {
     if (!args.isEnabledCudaRender || args.pCudaStream == nullptr || !src || !dst) return false;
+    if (needCloud && !cudaLegacyInputCloudCpuStagingAllowed()) {
+      cubeViewerDebugLog(
+          "renderCUDAHostBuffers legacy input_cloud readback suppressed "
+          "(set CHROMASPACE_CUDA_SOURCE_CPU_FALLBACK=1 for diagnostic staging).");
+      return false;
+    }
     const void* srcRaw = src->getPixelData();
     void* dstRaw = dst->getPixelData();
     if (!srcRaw || !dstRaw) return false;
@@ -11596,14 +12652,74 @@ class ChromaspaceEffect : public ImageEffect {
   void retainSentCloudTransportBlob(const std::shared_ptr<ViewerCloudTransportBlob>& blob) {
     if (!blob) return;
     const auto now = std::chrono::steady_clock::now();
-    const auto keepUntil = now + std::chrono::seconds(8);
+    const bool retainingCudaIpc = blob->transport == "cuda_ipc";
+    constexpr std::size_t kGeneralTransportRetainedBlobs = 8u;
+    constexpr std::size_t kCudaIpcRetainedBlobs = 24u;
+    constexpr std::size_t kCudaIpcRetainedBytes = 1024ull * 1024ull * 1024ull;
+    const auto keepUntil =
+        now + std::chrono::seconds(retainingCudaIpc ? 60 : 8);
+
+    // CUDA IPC handles are views of exporter-owned device allocations, not
+    // owning payloads. Keep those allocations alive well beyond socket send so
+    // the viewer can safely display/cache the imported source until newer CUDA
+    // source frames replace it. Plain shm/mmap transports keep the shorter
+    // historical retention because the viewer copies/imports their metadata.
     std::lock_guard<std::mutex> lock(ioMutex_);
     sentCloudBlobs_.emplace_back(keepUntil, blob);
-    while (!sentCloudBlobs_.empty() && sentCloudBlobs_.front().first <= now) {
-      sentCloudBlobs_.pop_front();
+
+    auto isCudaIpcBlob = [](const std::shared_ptr<ViewerCloudTransportBlob>& retained) {
+      return retained && retained->transport == "cuda_ipc";
+    };
+    auto eraseAt = [&](decltype(sentCloudBlobs_)::iterator it) {
+      sentCloudBlobs_.erase(it);
+    };
+    for (auto it = sentCloudBlobs_.begin(); it != sentCloudBlobs_.end();) {
+      if (it->first <= now) {
+        it = sentCloudBlobs_.erase(it);
+      } else {
+        ++it;
+      }
     }
-    while (sentCloudBlobs_.size() > 8u) {
-      sentCloudBlobs_.pop_front();
+
+    std::size_t generalCount = 0;
+    std::size_t cudaCount = 0;
+    std::size_t cudaBytes = 0;
+    for (const auto& retained : sentCloudBlobs_) {
+      if (isCudaIpcBlob(retained.second)) {
+        ++cudaCount;
+        cudaBytes += retained.second->byteSize;
+      } else {
+        ++generalCount;
+      }
+    }
+
+    while (generalCount > kGeneralTransportRetainedBlobs) {
+      auto eraseIt = sentCloudBlobs_.end();
+      for (auto it = sentCloudBlobs_.begin(); it != sentCloudBlobs_.end(); ++it) {
+        if (!isCudaIpcBlob(it->second)) {
+          eraseIt = it;
+          break;
+        }
+      }
+      if (eraseIt == sentCloudBlobs_.end()) break;
+      eraseAt(eraseIt);
+      --generalCount;
+    }
+
+    while ((cudaCount > kCudaIpcRetainedBlobs || cudaBytes > kCudaIpcRetainedBytes) &&
+           cudaCount > 1u) {
+      auto eraseIt = sentCloudBlobs_.end();
+      for (auto it = sentCloudBlobs_.begin(); it != sentCloudBlobs_.end(); ++it) {
+        if (isCudaIpcBlob(it->second) && it->second != blob) {
+          eraseIt = it;
+          break;
+        }
+      }
+      if (eraseIt == sentCloudBlobs_.end()) break;
+      const std::size_t erasedBytes = eraseIt->second ? eraseIt->second->byteSize : 0u;
+      cudaBytes = erasedBytes < cudaBytes ? cudaBytes - erasedBytes : 0u;
+      eraseAt(eraseIt);
+      --cudaCount;
     }
   }
 
@@ -13104,7 +14220,7 @@ class ChromaspaceFactory : public PluginFactoryHelper<ChromaspaceFactory> {
           {"cubeViewerChromaticityReferenceBasis", "Plot chromaticity coordinates relative to the CIE standard observer basis or the selected input observer basis."},
           {"cubeViewerChromaticityOverlayPrimaries", "Choose which gamut triangle to overlay on the chromaticity plot, or set None to hide the overlay triangle."},
           {"cubeViewerChromaticityPlanckianLocus", "Show the Planckian locus overlay and Kelvin labels in chromaticity mode."},
-          {"cubeViewerChromaticitySpectralLocus3D", "Show the spectral locus as a 3D xyY curve in chromaticity mode. Turn off to flatten it to the classic 2D chromaticity outline."},
+          {"cubeViewerChromaticitySpectralLocus3D", "3D guides lift both chromaticity guide curves. The spectral locus uses the CIE CMF Y component. The Planckian xy is still computed from Planck-law integration against CIE CMFs. The 3D Y lift is a display-normalized photopic shape value, not absolute blackbody radiance, because absolute radiance depends on arbitrary exposure/radiator scale and would make the curve visually unusable."},
           {"cubeViewerStatus", "Connection state for the external cube viewer."},
       };
       auto it = kHints.find(name);
@@ -13302,7 +14418,7 @@ class ChromaspaceFactory : public PluginFactoryHelper<ChromaspaceFactory> {
     if (const char* hint = tooltipFor("cubeViewerChromaticityPlanckianLocus")) cubeViewerChromaticityPlanckianLocus->setHint(hint);
 
     auto* cubeViewerChromaticitySpectralLocus3D = d.defineBooleanParam("cubeViewerChromaticitySpectralLocus3D");
-    cubeViewerChromaticitySpectralLocus3D->setLabel("3D Spectral Locus");
+    cubeViewerChromaticitySpectralLocus3D->setLabel("3D guides");
     cubeViewerChromaticitySpectralLocus3D->setDefault(true);
     if (const char* hint = tooltipFor("cubeViewerChromaticitySpectralLocus3D")) cubeViewerChromaticitySpectralLocus3D->setHint(hint);
 

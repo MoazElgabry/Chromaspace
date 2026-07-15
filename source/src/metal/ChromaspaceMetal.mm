@@ -4,6 +4,7 @@
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
+#import <IOSurface/IOSurface.h>
 
 #include <algorithm>
 #include <cstring>
@@ -16,6 +17,18 @@ namespace {
 
 inline size_t packedRowBytesForWidth(int width) {
   return static_cast<size_t>(width) * 4u * sizeof(float);
+}
+
+inline MTLPixelFormat sourceSignalMetalPixelFormat(int pixelFormat) {
+  return pixelFormat == 1 ? MTLPixelFormatRGBA32Float : MTLPixelFormatRGBA16Float;
+}
+
+inline OSType sourceSignalIOSurfacePixelFormat(int pixelFormat) {
+  return pixelFormat == 1 ? static_cast<OSType>('RGBA') : static_cast<OSType>('RGhA');
+}
+
+inline size_t sourceSignalBytesPerElement(int pixelFormat) {
+  return pixelFormat == 1 ? 16u : 8u;
 }
 
 inline bool validateFloatRowBytes(size_t rowBytes) {
@@ -243,6 +256,17 @@ struct AppendSelectRequestGpu {
   float radiusMax = 1.0f;
 };
 
+struct SourceProxyRequestGpu {
+  int sourceWidth = 0;
+  int sourceHeight = 0;
+  int originX = 0;
+  int originY = 0;
+  uint32_t srcRowFloats = 0;
+  int proxyWidth = 0;
+  int proxyHeight = 0;
+  uint32_t proxyRowFloats = 0;
+};
+
 struct PipelineBundle {
   id<MTLDevice> device = nil;
   id<MTLComputePipelineState> primary = nil;
@@ -252,6 +276,8 @@ struct PipelineBundle {
   id<MTLComputePipelineState> rampLayoutScore = nil;
   id<MTLComputePipelineState> packCombined = nil;
   id<MTLComputePipelineState> appendSelect = nil;
+  id<MTLComputePipelineState> sourceProxy = nil;
+  id<MTLComputePipelineState> sourceProxyTexture = nil;
 };
 
 std::mutex gPipelineMutex;
@@ -356,6 +382,17 @@ struct AppendSelectRequestGpu {
   int occupancyThreshold;
   float radiusMin;
   float radiusMax;
+};
+
+struct SourceProxyRequestGpu {
+  int sourceWidth;
+  int sourceHeight;
+  int originX;
+  int originY;
+  uint srcRowFloats;
+  int proxyWidth;
+  int proxyHeight;
+  uint proxyRowFloats;
 };
 
 constant float kRgbAxisMaxRadius = 0.8164965809277260f;
@@ -569,6 +606,74 @@ kernel void appendSelectKernel(device const OccupancyCandidate* candidateIn [[bu
   if ((int)outIndex >= request.extraPointCount) return;
   appendOut[outIndex] = candidate.sample;
 }
+
+inline float4 loadSourceRgbaForProxy(device const float* srcFloats, constant SourceProxyRequestGpu& request, int x, int y) {
+  const int px = request.originX + clamp(x, 0, max(0, request.sourceWidth - 1));
+  const int py = request.originY + clamp(y, 0, max(0, request.sourceHeight - 1));
+  if (px < 0 || py < 0) return float4(0.0f, 0.0f, 0.0f, 1.0f);
+  const uint base = (uint)py * request.srcRowFloats + (uint)px * 4u;
+  return float4(srcFloats[base + 0u], srcFloats[base + 1u], srcFloats[base + 2u], srcFloats[base + 3u]);
+}
+
+kernel void sourceProxyKernel(device const float* srcFloats [[buffer(0)]],
+                              device float* proxyFloats [[buffer(1)]],
+                              constant SourceProxyRequestGpu& request [[buffer(2)]],
+                              uint tid [[thread_position_in_grid]]) {
+  const int pixelCount = request.proxyWidth * request.proxyHeight;
+  const int index = (int)tid;
+  if (index >= pixelCount || request.proxyWidth <= 0 || request.proxyHeight <= 0 ||
+      request.sourceWidth <= 0 || request.sourceHeight <= 0) {
+    return;
+  }
+  const int px = index % request.proxyWidth;
+  const int py = index / request.proxyWidth;
+  const float srcX = ((float(px) + 0.5f) / float(request.proxyWidth)) * float(request.sourceWidth) - 0.5f;
+  const float srcY = ((float(py) + 0.5f) / float(request.proxyHeight)) * float(request.sourceHeight) - 0.5f;
+  const int x0 = clamp((int)floor(srcX), 0, request.sourceWidth - 1);
+  const int y0 = clamp((int)floor(srcY), 0, request.sourceHeight - 1);
+  const int x1 = clamp(x0 + 1, 0, request.sourceWidth - 1);
+  const int y1 = clamp(y0 + 1, 0, request.sourceHeight - 1);
+  const float tx = clamp(srcX - float(x0), 0.0f, 1.0f);
+  const float ty = clamp(srcY - float(y0), 0.0f, 1.0f);
+  const float4 p00 = loadSourceRgbaForProxy(srcFloats, request, x0, y0);
+  const float4 p10 = loadSourceRgbaForProxy(srcFloats, request, x1, y0);
+  const float4 p01 = loadSourceRgbaForProxy(srcFloats, request, x0, y1);
+  const float4 p11 = loadSourceRgbaForProxy(srcFloats, request, x1, y1);
+  const float4 top = mix(p00, p10, tx);
+  const float4 bottom = mix(p01, p11, tx);
+  const float4 value = mix(top, bottom, ty);
+  const uint dst = (uint)py * request.proxyRowFloats + (uint)px * 4u;
+  proxyFloats[dst + 0u] = value.r;
+  proxyFloats[dst + 1u] = value.g;
+  proxyFloats[dst + 2u] = value.b;
+  proxyFloats[dst + 3u] = value.a;
+}
+
+kernel void sourceProxyTextureKernel(device const float* srcFloats [[buffer(0)]],
+                                     texture2d<float, access::write> proxyTexture [[texture(0)]],
+                                     constant SourceProxyRequestGpu& request [[buffer(1)]],
+                                     uint2 gid [[thread_position_in_grid]]) {
+  if ((int)gid.x >= request.proxyWidth || (int)gid.y >= request.proxyHeight ||
+      request.proxyWidth <= 0 || request.proxyHeight <= 0 ||
+      request.sourceWidth <= 0 || request.sourceHeight <= 0) {
+    return;
+  }
+  const float srcX = ((float(gid.x) + 0.5f) / float(request.proxyWidth)) * float(request.sourceWidth) - 0.5f;
+  const float srcY = ((float(gid.y) + 0.5f) / float(request.proxyHeight)) * float(request.sourceHeight) - 0.5f;
+  const int x0 = clamp((int)floor(srcX), 0, request.sourceWidth - 1);
+  const int y0 = clamp((int)floor(srcY), 0, request.sourceHeight - 1);
+  const int x1 = clamp(x0 + 1, 0, request.sourceWidth - 1);
+  const int y1 = clamp(y0 + 1, 0, request.sourceHeight - 1);
+  const float tx = clamp(srcX - float(x0), 0.0f, 1.0f);
+  const float ty = clamp(srcY - float(y0), 0.0f, 1.0f);
+  const float4 p00 = loadSourceRgbaForProxy(srcFloats, request, x0, y0);
+  const float4 p10 = loadSourceRgbaForProxy(srcFloats, request, x1, y0);
+  const float4 p01 = loadSourceRgbaForProxy(srcFloats, request, x0, y1);
+  const float4 p11 = loadSourceRgbaForProxy(srcFloats, request, x1, y1);
+  const float4 top = mix(p00, p10, tx);
+  const float4 bottom = mix(p01, p11, tx);
+  proxyTexture.write(mix(top, bottom, ty), gid);
+}
 )METAL";
 
 bool ensurePipelines(id<MTLDevice> device, PipelineBundle* out, std::string* error) {
@@ -576,7 +681,8 @@ bool ensurePipelines(id<MTLDevice> device, PipelineBundle* out, std::string* err
   std::lock_guard<std::mutex> lock(gPipelineMutex);
   if (gPipelines.device == device && gPipelines.primary != nil && gPipelines.occupancy != nil &&
       gPipelines.stripCube != nil && gPipelines.stripRamp != nil && gPipelines.rampLayoutScore != nil && gPipelines.packCombined != nil &&
-      gPipelines.appendSelect != nil) { *out = gPipelines; return true; }
+      gPipelines.appendSelect != nil && gPipelines.sourceProxy != nil &&
+      gPipelines.sourceProxyTexture != nil) { *out = gPipelines; return true; }
   NSError* compileError = nil;
   const std::string sourceString = std::string(kCloudMetalSourcePart1) + kCloudMetalSourcePart2 + kCloudMetalSourcePart3;
   NSString* source = [NSString stringWithUTF8String:sourceString.c_str()];
@@ -603,8 +709,11 @@ bool ensurePipelines(id<MTLDevice> device, PipelineBundle* out, std::string* err
   built.rampLayoutScore = makePipeline(@"rampLayoutScoreKernel");
   built.packCombined = makePipeline(@"packCombinedKernel");
   built.appendSelect = makePipeline(@"appendSelectKernel");
+  built.sourceProxy = makePipeline(@"sourceProxyKernel");
+  built.sourceProxyTexture = makePipeline(@"sourceProxyTextureKernel");
   if (built.primary == nil || built.occupancy == nil || built.stripCube == nil ||
-      built.stripRamp == nil || built.rampLayoutScore == nil || built.packCombined == nil || built.appendSelect == nil) {
+      built.stripRamp == nil || built.rampLayoutScore == nil || built.packCombined == nil ||
+      built.appendSelect == nil || built.sourceProxy == nil || built.sourceProxyTexture == nil) {
     return false;
   }
   gPipelines = built; *out = gPipelines; return true;
@@ -1388,6 +1497,234 @@ bool copySourceToHost(
 
   std::memcpy(readbackSrc, readbackBuffer.contents, readbackBytes);
   return true;
+}
+
+bool copySourceProxyToHost(
+    const void* srcMetalBuffer,
+    int sourceWidth,
+    int sourceHeight,
+    size_t srcRowBytes,
+    int originX,
+    int originY,
+    int proxyWidth,
+    int proxyHeight,
+    void* metalCommandQueue,
+    float* readbackProxy,
+    size_t readbackProxyRowBytes,
+    std::string* error) {
+  if (error) error->clear();
+  if (!srcMetalBuffer || !metalCommandQueue || !readbackProxy ||
+      sourceWidth <= 0 || sourceHeight <= 0 || proxyWidth <= 0 || proxyHeight <= 0) {
+    if (error) *error = "invalid-source-proxy-request";
+    return false;
+  }
+  if (!validateFloatRowBytes(srcRowBytes)) {
+    if (error) *error = "invalid-source-row-bytes";
+    return false;
+  }
+  if (srcRowBytes < packedRowBytesForWidth(sourceWidth) ||
+      readbackProxyRowBytes < packedRowBytesForWidth(proxyWidth)) {
+    if (error) *error = "source-proxy-row-bytes-too-small";
+    return false;
+  }
+
+  @autoreleasepool {
+    id<MTLCommandQueue> queue = (__bridge id<MTLCommandQueue>)metalCommandQueue;
+    id<MTLBuffer> src = (__bridge id<MTLBuffer>)srcMetalBuffer;
+    if (queue == nil || src == nil || queue.device == nil) {
+      if (error) *error = "metal-unavailable";
+      return false;
+    }
+    int sourceOriginX = originX;
+    int sourceOriginY = originY;
+    if (!chooseSourceOrigin(src, sourceWidth, sourceHeight, srcRowBytes,
+                            originX, originY, &sourceOriginX, &sourceOriginY)) {
+      if (error) *error = "source-proxy-range-out-of-bounds";
+      return false;
+    }
+
+    PipelineBundle pipelines{};
+    if (!ensurePipelines(queue.device, &pipelines, error)) return false;
+
+    const size_t readbackBytes = readbackProxyRowBytes * static_cast<size_t>(proxyHeight);
+    id<MTLBuffer> proxyBuffer =
+        [queue.device newBufferWithLength:readbackBytes options:MTLResourceStorageModeShared];
+    if (proxyBuffer == nil) {
+      if (error) *error = "source-proxy-buffer-allocation-failed";
+      return false;
+    }
+
+    SourceProxyRequestGpu request{};
+    request.sourceWidth = sourceWidth;
+    request.sourceHeight = sourceHeight;
+    request.originX = sourceOriginX;
+    request.originY = sourceOriginY;
+    request.srcRowFloats = static_cast<uint32_t>(srcRowBytes / sizeof(float));
+    request.proxyWidth = proxyWidth;
+    request.proxyHeight = proxyHeight;
+    request.proxyRowFloats = static_cast<uint32_t>(readbackProxyRowBytes / sizeof(float));
+
+    id<MTLCommandBuffer> cmd = [queue commandBuffer];
+    if (cmd == nil) {
+      if (error) *error = "source-proxy-command-buffer-failed";
+      return false;
+    }
+    id<MTLComputeCommandEncoder> encoder = [cmd computeCommandEncoder];
+    if (encoder == nil) {
+      if (error) *error = "source-proxy-encoder-failed";
+      return false;
+    }
+    [encoder setBuffer:src offset:0 atIndex:0];
+    [encoder setBuffer:proxyBuffer offset:0 atIndex:1];
+    [encoder setBytes:&request length:sizeof(request) atIndex:2];
+    dispatch1D(encoder, pipelines.sourceProxy,
+               static_cast<NSUInteger>(proxyWidth) * static_cast<NSUInteger>(proxyHeight));
+    [encoder endEncoding];
+    [cmd commit];
+    [cmd waitUntilCompleted];
+    if (cmd.status != MTLCommandBufferStatusCompleted) {
+      if (error) {
+        *error = cmd.error ? nsErrorString(cmd.error) : std::string("source-proxy-command-failed");
+      }
+      return false;
+    }
+
+    std::memcpy(readbackProxy, proxyBuffer.contents, readbackBytes);
+    return true;
+  }
+}
+
+bool copySourceProxyToIOSurface(
+    const void* srcMetalBuffer,
+    int sourceWidth,
+    int sourceHeight,
+    size_t srcRowBytes,
+    int originX,
+    int originY,
+    int proxyWidth,
+    int proxyHeight,
+    int pixelFormat,
+    void* metalCommandQueue,
+    SharedSourceSignalSurface* out,
+    std::string* error) {
+  if (error) error->clear();
+  if (out) *out = SharedSourceSignalSurface{};
+  if (!srcMetalBuffer || !metalCommandQueue || !out ||
+      sourceWidth <= 0 || sourceHeight <= 0 || proxyWidth <= 0 || proxyHeight <= 0) {
+    if (error) *error = "invalid-source-iosurface-request";
+    return false;
+  }
+  if (pixelFormat != 0 && pixelFormat != 1) {
+    if (error) *error = "unsupported-source-iosurface-format";
+    return false;
+  }
+  if (!validateFloatRowBytes(srcRowBytes) || srcRowBytes < packedRowBytesForWidth(sourceWidth)) {
+    if (error) *error = "invalid-source-row-bytes";
+    return false;
+  }
+
+  @autoreleasepool {
+    id<MTLCommandQueue> queue = (__bridge id<MTLCommandQueue>)metalCommandQueue;
+    id<MTLBuffer> src = (__bridge id<MTLBuffer>)srcMetalBuffer;
+    if (queue == nil || src == nil || queue.device == nil) {
+      if (error) *error = "metal-unavailable";
+      return false;
+    }
+    int sourceOriginX = originX;
+    int sourceOriginY = originY;
+    if (!chooseSourceOrigin(src, sourceWidth, sourceHeight, srcRowBytes,
+                            originX, originY, &sourceOriginX, &sourceOriginY)) {
+      if (error) *error = "source-iosurface-range-out-of-bounds";
+      return false;
+    }
+
+    PipelineBundle pipelines{};
+    if (!ensurePipelines(queue.device, &pipelines, error)) return false;
+
+    const size_t bytesPerElement = sourceSignalBytesPerElement(pixelFormat);
+    const size_t bytesPerRow = static_cast<size_t>(proxyWidth) * bytesPerElement;
+    const size_t byteSize = bytesPerRow * static_cast<size_t>(proxyHeight);
+    NSDictionary* surfaceProperties = @{
+      (__bridge NSString*)kIOSurfaceWidth: @(proxyWidth),
+      (__bridge NSString*)kIOSurfaceHeight: @(proxyHeight),
+      (__bridge NSString*)kIOSurfaceBytesPerElement: @(bytesPerElement),
+      (__bridge NSString*)kIOSurfaceBytesPerRow: @(bytesPerRow),
+      (__bridge NSString*)kIOSurfaceAllocSize: @(byteSize),
+      (__bridge NSString*)kIOSurfacePixelFormat: @(sourceSignalIOSurfacePixelFormat(pixelFormat)),
+    };
+    IOSurfaceRef surface = IOSurfaceCreate((__bridge CFDictionaryRef)surfaceProperties);
+    if (surface == nullptr) {
+      if (error) *error = "iosurface-allocation-failed";
+      return false;
+    }
+
+    MTLTextureDescriptor* desc =
+        [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:sourceSignalMetalPixelFormat(pixelFormat)
+                                                           width:static_cast<NSUInteger>(proxyWidth)
+                                                          height:static_cast<NSUInteger>(proxyHeight)
+                                                       mipmapped:NO];
+    desc.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+    desc.storageMode = MTLStorageModeShared;
+    id<MTLTexture> texture = [queue.device newTextureWithDescriptor:desc iosurface:surface plane:0];
+    if (texture == nil) {
+      CFRelease(surface);
+      if (error) *error = "iosurface-metal-texture-failed";
+      return false;
+    }
+
+    SourceProxyRequestGpu request{};
+    request.sourceWidth = sourceWidth;
+    request.sourceHeight = sourceHeight;
+    request.originX = sourceOriginX;
+    request.originY = sourceOriginY;
+    request.srcRowFloats = static_cast<uint32_t>(srcRowBytes / sizeof(float));
+    request.proxyWidth = proxyWidth;
+    request.proxyHeight = proxyHeight;
+    request.proxyRowFloats = 0;
+
+    id<MTLCommandBuffer> cmd = [queue commandBuffer];
+    if (cmd == nil) {
+      CFRelease(surface);
+      if (error) *error = "source-iosurface-command-buffer-failed";
+      return false;
+    }
+    id<MTLComputeCommandEncoder> encoder = [cmd computeCommandEncoder];
+    if (encoder == nil) {
+      CFRelease(surface);
+      if (error) *error = "source-iosurface-encoder-failed";
+      return false;
+    }
+    [encoder setComputePipelineState:pipelines.sourceProxyTexture];
+    [encoder setBuffer:src offset:0 atIndex:0];
+    [encoder setTexture:texture atIndex:0];
+    [encoder setBytes:&request length:sizeof(request) atIndex:1];
+    NSUInteger maxThreads = pipelines.sourceProxyTexture.maxTotalThreadsPerThreadgroup;
+    if (maxThreads == 0) maxThreads = 64;
+    NSUInteger width = 1;
+    while ((width + 1u) * (width + 1u) <= maxThreads && width < 16u) ++width;
+    [encoder dispatchThreads:MTLSizeMake(static_cast<NSUInteger>(proxyWidth),
+                                         static_cast<NSUInteger>(proxyHeight),
+                                         1)
+       threadsPerThreadgroup:MTLSizeMake(width, width, 1)];
+    [encoder endEncoding];
+    [cmd commit];
+    [cmd waitUntilCompleted];
+    if (cmd.status != MTLCommandBufferStatusCompleted) {
+      if (error) {
+        *error = cmd.error ? nsErrorString(cmd.error) : std::string("source-iosurface-command-failed");
+      }
+      CFRelease(surface);
+      return false;
+    }
+
+    out->surfaceId = static_cast<std::uint32_t>(IOSurfaceGetID(surface));
+    out->width = proxyWidth;
+    out->height = proxyHeight;
+    out->pixelFormat = pixelFormat;
+    out->byteSize = byteSize;
+    out->retainedSurface = surface;
+    return out->surfaceId != 0;
+  }
 }
 
 bool copySourceRowsToHost(

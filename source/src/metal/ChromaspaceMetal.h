@@ -19,6 +19,15 @@ struct Sample {
   float b = 0.0f;
 };
 
+struct SharedSourceSignalSurface {
+  std::uint32_t surfaceId = 0;
+  int width = 0;
+  int height = 0;
+  int pixelFormat = 0;  // 0=RGBA16F, 1=RGBA32F.
+  std::size_t byteSize = 0;
+  void* retainedSurface = nullptr;
+};
+
 struct OccupancyCandidate {
   Sample sample{};
   float normalizedNeutralRadius = 0.0f;
@@ -177,6 +186,34 @@ bool copySourceToHost(
     void* metalCommandQueue,
     float* readbackSrc,
     size_t readbackSrcRowBytes);
+
+bool copySourceProxyToHost(
+    const void* srcMetalBuffer,
+    int sourceWidth,
+    int sourceHeight,
+    size_t srcRowBytes,
+    int originX,
+    int originY,
+    int proxyWidth,
+    int proxyHeight,
+    void* metalCommandQueue,
+    float* readbackProxy,
+    size_t readbackProxyRowBytes,
+    std::string* error = nullptr);
+
+bool copySourceProxyToIOSurface(
+    const void* srcMetalBuffer,
+    int sourceWidth,
+    int sourceHeight,
+    size_t srcRowBytes,
+    int originX,
+    int originY,
+    int proxyWidth,
+    int proxyHeight,
+    int pixelFormat,
+    void* metalCommandQueue,
+    SharedSourceSignalSurface* out,
+    std::string* error = nullptr);
 
 bool copySourceRowsToHost(
     const void* srcMetalBuffer,

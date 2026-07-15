@@ -13,6 +13,18 @@ struct ProbeResult {
   const char* deviceName = "";
 };
 
+struct ResidentReadiness {
+  bool contextReady = false;
+  bool rasterSourceTextureReady = false;
+  bool analyticalScopeReady = false;
+  bool histogramSurfaceReady = false;
+  bool glossFieldCacheReady = false;
+  bool glossFieldSurfaceReady = false;
+  bool glossProjectionSurfaceReady = false;
+  bool plotSurfaceReady = false;
+  std::string missing;
+};
+
 struct RemapUniforms {
   int plotMode = 0;
   int circularHsl = 0;
@@ -144,6 +156,14 @@ struct GlossFieldResult {
   std::vector<float> confidence;
 };
 
+struct GlossFieldCache {
+  uint64_t cacheId = 0;
+  int gridWidth = 0;
+  int gridHeight = 0;
+  uint64_t builtSerial = 0;
+  bool available = false;
+};
+
 struct ScopeDensityRequest {
   int pointCount = 0;
   int waveform = 1;
@@ -153,8 +173,80 @@ struct ScopeDensityRequest {
   float rangeMin = 0.0f;
   float invRange = 1.0f;
   int excludeOverflow = 1;
+  int onlyOverflow = 0;
   int channelCount = 3;
   int lumaMethod = 0;
+};
+
+struct ScopeRangeRequest {
+  int pointCount = 0;
+  int waveform = 1;
+  int scopeMode = 0;
+  int includeRed = 1;
+  int includeGreen = 1;
+  int includeBlue = 1;
+  int includeLuma = 0;
+  int includeOverflow = 1;
+  int lumaMethod = 0;
+  int previousRangeValid = 0;
+  float previousRangeMin = 0.0f;
+  float previousRangeMax = 1.0f;
+};
+
+struct ScopeRangeResult {
+  float minValue = 0.0f;
+  float maxValue = 1.0f;
+  uint32_t validCount = 0;
+};
+
+struct HistogramSurfaceRequest {
+  int pointCount = 0;
+  int scopeMode = 0;  // 0=RGB overlay, 1=luma.
+  int width = 1024;
+  int height = 512;
+  float rangeMin = 0.0f;
+  float invRange = 1.0f;
+  int showOverflow = 1;
+  int highlightOverflow = 1;
+  int lumaMethod = 0;
+};
+
+struct GlossFieldSurfaceRequest {
+  int width = 768;
+  int height = 768;
+  int algorithm = 0;  // 0=Candidate 1, 1=Candidate 2.
+  int colorMode = 0;  // 0=Semantic signal, 1=Source hue tint.
+  int debugMode = 0;  // 0=Signal, 1=max, 2=Y, 3=min, 4=neutrality.
+  int diagnosticMode = 0;  // 0=Off, 1=Confidence, 2=Ambiguity.
+  float colorSaturation = 2.0f;
+  float glossBodyOpacity = 0.10f;
+  float glossHighlightOpacity = 0.42f;
+  float glossLiftScale = 1.0f;
+};
+
+struct GlossProjectionSurfaceRequest {
+  int width = 1024;
+  int height = 768;
+  int algorithm = 0;  // 0=Candidate 1, 1=Candidate 2.
+  int colorMode = 0;  // 0=Semantic signal, 1=Source hue tint.
+  int debugMode = 0;  // 0=Signal, 1=max, 2=Y, 3=min, 4=neutrality.
+  int diagnosticMode = 0;  // 0=Off, 1=Confidence, 2=Ambiguity.
+  float sourceAspect = 16.0f / 9.0f;
+  float colorSaturation = 2.0f;
+  float glossBodyOpacity = 0.10f;
+  float glossHighlightOpacity = 0.42f;
+  float glossLiftScale = 1.0f;
+  float pointRadiusPixels = 2.0f;
+  float modelView[16] = {};
+  float projection[16] = {};
+};
+
+struct PlotSurface {
+  uint32_t surfaceId = 0;
+  int width = 0;
+  int height = 0;
+  int pixelFormat = 0;  // 0=RGBA16F, 1=RGBA32F.
+  size_t byteSize = 0;
 };
 
 enum ModifierFlags : uint32_t {
@@ -167,6 +259,28 @@ enum ModifierFlags : uint32_t {
 bool activateWindow(void* nativeWindow);
 uint32_t currentModifierFlags();
 ProbeResult probe();
+ResidentReadiness residentReadiness();
+bool bindIOSurfaceToOpenGLTexture(uint32_t surfaceId,
+                                  int width,
+                                  int height,
+                                  int pixelFormat,
+                                  uint32_t glTexture,
+                                  std::string* error);
+bool createPlotSurface(int width,
+                       int height,
+                       int pixelFormat,
+                       PlotSurface* outSurface,
+                       std::string* error);
+bool clearPlotSurface(uint32_t surfaceId,
+                      int width,
+                      int height,
+                      int pixelFormat,
+                      float r,
+                      float g,
+                      float b,
+                      float a,
+                      std::string* error);
+void releasePlotSurface(uint32_t surfaceId);
 bool buildOverlayMesh(const OverlayRequest& request,
                       const std::vector<float>& inputPoints,
                       std::vector<float>* outVerts,
@@ -183,6 +297,14 @@ bool buildRasterSourceMesh(const RasterSourceRequest& request,
                            std::vector<float>* outVerts,
                            std::vector<float>* outColors,
                            std::string* error);
+bool buildRasterSourceMeshFromIOSurface(const RasterSourceRequest& request,
+                                        uint32_t surfaceId,
+                                        int surfaceWidth,
+                                        int surfaceHeight,
+                                        int surfacePixelFormat,
+                                        std::vector<float>* outVerts,
+                                        std::vector<float>* outColors,
+                                        std::string* error);
 bool buildInputSampledMesh(const InputSampleRequest& request,
                            const std::vector<float>& fullVerts,
                            const std::vector<float>& fullColors,
@@ -191,11 +313,65 @@ bool buildInputSampledMesh(const InputSampleRequest& request,
                            std::string* error);
 bool buildGlossField(const GlossFieldRequest& request,
                      const std::vector<float>& packedPoints,
+                     bool allowReadback,
                      GlossFieldResult* out,
                      std::string* error);
+bool buildGlossFieldFromIOSurface(GlossFieldCache* cache,
+                                  const RasterSourceRequest& rasterRequest,
+                                  const GlossFieldRequest& fieldRequest,
+                                  uint32_t surfaceId,
+                                  int surfaceWidth,
+                                  int surfaceHeight,
+                                  int surfacePixelFormat,
+                                  uint64_t buildSerial,
+                                  std::string* error);
+void releaseGlossFieldCache(GlossFieldCache* cache);
 bool buildScopeDensity(const ScopeDensityRequest& request,
                        const std::vector<float>& packedSamples,
+                       bool allowReadback,
                        std::vector<float>* outDensity,
                        std::string* error);
+bool buildScopeDensityFromIOSurface(const RasterSourceRequest& rasterRequest,
+                                    const ScopeDensityRequest& scopeRequest,
+                                    uint32_t surfaceId,
+                                    int surfaceWidth,
+                                    int surfaceHeight,
+                                    int surfacePixelFormat,
+                                    bool allowReadback,
+                                    std::vector<float>* outDensity,
+                                    std::string* error);
+bool buildScopeRangeFromIOSurface(const RasterSourceRequest& rasterRequest,
+                                  const ScopeRangeRequest& rangeRequest,
+                                  uint32_t surfaceId,
+                                  int surfaceWidth,
+                                  int surfaceHeight,
+                                  int surfacePixelFormat,
+                                  ScopeRangeResult* outRange,
+                                  std::string* error);
+bool renderHistogramSurfaceFromIOSurface(const RasterSourceRequest& rasterRequest,
+                                         const HistogramSurfaceRequest& histogramRequest,
+                                         uint32_t sourceSurfaceId,
+                                         int sourceSurfaceWidth,
+                                         int sourceSurfaceHeight,
+                                         int sourceSurfacePixelFormat,
+                                         uint32_t outputSurfaceId,
+                                         int outputSurfaceWidth,
+                                         int outputSurfaceHeight,
+                                         int outputSurfacePixelFormat,
+                                         std::string* error);
+bool renderGlossFieldSurfaceFromCache(const GlossFieldCache& cache,
+                                      const GlossFieldSurfaceRequest& surfaceRequest,
+                                      uint32_t outputSurfaceId,
+                                      int outputSurfaceWidth,
+                                      int outputSurfaceHeight,
+                                      int outputSurfacePixelFormat,
+                                      std::string* error);
+bool renderGlossProjectionSurfaceFromCache(const GlossFieldCache& cache,
+                                           const GlossProjectionSurfaceRequest& projectionRequest,
+                                           uint32_t outputSurfaceId,
+                                           int outputSurfaceWidth,
+                                           int outputSurfaceHeight,
+                                           int outputSurfacePixelFormat,
+                                           std::string* error);
 
 }  // namespace ChromaspaceMetal

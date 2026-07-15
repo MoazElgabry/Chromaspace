@@ -131,4 +131,31 @@ struct StripResult {
 
 bool buildIdentityStripCloud(const StripRequest& request, StripResult* out);
 
+struct SourceProxyRequest {
+  const float* srcBase = nullptr;
+  std::size_t srcRowBytes = 0;
+  void* outputDevicePtr = nullptr;
+  std::size_t outputByteSize = 0;
+  int sampledWidth = 0;
+  int sampledHeight = 0;
+  int proxyWidth = 0;
+  int proxyHeight = 0;
+  int exportIpc = 0;
+  int readback = 1;
+  cudaStream_t stream = nullptr;
+};
+
+struct SourceProxyResult {
+  std::vector<float> rgba32f;
+  std::size_t rowBytes = 0;
+  void* devicePtr = nullptr;
+  std::size_t byteSize = 0;
+  cudaIpcMemHandle_t ipcHandle{};
+  int hasIpcHandle = 0;
+  std::string error;
+  bool success = false;
+};
+
+bool buildSourceSignalProxy(const SourceProxyRequest& request, SourceProxyResult* out);
+
 }  // namespace ChromaspaceCloudCuda

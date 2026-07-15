@@ -103,7 +103,7 @@ struct ViewerRuntimeState {
   bool waveformHighDetailRequested = false;
   int waveformSampleColumns = 768;
   int waveformSamplesPerColumn = 96;
-  double waveformPointBrightness = 1.5;
+  double waveformPointBrightness = 0.4;
   double waveformGridBrightness = 1.0;
   double waveformSaturation = 0.75;
   double waveformDotSize = 0.25;

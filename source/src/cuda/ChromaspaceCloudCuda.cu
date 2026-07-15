@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <memory>
 
 namespace ChromaspaceCloudCuda {
@@ -793,6 +794,48 @@ __global__ void stripRampKernel(StripRequest request, Sample* outSamples) {
   outSamples[index] = sample;
 }
 
+__global__ void sourceSignalProxyKernel(SourceProxyRequest request, float* outRgba32f) {
+  const int index = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+  const int total = max(0, request.proxyWidth) * max(0, request.proxyHeight);
+  if (index >= total || !request.srcBase || !outRgba32f ||
+      request.sampledWidth <= 0 || request.sampledHeight <= 0 ||
+      request.proxyWidth <= 0 || request.proxyHeight <= 0) {
+    return;
+  }
+
+  const int px = index % request.proxyWidth;
+  const int py = index / request.proxyWidth;
+  const float srcX = ((static_cast<float>(px) + 0.5f) / static_cast<float>(request.proxyWidth)) *
+                         static_cast<float>(request.sampledWidth) -
+                     0.5f;
+  const float srcY = ((static_cast<float>(py) + 0.5f) / static_cast<float>(request.proxyHeight)) *
+                         static_cast<float>(request.sampledHeight) -
+                     0.5f;
+  const int x0 = clampValue(static_cast<int>(floorf(srcX)), 0, request.sampledWidth - 1);
+  const int y0 = clampValue(static_cast<int>(floorf(srcY)), 0, request.sampledHeight - 1);
+  const int x1 = clampValue(x0 + 1, 0, request.sampledWidth - 1);
+  const int y1 = clampValue(y0 + 1, 0, request.sampledHeight - 1);
+  const float tx = clamp01Safe(srcX - static_cast<float>(x0));
+  const float ty = clamp01Safe(srcY - static_cast<float>(y0));
+
+  const char* row0Bytes =
+      reinterpret_cast<const char*>(request.srcBase) + static_cast<std::size_t>(y0) * request.srcRowBytes;
+  const char* row1Bytes =
+      reinterpret_cast<const char*>(request.srcBase) + static_cast<std::size_t>(y1) * request.srcRowBytes;
+  const float* p00 = reinterpret_cast<const float*>(row0Bytes) + static_cast<std::size_t>(x0) * 4u;
+  const float* p10 = reinterpret_cast<const float*>(row0Bytes) + static_cast<std::size_t>(x1) * 4u;
+  const float* p01 = reinterpret_cast<const float*>(row1Bytes) + static_cast<std::size_t>(x0) * 4u;
+  const float* p11 = reinterpret_cast<const float*>(row1Bytes) + static_cast<std::size_t>(x1) * 4u;
+
+  float* dst = outRgba32f + static_cast<std::size_t>(index) * 4u;
+  for (int c = 0; c < 4; ++c) {
+    const float top = p00[c] * (1.0f - tx) + p10[c] * tx;
+    const float bottom = p01[c] * (1.0f - tx) + p11[c] * tx;
+    const float value = top * (1.0f - ty) + bottom * ty;
+    dst[c] = isfinite(value) ? value : (c == 3 ? 1.0f : 0.0f);
+  }
+}
+
 template <typename T>
 struct DeviceBuffer {
   T* ptr = nullptr;
@@ -802,6 +845,11 @@ struct DeviceBuffer {
   }
   DeviceBuffer(const DeviceBuffer&) = delete;
   DeviceBuffer& operator=(const DeviceBuffer&) = delete;
+  T* release() {
+    T* out = ptr;
+    ptr = nullptr;
+    return out;
+  }
 };
 
 template <typename T>
@@ -1046,6 +1094,82 @@ bool buildIdentityStripCloud(const StripRequest& request, StripResult* out) {
                  cudaMemcpyDeviceToHost) != cudaSuccess) {
     out->error = "strip readback failed";
     return false;
+  }
+  out->success = true;
+  return true;
+}
+
+bool buildSourceSignalProxy(const SourceProxyRequest& request, SourceProxyResult* out) {
+  if (!out) return false;
+  *out = SourceProxyResult{};
+  if (!request.srcBase || request.srcRowBytes == 0 ||
+      request.sampledWidth <= 0 || request.sampledHeight <= 0 ||
+      request.proxyWidth <= 0 || request.proxyHeight <= 0) {
+    out->error = "invalid-source-proxy-request";
+    return false;
+  }
+  const std::size_t pixelCount =
+      static_cast<std::size_t>(request.proxyWidth) * static_cast<std::size_t>(request.proxyHeight);
+  if (pixelCount == 0 ||
+      pixelCount > (std::numeric_limits<std::size_t>::max() / (4u * sizeof(float)))) {
+    out->error = "source-proxy-size-overflow";
+    return false;
+  }
+
+  const std::size_t proxyFloatCount = pixelCount * 4u;
+  const std::size_t proxyByteSize = proxyFloatCount * sizeof(float);
+  DeviceBuffer<float> proxy;
+  float* proxyPtr = reinterpret_cast<float*>(request.outputDevicePtr);
+  const bool callerOwnsProxy = proxyPtr != nullptr;
+  if (callerOwnsProxy) {
+    if (request.outputByteSize < proxyByteSize) {
+      out->error = "source-proxy-output-buffer-too-small";
+      return false;
+    }
+  } else {
+    if (!allocBuffer(&proxy, proxyFloatCount, &out->error)) return false;
+    proxyPtr = proxy.ptr;
+  }
+
+  const int total = static_cast<int>(std::min<std::size_t>(
+      pixelCount, static_cast<std::size_t>(std::numeric_limits<int>::max())));
+  if (static_cast<std::size_t>(total) != pixelCount) {
+    out->error = "source-proxy-point-limit";
+    return false;
+  }
+  const int blocks = std::max(1, (total + 255) / 256);
+  sourceSignalProxyKernel<<<blocks, 256, 0, request.stream>>>(request, proxyPtr);
+  if (cudaGetLastError() != cudaSuccess || cudaStreamSynchronize(request.stream) != cudaSuccess) {
+    out->error = "source-proxy-kernel failed";
+    return false;
+  }
+
+  out->rowBytes = static_cast<std::size_t>(request.proxyWidth) * 4u * sizeof(float);
+  out->byteSize = proxyByteSize;
+  if (request.exportIpc != 0) {
+    const cudaError_t ipcStatus = cudaIpcGetMemHandle(&out->ipcHandle, proxyPtr);
+    if (ipcStatus == cudaSuccess) {
+      out->hasIpcHandle = 1;
+      out->devicePtr = callerOwnsProxy ? proxyPtr : proxy.release();
+    } else if (request.readback == 0) {
+      out->error = std::string("source-proxy-ipc-export failed: ") + cudaGetErrorString(ipcStatus);
+      return false;
+    }
+  }
+  if (request.readback != 0) {
+    out->rgba32f.assign(pixelCount * 4u, 0.0f);
+    if (cudaMemcpy(out->rgba32f.data(),
+                   out->devicePtr ? out->devicePtr : proxyPtr,
+                   out->rgba32f.size() * sizeof(float),
+                   cudaMemcpyDeviceToHost) != cudaSuccess) {
+      if (out->devicePtr && !callerOwnsProxy) {
+        cudaFree(out->devicePtr);
+        out->devicePtr = nullptr;
+        out->hasIpcHandle = 0;
+      }
+      out->error = "source-proxy-readback failed";
+      return false;
+    }
   }
   out->success = true;
   return true;
