@@ -1549,6 +1549,31 @@ const ViewerGlComputeApi& viewerGlComputeApi() {
   return api;
 }
 
+bool viewerGlShaderProgramApiAvailable(const ViewerGlComputeApi& api,
+                                       bool requireMatrixUniform = false,
+                                       bool requireTextureUnit = false) {
+  return api.createShader != nullptr &&
+         api.shaderSource != nullptr &&
+         api.compileShader != nullptr &&
+         api.getShaderiv != nullptr &&
+         api.getShaderInfoLog != nullptr &&
+         api.createProgram != nullptr &&
+         api.attachShader != nullptr &&
+         api.linkProgram != nullptr &&
+         api.getProgramiv != nullptr &&
+         api.getProgramInfoLog != nullptr &&
+         api.deleteShader != nullptr &&
+         api.deleteProgram != nullptr &&
+         api.useProgram != nullptr &&
+         api.getUniformLocation != nullptr &&
+         api.uniform1i != nullptr &&
+         api.uniform1f != nullptr &&
+         api.uniform2f != nullptr &&
+         api.uniform3f != nullptr &&
+         (!requireMatrixUniform || api.uniformMatrix4fv != nullptr) &&
+         (!requireTextureUnit || api.activeTexture != nullptr);
+}
+
 std::string currentGlVersionString() {
   const GLubyte* version = glGetString(GL_VERSION);
   return version != nullptr ? reinterpret_cast<const char*>(version) : std::string();
@@ -1777,7 +1802,11 @@ bool ensureDirectRasterSourceProgram(DirectRasterSourceProgramCache* cache) {
   if (cache->available && cache->program != 0) return true;
   cache->initAttempted = true;
   const ViewerGlComputeApi& api = viewerGlComputeApi();
-  if (!api.available || !api.uniformMatrix4fv) return false;
+  if (!viewerGlShaderProgramApiAvailable(api, true, true)) {
+    logViewerEvent(std::string("Direct raster shader API unavailable: glVersion=") +
+                   currentGlVersionString());
+    return false;
+  }
 
   // Mac OpenGL has no compute shader path, so the IOSurface residency lane uses
   // a vertex shader driven by gl_VertexID: source texture -> plot point -> final
@@ -1850,15 +1879,6 @@ uniform vec3 uChromaticityRgbToXyz2;
 uniform vec3 uChromaticityXyzToRgb0;
 uniform vec3 uChromaticityXyzToRgb1;
 uniform vec3 uChromaticityXyzToRgb2;
-uniform int uCubeSlicingEnabled;
-uniform int uNeutralRadiusEnabled;
-uniform float uNeutralRadius;
-uniform int uCubeSliceRed;
-uniform int uCubeSliceYellow;
-uniform int uCubeSliceGreen;
-uniform int uCubeSliceCyan;
-uniform int uCubeSliceBlue;
-uniform int uCubeSliceMagenta;
 uniform float uPointAlphaScale;
 uniform float uDenseAlphaBias;
 uniform float uColorSaturation;
@@ -3323,6 +3343,8 @@ struct InputCloudComputeCache {
   GLint glossViewLoc = -1;
   GLint sourceAspectLoc = -1;
   GLint glossLiftScaleLoc = -1;
+  GLint plotLinearLoc = -1;
+  GLint plotLinearTransferLoc = -1;
   GLint chromaticityTransferLoc = -1;
   GLint chromaticityReferenceBasisLoc = -1;
   GLint chromaticityWhiteLoc = -1;
@@ -4779,6 +4801,10 @@ struct SourceSignalStore {
 #endif
 };
 
+bool sourceSignalTextureImportFailureActive(const SourceSignalStore* store,
+                                            const SourceSignalPayload& source,
+                                            std::string* reason);
+
 bool sourceSignalRequiresCudaResidency(const SourceSignalPayload& source,
                                        const ViewerGpuCapabilities& gpuCaps) {
   return sessionWantsCuda(gpuCaps) &&
@@ -6029,6 +6055,8 @@ uniform int uInputStride;
 uniform int uGlossView;
 uniform float uSourceAspect;
 uniform float uGlossLiftScale;
+uniform int uPlotLinear;
+uniform int uPlotLinearTransfer;
 uniform int uChromaticityInputTransfer;
 uniform int uChromaticityReferenceBasis;
 uniform vec2 uChromaticityWhite;
@@ -6670,6 +6698,11 @@ void main() {
     g = inputVals[inBase + 4u];
     b = inputVals[inBase + 5u];
   }
+  if (uPlotLinear != 0 && uPlotMode != 8) {
+    r = decodeTransferChannel(r, uPlotLinearTransfer);
+    g = decodeTransferChannel(g, uPlotLinearTransfer);
+    b = decodeTransferChannel(b, uPlotLinearTransfer);
+  }
   bool overflowPoint = outOfBounds(r, g, b);
   bool visibleByGpuFilter = cubeSliceContains(vec3(r, g, b));
   uint packedCoord = topologyWords[index];
@@ -6788,6 +6821,8 @@ void main() {
   cache->glossViewLoc = api.getUniformLocation(program, "uGlossView");
   cache->sourceAspectLoc = api.getUniformLocation(program, "uSourceAspect");
   cache->glossLiftScaleLoc = api.getUniformLocation(program, "uGlossLiftScale");
+  cache->plotLinearLoc = api.getUniformLocation(program, "uPlotLinear");
+  cache->plotLinearTransferLoc = api.getUniformLocation(program, "uPlotLinearTransfer");
   cache->chromaticityTransferLoc = api.getUniformLocation(program, "uChromaticityInputTransfer");
   cache->chromaticityReferenceBasisLoc = api.getUniformLocation(program, "uChromaticityReferenceBasis");
   cache->chromaticityWhiteLoc = api.getUniformLocation(program, "uChromaticityWhite");
@@ -6849,6 +6884,8 @@ void main() {
                      cache->glossViewLoc >= 0 &&
                      cache->sourceAspectLoc >= 0 &&
                      cache->glossLiftScaleLoc >= 0 &&
+                     cache->plotLinearLoc >= 0 &&
+                     cache->plotLinearTransferLoc >= 0 &&
                      cache->chromaticityTransferLoc >= 0 &&
                      cache->chromaticityReferenceBasisLoc >= 0 &&
                      cache->chromaticityWhiteLoc >= 0 &&
@@ -7903,7 +7940,6 @@ bool rasterGlComputeCanRepresentPayload(const ResolvedPayload& payload,
     if (payload.plotMode != "histogram") return reject("analytical-scope-point-or-surface-required");
   }
   if (classifyPlotMode(payload) == PlotModeKind::GlossLift) return reject("gloss-field-cpu-reference");
-  if (viewerPlotLinearApplies(payload)) return reject("plot-linear-filter");
   if (payload.occupancyFill) return reject("occupancy-fill-filter");
   if (analyticalScope &&
       (payload.readGrayRamp || payload.readIdentityPlot || payload.isolateIdentityData ||
@@ -9430,6 +9466,8 @@ bool buildRasterDerivedMeshGlCompute(const ResolvedPayload& resolved,
   computeApi.uniform1i(mapCache.glossViewLoc, 0);
   computeApi.uniform1f(mapCache.sourceAspectLoc, payload.sourceAspect);
   computeApi.uniform1f(mapCache.glossLiftScaleLoc, payload.glossLiftScale);
+  computeApi.uniform1i(mapCache.plotLinearLoc, viewerPlotLinearApplies(payload) ? 1 : 0);
+  computeApi.uniform1i(mapCache.plotLinearTransferLoc, viewerPlotLinearTransferId(payload));
   computeApi.uniform1f(mapCache.pointAlphaScaleLoc,
                        pointAlphaScaleForPlot(payload.pointSize, payload.pointDensity, payload.resolution));
   computeApi.uniform1f(mapCache.denseAlphaBiasLoc,
@@ -20376,6 +20414,32 @@ void rememberViewerLassoTargetFromSettingsWindow(AppState* app) {
   rememberViewerLassoTargetFromCurrentFocus(app);
 }
 
+ChromaspaceViewer::ViewerRuntimeState viewerStateForLassoSettingsEdit(AppState* app) {
+  auto state = viewerStateWithModelCapabilities(app ? app->viewerState
+                                                    : ChromaspaceViewer::ViewerRuntimeState{});
+  if (!app) return state;
+
+  PlotWindowState* owner = effectiveSettingsPlotWindow(app);
+  if (!owner || !plotWindowCanOwnViewerLassoSelection(*owner)) {
+    owner = activeViewerLassoTargetWindow(app);
+  }
+  if (!owner || !plotWindowCanOwnViewerLassoSelection(*owner)) return state;
+
+  // Image Lasso is a per-plot slicing mode in multi-window workspaces. Seed
+  // lasso-only edits from the owning plot window so toggling the lasso cannot
+  // reapply a stale app-level fallback model, while keeping global sync toggles
+  // from the app mirror.
+  auto ownerState = viewerStateWithModelCapabilities(owner->viewState);
+  ownerState.sourceSyncSelections = state.sourceSyncSelections;
+  ownerState.sourceSyncCommonPlotSettings = state.sourceSyncCommonPlotSettings;
+  ownerState.keepOnTop = state.keepOnTop;
+  ownerState.resetViewOnPlotSwitch = state.resetViewOnPlotSwitch;
+  ownerState.liveUpdate = state.liveUpdate;
+  ownerState.updateMode = state.updateMode;
+  ownerState.stateRevision = std::max(ownerState.stateRevision, state.stateRevision);
+  return viewerStateWithModelCapabilities(ownerState);
+}
+
 const PlotWindowState* activeSourceSignalLassoWindow(const AppState& app) {
   if (const PlotWindowState* focused = focusedPlotWindow(app);
       focused && plotWindowIsSourceSignal(*focused) && !plotWindowIsDockedSourceSignal(*focused)) {
@@ -25980,7 +26044,9 @@ bool resetViewerMenuParameterFromSelectedPreset(AppState* app, const ViewerMenuR
     if (!loadViewerUserPreset(presetName, &preset)) return false;
   }
 
-  auto state = viewerStateWithModelCapabilities(app->viewerState);
+  auto state = row.action == ViewerMenuAction::ViewerLasso
+                   ? viewerStateForLassoSettingsEdit(app)
+                   : viewerStateWithModelCapabilities(app->viewerState);
   const std::string previousSampleKey = ChromaspaceViewer::sampleSettingsKey(state, false);
   const std::string previousPlotMode = app->plotMode;
   const int previousPlotModel = state.plotModel;
@@ -26069,7 +26135,10 @@ void activateViewerMenuRow(AppState* app, const ViewerMenuRow& row) {
     app->viewerChoiceMenuScroll = 0.0f;
     return;
   }
-  auto state = viewerStateWithModelCapabilities(app->viewerState);
+  auto state = (row.action == ViewerMenuAction::ViewerLasso ||
+                row.action == ViewerMenuAction::ClearViewerLasso)
+                   ? viewerStateForLassoSettingsEdit(app)
+                   : viewerStateWithModelCapabilities(app->viewerState);
   const std::string previousSampleKey = ChromaspaceViewer::sampleSettingsKey(state, false);
   const std::string previousPlotMode = app->plotMode;
   const int previousPlotModel = state.plotModel;
@@ -26166,7 +26235,7 @@ void activateViewerMenuRow(AppState* app, const ViewerMenuRow& row) {
       break;
     case ViewerMenuAction::ClearViewerLasso:
       clearActiveViewerLassoSelection(app);
-      state = viewerStateWithModelCapabilities(app->viewerState);
+      state = viewerStateForLassoSettingsEdit(app);
       bump();
       beginPendingImageLassoClear(app, state.stateRevision);
       break;
@@ -26630,7 +26699,7 @@ void toggleViewerShowOverflowFromPopover(AppState* app) {
 void toggleViewerLassoFromIdentityPopover(AppState* app) {
   if (!app) return;
   if (app->viewerState.volumeSliceLassoRegion) clearViewerLassoState(app);
-  auto state = viewerStateWithModelCapabilities(app->viewerState);
+  auto state = viewerStateForLassoSettingsEdit(app);
   const std::string previousSampleKey = ChromaspaceViewer::sampleSettingsKey(state, false);
   const bool enablingLasso = !state.volumeSliceLassoRegion;
   if (enablingLasso) rememberViewerLassoTargetFromSettingsWindow(app);
@@ -32900,35 +32969,54 @@ bool rebuildPlotWindowDerivedMeshIfNeeded(PlotWindowState* window,
       std::string rasterBackend = "cpu";
       std::string rasterFallbackReason;
       bool built = false;
+      bool directImportBlocked = false;
+      bool directDrawableBlocked = false;
       std::string directReason;
-      if (rasterDirectGlVertexCanRepresentPayload(payload, *rasterSource, analyticalScope, &directReason) &&
-          ensureSourceSignalTexture(sourceSignalStore, *rasterSource, &app.gpuCaps) &&
-          ensureDirectRasterSourceProgram(&directRasterSourceProgramCache())) {
-        built = buildDirectRasterSourceDrawableMesh(payload,
-                                                    *rasterSource,
-                                                    analyticalScope,
-                                                    &mesh,
-                                                    &rasterFallbackReason);
-        if (built) rasterBackend = "gl-vertex-iosurface";
+      if (rasterDirectGlVertexCanRepresentPayload(payload, *rasterSource, analyticalScope, &directReason)) {
+        const bool importedSourceTexture = ensureSourceSignalTexture(sourceSignalStore, *rasterSource, &app.gpuCaps);
+        if (importedSourceTexture) {
+          if (ensureDirectRasterSourceProgram(&directRasterSourceProgramCache())) {
+            built = buildDirectRasterSourceDrawableMesh(payload,
+                                                        *rasterSource,
+                                                        analyticalScope,
+                                                        &mesh,
+                                                        &rasterFallbackReason);
+            if (built) rasterBackend = "gl-vertex-iosurface";
+          } else if (rasterSource->transport == "iosurface_metal" &&
+                     !metalIOSurfaceCpuRasterFallbackEnabled()) {
+            rasterFallbackReason =
+                "metal-iosurface-residency-required:gl-vertex-iosurface-program-unavailable";
+            directDrawableBlocked = true;
+          }
+        } else if (rasterSource->transport == "iosurface_metal" &&
+                   !metalIOSurfaceCpuRasterFallbackEnabled()) {
+          std::string importFailureReason;
+          if (sourceSignalTextureImportFailureActive(sourceSignalStore, *rasterSource, &importFailureReason)) {
+            rasterFallbackReason = "metal-iosurface-import-failed:" + importFailureReason;
+            directImportBlocked = true;
+          }
+        }
       }
       if (!built) {
-        if (!directReason.empty()) rasterFallbackReason = directReason;
-        built = buildRasterDerivedMeshBackendMapped(payload,
-                                                    *rasterSource,
-                                                    app.gpuCaps,
-                                                    &app.computeSession,
+        if (!directReason.empty() && rasterFallbackReason.empty()) rasterFallbackReason = directReason;
+        if (!directImportBlocked && !directDrawableBlocked) {
+          built = buildRasterDerivedMeshBackendMapped(payload,
+                                                      *rasterSource,
+                                                      app.gpuCaps,
+                                                      &app.computeSession,
 #if defined(CHROMASPACE_VIEWER_HAS_CUDA) && !defined(__APPLE__)
-                                                    &window->residentInputCudaCache,
-                                                    &window->residentScopeGeometryCudaCache,
+                                                      &window->residentInputCudaCache,
+                                                      &window->residentScopeGeometryCudaCache,
 #endif
 #if defined(__APPLE__)
-                                                    &window->residentGlossFieldMetalCache,
+                                                      &window->residentGlossFieldMetalCache,
 #endif
-                                                    sourceSignalStore,
-                                                    analyticalScope,
-                                                    window->derivedMeshValid ? &window->derivedMesh : nullptr,
-                                                    &mesh,
-                                                    &rasterFallbackReason);
+                                                      sourceSignalStore,
+                                                      analyticalScope,
+                                                      window->derivedMeshValid ? &window->derivedMesh : nullptr,
+                                                      &mesh,
+                                                      &rasterFallbackReason);
+        }
       }
       if (built) {
         if (rasterBackend != "gl-vertex-iosurface") {
@@ -32949,7 +33037,8 @@ bool rebuildPlotWindowDerivedMeshIfNeeded(PlotWindowState* window,
             stringStartsWith(backendFallbackReason, "cuda-source-residency-required:") &&
             !cudaSourceCpuFallbackEnabled();
         const bool metalIOSurfaceResidencyBlocked =
-            stringStartsWith(backendFallbackReason, "metal-iosurface-residency-required:") &&
+            (stringStartsWith(backendFallbackReason, "metal-iosurface-residency-required:") ||
+             stringStartsWith(backendFallbackReason, "metal-iosurface-import-failed:")) &&
             !metalIOSurfaceCpuRasterFallbackEnabled();
         if ((rasterSource->transport == "cuda_ipc" && !cudaIpcCpuRasterFallbackEnabled()) ||
             cudaGlossResidencyBlocked ||
@@ -33461,6 +33550,23 @@ std::string sourceSignalTextureCacheKey(const SourceSignalPayload& source, GLenu
   return os.str();
 }
 
+constexpr double kIOSurfaceFailedImportRetrySeconds = 0.75;
+
+bool sourceSignalTextureImportFailureActive(const SourceSignalStore* store,
+                                            const SourceSignalPayload& source,
+                                            std::string* reason) {
+  if (reason) reason->clear();
+  if (!store || source.transport != "iosurface_metal") return false;
+  const std::string cacheKey = sourceSignalTextureCacheKey(source, GL_TEXTURE_RECTANGLE);
+  if (store->textureFailedSourceKey != cacheKey || store->textureFailedAt <= 0.0) return false;
+  if (glfwGetTime() - store->textureFailedAt >= kIOSurfaceFailedImportRetrySeconds) return false;
+  if (reason) {
+    *reason = store->textureFailedReason.empty() ? "iosurface-import-failed"
+                                                 : store->textureFailedReason;
+  }
+  return true;
+}
+
 bool ensureSourceSignalTexture(SourceSignalStore* store,
                                const SourceSignalPayload& source,
                                const ViewerGpuCapabilities* gpuCaps) {
@@ -33515,7 +33621,6 @@ bool ensureSourceSignalTexture(SourceSignalStore* store,
   }
 #if defined(__APPLE__)
   if (hasGpuSurface) {
-    constexpr double kIOSurfaceFailedImportRetrySeconds = 0.75;
     const double now = glfwGetTime();
     if (store->textureFailedSourceKey == cacheKey &&
         now - store->textureFailedAt < kIOSurfaceFailedImportRetrySeconds) {
