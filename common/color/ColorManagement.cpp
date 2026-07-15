@@ -520,12 +520,28 @@ const std::array<Vec3f, 82>& cie1931XyzCmfs5nm() {
   return kCie1931XyzCmfs5nm;
 }
 
-bool blackBodyChromaticity(float kelvin, Vec2f* xy) {
-  if (!xy || !std::isfinite(kelvin) || kelvin < 1000.0f || kelvin > 25000.0f) return false;
+bool blackBodyXyY(float kelvin, XyY* xyY) {
+  if (!xyY || !std::isfinite(kelvin) || kelvin < 1000.0f || kelvin > 25000.0f) return false;
+
+  // xy comes from the absolute Planck-law integration and is scale independent.
+  // The returned Y is a display guide value: each blackbody SPD is normalized to
+  // its visible-range peak before integrating y_bar, then callers may normalize
+  // a curve to their chosen presentation range.
+  double peakVisibleSpd = 0.0;
+  for (std::size_t i = 0; i + 1 < kCie1931XyzCmfs5nm.size(); ++i) {
+    const double wavelengthNm = 380.0 + static_cast<double>(i) * 5.0;
+    const double wavelengthM = wavelengthNm * 1.0e-9;
+    const double exponent = kPlanckC2 / (wavelengthM * static_cast<double>(kelvin));
+    const double spd = kPlanckC1 /
+                       (std::pow(wavelengthM, 5.0) * std::max(std::exp(exponent) - 1.0, 1e-30));
+    peakVisibleSpd = std::max(peakVisibleSpd, spd);
+  }
+  if (!(peakVisibleSpd > 1e-30)) return false;
 
   double X = 0.0;
   double Y = 0.0;
   double Z = 0.0;
+  double shapeY = 0.0;
   for (std::size_t i = 0; i + 1 < kCie1931XyzCmfs5nm.size(); ++i) {
     const double wavelengthNm = 380.0 + static_cast<double>(i) * 5.0;
     const double wavelengthM = wavelengthNm * 1.0e-9;
@@ -535,12 +551,23 @@ bool blackBodyChromaticity(float kelvin, Vec2f* xy) {
     X += spd * static_cast<double>(kCie1931XyzCmfs5nm[i].x);
     Y += spd * static_cast<double>(kCie1931XyzCmfs5nm[i].y);
     Z += spd * static_cast<double>(kCie1931XyzCmfs5nm[i].z);
+    shapeY += (spd / peakVisibleSpd) * static_cast<double>(kCie1931XyzCmfs5nm[i].y);
   }
 
   const double sum = X + Y + Z;
   if (!(sum > 1e-30)) return false;
-  xy->x = static_cast<float>(X / sum);
-  xy->y = static_cast<float>(Y / sum);
+  xyY->x = static_cast<float>(X / sum);
+  xyY->y = static_cast<float>(Y / sum);
+  xyY->Y = static_cast<float>(std::max(0.0, shapeY));
+  return isFinite(Vec2f{xyY->x, xyY->y}) && std::isfinite(xyY->Y);
+}
+
+bool blackBodyChromaticity(float kelvin, Vec2f* xy) {
+  if (!xy) return false;
+  XyY xyY{};
+  if (!blackBodyXyY(kelvin, &xyY)) return false;
+  xy->x = xyY.x;
+  xy->y = xyY.y;
   return isFinite(*xy);
 }
 
@@ -594,6 +621,23 @@ std::vector<Vec2f> blackBodyChromaticityCurve(float minKelvin, float maxKelvin, 
     const float kelvin = minKelvin + (maxKelvin - minKelvin) * t;
     Vec2f sample{};
     if (blackBodyChromaticity(kelvin, &sample)) {
+      curve.push_back(sample);
+    }
+  }
+  return curve;
+}
+
+std::vector<XyY> blackBodyXyYCurve(float minKelvin, float maxKelvin, std::size_t steps) {
+  std::vector<XyY> curve;
+  if (steps < 2) return curve;
+  minKelvin = std::clamp(minKelvin, 1000.0f, 25000.0f);
+  maxKelvin = std::clamp(maxKelvin, minKelvin, 25000.0f);
+  curve.reserve(steps);
+  for (std::size_t i = 0; i < steps; ++i) {
+    const float t = steps > 1 ? static_cast<float>(i) / static_cast<float>(steps - 1) : 0.0f;
+    const float kelvin = minKelvin + (maxKelvin - minKelvin) * t;
+    XyY sample{};
+    if (blackBodyXyY(kelvin, &sample)) {
       curve.push_back(sample);
     }
   }

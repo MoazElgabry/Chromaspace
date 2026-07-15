@@ -139,7 +139,9 @@ Vec2f inputObserverToStandardObserver(Vec2f xy, ColorPrimariesId inputPrimaries)
 
 const std::array<Vec3f, 82>& cie1931XyzCmfs5nm();
 bool blackBodyChromaticity(float kelvin, Vec2f* xy);
+bool blackBodyXyY(float kelvin, XyY* xyY);
 float nearestBlackBodyTemperature(Vec2f xy, float minKelvin = 1000.0f, float maxKelvin = 20000.0f);
 std::vector<Vec2f> blackBodyChromaticityCurve(float minKelvin, float maxKelvin, std::size_t steps);
+std::vector<XyY> blackBodyXyYCurve(float minKelvin, float maxKelvin, std::size_t steps);
 
 }  // namespace WorkshopColor

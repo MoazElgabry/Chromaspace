@@ -21,6 +21,15 @@
 #ifndef GL_TEXTURE_RECTANGLE
 #define GL_TEXTURE_RECTANGLE 0x84F5
 #endif
+#ifndef GL_RGBA16F
+#define GL_RGBA16F 0x881A
+#endif
+#ifndef GL_RGBA32F
+#define GL_RGBA32F 0x8814
+#endif
+#ifndef GL_HALF_FLOAT
+#define GL_HALF_FLOAT 0x140B
+#endif
 
 namespace ChromaspaceMetal {
 namespace {

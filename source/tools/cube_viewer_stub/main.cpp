@@ -3032,6 +3032,8 @@ struct MeshData {
   int scopeLumaMethod = 0;
 };
 
+void glossViewHalfExtents(float sourceAspect, float* outHalfWidth, float* outHalfDepth);
+
 bool stringStartsWith(const std::string& value, const char* prefix) {
   if (!prefix) return false;
   const size_t prefixLen = std::strlen(prefix);
@@ -39816,8 +39818,8 @@ int main() {
       ResidentField2DDrawBuffers residentField2D;
       ResidentFieldSurfaceDraw residentFieldSurface;
 #if defined(__APPLE__)
-      if (focusedWindowForRender) {
-        (void)buildMetalGlossFieldSurfaceDraw(focusedWindowForRender, resolved, app, &residentFieldSurface);
+      if (PlotWindowState* focusedSurfaceWindow = focusedPlotWindow(&app)) {
+        (void)buildMetalGlossFieldSurfaceDraw(focusedSurfaceWindow, resolved, app, &residentFieldSurface);
       }
 #endif
 #if defined(CHROMASPACE_VIEWER_HAS_CUDA) && !defined(__APPLE__)
@@ -39902,8 +39904,8 @@ int main() {
       ResidentField2DDrawBuffers residentFieldInset;
       ResidentFieldSurfaceDraw residentFieldSurface;
 #if defined(__APPLE__)
-      if (focusedWindowForRender) {
-        (void)buildMetalGlossFieldSurfaceDraw(focusedWindowForRender, resolved, app, &residentFieldSurface);
+      if (PlotWindowState* focusedSurfaceWindow = focusedPlotWindow(&app)) {
+        (void)buildMetalGlossFieldSurfaceDraw(focusedSurfaceWindow, resolved, app, &residentFieldSurface);
       }
 #endif
 #if defined(CHROMASPACE_VIEWER_HAS_CUDA) && !defined(__APPLE__)
