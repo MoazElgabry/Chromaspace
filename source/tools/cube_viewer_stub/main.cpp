@@ -453,6 +453,14 @@ bool metalIOSurfaceCpuRasterFallbackEnabled() {
   return viewerEnvFlagEnabled("CHROMASPACE_METAL_IOSURFACE_CPU_RASTER_FALLBACK", false);
 }
 
+bool glRasterComputeCpuReadbackFallbackEnabled() {
+  return viewerEnvFlagEnabled("CHROMASPACE_GL_RASTER_COMPUTE_CPU_READBACK_FALLBACK", false);
+}
+
+bool glAnalyticalScopeCpuReadbackFallbackEnabled() {
+  return viewerEnvFlagEnabled("CHROMASPACE_GL_SCOPE_DENSITY_CPU_READBACK_FALLBACK", false);
+}
+
 bool viewerCudaDisabled() {
   return viewerEnvFlagEnabled("CHROMASPACE_DISABLE_CUDA", false);
 }
@@ -1838,6 +1846,15 @@ uniform vec3 uChromaticityRgbToXyz2;
 uniform vec3 uChromaticityXyzToRgb0;
 uniform vec3 uChromaticityXyzToRgb1;
 uniform vec3 uChromaticityXyzToRgb2;
+uniform int uCubeSlicingEnabled;
+uniform int uNeutralRadiusEnabled;
+uniform float uNeutralRadius;
+uniform int uCubeSliceRed;
+uniform int uCubeSliceYellow;
+uniform int uCubeSliceGreen;
+uniform int uCubeSliceCyan;
+uniform int uCubeSliceBlue;
+uniform int uCubeSliceMagenta;
 uniform float uPointAlphaScale;
 uniform float uDenseAlphaBias;
 uniform float uColorSaturation;
@@ -2940,11 +2957,12 @@ struct MeshData {
   bool cudaSourceDeviceResident = false;
   std::string sourceTransport;
   // Residency audit stages are diagnostic breadcrumbs for Source Signal plots:
-  // source import, derivation/topology, and final drawable ownership must be
-  // tracked separately so Metal/CUDA paths cannot hide CPU staging behind a GPU
-  // source label.
+  // source import, derivation, topology/index ownership, and final drawable
+  // ownership must be tracked separately so a GPU source or kernel cannot hide
+  // CPU point vectors, density grids, or draw arrays.
   std::string residencySourceStage;
   std::string residencyDerivationStage;
+  std::string residencyTopologyStage;
   std::string residencyDrawableStage;
   int directRasterSampleStride = 1;
   int directRasterSampleCountX = 0;
@@ -3080,11 +3098,48 @@ bool meshRequiresCudaPointResidency(const MeshData& mesh) {
 void setMeshResidencyAudit(MeshData* mesh,
                            std::string sourceStage,
                            std::string derivationStage,
+                           std::string topologyStage,
                            std::string drawableStage) {
   if (!mesh) return;
   mesh->residencySourceStage = std::move(sourceStage);
   mesh->residencyDerivationStage = std::move(derivationStage);
+  mesh->residencyTopologyStage = std::move(topologyStage);
   mesh->residencyDrawableStage = std::move(drawableStage);
+}
+
+void setMeshResidencyAudit(MeshData* mesh,
+                           std::string sourceStage,
+                           std::string derivationStage,
+                           std::string drawableStage) {
+  setMeshResidencyAudit(mesh,
+                        std::move(sourceStage),
+                        std::move(derivationStage),
+                        std::string(),
+                        std::move(drawableStage));
+}
+
+std::string meshTopologyResidencyStage(const MeshData& mesh) {
+  if (!mesh.residencyTopologyStage.empty()) return mesh.residencyTopologyStage;
+  if (mesh.directRasterSourceDrawable) return "gl-vertex-id-direct-plan";
+  if (mesh.residentScopeSurfaceDrawable) return "gpu-scope-surface-grid";
+  if (mesh.residentScopeGeometryDrawable) return "gpu-scope-geometry-buffer";
+  if (mesh.residentScopePointDrawable) return "gpu-scope-point-buffer";
+  if (mesh.residentGlossFieldSurfaceDrawable) return "gpu-gloss-surface-grid";
+  if (mesh.hasGlossField) {
+    if ((mesh.glossFieldResidentCuda || mesh.glossFieldResidentMetal) &&
+        !mesh.glossFieldCpuReadable) {
+      return "gpu-gloss-field-grid";
+    }
+    if (mesh.glossFieldCpuReadable) return "cpu-gloss-field-grid";
+  }
+  if (!mesh.scopeDensity.empty()) return "cpu-scope-density-grid";
+  if (!mesh.glossFieldPointCellIndices.empty() || !mesh.glossProjectionCellIndices.empty()) {
+    return "cpu-gloss-cell-index-vector";
+  }
+  if (!mesh.pointVerts.empty() || !mesh.pointColors.empty()) return "cpu-point-vector";
+  if (!mesh.lineVerts.empty() || !mesh.lineColors.empty()) return "cpu-line-vector";
+  if (!mesh.scopeFillVerts.empty() || !mesh.scopeFillColors.empty()) return "cpu-scope-fill-vector";
+  return "unspecified";
 }
 
 std::string pointDrawSourceLabel(bool useInputCudaBuffers,
@@ -3245,6 +3300,7 @@ struct InputCloudComputeCache {
   GLuint input = 0;
   GLuint verts = 0;
   GLuint colors = 0;
+  GLuint topology = 0;
   GLuint program = 0;
   GLuint boundsBuffer = 0;
   GLuint boundsProgram = 0;
@@ -3272,21 +3328,93 @@ struct InputCloudComputeCache {
   GLint chromaticityInverseRow0Loc = -1;
   GLint chromaticityInverseRow1Loc = -1;
   GLint chromaticityInverseRow2Loc = -1;
+  GLint cubeSlicingEnabledLoc = -1;
+  GLint neutralRadiusEnabledLoc = -1;
+  GLint neutralRadiusLoc = -1;
+  GLint cubeSliceRedLoc = -1;
+  GLint cubeSliceYellowLoc = -1;
+  GLint cubeSliceGreenLoc = -1;
+  GLint cubeSliceCyanLoc = -1;
+  GLint cubeSliceBlueLoc = -1;
+  GLint cubeSliceMagentaLoc = -1;
+  GLint sourceWidthLoc = -1;
+  GLint sourceHeightLoc = -1;
+  GLint lassoEnabledLoc = -1;
+  GLint lassoStrokeCountLoc = -1;
+  GLint lassoPointCountLoc = -1;
+  std::array<GLint, 16> lassoStrokeFirstLoc{};
+  std::array<GLint, 16> lassoStrokeCountPerStrokeLoc{};
+  std::array<GLint, 16> lassoStrokeSubtractLoc{};
+  std::array<GLint, 256> lassoXLoc{};
+  std::array<GLint, 256> lassoYLoc{};
   uint64_t builtSerial = 0;
   GLsizei pointCount = 0;
   bool available = false;
 };
 
 struct RasterSignalComputeCache {
-  GLuint source = 0;
   GLuint program = 0;
+  GLuint topologyProgram = 0;
   GLint pointCountLoc = -1;
   GLint sourceWidthLoc = -1;
   GLint sourceHeightLoc = -1;
-  GLint sampleStrideLoc = -1;
-  GLint sampleCountXLoc = -1;
   GLint pixelFormatLoc = -1;
+  GLint topologyPointCountLoc = -1;
+  GLint topologySourceWidthLoc = -1;
+  GLint topologySourceHeightLoc = -1;
+  GLint topologySampleStrideLoc = -1;
+  GLint topologySampleCountXLoc = -1;
   bool initAttempted = false;
+  bool available = false;
+};
+
+struct ScopeHistogramGlProgramCache {
+  GLuint clearProgram = 0;
+  GLuint rangeProgram = 0;
+  GLuint densityProgram = 0;
+  GLuint geometryProgram = 0;
+  GLint clearBinCountLoc = -1;
+  GLint rangePointCountLoc = -1;
+  GLint rangeSourceWidthLoc = -1;
+  GLint rangeSourceHeightLoc = -1;
+  GLint rangePixelFormatLoc = -1;
+  GLint rangeScopeModeLoc = -1;
+  GLint rangeIncludeOverflowLoc = -1;
+  GLint densityPointCountLoc = -1;
+  GLint densitySourceWidthLoc = -1;
+  GLint densitySourceHeightLoc = -1;
+  GLint densityPixelFormatLoc = -1;
+  GLint densityWidthLoc = -1;
+  GLint densityRangeMinLoc = -1;
+  GLint densityInvRangeLoc = -1;
+  GLint densityChannelCountLoc = -1;
+  GLint densityScopeModeLoc = -1;
+  GLint densityOverflowEnabledLoc = -1;
+  GLint densityOverflowRangeMinLoc = -1;
+  GLint densityOverflowInvRangeLoc = -1;
+  GLint geometryWidthLoc = -1;
+  GLint geometryChannelCountLoc = -1;
+  GLint geometryScopeModeLoc = -1;
+  GLint geometryOverflowEnabledLoc = -1;
+  GLint geometryRangeMinLoc = -1;
+  GLint geometryInvRangeLoc = -1;
+  GLint geometryOverflowRangeMinLoc = -1;
+  GLint geometryOverflowInvRangeLoc = -1;
+  GLint geometryHighlightOverflowLoc = -1;
+  bool initAttempted = false;
+  bool available = false;
+};
+
+struct ScopeGeometryGlCache {
+  GLuint range = 0;
+  GLuint density = 0;
+  GLuint lineVerts = 0;
+  GLuint lineColors = 0;
+  GLuint fillVerts = 0;
+  GLuint fillColors = 0;
+  uint64_t builtSerial = 0;
+  GLsizei lineVertexCount = 0;
+  GLsizei fillVertexCount = 0;
   bool available = false;
 };
 
@@ -3489,6 +3617,28 @@ bool residentCudaPointDrawBuffers(const MeshData& mesh,
 }
 #endif
 
+bool residentGlComputePointDrawBuffers(const MeshData& mesh,
+                                       const InputCloudComputeCache& computeCache,
+                                       PointDrawBuffers* out) {
+  if (!out) return false;
+  *out = PointDrawBuffers{};
+  if (mesh.pointCount == 0 ||
+      !computeCache.available ||
+      computeCache.builtSerial != mesh.serial ||
+      computeCache.verts == 0 ||
+      computeCache.colors == 0 ||
+      static_cast<size_t>(std::max(computeCache.pointCount, 0)) < mesh.pointCount) {
+    return false;
+  }
+  out->verts = computeCache.verts;
+  out->colors = computeCache.colors;
+  out->pointCount = mesh.pointCount;
+  out->sourceSerial = mesh.serial;
+  out->visiblePointCount = mesh.pointCount;
+  out->available = true;
+  return true;
+}
+
 void releasePointBufferCache(PointBufferCache* cache) {
   if (!cache) return;
   const ViewerGlBufferApi& api = viewerGlBufferApi();
@@ -3530,8 +3680,8 @@ void releaseInputCloudComputeCache(InputCloudComputeCache* cache) {
   const ViewerGlBufferApi& bufferApi = viewerGlBufferApi();
   const ViewerGlComputeApi& computeApi = viewerGlComputeApi();
   if (bufferApi.available) {
-    GLuint buffers[4] = {cache->input, cache->verts, cache->colors, cache->boundsBuffer};
-    GLuint toDelete[4] = {};
+    GLuint buffers[5] = {cache->input, cache->verts, cache->colors, cache->topology, cache->boundsBuffer};
+    GLuint toDelete[5] = {};
     GLsizei count = 0;
     for (GLuint id : buffers) {
       if (id != 0) toDelete[count++] = id;
@@ -3544,6 +3694,29 @@ void releaseInputCloudComputeCache(InputCloudComputeCache* cache) {
     if (cache->boundsProgram != 0) computeApi.deleteProgram(cache->boundsProgram);
   }
   *cache = InputCloudComputeCache{};
+}
+
+void releaseScopeGeometryGlCache(ScopeGeometryGlCache* cache) {
+  if (!cache) return;
+  const ViewerGlBufferApi& bufferApi = viewerGlBufferApi();
+  if (bufferApi.available) {
+    GLuint buffers[6] = {
+        cache->range,
+        cache->density,
+        cache->lineVerts,
+        cache->lineColors,
+        cache->fillVerts,
+        cache->fillColors};
+    GLuint toDelete[6] = {};
+    GLsizei count = 0;
+    for (GLuint id : buffers) {
+      if (id != 0) toDelete[count++] = id;
+    }
+    if (count > 0) bufferApi.deleteBuffers(count, toDelete);
+    bufferApi.bindBuffer(GL_ARRAY_BUFFER, 0);
+    bufferApi.bindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+  }
+  *cache = ScopeGeometryGlCache{};
 }
 
 void releasePointRenderProgramCache(PointRenderProgramCache* cache) {
@@ -4564,8 +4737,17 @@ struct SourceSignalStore {
   GLenum textureTarget = GL_TEXTURE_2D;
   uint64_t textureContentHash = 0;
   std::string textureSourceKey;
+  std::string textureFailedSourceKey;
+  std::string textureFailedReason;
+  double textureFailedAt = 0.0;
   int textureWidth = 0;
   int textureHeight = 0;
+  GLuint glSourceWordsBuffer = 0;
+  std::string glSourceWordsKey;
+  uint64_t glSourceWordsContentHash = 0;
+  int glSourceWordsWidth = 0;
+  int glSourceWordsHeight = 0;
+  size_t glSourceWordCount = 0;
 #if defined(CHROMASPACE_VIEWER_HAS_CUDA) && !defined(__APPLE__)
   ChromaspaceCuda::ImportedSource cudaIpcSource{};
   ChromaspaceCuda::SourceTextureCache cudaSourceTextureCache{};
@@ -4606,6 +4788,22 @@ std::string metalIOSurfaceResidencyReason(const SourceSignalPayload& source,
 
 void releaseSourceSignalStoreGpuResources(SourceSignalStore* store) {
   if (!store) return;
+  if (store->glSourceWordsBuffer != 0) {
+    const ViewerGlBufferApi& bufferApi = viewerGlBufferApi();
+    if (bufferApi.available) {
+      bufferApi.deleteBuffers(1, &store->glSourceWordsBuffer);
+      bufferApi.bindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+    }
+    store->glSourceWordsBuffer = 0;
+  }
+  store->glSourceWordsKey.clear();
+  store->glSourceWordsContentHash = 0;
+  store->glSourceWordsWidth = 0;
+  store->glSourceWordsHeight = 0;
+  store->glSourceWordCount = 0;
+  store->textureFailedSourceKey.clear();
+  store->textureFailedReason.clear();
+  store->textureFailedAt = 0.0;
 #if defined(CHROMASPACE_VIEWER_HAS_CUDA) && !defined(__APPLE__)
   ChromaspaceCuda::releaseImportedSource(&store->cudaIpcSource);
   ChromaspaceCuda::releaseSourceTextureCache(&store->cudaSourceTextureCache);
@@ -5789,7 +5987,10 @@ layout(local_size_x = 64) in;
 layout(std430, binding = 0) readonly buffer InputBuffer { float inputVals[]; };
 layout(std430, binding = 1) writeonly buffer VertBuffer { float vertVals[]; };
 layout(std430, binding = 2) writeonly buffer ColorBuffer { float colorVals[]; };
+layout(std430, binding = 3) readonly buffer TopologyWords { uint topologyWords[]; };
 uniform int uPointCount;
+uniform int uSourceWidth;
+uniform int uSourceHeight;
 uniform int uShowOverflow;
 uniform int uHighlightOverflow;
 uniform int uPlotMode;
@@ -5812,6 +6013,23 @@ uniform vec3 uChromaticityRgbToXyz2;
 uniform vec3 uChromaticityXyzToRgb0;
 uniform vec3 uChromaticityXyzToRgb1;
 uniform vec3 uChromaticityXyzToRgb2;
+uniform int uCubeSlicingEnabled;
+uniform int uNeutralRadiusEnabled;
+uniform float uNeutralRadius;
+uniform int uCubeSliceRed;
+uniform int uCubeSliceYellow;
+uniform int uCubeSliceGreen;
+uniform int uCubeSliceCyan;
+uniform int uCubeSliceBlue;
+uniform int uCubeSliceMagenta;
+uniform int uLassoEnabled;
+uniform int uLassoStrokeCount;
+uniform int uLassoPointCount;
+uniform int uLassoStrokeFirst[16];
+uniform int uLassoStrokeCountPerStroke[16];
+uniform int uLassoStrokeSubtract[16];
+uniform float uLassoX[256];
+uniform float uLassoY[256];
 
 const float kTau = 6.28318530717958647692;
 const float kPi = 3.14159265358979323846;
@@ -5965,6 +6183,149 @@ float rawRgbHue01(float r, float g, float b, float cMax, float delta) {
   return wrapHue01(h / 6.0);
 }
 
+float neutralRadiusValue(float r, float g, float b) {
+  const float kRgbAxisMaxRadius = 0.8164965809277260;
+  const float kPolarMax = 0.9553166181245093;
+  const float kChenPolarScale = 1.0467733744265997;
+  if (uPlotMode == 1) {
+    float cMax = max(r, max(g, b));
+    float cMin = min(r, min(g, b));
+    if (uCircularHsl != 0) {
+      float l = 0.5 * (cMax + cMin);
+      float denom = 1.0 - abs(2.0 * l - 1.0);
+      if (abs(denom) <= 1e-6) denom = denom < 0.0 ? -1e-6 : 1e-6;
+      return clamp01(abs((cMax - cMin) / denom));
+    }
+    return clamp01(cMax - cMin);
+  }
+  if (uPlotMode == 2) {
+    if (uCircularHsv != 0) {
+      float cMax = max(r, max(g, b));
+      float cMin = min(r, min(g, b));
+      float delta = cMax - cMin;
+      return (delta > 1e-6 && cMax > 1e-6) ? clamp01(delta / cMax) : 0.0;
+    }
+    float x = r - 0.5 * g - 0.5 * b;
+    float z = 0.8660254037844386 * (g - b);
+    return clamp01(sqrt(x * x + z * z));
+  }
+  bool overflowMode = uShowOverflow != 0 && (uPlotMode == 5 || uPlotMode == 6 || uPlotMode == 7);
+  float rr = overflowMode ? r : clamp01(r);
+  float gg = overflowMode ? g : clamp01(g);
+  float bb = overflowMode ? b : clamp01(b);
+  float rotX = 0.81649658093 * rr - 0.40824829046 * gg - 0.40824829046 * bb;
+  float rotY = 0.70710678118 * gg - 0.70710678118 * bb;
+  float rotZ = 0.57735026919 * (rr + gg + bb);
+  float chromaRadius = sqrt(rotX * rotX + rotY * rotY);
+  if (uPlotMode == 3) {
+    float radius3 = sqrt(rotX * rotX + rotY * rotY + rotZ * rotZ);
+    float polar = atan(chromaRadius, max(rotZ, 1e-8));
+    float light = radius3 * 0.5773502691896258;
+    return clamp01((light * sin(polar * kChenPolarScale)) / kRgbAxisMaxRadius);
+  }
+  if (uPlotMode == 4 || uPlotMode == 5) {
+    float radius3 = sqrt(rotX * rotX + rotY * rotY + rotZ * rotZ);
+    float polar = atan(chromaRadius, rotZ);
+    float radial = radius3 * sin((polar / kPolarMax) * kPolarMax);
+    return clamp01(radial / sin(kPolarMax));
+  }
+  if (uPlotMode == 6) {
+    float polar = atan(chromaRadius, rotZ);
+    return clamp01(polar / kPolarMax);
+  }
+  if (uPlotMode == 7) {
+    float rotZAvg = (rr + gg + bb) / 3.0;
+    float rx = 0.33333333333 * (2.0 * rr - gg - bb) * 0.70710678118;
+    float ry = (gg - bb) * 0.40824829046;
+    float sat = abs(rotZAvg) <= 1e-6 ? 0.0 : sqrt(rx * rx + ry * ry) / rotZAvg;
+    return clamp01(abs(sat) / 1.41421356237);
+  }
+  return clamp01(sqrt(rotX * rotX + rotY * rotY) / kRgbAxisMaxRadius);
+}
+
+bool cubeSliceContains(vec3 rgb) {
+  if (uNeutralRadiusEnabled != 0 && uPlotMode != 8 && uShowOverflow == 0) {
+    float threshold = clamp01(uNeutralRadius) * clamp01(uNeutralRadius);
+    if (neutralRadiusValue(rgb.r, rgb.g, rgb.b) > threshold + 1.0e-6) return false;
+  }
+  if (uCubeSlicingEnabled == 0) return true;
+  bool anySelected = (uCubeSliceRed != 0) || (uCubeSliceYellow != 0) || (uCubeSliceGreen != 0) ||
+                     (uCubeSliceCyan != 0) || (uCubeSliceBlue != 0) || (uCubeSliceMagenta != 0);
+  if (!anySelected) return false;
+  if (uPlotMode == 0) {
+    const float kEps = 1.0e-6;
+    bool geRG = rgb.r + kEps >= rgb.g;
+    bool geGB = rgb.g + kEps >= rgb.b;
+    bool geGR = rgb.g + kEps >= rgb.r;
+    bool geRB = rgb.r + kEps >= rgb.b;
+    bool geBG = rgb.b + kEps >= rgb.g;
+    bool geBR = rgb.b + kEps >= rgb.r;
+    if (uCubeSliceRed != 0 && geRG && geGB) return true;
+    if (uCubeSliceYellow != 0 && geGR && geRB) return true;
+    if (uCubeSliceGreen != 0 && geGB && geBR) return true;
+    if (uCubeSliceCyan != 0 && geBG && geGR) return true;
+    if (uCubeSliceBlue != 0 && geBR && geRG) return true;
+    if (uCubeSliceMagenta != 0 && geRB && geBG) return true;
+    return false;
+  }
+  float cMax = max(rgb.r, max(rgb.g, rgb.b));
+  float cMin = min(rgb.r, min(rgb.g, rgb.b));
+  float delta = cMax - cMin;
+  if (delta <= 1.0e-6) return false;
+  float hue = wrapHue01(rawRgbHue01(rgb.r, rgb.g, rgb.b, cMax, delta));
+  int sector = int(floor((hue + (1.0 / 12.0)) * 6.0)) % 6;
+  if (sector == 0) return uCubeSliceRed != 0;
+  if (sector == 1) return uCubeSliceYellow != 0;
+  if (sector == 2) return uCubeSliceGreen != 0;
+  if (sector == 3) return uCubeSliceCyan != 0;
+  if (sector == 4) return uCubeSliceBlue != 0;
+  return uCubeSliceMagenta != 0;
+}
+
+bool pointInLassoStroke(int strokeIndex, float xNorm, float yNorm) {
+  if (strokeIndex < 0 || strokeIndex >= uLassoStrokeCount) return false;
+  int start = uLassoStrokeFirst[strokeIndex];
+  int count = uLassoStrokeCountPerStroke[strokeIndex];
+  if (count < 3 || start < 0 || start + count > uLassoPointCount) return false;
+  bool inside = false;
+  for (int i = 0, j = 255; i < 256; ++i) {
+    if (i >= count) break;
+    if (i == 0) j = count - 1;
+    float xi = uLassoX[start + i];
+    float yi = uLassoY[start + i];
+    float xj = uLassoX[start + j];
+    float yj = uLassoY[start + j];
+    bool intersects = ((yi > yNorm) != (yj > yNorm)) &&
+                      (xNorm < (xj - xi) * (yNorm - yi) / ((yj - yi) + 1e-12) + xi);
+    if (intersects) inside = !inside;
+    j = i;
+  }
+  return inside;
+}
+
+bool lassoAcceptsPoint(float xNorm, float yNorm) {
+  if (uLassoEnabled == 0) return true;
+  if (uLassoStrokeCount <= 0 || uLassoPointCount <= 0) return false;
+  bool inside = false;
+  for (int stroke = 0; stroke < 16; ++stroke) {
+    if (stroke >= uLassoStrokeCount) break;
+    if (!pointInLassoStroke(stroke, xNorm, yNorm)) continue;
+    inside = uLassoStrokeSubtract[stroke] == 0;
+  }
+  return inside;
+}
+
+vec2 topologySourceNorm(uint index) {
+  if (uSourceWidth <= 0 || uSourceHeight <= 0) return vec2(0.5, 0.5);
+  uint packedCoord = topologyWords[index];
+  int x = int(packedCoord & 0xffffu);
+  int y = int((packedCoord >> 16u) & 0xffffu);
+  return vec2((float(clamp(x, 0, max(uSourceWidth - 1, 0))) + 0.5) / float(max(uSourceWidth, 1)),
+              (float(clamp(y, 0, max(uSourceHeight - 1, 0))) + 0.5) / float(max(uSourceHeight, 1)));
+}
+
+)GLSL"
+R"GLSL(
 vec3 mapPlotPosition(float r, float g, float b) {
   if (uPlotMode == 8) {
     return mapChromaticityPlot(r, g, b);
@@ -6263,6 +6624,11 @@ void main() {
     b = inputVals[inBase + 5u];
   }
   bool overflowPoint = outOfBounds(r, g, b);
+  bool visibleByGpuFilter = cubeSliceContains(vec3(r, g, b));
+  if (visibleByGpuFilter && uLassoEnabled != 0) {
+    vec2 sourceNorm = topologySourceNorm(index);
+    visibleByGpuFilter = lassoAcceptsPoint(sourceNorm.x, sourceNorm.y);
+  }
   float plotR = (uShowOverflow != 0) ? r : clamp01(r);
   float plotG = (uShowOverflow != 0) ? g : clamp01(g);
   float plotB = (uShowOverflow != 0) ? b : clamp01(b);
@@ -6318,7 +6684,8 @@ void main() {
     float glossPresence = glossPresenceWeight(glossStrengthCue(plotR, plotG, plotB));
     baseAlpha = mix(0.01, 0.98, glossPresence);
   }
-  colorVals[colorBase + 3u] = luminanceAwareAlpha(baseAlpha, cr, cg, cb, overflowPoint);
+  colorVals[colorBase + 3u] =
+      visibleByGpuFilter ? luminanceAwareAlpha(baseAlpha, cr, cg, cb, overflowPoint) : 0.0;
 }
 )GLSL";
 
@@ -6375,6 +6742,36 @@ void main() {
   cache->chromaticityInverseRow0Loc = api.getUniformLocation(program, "uChromaticityXyzToRgb0");
   cache->chromaticityInverseRow1Loc = api.getUniformLocation(program, "uChromaticityXyzToRgb1");
   cache->chromaticityInverseRow2Loc = api.getUniformLocation(program, "uChromaticityXyzToRgb2");
+  cache->cubeSlicingEnabledLoc = api.getUniformLocation(program, "uCubeSlicingEnabled");
+  cache->neutralRadiusEnabledLoc = api.getUniformLocation(program, "uNeutralRadiusEnabled");
+  cache->neutralRadiusLoc = api.getUniformLocation(program, "uNeutralRadius");
+  cache->cubeSliceRedLoc = api.getUniformLocation(program, "uCubeSliceRed");
+  cache->cubeSliceYellowLoc = api.getUniformLocation(program, "uCubeSliceYellow");
+  cache->cubeSliceGreenLoc = api.getUniformLocation(program, "uCubeSliceGreen");
+  cache->cubeSliceCyanLoc = api.getUniformLocation(program, "uCubeSliceCyan");
+  cache->cubeSliceBlueLoc = api.getUniformLocation(program, "uCubeSliceBlue");
+  cache->cubeSliceMagentaLoc = api.getUniformLocation(program, "uCubeSliceMagenta");
+  cache->sourceWidthLoc = api.getUniformLocation(program, "uSourceWidth");
+  cache->sourceHeightLoc = api.getUniformLocation(program, "uSourceHeight");
+  cache->lassoEnabledLoc = api.getUniformLocation(program, "uLassoEnabled");
+  cache->lassoStrokeCountLoc = api.getUniformLocation(program, "uLassoStrokeCount");
+  cache->lassoPointCountLoc = api.getUniformLocation(program, "uLassoPointCount");
+  for (int i = 0; i < 16; ++i) {
+    const std::string idx = std::to_string(i);
+    cache->lassoStrokeFirstLoc[static_cast<size_t>(i)] =
+        api.getUniformLocation(program, (std::string("uLassoStrokeFirst[") + idx + "]").c_str());
+    cache->lassoStrokeCountPerStrokeLoc[static_cast<size_t>(i)] =
+        api.getUniformLocation(program, (std::string("uLassoStrokeCountPerStroke[") + idx + "]").c_str());
+    cache->lassoStrokeSubtractLoc[static_cast<size_t>(i)] =
+        api.getUniformLocation(program, (std::string("uLassoStrokeSubtract[") + idx + "]").c_str());
+  }
+  for (int i = 0; i < 256; ++i) {
+    const std::string idx = std::to_string(i);
+    cache->lassoXLoc[static_cast<size_t>(i)] =
+        api.getUniformLocation(program, (std::string("uLassoX[") + idx + "]").c_str());
+    cache->lassoYLoc[static_cast<size_t>(i)] =
+        api.getUniformLocation(program, (std::string("uLassoY[") + idx + "]").c_str());
+  }
   cache->available = cache->pointCountLoc >= 0 &&
                      cache->showOverflowLoc >= 0 &&
                      cache->highlightOverflowLoc >= 0 &&
@@ -6397,7 +6794,30 @@ void main() {
                      cache->chromaticityMatrixRow2Loc >= 0 &&
                      cache->chromaticityInverseRow0Loc >= 0 &&
                      cache->chromaticityInverseRow1Loc >= 0 &&
-                     cache->chromaticityInverseRow2Loc >= 0;
+                     cache->chromaticityInverseRow2Loc >= 0 &&
+                     cache->cubeSlicingEnabledLoc >= 0 &&
+                     cache->neutralRadiusEnabledLoc >= 0 &&
+                     cache->neutralRadiusLoc >= 0 &&
+                     cache->cubeSliceRedLoc >= 0 &&
+                     cache->cubeSliceYellowLoc >= 0 &&
+                     cache->cubeSliceGreenLoc >= 0 &&
+                     cache->cubeSliceCyanLoc >= 0 &&
+                     cache->cubeSliceBlueLoc >= 0 &&
+                     cache->cubeSliceMagentaLoc >= 0 &&
+                     cache->sourceWidthLoc >= 0 &&
+                     cache->sourceHeightLoc >= 0 &&
+                     cache->lassoEnabledLoc >= 0 &&
+                     cache->lassoStrokeCountLoc >= 0 &&
+                     cache->lassoPointCountLoc >= 0;
+  for (int i = 0; i < 16 && cache->available; ++i) {
+    cache->available = cache->lassoStrokeFirstLoc[static_cast<size_t>(i)] >= 0 &&
+                       cache->lassoStrokeCountPerStrokeLoc[static_cast<size_t>(i)] >= 0 &&
+                       cache->lassoStrokeSubtractLoc[static_cast<size_t>(i)] >= 0;
+  }
+  for (int i = 0; i < 256 && cache->available; ++i) {
+    cache->available = cache->lassoXLoc[static_cast<size_t>(i)] >= 0 &&
+                       cache->lassoYLoc[static_cast<size_t>(i)] >= 0;
+  }
   if (!cache->available) {
     logViewerEvent("Input-cloud compute program missing one or more uniforms; falling back to CPU.");
     releaseInputCloudComputeCache(cache);
@@ -7408,7 +7828,9 @@ bool rasterGlComputeCanRepresentPayload(const ResolvedPayload& payload,
     return false;
   };
   if (!rasterGpuDerivationEnabled()) return reject("disabled");
-  if (analyticalScope) return reject("analytical-scope-cpu-reference");
+  if (analyticalScope) {
+    if (payload.plotMode != "histogram") return reject("analytical-scope-point-or-surface-required");
+  }
   if (classifyPlotMode(payload) == PlotModeKind::GlossLift) return reject("gloss-field-cpu-reference");
   if (viewerPlotLinearApplies(payload)) return reject("plot-linear-filter");
   if (payload.occupancyFill) return reject("occupancy-fill-filter");
@@ -7416,11 +7838,13 @@ bool rasterGlComputeCanRepresentPayload(const ResolvedPayload& payload,
       payload.excludeIdentityData) {
     return reject("identity-ramp-filter");
   }
-  if (payload.volumeSlicingEnabled && payload.volumeSlicingMode == "lasso") {
-    return reject("source-lasso-filter");
+  if (analyticalScope && payload.volumeSlicingEnabled && payload.volumeSlicingMode == "lasso") {
+    return reject("source-lasso-scope-filter");
   }
   const PlotRemapSpec remap = makePlotRemapSpec(payload);
-  if (remap.cubeSlicingEnabled || remap.neutralRadiusEnabled) return reject("volume-slicing-filter");
+  if (analyticalScope && (remap.cubeSlicingEnabled || remap.neutralRadiusEnabled)) {
+    return reject("volume-slicing-scope-filter");
+  }
   if (source.proxyWidth <= 0 || source.proxyHeight <= 0) return reject("empty-source");
   if (source.pixelFormat == "rgba32f") {
     if (source.rgba32f.size() < static_cast<size_t>(source.proxyWidth) *
@@ -7451,7 +7875,12 @@ bool rasterDirectGlVertexCanRepresentPayload(const ResolvedPayload& payload,
     return false;
   };
   if (!rasterGpuDerivationEnabled()) return reject("disabled");
-  if (analyticalScope) return reject("analytical-scope-density");
+  if (analyticalScope && payload.plotMode != "waveform") {
+    return reject("analytical-scope-density");
+  }
+  if (analyticalScope && payload.viewerState.scopeRangeMode == 2) {
+    return reject("analytical-scope-auto-range");
+  }
   if (classifyPlotMode(payload) == PlotModeKind::GlossLift) return reject("gloss-field-path");
   if ((payload.readGrayRamp || payload.readIdentityPlot || payload.isolateIdentityData) &&
       !source.identityStripPresent) {
@@ -7469,7 +7898,7 @@ bool rasterDirectGlVertexCanRepresentPayload(const ResolvedPayload& payload,
   if (source.surfacePixelFormat != 0 && source.surfacePixelFormat != 1) {
     return reject("unsupported-iosurface-format");
   }
-  if (reason) *reason = "gl-vertex-iosurface";
+  if (reason) *reason = analyticalScope ? "gl-vertex-iosurface-waveform" : "gl-vertex-iosurface";
   return true;
 }
 
@@ -7493,6 +7922,7 @@ bool buildDirectRasterSourceDrawableMesh(const ResolvedPayload& payload,
     mesh.residencySourceStage =
         source.transport == "iosurface_metal" ? "metal-iosurface-texture" : source.transport;
     mesh.residencyDerivationStage = "empty-lasso-standby";
+    mesh.residencyTopologyStage = "empty-direct-plan";
     mesh.residencyDrawableStage = "none";
     mesh.serial = nextMeshSerial();
     mesh.pointCount = 0;
@@ -7505,19 +7935,53 @@ bool buildDirectRasterSourceDrawableMesh(const ResolvedPayload& payload,
     if (fallbackReason) *fallbackReason = "empty-sample-plan";
     return false;
   }
+  const bool directWaveformScope = analyticalScope && payload.plotMode == "waveform";
+  const bool directWaveformLumaOnly = directWaveformScope && payload.viewerState.waveformMode == 2;
+  const bool directWaveformParadeLuma =
+      directWaveformScope && payload.viewerState.waveformMode == 1 &&
+      payload.viewerState.waveformChannelLuma;
+  const int directWaveformChannelCount =
+      directWaveformScope ? (directWaveformLumaOnly ? 1 : (directWaveformParadeLuma ? 4 : 3)) : 1;
+  const size_t drawablePointCount =
+      plan.totalPointCount * static_cast<size_t>(std::max(1, directWaveformChannelCount));
+  if (drawablePointCount > static_cast<size_t>(std::numeric_limits<int>::max())) {
+    if (fallbackReason) *fallbackReason = "direct-point-count-overflow";
+    return false;
+  }
   MeshData mesh{};
   mesh.resolution = payload.resolution <= 25 ? 25 : (payload.resolution <= 41 ? 41 : 57);
   mesh.quality = (source.tierLabel.empty() ? std::string("Raster") : source.tierLabel) +
-                 " IOSurface Direct";
-  mesh.paramHash = std::string("raster-gl-vertex-iosurface:") + source.tierLabel + ":" + source.pixelFormat;
+                 (directWaveformScope ? " IOSurface Waveform" : " IOSurface Direct");
+  mesh.paramHash =
+      std::string(directWaveformScope ? "raster-gl-vertex-iosurface-waveform:"
+                                      : "raster-gl-vertex-iosurface:") +
+      source.tierLabel + ":" + source.pixelFormat;
   mesh.serial = nextMeshSerial();
-  mesh.pointCount = plan.totalPointCount;
+  mesh.pointCount = drawablePointCount;
   mesh.pointCloudMayContainHiddenVerts = rasterGpuSourceRequestMayHideSamples(payload, makePlotRemapSpec(payload));
   mesh.directRasterSourceDrawable = true;
   mesh.sourceTransport = source.transport;
   mesh.residencySourceStage = "metal-iosurface-texture";
-  mesh.residencyDerivationStage = "gl-vertex-source-sampling";
-  mesh.residencyDrawableStage = "gl-vertex-iosurface";
+  mesh.residencyDerivationStage =
+      directWaveformScope ? "gl-vertex-waveform-source-sampling" : "gl-vertex-source-sampling";
+  mesh.residencyTopologyStage = "gl-vertex-id-direct-plan";
+  mesh.residencyDrawableStage =
+      directWaveformScope ? "gl-vertex-iosurface-waveform" : "gl-vertex-iosurface";
+  mesh.analyticalScope = analyticalScope;
+  mesh.waveformScope = directWaveformScope;
+  mesh.scopeMode = directWaveformScope ? payload.viewerState.waveformMode : 0;
+  mesh.scopeRangeMode = directWaveformScope ? payload.viewerState.scopeRangeMode : 0;
+  mesh.scopeLumaMethod = directWaveformScope ? payload.viewerState.waveformLumaMethod : 0;
+  if (directWaveformScope) {
+    mesh.scopeRangeMin = 0.0f;
+    mesh.scopeRangeMax = payload.viewerState.scopeRangeMode == 1 ? 4.0f : 1.0f;
+    mesh.scopeWidth =
+        std::max(1, static_cast<int>(plan.sample.pointCount /
+                                     static_cast<size_t>(std::max(1, plan.sample.countY))));
+    mesh.scopeHeight = 512;
+    mesh.scopeSourceRows = std::max(1, plan.sample.countY);
+    mesh.directRasterScopeChannelCount = directWaveformChannelCount;
+  }
   mesh.directRasterSampleStride = plan.sample.stride;
   mesh.directRasterSampleCountX = plan.sample.countX;
   mesh.directRasterBasePointCount =
@@ -7688,12 +8152,11 @@ bool ensureRasterSignalComputeProgram(RasterSignalComputeCache* cache) {
 #version 430
 layout(local_size_x = 256) in;
 layout(std430, binding = 0) readonly buffer SourceWords { uint sourceWords[]; };
-layout(std430, binding = 1) buffer InputSamples { float inputVals[]; };
+layout(std430, binding = 1) readonly buffer TopologyWords { uint topologyWords[]; };
+layout(std430, binding = 2) buffer InputSamples { float inputVals[]; };
 uniform int uPointCount;
 uniform int uSourceWidth;
 uniform int uSourceHeight;
-uniform int uSampleStride;
-uniform int uSampleCountX;
 uniform int uPixelFormat; // 0=rgba16f packed as two uint words per pixel, 1=rgba32f as float bits.
 
 vec3 readSourceRgb(int x, int y) {
@@ -7715,9 +8178,9 @@ vec3 readSourceRgb(int x, int y) {
 void main() {
   int index = int(gl_GlobalInvocationID.x);
   if (index >= uPointCount) return;
-  int sx = max(uSampleCountX, 1);
-  int x = (index % sx) * max(uSampleStride, 1);
-  int y = (index / sx) * max(uSampleStride, 1);
+  uint packedCoord = topologyWords[index];
+  int x = int(packedCoord & 0xffffu);
+  int y = int((packedCoord >> 16u) & 0xffffu);
   vec3 rgb = readSourceRgb(x, y);
   int base = index * 3;
   inputVals[base + 0] = rgb.r;
@@ -7757,17 +8220,77 @@ void main() {
   cache->pointCountLoc = api.getUniformLocation(program, "uPointCount");
   cache->sourceWidthLoc = api.getUniformLocation(program, "uSourceWidth");
   cache->sourceHeightLoc = api.getUniformLocation(program, "uSourceHeight");
-  cache->sampleStrideLoc = api.getUniformLocation(program, "uSampleStride");
-  cache->sampleCountXLoc = api.getUniformLocation(program, "uSampleCountX");
   cache->pixelFormatLoc = api.getUniformLocation(program, "uPixelFormat");
   cache->available = cache->pointCountLoc >= 0 &&
                      cache->sourceWidthLoc >= 0 &&
                      cache->sourceHeightLoc >= 0 &&
-                     cache->sampleStrideLoc >= 0 &&
-                     cache->sampleCountXLoc >= 0 &&
                      cache->pixelFormatLoc >= 0;
   if (!cache->available) {
     logViewerEvent("Raster source compute program missing uniforms; falling back to CPU.");
+    return false;
+  }
+  static const char* kTopologyShaderSrc = R"GLSL(
+#version 430
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) writeonly buffer TopologyWords { uint topologyWords[]; };
+uniform int uPointCount;
+uniform int uSourceWidth;
+uniform int uSourceHeight;
+uniform int uSampleStride;
+uniform int uSampleCountX;
+void main() {
+  int index = int(gl_GlobalInvocationID.x);
+  if (index >= uPointCount) return;
+  int sx = max(uSampleCountX, 1);
+  int stride = max(uSampleStride, 1);
+  int x = clamp((index % sx) * stride, 0, max(uSourceWidth - 1, 0));
+  int y = clamp((index / sx) * stride, 0, max(uSourceHeight - 1, 0));
+  topologyWords[index] = uint(x & 0xffff) | (uint(y & 0xffff) << 16u);
+}
+)GLSL";
+  const GLuint topologyShader = api.createShader(GL_COMPUTE_SHADER);
+  if (topologyShader == 0) return false;
+  api.shaderSource(topologyShader, 1, &kTopologyShaderSrc, nullptr);
+  api.compileShader(topologyShader);
+  compiled = 0;
+  api.getShaderiv(topologyShader, GL_COMPILE_STATUS, &compiled);
+  if (!compiled) {
+    logViewerEvent(std::string("Raster topology compute shader compile failed: ") +
+                   readShaderLog(topologyShader, false, api));
+    api.deleteShader(topologyShader);
+    return false;
+  }
+  const GLuint topologyProgram = api.createProgram();
+  if (topologyProgram == 0) {
+    api.deleteShader(topologyShader);
+    return false;
+  }
+  api.attachShader(topologyProgram, topologyShader);
+  api.linkProgram(topologyProgram);
+  api.deleteShader(topologyShader);
+  linked = 0;
+  api.getProgramiv(topologyProgram, GL_LINK_STATUS, &linked);
+  if (!linked) {
+    logViewerEvent(std::string("Raster topology compute program link failed: ") +
+                   readShaderLog(topologyProgram, true, api));
+    api.deleteProgram(topologyProgram);
+    return false;
+  }
+  cache->topologyProgram = topologyProgram;
+  cache->topologyPointCountLoc = api.getUniformLocation(topologyProgram, "uPointCount");
+  cache->topologySourceWidthLoc = api.getUniformLocation(topologyProgram, "uSourceWidth");
+  cache->topologySourceHeightLoc = api.getUniformLocation(topologyProgram, "uSourceHeight");
+  cache->topologySampleStrideLoc = api.getUniformLocation(topologyProgram, "uSampleStride");
+  cache->topologySampleCountXLoc = api.getUniformLocation(topologyProgram, "uSampleCountX");
+  cache->available = cache->available &&
+                     cache->topologyProgram != 0 &&
+                     cache->topologyPointCountLoc >= 0 &&
+                     cache->topologySourceWidthLoc >= 0 &&
+                     cache->topologySourceHeightLoc >= 0 &&
+                     cache->topologySampleStrideLoc >= 0 &&
+                     cache->topologySampleCountXLoc >= 0;
+  if (!cache->available) {
+    logViewerEvent("Raster topology compute program missing uniforms; falling back to CPU.");
     return false;
   }
   return true;
@@ -7799,9 +8322,791 @@ bool packSourceSignalWordsForGl(const SourceSignalPayload& source, std::vector<u
   return true;
 }
 
+std::string sourceSignalTextureCacheKey(const SourceSignalPayload& source, GLenum target);
+
+bool ensureSourceSignalGlWordsBuffer(SourceSignalStore* store,
+                                     const SourceSignalPayload& source,
+                                     bool* outUploaded,
+                                     std::string* reason) {
+  if (outUploaded) *outUploaded = false;
+  if (!store) {
+    if (reason) *reason = "no-source-store";
+    return false;
+  }
+  if (source.proxyWidth <= 0 || source.proxyHeight <= 0) {
+    if (reason) *reason = "empty-source";
+    return false;
+  }
+  const ViewerGlBufferApi& bufferApi = viewerGlBufferApi();
+  if (!bufferApi.available) {
+    if (reason) *reason = "no-gl-buffer-api";
+    return false;
+  }
+  const std::string cacheKey = sourceSignalTextureCacheKey(source, GL_SHADER_STORAGE_BUFFER);
+  if (store->glSourceWordsBuffer != 0 &&
+      store->glSourceWordsKey == cacheKey &&
+      store->glSourceWordsContentHash == source.contentHash &&
+      store->glSourceWordsWidth == source.proxyWidth &&
+      store->glSourceWordsHeight == source.proxyHeight &&
+      store->glSourceWordCount > 0) {
+    return true;
+  }
+
+  std::vector<uint32_t> sourceWords;
+  if (!packSourceSignalWordsForGl(source, &sourceWords) || sourceWords.empty()) {
+    if (reason) *reason = "source-pack";
+    return false;
+  }
+  if (store->glSourceWordsBuffer == 0) {
+    bufferApi.genBuffers(1, &store->glSourceWordsBuffer);
+  }
+  if (store->glSourceWordsBuffer == 0) {
+    if (reason) *reason = "source-buffer-allocation";
+    return false;
+  }
+  bufferApi.bindBuffer(GL_SHADER_STORAGE_BUFFER, store->glSourceWordsBuffer);
+  bufferApi.bufferData(GL_SHADER_STORAGE_BUFFER,
+                       static_cast<ViewerGLsizeiptr>(sourceWords.size() * sizeof(uint32_t)),
+                       sourceWords.data(),
+                       GL_DYNAMIC_DRAW);
+  bufferApi.bindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+  if (glGetError() != GL_NO_ERROR) {
+    if (reason) *reason = "source-buffer-upload";
+    return false;
+  }
+  store->glSourceWordsKey = cacheKey;
+  store->glSourceWordsContentHash = source.contentHash;
+  store->glSourceWordsWidth = source.proxyWidth;
+  store->glSourceWordsHeight = source.proxyHeight;
+  store->glSourceWordCount = sourceWords.size();
+  if (outUploaded) *outUploaded = true;
+  return true;
+}
+
+bool ensureScopeHistogramGlPrograms(ScopeHistogramGlProgramCache* cache) {
+  if (!cache) return false;
+  if (cache->available && cache->clearProgram != 0 && cache->rangeProgram != 0 &&
+      cache->densityProgram != 0 && cache->geometryProgram != 0) {
+    return true;
+  }
+  if (cache->initAttempted) return false;
+  cache->initAttempted = true;
+  const ViewerGlComputeApi& api = viewerGlComputeApi();
+  if (!api.available) return false;
+
+  auto compileProgram = [&](const char* label, const char* source) -> GLuint {
+    const GLuint shader = api.createShader(GL_COMPUTE_SHADER);
+    if (shader == 0) return 0;
+    api.shaderSource(shader, 1, &source, nullptr);
+    api.compileShader(shader);
+    GLint compiled = GL_FALSE;
+    api.getShaderiv(shader, GL_COMPILE_STATUS, &compiled);
+    if (compiled != GL_TRUE) {
+      logViewerEvent(std::string(label) + " compute shader compile failed: " +
+                     readShaderLog(shader, false, api));
+      api.deleteShader(shader);
+      return 0;
+    }
+    const GLuint program = api.createProgram();
+    if (program == 0) {
+      api.deleteShader(shader);
+      return 0;
+    }
+    api.attachShader(program, shader);
+    api.linkProgram(program);
+    api.deleteShader(shader);
+    GLint linked = GL_FALSE;
+    api.getProgramiv(program, GL_LINK_STATUS, &linked);
+    if (linked != GL_TRUE) {
+      logViewerEvent(std::string(label) + " compute program link failed: " +
+                     readShaderLog(program, true, api));
+      api.deleteProgram(program);
+      return 0;
+    }
+    return program;
+  };
+
+  static const char* kClearSource = R"GLSL(
+#version 430
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) buffer DensityBins { uint density[]; };
+uniform int uBinCount;
+void main() {
+  int index = int(gl_GlobalInvocationID.x);
+  if (index < uBinCount) density[index] = 0u;
+}
+)GLSL";
+
+  static const char* kRangeSource = R"GLSL(
+#version 430
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) readonly buffer SourceWords { uint sourceWords[]; };
+layout(std430, binding = 1) readonly buffer TopologyWords { uint topologyWords[]; };
+layout(std430, binding = 2) buffer RangeWords { uint rangeWords[]; };
+uniform int uPointCount;
+uniform int uSourceWidth;
+uniform int uSourceHeight;
+uniform int uPixelFormat;
+uniform int uScopeMode;
+uniform int uIncludeOverflowForRange;
+
+vec3 readSourceRgb(int x, int y) {
+  int pixel = clamp(y, 0, max(uSourceHeight - 1, 0)) * max(uSourceWidth, 1) +
+              clamp(x, 0, max(uSourceWidth - 1, 0));
+  if (uPixelFormat == 1) {
+    int base = pixel * 4;
+    return vec3(uintBitsToFloat(sourceWords[base + 0]),
+                uintBitsToFloat(sourceWords[base + 1]),
+                uintBitsToFloat(sourceWords[base + 2]));
+  }
+  int base = pixel * 2;
+  vec2 rg = unpackHalf2x16(sourceWords[base + 0]);
+  vec2 ba = unpackHalf2x16(sourceWords[base + 1]);
+  return vec3(rg.x, rg.y, ba.x);
+}
+
+uint orderedUintFromFloat(float value) {
+  uint bits = floatBitsToUint(value);
+  return (bits & 0x80000000u) != 0u ? ~bits : (bits ^ 0x80000000u);
+}
+
+float scopeLuma(vec3 rgb) {
+  return dot(rgb, vec3(0.2126, 0.7152, 0.0722));
+}
+
+void includeValue(float value) {
+  if (isnan(value) || isinf(value)) return;
+  bool inDisplayRange = value >= 0.0 && value <= 1.0;
+  uint ordered = orderedUintFromFloat(value);
+  if (uIncludeOverflowForRange != 0 || inDisplayRange) {
+    atomicMin(rangeWords[0], ordered);
+    atomicMax(rangeWords[1], ordered);
+  }
+  if (!inDisplayRange) {
+    atomicMin(rangeWords[2], ordered);
+    atomicMax(rangeWords[3], ordered);
+  }
+}
+
+void main() {
+  int index = int(gl_GlobalInvocationID.x);
+  if (index >= uPointCount) return;
+  uint packedCoord = topologyWords[index];
+  int x = int(packedCoord & 0xffffu);
+  int y = int((packedCoord >> 16u) & 0xffffu);
+  vec3 rgb = readSourceRgb(x, y);
+  if (uScopeMode == 1) {
+    includeValue(scopeLuma(rgb));
+  } else {
+    includeValue(rgb.r);
+    includeValue(rgb.g);
+    includeValue(rgb.b);
+  }
+}
+)GLSL";
+
+  static const char* kDensitySource = R"GLSL(
+#version 430
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) readonly buffer SourceWords { uint sourceWords[]; };
+layout(std430, binding = 1) readonly buffer TopologyWords { uint topologyWords[]; };
+layout(std430, binding = 2) buffer DensityBins { uint density[]; };
+uniform int uPointCount;
+uniform int uSourceWidth;
+uniform int uSourceHeight;
+uniform int uPixelFormat;
+uniform int uWidth;
+uniform float uRangeMin;
+uniform float uInvRange;
+uniform int uChannelCount;
+uniform int uScopeMode;
+uniform int uOverflowEnabled;
+uniform float uOverflowRangeMin;
+uniform float uOverflowInvRange;
+
+vec3 readSourceRgb(int x, int y) {
+  int pixel = clamp(y, 0, max(uSourceHeight - 1, 0)) * max(uSourceWidth, 1) +
+              clamp(x, 0, max(uSourceWidth - 1, 0));
+  if (uPixelFormat == 1) {
+    int base = pixel * 4;
+    return vec3(uintBitsToFloat(sourceWords[base + 0]),
+                uintBitsToFloat(sourceWords[base + 1]),
+                uintBitsToFloat(sourceWords[base + 2]));
+  }
+  int base = pixel * 2;
+  vec2 rg = unpackHalf2x16(sourceWords[base + 0]);
+  vec2 ba = unpackHalf2x16(sourceWords[base + 1]);
+  return vec3(rg.x, rg.y, ba.x);
+}
+
+float scopeLuma(vec3 rgb) {
+  return dot(rgb, vec3(0.2126, 0.7152, 0.0722));
+}
+
+void accumulateNormal(int channel, float value) {
+  if (channel < 0 || channel >= max(uChannelCount, 1)) return;
+  if (value < 0.0 || value > 1.0) return;
+  int bin = clamp(int((value - uRangeMin) * uInvRange * float(uWidth)), 0, uWidth - 1);
+  atomicAdd(density[channel * uWidth + bin], 1u);
+}
+
+void accumulateOverflow(int channel, float value) {
+  if (uOverflowEnabled == 0) return;
+  if (channel < 0 || channel >= max(uChannelCount, 1)) return;
+  if (value >= 0.0 && value <= 1.0) return;
+  int bin = clamp(int((value - uOverflowRangeMin) * uOverflowInvRange * float(uWidth)), 0, uWidth - 1);
+  int offset = max(uChannelCount, 1) * uWidth;
+  atomicAdd(density[offset + channel * uWidth + bin], 1u);
+}
+
+void accumulate(int channel, float value) {
+  accumulateNormal(channel, value);
+  accumulateOverflow(channel, value);
+}
+
+void main() {
+  int index = int(gl_GlobalInvocationID.x);
+  if (index >= uPointCount) return;
+  uint packedCoord = topologyWords[index];
+  int x = int(packedCoord & 0xffffu);
+  int y = int((packedCoord >> 16u) & 0xffffu);
+  vec3 rgb = readSourceRgb(x, y);
+  bool lumaOnly = uScopeMode == 1;
+  if (lumaOnly) {
+    accumulate(0, scopeLuma(rgb));
+  } else {
+    accumulate(0, rgb.r);
+    accumulate(1, rgb.g);
+    accumulate(2, rgb.b);
+  }
+}
+)GLSL";
+
+  static const char* kGeometrySource = R"GLSL(
+#version 430
+layout(local_size_x = 128) in;
+layout(std430, binding = 0) readonly buffer DensityBins { uint density[]; };
+layout(std430, binding = 1) buffer LineVerts { float lineVerts[]; };
+layout(std430, binding = 2) buffer LineColors { float lineColors[]; };
+layout(std430, binding = 3) buffer FillVerts { float fillVerts[]; };
+layout(std430, binding = 4) buffer FillColors { float fillColors[]; };
+uniform int uWidth;
+uniform int uChannelCount;
+uniform int uScopeMode;
+uniform int uOverflowEnabled;
+uniform float uRangeMin;
+uniform float uInvRange;
+uniform float uOverflowRangeMin;
+uniform float uOverflowInvRange;
+uniform int uHighlightOverflow;
+
+const float kScopePlotLeft = -0.82;
+const float kScopePlotRight = 0.96;
+const float kScopePlotBottom = -0.88;
+const float kScopePlotTop = 0.88;
+const float kScopePlotWidth = kScopePlotRight - kScopePlotLeft;
+const float kScopePlotHeight = kScopePlotTop - kScopePlotBottom;
+
+float smoothedDensityAt(int offset, int channel, int bin) {
+  float sum = 0.0;
+  float weightSum = 0.0;
+  for (int tap = -2; tap <= 2; ++tap) {
+    int sourceBin = clamp(bin + tap, 0, uWidth - 1);
+    int at = abs(tap);
+    float weight = at == 0 ? 6.0 : (at == 1 ? 4.0 : 1.0);
+    sum += float(density[offset + channel * uWidth + sourceBin]) * weight;
+    weightSum += weight;
+  }
+  return sum / max(weightSum, 1.0);
+}
+
+float smoothedDensity(int channel, int bin) {
+  return smoothedDensityAt(0, channel, bin);
+}
+
+float smoothedOverflowDensity(int channel, int bin) {
+  return smoothedDensityAt(max(uChannelCount, 1) * uWidth, channel, bin);
+}
+
+float maxSmoothedDensity() {
+  float maxDensity = 1.0;
+  for (int channel = 0; channel < uChannelCount; ++channel) {
+    for (int bin = 0; bin < uWidth; ++bin) {
+      maxDensity = max(maxDensity, smoothedDensity(channel, bin));
+    }
+  }
+  return maxDensity;
+}
+
+vec4 lineColorForChannel(int channel, bool lumaOnly) {
+  if (lumaOnly) return vec4(0.88, 0.92, 0.96, 0.88);
+  if (channel == 0) return vec4(1.00, 0.16, 0.12, 0.76);
+  if (channel == 1) return vec4(0.20, 1.00, 0.28, 0.76);
+  return vec4(0.24, 0.52, 1.00, 0.76);
+}
+
+vec4 fillColorForChannel(int channel, bool lumaOnly, bool upper) {
+  vec4 c;
+  if (lumaOnly) c = vec4(0.88, 0.92, 0.96, 0.14);
+  else if (channel == 0) c = vec4(1.00, 0.16, 0.12, 0.10);
+  else if (channel == 1) c = vec4(0.20, 1.00, 0.28, 0.10);
+  else c = vec4(0.24, 0.52, 1.00, 0.10);
+  if (!upper) c.a *= 0.12;
+  return c;
+}
+
+vec4 overflowColorForChannel(int channel, bool lumaOnly, bool line) {
+  vec4 base = lineColorForChannel(channel, lumaOnly);
+  if (uHighlightOverflow != 0) {
+    vec3 purple = vec3(0.82, 0.24, 1.00);
+    base.rgb = mix(base.rgb, purple, 0.68);
+  }
+  base.a = line ? 0.94 : 0.16;
+  return base;
+}
+
+void writeLineVertex3(int base, vec3 value) {
+  lineVerts[base + 0] = value.x;
+  lineVerts[base + 1] = value.y;
+  lineVerts[base + 2] = value.z;
+}
+
+void writeLineColor4(int base, vec4 value) {
+  lineColors[base + 0] = value.r;
+  lineColors[base + 1] = value.g;
+  lineColors[base + 2] = value.b;
+  lineColors[base + 3] = value.a;
+}
+
+void writeFillVertex3(int base, vec3 value) {
+  fillVerts[base + 0] = value.x;
+  fillVerts[base + 1] = value.y;
+  fillVerts[base + 2] = value.z;
+}
+
+void writeFillColor4(int base, vec4 value) {
+  fillColors[base + 0] = value.r;
+  fillColors[base + 1] = value.g;
+  fillColors[base + 2] = value.b;
+  fillColors[base + 3] = value.a;
+}
+
+void main() {
+  int segment = int(gl_GlobalInvocationID.x);
+  int segmentsPerChannel = max(uWidth - 1, 1);
+  int normalSegmentCount = max(uChannelCount, 1) * segmentsPerChannel;
+  int totalSegments = normalSegmentCount * (uOverflowEnabled != 0 ? 2 : 1);
+  if (segment >= totalSegments) return;
+  bool overflowSegment = segment >= normalSegmentCount;
+  int localSegment = overflowSegment ? segment - normalSegmentCount : segment;
+  int channel = localSegment / segmentsPerChannel;
+  int bin = (localSegment % segmentsPerChannel) + 1;
+  float maxDensity = maxSmoothedDensity();
+  float x0;
+  float x1;
+  if (overflowSegment) {
+    float value0 = uOverflowRangeMin +
+                   float(bin - 1) / float(max(uWidth - 1, 1)) / max(uOverflowInvRange, 1.0e-6);
+    float value1 = uOverflowRangeMin +
+                   float(bin) / float(max(uWidth - 1, 1)) / max(uOverflowInvRange, 1.0e-6);
+    x0 = kScopePlotLeft + kScopePlotWidth * (value0 - uRangeMin) * uInvRange;
+    x1 = kScopePlotLeft + kScopePlotWidth * (value1 - uRangeMin) * uInvRange;
+  } else {
+    x0 = kScopePlotLeft + kScopePlotWidth * float(bin - 1) / float(max(uWidth - 1, 1));
+    x1 = kScopePlotLeft + kScopePlotWidth * float(bin) / float(max(uWidth - 1, 1));
+  }
+  float d0 = overflowSegment ? smoothedOverflowDensity(channel, bin - 1)
+                             : smoothedDensity(channel, bin - 1);
+  float d1 = overflowSegment ? smoothedOverflowDensity(channel, bin)
+                             : smoothedDensity(channel, bin);
+  float y0 = kScopePlotBottom + (kScopePlotHeight - 0.06) *
+             sqrt(clamp(d0 / maxDensity, 0.0, 1.0));
+  float y1 = kScopePlotBottom + (kScopePlotHeight - 0.06) *
+             sqrt(clamp(d1 / maxDensity, 0.0, 1.0));
+  bool lumaOnly = uScopeMode == 1;
+  int lineVertexBase = segment * 2 * 3;
+  bool hiddenOverflow = overflowSegment && d0 <= 0.0 && d1 <= 0.0;
+  writeLineVertex3(lineVertexBase + 0, hiddenOverflow ? vec3(0.0) : vec3(x0, y0, 0.0));
+  writeLineVertex3(lineVertexBase + 3, hiddenOverflow ? vec3(0.0) : vec3(x1, y1, 0.0));
+  vec4 lc = overflowSegment ? overflowColorForChannel(channel, lumaOnly, true)
+                            : lineColorForChannel(channel, lumaOnly);
+  if (hiddenOverflow) lc.a = 0.0;
+  int lineColorBase = segment * 2 * 4;
+  writeLineColor4(lineColorBase + 0, lc);
+  writeLineColor4(lineColorBase + 4, lc);
+
+  vec3 fillPositions[6] = vec3[6](
+      vec3(x0, kScopePlotBottom, 0.0),
+      vec3(x0, y0, 0.0),
+      vec3(x1, y1, 0.0),
+      vec3(x0, kScopePlotBottom, 0.0),
+      vec3(x1, y1, 0.0),
+      vec3(x1, kScopePlotBottom, 0.0));
+  int fillVertexBase = segment * 6 * 3;
+  int fillColorBase = segment * 6 * 4;
+  for (int i = 0; i < 6; ++i) {
+    writeFillVertex3(fillVertexBase + i * 3, hiddenOverflow ? vec3(0.0) : fillPositions[i]);
+    bool upper = i == 1 || i == 2 || i == 4;
+    vec4 fc = overflowSegment ? overflowColorForChannel(channel, lumaOnly, false)
+                              : fillColorForChannel(channel, lumaOnly, upper);
+    if (overflowSegment && !upper) fc.a *= 0.12;
+    if (hiddenOverflow) fc.a = 0.0;
+    writeFillColor4(fillColorBase + i * 4, fc);
+  }
+}
+)GLSL";
+
+  cache->clearProgram = compileProgram("GL Histogram scope clear", kClearSource);
+  cache->rangeProgram = compileProgram("GL Histogram scope range", kRangeSource);
+  cache->densityProgram = compileProgram("GL Histogram scope density", kDensitySource);
+  cache->geometryProgram = compileProgram("GL Histogram scope geometry", kGeometrySource);
+  if (cache->clearProgram == 0 || cache->rangeProgram == 0 ||
+      cache->densityProgram == 0 || cache->geometryProgram == 0) {
+    if (cache->clearProgram != 0) api.deleteProgram(cache->clearProgram);
+    if (cache->rangeProgram != 0) api.deleteProgram(cache->rangeProgram);
+    if (cache->densityProgram != 0) api.deleteProgram(cache->densityProgram);
+    if (cache->geometryProgram != 0) api.deleteProgram(cache->geometryProgram);
+    *cache = ScopeHistogramGlProgramCache{};
+    cache->initAttempted = true;
+    return false;
+  }
+
+  cache->clearBinCountLoc = api.getUniformLocation(cache->clearProgram, "uBinCount");
+  cache->rangePointCountLoc = api.getUniformLocation(cache->rangeProgram, "uPointCount");
+  cache->rangeSourceWidthLoc = api.getUniformLocation(cache->rangeProgram, "uSourceWidth");
+  cache->rangeSourceHeightLoc = api.getUniformLocation(cache->rangeProgram, "uSourceHeight");
+  cache->rangePixelFormatLoc = api.getUniformLocation(cache->rangeProgram, "uPixelFormat");
+  cache->rangeScopeModeLoc = api.getUniformLocation(cache->rangeProgram, "uScopeMode");
+  cache->rangeIncludeOverflowLoc = api.getUniformLocation(cache->rangeProgram, "uIncludeOverflowForRange");
+  cache->densityPointCountLoc = api.getUniformLocation(cache->densityProgram, "uPointCount");
+  cache->densitySourceWidthLoc = api.getUniformLocation(cache->densityProgram, "uSourceWidth");
+  cache->densitySourceHeightLoc = api.getUniformLocation(cache->densityProgram, "uSourceHeight");
+  cache->densityPixelFormatLoc = api.getUniformLocation(cache->densityProgram, "uPixelFormat");
+  cache->densityWidthLoc = api.getUniformLocation(cache->densityProgram, "uWidth");
+  cache->densityRangeMinLoc = api.getUniformLocation(cache->densityProgram, "uRangeMin");
+  cache->densityInvRangeLoc = api.getUniformLocation(cache->densityProgram, "uInvRange");
+  cache->densityChannelCountLoc = api.getUniformLocation(cache->densityProgram, "uChannelCount");
+  cache->densityScopeModeLoc = api.getUniformLocation(cache->densityProgram, "uScopeMode");
+  cache->densityOverflowEnabledLoc = api.getUniformLocation(cache->densityProgram, "uOverflowEnabled");
+  cache->densityOverflowRangeMinLoc = api.getUniformLocation(cache->densityProgram, "uOverflowRangeMin");
+  cache->densityOverflowInvRangeLoc = api.getUniformLocation(cache->densityProgram, "uOverflowInvRange");
+  cache->geometryWidthLoc = api.getUniformLocation(cache->geometryProgram, "uWidth");
+  cache->geometryChannelCountLoc = api.getUniformLocation(cache->geometryProgram, "uChannelCount");
+  cache->geometryScopeModeLoc = api.getUniformLocation(cache->geometryProgram, "uScopeMode");
+  cache->geometryOverflowEnabledLoc = api.getUniformLocation(cache->geometryProgram, "uOverflowEnabled");
+  cache->geometryRangeMinLoc = api.getUniformLocation(cache->geometryProgram, "uRangeMin");
+  cache->geometryInvRangeLoc = api.getUniformLocation(cache->geometryProgram, "uInvRange");
+  cache->geometryOverflowRangeMinLoc = api.getUniformLocation(cache->geometryProgram, "uOverflowRangeMin");
+  cache->geometryOverflowInvRangeLoc = api.getUniformLocation(cache->geometryProgram, "uOverflowInvRange");
+  cache->geometryHighlightOverflowLoc = api.getUniformLocation(cache->geometryProgram, "uHighlightOverflow");
+  cache->available =
+      cache->clearBinCountLoc >= 0 &&
+      cache->rangePointCountLoc >= 0 &&
+      cache->rangeSourceWidthLoc >= 0 &&
+      cache->rangeSourceHeightLoc >= 0 &&
+      cache->rangePixelFormatLoc >= 0 &&
+      cache->rangeScopeModeLoc >= 0 &&
+      cache->rangeIncludeOverflowLoc >= 0 &&
+      cache->densityPointCountLoc >= 0 &&
+      cache->densitySourceWidthLoc >= 0 &&
+      cache->densitySourceHeightLoc >= 0 &&
+      cache->densityPixelFormatLoc >= 0 &&
+      cache->densityWidthLoc >= 0 &&
+      cache->densityRangeMinLoc >= 0 &&
+      cache->densityInvRangeLoc >= 0 &&
+      cache->densityChannelCountLoc >= 0 &&
+      cache->densityScopeModeLoc >= 0 &&
+      cache->densityOverflowEnabledLoc >= 0 &&
+      cache->densityOverflowRangeMinLoc >= 0 &&
+      cache->densityOverflowInvRangeLoc >= 0 &&
+      cache->geometryWidthLoc >= 0 &&
+      cache->geometryChannelCountLoc >= 0 &&
+      cache->geometryScopeModeLoc >= 0 &&
+      cache->geometryOverflowEnabledLoc >= 0 &&
+      cache->geometryRangeMinLoc >= 0 &&
+      cache->geometryInvRangeLoc >= 0 &&
+      cache->geometryOverflowRangeMinLoc >= 0 &&
+      cache->geometryOverflowInvRangeLoc >= 0 &&
+      cache->geometryHighlightOverflowLoc >= 0;
+  if (!cache->available) {
+    logViewerEvent("GL Histogram scope programs missing uniforms; resident path unavailable.");
+  }
+  return cache->available;
+}
+
+bool buildHistogramScopeGeometryGlCompute(const ResolvedPayload& payload,
+                                          const SourceSignalPayload& source,
+                                          SourceSignalStore* sourceStore,
+                                          InputCloudComputeCache* topologyCache,
+                                          ScopeGeometryGlCache* scopeCache,
+                                          MeshData* out,
+                                          std::string* fallbackReason) {
+  if (!out || !sourceStore || !topologyCache || !scopeCache) return false;
+  if (payload.plotMode != "histogram") {
+    if (fallbackReason) *fallbackReason = "not-histogram";
+    return false;
+  }
+  RasterSamplePlan plan = rasterSamplePlanForPayload(source, payload, true);
+  if (plan.pointCount == 0) {
+    if (fallbackReason) *fallbackReason = "empty-sample-plan";
+    return false;
+  }
+  const ViewerGlBufferApi& bufferApi = viewerGlBufferApi();
+  const ViewerGlComputeApi& computeApi = viewerGlComputeApi();
+  if (!bufferApi.available || !computeApi.available) {
+    if (fallbackReason) *fallbackReason = "no-gl-compute";
+    return false;
+  }
+  static RasterSignalComputeCache rasterCache{};
+  static ScopeHistogramGlProgramCache scopeProgramCache{};
+  if (!ensureRasterSignalComputeProgram(&rasterCache) ||
+      !ensureScopeHistogramGlPrograms(&scopeProgramCache)) {
+    if (fallbackReason) *fallbackReason = "program-unavailable";
+    return false;
+  }
+  auto ensureBuffer = [&](GLuint* id) {
+    if (*id == 0) bufferApi.genBuffers(1, id);
+    return *id != 0;
+  };
+  if (!ensureBuffer(&topologyCache->topology) ||
+      !ensureBuffer(&scopeCache->range) ||
+      !ensureBuffer(&scopeCache->density) ||
+      !ensureBuffer(&scopeCache->lineVerts) ||
+      !ensureBuffer(&scopeCache->lineColors) ||
+      !ensureBuffer(&scopeCache->fillVerts) ||
+      !ensureBuffer(&scopeCache->fillColors)) {
+    if (fallbackReason) *fallbackReason = "buffer-allocation";
+    return false;
+  }
+  bool sourceUploaded = false;
+  std::string sourceBufferReason;
+  if (!ensureSourceSignalGlWordsBuffer(sourceStore, source, &sourceUploaded, &sourceBufferReason)) {
+    if (fallbackReason) {
+      *fallbackReason = sourceBufferReason.empty() ? "source-buffer-unavailable" : sourceBufferReason;
+    }
+    return false;
+  }
+
+  constexpr int kHistogramBins = 512;
+  const bool lumaOnly = payload.viewerState.histogramMode == 1;
+  const int channelCount = lumaOnly ? 1 : 3;
+  const int normalSegmentCount = channelCount * (kHistogramBins - 1);
+  const size_t normalDensityBinCount = static_cast<size_t>(channelCount) * kHistogramBins;
+  float rangeMin = 0.0f;
+  float rangeMax = payload.viewerState.scopeRangeMode == 1 ? 4.0f : 1.0f;
+  float overflowRangeMin = 0.0f;
+  float overflowRangeMax = 1.0f;
+  bool hasHistogramOverflow = false;
+
+  while (glGetError() != GL_NO_ERROR) {
+  }
+  bufferApi.bindBuffer(GL_SHADER_STORAGE_BUFFER, topologyCache->topology);
+  bufferApi.bufferData(GL_SHADER_STORAGE_BUFFER,
+                       static_cast<ViewerGLsizeiptr>(plan.pointCount * sizeof(uint32_t)),
+                       nullptr,
+                       GL_DYNAMIC_DRAW);
+  const uint32_t initialRangeWords[4] = {
+      orderedUintFromFloat(std::numeric_limits<float>::infinity()),
+      orderedUintFromFloat(-std::numeric_limits<float>::infinity()),
+      orderedUintFromFloat(std::numeric_limits<float>::infinity()),
+      orderedUintFromFloat(-std::numeric_limits<float>::infinity())};
+  bufferApi.bindBuffer(GL_SHADER_STORAGE_BUFFER, scopeCache->range);
+  bufferApi.bufferData(GL_SHADER_STORAGE_BUFFER,
+                       static_cast<ViewerGLsizeiptr>(sizeof(initialRangeWords)),
+                       initialRangeWords,
+                       GL_DYNAMIC_DRAW);
+
+  computeApi.useProgram(rasterCache.topologyProgram);
+  computeApi.uniform1i(rasterCache.topologyPointCountLoc, static_cast<GLint>(plan.pointCount));
+  computeApi.uniform1i(rasterCache.topologySourceWidthLoc, source.proxyWidth);
+  computeApi.uniform1i(rasterCache.topologySourceHeightLoc, source.proxyHeight);
+  computeApi.uniform1i(rasterCache.topologySampleStrideLoc, plan.stride);
+  computeApi.uniform1i(rasterCache.topologySampleCountXLoc, plan.countX);
+  computeApi.bindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, topologyCache->topology);
+  computeApi.dispatchCompute(static_cast<GLuint>((plan.pointCount + 255u) / 256u), 1u, 1u);
+  computeApi.memoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+
+  if (payload.viewerState.scopeRangeMode == 2 || payload.viewerState.histogramShowOverflow) {
+    if (!bufferApi.getBufferSubData) {
+      if (fallbackReason) *fallbackReason = "no-gl-range-metadata-readback";
+      return false;
+    }
+    computeApi.useProgram(scopeProgramCache.rangeProgram);
+    computeApi.uniform1i(scopeProgramCache.rangePointCountLoc, static_cast<GLint>(plan.pointCount));
+    computeApi.uniform1i(scopeProgramCache.rangeSourceWidthLoc, source.proxyWidth);
+    computeApi.uniform1i(scopeProgramCache.rangeSourceHeightLoc, source.proxyHeight);
+    computeApi.uniform1i(scopeProgramCache.rangePixelFormatLoc, source.pixelFormat == "rgba32f" ? 1 : 0);
+    computeApi.uniform1i(scopeProgramCache.rangeScopeModeLoc, payload.viewerState.histogramMode);
+    computeApi.uniform1i(scopeProgramCache.rangeIncludeOverflowLoc,
+                         payload.viewerState.histogramShowOverflow ? 1 : 0);
+    computeApi.bindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, sourceStore->glSourceWordsBuffer);
+    computeApi.bindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, topologyCache->topology);
+    computeApi.bindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, scopeCache->range);
+    computeApi.dispatchCompute(static_cast<GLuint>((plan.pointCount + 255u) / 256u), 1u, 1u);
+    computeApi.memoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_BUFFER_UPDATE_BARRIER_BIT);
+    uint32_t resolvedRangeWords[4] = {};
+    bufferApi.bindBuffer(GL_SHADER_STORAGE_BUFFER, scopeCache->range);
+    bufferApi.getBufferSubData(GL_SHADER_STORAGE_BUFFER,
+                               0,
+                               static_cast<ViewerGLsizeiptr>(sizeof(resolvedRangeWords)),
+                               resolvedRangeWords);
+    const uint32_t emptyMin = orderedUintFromFloat(std::numeric_limits<float>::infinity());
+    const uint32_t emptyMax = orderedUintFromFloat(-std::numeric_limits<float>::infinity());
+    if (payload.viewerState.scopeRangeMode == 2 &&
+        resolvedRangeWords[0] != emptyMin && resolvedRangeWords[1] != emptyMax) {
+      rangeMin = std::min(0.0f, floatFromOrderedUint(resolvedRangeWords[0]));
+      rangeMax = std::max(1.0f, floatFromOrderedUint(resolvedRangeWords[1]));
+      const float pad = std::max(0.02f, (rangeMax - rangeMin) * 0.04f);
+      rangeMin -= pad;
+      rangeMax += pad;
+      if (!(rangeMax > rangeMin + 1.0e-5f)) {
+        rangeMin = 0.0f;
+        rangeMax = 1.0f;
+      }
+    }
+    if (payload.viewerState.histogramShowOverflow &&
+        resolvedRangeWords[2] != emptyMin && resolvedRangeWords[3] != emptyMax) {
+      overflowRangeMin = floatFromOrderedUint(resolvedRangeWords[2]);
+      overflowRangeMax = floatFromOrderedUint(resolvedRangeWords[3]);
+      hasHistogramOverflow = overflowRangeMax > overflowRangeMin + 1.0e-6f;
+      if (!hasHistogramOverflow) {
+        const float center = overflowRangeMin;
+        overflowRangeMin = center - 0.5f;
+        overflowRangeMax = center + 0.5f;
+        hasHistogramOverflow = true;
+      }
+    }
+  }
+  const float invRange = 1.0f / std::max(1e-6f, rangeMax - rangeMin);
+  const float overflowInvRange =
+      1.0f / std::max(1e-6f, overflowRangeMax - overflowRangeMin);
+  const bool emitHistogramOverflow =
+      payload.viewerState.histogramShowOverflow && hasHistogramOverflow;
+  const int segmentCount = normalSegmentCount * (emitHistogramOverflow ? 2 : 1);
+  const size_t densityBinCount = normalDensityBinCount * (emitHistogramOverflow ? 2u : 1u);
+  const size_t lineVertexCount = static_cast<size_t>(segmentCount) * 2u;
+  const size_t fillVertexCount = static_cast<size_t>(segmentCount) * 6u;
+
+  bufferApi.bindBuffer(GL_SHADER_STORAGE_BUFFER, scopeCache->density);
+  bufferApi.bufferData(GL_SHADER_STORAGE_BUFFER,
+                       static_cast<ViewerGLsizeiptr>(densityBinCount * sizeof(uint32_t)),
+                       nullptr,
+                       GL_DYNAMIC_DRAW);
+  bufferApi.bindBuffer(GL_SHADER_STORAGE_BUFFER, scopeCache->lineVerts);
+  bufferApi.bufferData(GL_SHADER_STORAGE_BUFFER,
+                       static_cast<ViewerGLsizeiptr>(lineVertexCount * 3u * sizeof(float)),
+                       nullptr,
+                       GL_DYNAMIC_DRAW);
+  bufferApi.bindBuffer(GL_SHADER_STORAGE_BUFFER, scopeCache->lineColors);
+  bufferApi.bufferData(GL_SHADER_STORAGE_BUFFER,
+                       static_cast<ViewerGLsizeiptr>(lineVertexCount * 4u * sizeof(float)),
+                       nullptr,
+                       GL_DYNAMIC_DRAW);
+  bufferApi.bindBuffer(GL_SHADER_STORAGE_BUFFER, scopeCache->fillVerts);
+  bufferApi.bufferData(GL_SHADER_STORAGE_BUFFER,
+                       static_cast<ViewerGLsizeiptr>(fillVertexCount * 3u * sizeof(float)),
+                       nullptr,
+                       GL_DYNAMIC_DRAW);
+  bufferApi.bindBuffer(GL_SHADER_STORAGE_BUFFER, scopeCache->fillColors);
+  bufferApi.bufferData(GL_SHADER_STORAGE_BUFFER,
+                       static_cast<ViewerGLsizeiptr>(fillVertexCount * 4u * sizeof(float)),
+                       nullptr,
+                       GL_DYNAMIC_DRAW);
+
+  computeApi.useProgram(scopeProgramCache.clearProgram);
+  computeApi.uniform1i(scopeProgramCache.clearBinCountLoc, static_cast<GLint>(densityBinCount));
+  computeApi.bindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, scopeCache->density);
+  computeApi.dispatchCompute(static_cast<GLuint>((densityBinCount + 255u) / 256u), 1u, 1u);
+  computeApi.memoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+
+  computeApi.useProgram(scopeProgramCache.densityProgram);
+  computeApi.uniform1i(scopeProgramCache.densityPointCountLoc, static_cast<GLint>(plan.pointCount));
+  computeApi.uniform1i(scopeProgramCache.densitySourceWidthLoc, source.proxyWidth);
+  computeApi.uniform1i(scopeProgramCache.densitySourceHeightLoc, source.proxyHeight);
+  computeApi.uniform1i(scopeProgramCache.densityPixelFormatLoc, source.pixelFormat == "rgba32f" ? 1 : 0);
+  computeApi.uniform1i(scopeProgramCache.densityWidthLoc, kHistogramBins);
+  computeApi.uniform1f(scopeProgramCache.densityRangeMinLoc, rangeMin);
+  computeApi.uniform1f(scopeProgramCache.densityInvRangeLoc, invRange);
+  computeApi.uniform1i(scopeProgramCache.densityChannelCountLoc, channelCount);
+  computeApi.uniform1i(scopeProgramCache.densityScopeModeLoc, payload.viewerState.histogramMode);
+  computeApi.uniform1i(scopeProgramCache.densityOverflowEnabledLoc, emitHistogramOverflow ? 1 : 0);
+  computeApi.uniform1f(scopeProgramCache.densityOverflowRangeMinLoc, overflowRangeMin);
+  computeApi.uniform1f(scopeProgramCache.densityOverflowInvRangeLoc, overflowInvRange);
+  computeApi.bindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, sourceStore->glSourceWordsBuffer);
+  computeApi.bindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, topologyCache->topology);
+  computeApi.bindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, scopeCache->density);
+  computeApi.dispatchCompute(static_cast<GLuint>((plan.pointCount + 255u) / 256u), 1u, 1u);
+  computeApi.memoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+
+  computeApi.useProgram(scopeProgramCache.geometryProgram);
+  computeApi.uniform1i(scopeProgramCache.geometryWidthLoc, kHistogramBins);
+  computeApi.uniform1i(scopeProgramCache.geometryChannelCountLoc, channelCount);
+  computeApi.uniform1i(scopeProgramCache.geometryScopeModeLoc, payload.viewerState.histogramMode);
+  computeApi.uniform1i(scopeProgramCache.geometryOverflowEnabledLoc, emitHistogramOverflow ? 1 : 0);
+  computeApi.uniform1f(scopeProgramCache.geometryRangeMinLoc, rangeMin);
+  computeApi.uniform1f(scopeProgramCache.geometryInvRangeLoc, invRange);
+  computeApi.uniform1f(scopeProgramCache.geometryOverflowRangeMinLoc, overflowRangeMin);
+  computeApi.uniform1f(scopeProgramCache.geometryOverflowInvRangeLoc, overflowInvRange);
+  computeApi.uniform1i(scopeProgramCache.geometryHighlightOverflowLoc,
+                       payload.viewerState.histogramHighlightOverflow ? 1 : 0);
+  computeApi.bindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, scopeCache->density);
+  computeApi.bindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, scopeCache->lineVerts);
+  computeApi.bindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, scopeCache->lineColors);
+  computeApi.bindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, scopeCache->fillVerts);
+  computeApi.bindBufferBase(GL_SHADER_STORAGE_BUFFER, 4, scopeCache->fillColors);
+  computeApi.dispatchCompute(static_cast<GLuint>((static_cast<size_t>(segmentCount) + 127u) / 128u), 1u, 1u);
+  computeApi.memoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_BUFFER_UPDATE_BARRIER_BIT |
+                           GL_VERTEX_ATTRIB_ARRAY_BARRIER_BIT);
+  computeApi.useProgram(0);
+  bufferApi.bindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+  if (glGetError() != GL_NO_ERROR) {
+    if (fallbackReason) *fallbackReason = "gl-error";
+    return false;
+  }
+
+  MeshData mesh{};
+  mesh.resolution = payload.resolution <= 25 ? 25 : (payload.resolution <= 41 ? 41 : 57);
+  mesh.quality = source.tierLabel.empty() ? std::string("Raster GL Histogram")
+                                          : source.tierLabel + " GL Histogram";
+  mesh.paramHash = std::string("raster-gl-histogram:") + source.tierLabel + ":" + source.pixelFormat;
+  mesh.serial = nextMeshSerial();
+  mesh.sourceTransport = source.transport;
+  mesh.analyticalScope = true;
+  mesh.waveformScope = false;
+  mesh.scopeMode = payload.viewerState.histogramMode;
+  mesh.scopeRangeMode = payload.viewerState.scopeRangeMode;
+  mesh.scopeRangeMin = rangeMin;
+  mesh.scopeRangeMax = rangeMax;
+  mesh.scopeWidth = kHistogramBins;
+  mesh.scopeHeight = 1;
+  mesh.lineVertexCount = lineVertexCount;
+  mesh.scopeFillVertexCount = fillVertexCount;
+  mesh.residentScopeGeometryDrawable = true;
+  mesh.hasFitBounds = true;
+  mesh.fitMin = Vec3{-0.82f, -0.88f, 0.0f};
+  mesh.fitMax = Vec3{0.96f, 0.88f, 0.0f};
+  setMeshResidencyAudit(&mesh,
+                        sourceUploaded ? "host-upload-to-gl-source-ssbo" : "gl-source-ssbo-cache",
+                        "gl-compute-histogram-density-geometry",
+                        "gl-topology-ssbo",
+                        "gl-scope-geometry-buffer");
+  scopeCache->builtSerial = mesh.serial;
+  scopeCache->lineVertexCount = static_cast<GLsizei>(lineVertexCount);
+  scopeCache->fillVertexCount = static_cast<GLsizei>(fillVertexCount);
+  scopeCache->available = true;
+  topologyCache->builtSerial = mesh.serial;
+  topologyCache->available = true;
+  *out = std::move(mesh);
+  if (fallbackReason) *fallbackReason = "gl-histogram-resident-geometry";
+  return true;
+}
+
 bool buildRasterDerivedMeshGlCompute(const ResolvedPayload& resolved,
                                      const SourceSignalPayload& source,
                                      bool analyticalScope,
+                                     SourceSignalStore* sourceStore,
+                                     InputCloudComputeCache* residentCache,
+                                     ScopeGeometryGlCache* residentScopeGeometryCache,
                                      MeshData* out,
                                      std::string* fallbackReason) {
   if (!out) return false;
@@ -7820,14 +9125,32 @@ bool buildRasterDerivedMeshGlCompute(const ResolvedPayload& resolved,
     if (fallbackReason) *fallbackReason = "empty-sample-plan";
     return false;
   }
+  if (analyticalScope) {
+    return buildHistogramScopeGeometryGlCompute(payload,
+                                                source,
+                                                sourceStore,
+                                                residentCache,
+                                                residentScopeGeometryCache,
+                                                out,
+                                                fallbackReason);
+  }
   const ViewerGlBufferApi& bufferApi = viewerGlBufferApi();
   const ViewerGlComputeApi& computeApi = viewerGlComputeApi();
-  if (!bufferApi.available || !bufferApi.getBufferSubData || !computeApi.available) {
+  const bool allowCpuReadback = glRasterComputeCpuReadbackFallbackEnabled();
+  if (!bufferApi.available || !computeApi.available) {
     if (fallbackReason) *fallbackReason = "no-gl-compute";
     return false;
   }
+  if (!residentCache) {
+    if (fallbackReason) *fallbackReason = "no-gl-resident-cache";
+    return false;
+  }
+  if (allowCpuReadback && !bufferApi.getBufferSubData) {
+    if (fallbackReason) *fallbackReason = "no-gl-readback";
+    return false;
+  }
   static RasterSignalComputeCache rasterCache{};
-  static InputCloudComputeCache mapCache{};
+  InputCloudComputeCache& mapCache = *residentCache;
   if (!ensureRasterSignalComputeProgram(&rasterCache) ||
       !ensureInputCloudComputeProgram(&mapCache)) {
     if (fallbackReason) *fallbackReason = "program-unavailable";
@@ -7837,25 +9160,23 @@ bool buildRasterDerivedMeshGlCompute(const ResolvedPayload& resolved,
     if (*id == 0) bufferApi.genBuffers(1, id);
     return *id != 0;
   };
-  if (!ensureBuffer(&rasterCache.source) ||
-      !ensureBuffer(&mapCache.input) ||
+  if (!ensureBuffer(&mapCache.input) ||
       !ensureBuffer(&mapCache.verts) ||
-      !ensureBuffer(&mapCache.colors)) {
+      !ensureBuffer(&mapCache.colors) ||
+      !ensureBuffer(&mapCache.topology)) {
     if (fallbackReason) *fallbackReason = "buffer-allocation";
     return false;
   }
-  std::vector<uint32_t> sourceWords;
-  if (!packSourceSignalWordsForGl(source, &sourceWords) || sourceWords.empty()) {
-    if (fallbackReason) *fallbackReason = "source-pack";
+  bool sourceUploaded = false;
+  std::string sourceBufferReason;
+  if (!ensureSourceSignalGlWordsBuffer(sourceStore, source, &sourceUploaded, &sourceBufferReason)) {
+    if (fallbackReason) {
+      *fallbackReason = sourceBufferReason.empty() ? "source-buffer-unavailable" : sourceBufferReason;
+    }
     return false;
   }
   while (glGetError() != GL_NO_ERROR) {
   }
-  bufferApi.bindBuffer(GL_SHADER_STORAGE_BUFFER, rasterCache.source);
-  bufferApi.bufferData(GL_SHADER_STORAGE_BUFFER,
-                       static_cast<ViewerGLsizeiptr>(sourceWords.size() * sizeof(uint32_t)),
-                       sourceWords.data(),
-                       GL_DYNAMIC_DRAW);
   bufferApi.bindBuffer(GL_SHADER_STORAGE_BUFFER, mapCache.input);
   bufferApi.bufferData(GL_SHADER_STORAGE_BUFFER,
                        static_cast<ViewerGLsizeiptr>(plan.pointCount * 3u * sizeof(float)),
@@ -7871,16 +9192,30 @@ bool buildRasterDerivedMeshGlCompute(const ResolvedPayload& resolved,
                        static_cast<ViewerGLsizeiptr>(plan.pointCount * 4u * sizeof(float)),
                        nullptr,
                        GL_DYNAMIC_DRAW);
+  bufferApi.bindBuffer(GL_SHADER_STORAGE_BUFFER, mapCache.topology);
+  bufferApi.bufferData(GL_SHADER_STORAGE_BUFFER,
+                       static_cast<ViewerGLsizeiptr>(plan.pointCount * sizeof(uint32_t)),
+                       nullptr,
+                       GL_DYNAMIC_DRAW);
+
+  computeApi.useProgram(rasterCache.topologyProgram);
+  computeApi.uniform1i(rasterCache.topologyPointCountLoc, static_cast<GLint>(plan.pointCount));
+  computeApi.uniform1i(rasterCache.topologySourceWidthLoc, source.proxyWidth);
+  computeApi.uniform1i(rasterCache.topologySourceHeightLoc, source.proxyHeight);
+  computeApi.uniform1i(rasterCache.topologySampleStrideLoc, plan.stride);
+  computeApi.uniform1i(rasterCache.topologySampleCountXLoc, plan.countX);
+  computeApi.bindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, mapCache.topology);
+  computeApi.dispatchCompute(static_cast<GLuint>((plan.pointCount + 255u) / 256u), 1u, 1u);
+  computeApi.memoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
 
   computeApi.useProgram(rasterCache.program);
   computeApi.uniform1i(rasterCache.pointCountLoc, static_cast<GLint>(plan.pointCount));
   computeApi.uniform1i(rasterCache.sourceWidthLoc, source.proxyWidth);
   computeApi.uniform1i(rasterCache.sourceHeightLoc, source.proxyHeight);
-  computeApi.uniform1i(rasterCache.sampleStrideLoc, plan.stride);
-  computeApi.uniform1i(rasterCache.sampleCountXLoc, plan.countX);
   computeApi.uniform1i(rasterCache.pixelFormatLoc, source.pixelFormat == "rgba32f" ? 1 : 0);
-  computeApi.bindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, rasterCache.source);
-  computeApi.bindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, mapCache.input);
+  computeApi.bindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, sourceStore->glSourceWordsBuffer);
+  computeApi.bindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, mapCache.topology);
+  computeApi.bindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, mapCache.input);
   computeApi.dispatchCompute(static_cast<GLuint>((plan.pointCount + 255u) / 256u), 1u, 1u);
   computeApi.memoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
 
@@ -7930,9 +9265,50 @@ bool buildRasterDerivedMeshGlCompute(const ResolvedPayload& resolved,
                        uniforms.chromaticityXyzToRgb[6],
                        uniforms.chromaticityXyzToRgb[7],
                        uniforms.chromaticityXyzToRgb[8]);
+  computeApi.uniform1i(mapCache.cubeSlicingEnabledLoc, remap.cubeSlicingEnabled ? 1 : 0);
+  computeApi.uniform1i(mapCache.neutralRadiusEnabledLoc, remap.neutralRadiusEnabled ? 1 : 0);
+  computeApi.uniform1f(mapCache.neutralRadiusLoc, remap.neutralRadius);
+  computeApi.uniform1i(mapCache.cubeSliceRedLoc, remap.cubeSliceRed ? 1 : 0);
+  computeApi.uniform1i(mapCache.cubeSliceYellowLoc, remap.cubeSliceYellow ? 1 : 0);
+  computeApi.uniform1i(mapCache.cubeSliceGreenLoc, remap.cubeSliceGreen ? 1 : 0);
+  computeApi.uniform1i(mapCache.cubeSliceCyanLoc, remap.cubeSliceCyan ? 1 : 0);
+  computeApi.uniform1i(mapCache.cubeSliceBlueLoc, remap.cubeSliceBlue ? 1 : 0);
+  computeApi.uniform1i(mapCache.cubeSliceMagentaLoc, remap.cubeSliceMagenta ? 1 : 0);
+  computeApi.uniform1i(mapCache.sourceWidthLoc, source.proxyWidth);
+  computeApi.uniform1i(mapCache.sourceHeightLoc, source.proxyHeight);
+  computeApi.uniform1i(mapCache.lassoEnabledLoc, 0);
+  computeApi.uniform1i(mapCache.lassoStrokeCountLoc, 0);
+  computeApi.uniform1i(mapCache.lassoPointCountLoc, 0);
+  if (payload.volumeSlicingEnabled && payload.volumeSlicingMode == "lasso") {
+    const LassoRegionState lassoState = parseViewerLassoRegionState(payload.lassoData);
+    int strokeIndex = 0;
+    int pointIndex = 0;
+    computeApi.uniform1i(mapCache.lassoEnabledLoc, 1);
+    for (const auto& stroke : lassoState.strokes) {
+      if (stroke.points.size() < 3 || strokeIndex >= 16 || pointIndex >= 256) continue;
+      const int available = 256 - pointIndex;
+      const int count = std::min<int>(available, static_cast<int>(stroke.points.size()));
+      if (count < 3) break;
+      computeApi.uniform1i(mapCache.lassoStrokeFirstLoc[static_cast<size_t>(strokeIndex)], pointIndex);
+      computeApi.uniform1i(mapCache.lassoStrokeCountPerStrokeLoc[static_cast<size_t>(strokeIndex)], count);
+      computeApi.uniform1i(mapCache.lassoStrokeSubtractLoc[static_cast<size_t>(strokeIndex)],
+                           stroke.subtract ? 1 : 0);
+      for (int i = 0; i < count; ++i) {
+        computeApi.uniform1f(mapCache.lassoXLoc[static_cast<size_t>(pointIndex + i)],
+                             clampf(stroke.points[static_cast<size_t>(i)].xNorm, 0.0f, 1.0f));
+        computeApi.uniform1f(mapCache.lassoYLoc[static_cast<size_t>(pointIndex + i)],
+                             clampf(stroke.points[static_cast<size_t>(i)].yNorm, 0.0f, 1.0f));
+      }
+      pointIndex += count;
+      ++strokeIndex;
+    }
+    computeApi.uniform1i(mapCache.lassoStrokeCountLoc, strokeIndex);
+    computeApi.uniform1i(mapCache.lassoPointCountLoc, pointIndex);
+  }
   computeApi.bindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, mapCache.input);
   computeApi.bindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, mapCache.verts);
   computeApi.bindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, mapCache.colors);
+  computeApi.bindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, mapCache.topology);
   computeApi.dispatchCompute(static_cast<GLuint>((plan.pointCount + 63u) / 64u), 1u, 1u);
   computeApi.memoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_BUFFER_UPDATE_BARRIER_BIT |
                            GL_VERTEX_ATTRIB_ARRAY_BARRIER_BIT);
@@ -7944,33 +9320,50 @@ bool buildRasterDerivedMeshGlCompute(const ResolvedPayload& resolved,
   mesh.paramHash = std::string("raster-gl:") + source.tierLabel + ":" + source.pixelFormat;
   mesh.serial = nextMeshSerial();
   mesh.sourceTransport = source.transport;
+  const std::string sourceResidencyStage =
+      sourceUploaded ? "host-upload-to-gl-source-ssbo" : "gl-source-ssbo-cache";
   setMeshResidencyAudit(&mesh,
-                        "host-memory",
-                        "gl-compute-host-packed-readback",
-                        "cpu-point-array-diagnostic");
+                        sourceResidencyStage,
+                        "gl-compute-raster-to-point-buffer",
+                        "gl-topology-ssbo",
+                        "gl-buffer");
   mesh.pointCount = plan.pointCount;
-  mesh.pointVerts.resize(plan.pointCount * 3u);
-  mesh.pointColors.resize(plan.pointCount * 4u);
-  bufferApi.bindBuffer(GL_SHADER_STORAGE_BUFFER, mapCache.verts);
-  bufferApi.getBufferSubData(GL_SHADER_STORAGE_BUFFER,
-                             0,
-                             static_cast<ViewerGLsizeiptr>(mesh.pointVerts.size() * sizeof(float)),
-                             mesh.pointVerts.data());
-  bufferApi.bindBuffer(GL_SHADER_STORAGE_BUFFER, mapCache.colors);
-  bufferApi.getBufferSubData(GL_SHADER_STORAGE_BUFFER,
-                             0,
-                             static_cast<ViewerGLsizeiptr>(mesh.pointColors.size() * sizeof(float)),
-                             mesh.pointColors.data());
+  mesh.hasFitBounds = true;
+  mesh.fitMin = Vec3{-1.8f, -1.8f, -1.8f};
+  mesh.fitMax = Vec3{1.8f, 1.8f, 1.8f};
+  if (allowCpuReadback) {
+    mesh.pointVerts.resize(plan.pointCount * 3u);
+    mesh.pointColors.resize(plan.pointCount * 4u);
+    bufferApi.bindBuffer(GL_SHADER_STORAGE_BUFFER, mapCache.verts);
+    bufferApi.getBufferSubData(GL_SHADER_STORAGE_BUFFER,
+                               0,
+                               static_cast<ViewerGLsizeiptr>(mesh.pointVerts.size() * sizeof(float)),
+                               mesh.pointVerts.data());
+    bufferApi.bindBuffer(GL_SHADER_STORAGE_BUFFER, mapCache.colors);
+    bufferApi.getBufferSubData(GL_SHADER_STORAGE_BUFFER,
+                               0,
+                               static_cast<ViewerGLsizeiptr>(mesh.pointColors.size() * sizeof(float)),
+                               mesh.pointColors.data());
+    setMeshResidencyAudit(&mesh,
+                          sourceResidencyStage,
+                          "gl-compute-raster-to-point-buffer-readback",
+                          "cpu-point-vector-readback",
+                          "cpu-point-array-diagnostic");
+    setMeshFitBoundsFromVerts(&mesh);
+  }
   bufferApi.bindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
   if (glGetError() != GL_NO_ERROR) {
     if (fallbackReason) *fallbackReason = "gl-error";
     return false;
   }
-  setMeshFitBoundsFromVerts(&mesh);
   mapCache.builtSerial = mesh.serial;
   mapCache.pointCount = static_cast<GLsizei>(mesh.pointCount);
+  mapCache.available = true;
   *out = std::move(mesh);
-  if (fallbackReason) *fallbackReason = "gl-raster-compute";
+  if (fallbackReason) {
+    *fallbackReason = allowCpuReadback ? "gl-raster-compute-readback-diagnostic"
+                                       : "gl-raster-compute-resident";
+  }
   return true;
 }
 
@@ -10379,9 +11772,24 @@ bool buildInputCloudMeshOnGpu(const ResolvedPayload& payload,
                        uniforms.chromaticityXyzToRgb[6],
                        uniforms.chromaticityXyzToRgb[7],
                        uniforms.chromaticityXyzToRgb[8]);
+  computeApi.uniform1i(cache->cubeSlicingEnabledLoc, remap.cubeSlicingEnabled ? 1 : 0);
+  computeApi.uniform1i(cache->neutralRadiusEnabledLoc, remap.neutralRadiusEnabled ? 1 : 0);
+  computeApi.uniform1f(cache->neutralRadiusLoc, remap.neutralRadius);
+  computeApi.uniform1i(cache->cubeSliceRedLoc, remap.cubeSliceRed ? 1 : 0);
+  computeApi.uniform1i(cache->cubeSliceYellowLoc, remap.cubeSliceYellow ? 1 : 0);
+  computeApi.uniform1i(cache->cubeSliceGreenLoc, remap.cubeSliceGreen ? 1 : 0);
+  computeApi.uniform1i(cache->cubeSliceCyanLoc, remap.cubeSliceCyan ? 1 : 0);
+  computeApi.uniform1i(cache->cubeSliceBlueLoc, remap.cubeSliceBlue ? 1 : 0);
+  computeApi.uniform1i(cache->cubeSliceMagentaLoc, remap.cubeSliceMagenta ? 1 : 0);
+  computeApi.uniform1i(cache->sourceWidthLoc, 1);
+  computeApi.uniform1i(cache->sourceHeightLoc, 1);
+  computeApi.uniform1i(cache->lassoEnabledLoc, 0);
+  computeApi.uniform1i(cache->lassoStrokeCountLoc, 0);
+  computeApi.uniform1i(cache->lassoPointCountLoc, 0);
   computeApi.bindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, cache->input);
   computeApi.bindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, cache->verts);
   computeApi.bindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, cache->colors);
+  computeApi.bindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, 0);
   const GLuint groups = static_cast<GLuint>((pointCount + 63u) / 64u);
   computeApi.dispatchCompute(groups, 1, 1);
   computeApi.memoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_VERTEX_ATTRIB_ARRAY_BARRIER_BIT);
@@ -10552,6 +11960,159 @@ std::mutex gViewerCommandMutex;
 PendingViewerCommand gPendingViewerCommand;
 std::atomic<uint64_t> gViewerCommandSeq{1};
 
+struct SourceRasterHealth {
+  std::string senderId;
+  std::string status = "waiting_for_resolve";
+  std::string reason = "no-source-signal";
+  std::string transport;
+  uint64_t seq = 0;
+  uint64_t contentHash = 0;
+  uint32_t surfaceId = 0;
+  int proxyWidth = 0;
+  int proxyHeight = 0;
+  int surfaceWidth = 0;
+  int surfaceHeight = 0;
+  int surfacePixelFormat = -1;
+  bool imported = false;
+  int64_t updatedMs = 0;
+};
+
+std::mutex gSourceRasterHealthMutex;
+SourceRasterHealth gSourceRasterHealth;
+std::string gLastSourceRasterHealthSummary;
+
+std::string sourceRasterJsonEscape(const std::string& value) {
+  std::string out;
+  out.reserve(value.size());
+  for (char c : value) {
+    switch (c) {
+      case '\\': out += "\\\\"; break;
+      case '"': out += "\\\""; break;
+      case '\n': out += "\\n"; break;
+      case '\r': out += "\\r"; break;
+      case '\t': out += "\\t"; break;
+      default: out += c; break;
+    }
+  }
+  return out;
+}
+
+int64_t monotonicMillis() {
+  return std::chrono::duration_cast<std::chrono::milliseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+
+std::string sourceRasterHealthSummary(const SourceRasterHealth& health) {
+  std::ostringstream os;
+  os << "status=" << health.status
+     << " reason=" << health.reason
+     << " sender=" << health.senderId
+     << " seq=" << health.seq
+     << " hash=" << health.contentHash
+     << " transport=" << health.transport
+     << " imported=" << (health.imported ? 1 : 0);
+  if (health.transport == "iosurface_metal" || health.surfaceId != 0) {
+    os << " surfaceId=" << health.surfaceId
+       << " surface=" << health.surfaceWidth << "x" << health.surfaceHeight
+       << " surfaceFormat=" << health.surfacePixelFormat;
+  }
+  if (health.proxyWidth > 0 || health.proxyHeight > 0) {
+    os << " proxy=" << health.proxyWidth << "x" << health.proxyHeight;
+  }
+  return os.str();
+}
+
+std::filesystem::path sourceRasterStatusPath(const std::string& sessionId);
+bool writeViewerMailboxAtomic(const std::filesystem::path& path, const std::string& text);
+
+void publishSourceRasterHealth(SourceRasterHealth health) {
+  health.updatedMs = monotonicMillis();
+  std::string summary;
+  {
+    std::lock_guard<std::mutex> lock(gSourceRasterHealthMutex);
+    gSourceRasterHealth = health;
+    summary = sourceRasterHealthSummary(gSourceRasterHealth);
+    if (summary != gLastSourceRasterHealthSummary) {
+      gLastSourceRasterHealthSummary = summary;
+      logViewerEvent(std::string("Source raster health: ") + summary);
+    }
+  }
+  if (!health.senderId.empty()) {
+    std::ostringstream os;
+    os << "{\"type\":\"chromaspace_source_raster_status\""
+       << ",\"senderId\":\"" << sourceRasterJsonEscape(health.senderId) << "\""
+       << ",\"status\":\"" << sourceRasterJsonEscape(health.status) << "\""
+       << ",\"reason\":\"" << sourceRasterJsonEscape(health.reason) << "\""
+       << ",\"transport\":\"" << sourceRasterJsonEscape(health.transport) << "\""
+       << ",\"seq\":" << health.seq
+       << ",\"contentHash\":" << health.contentHash
+       << ",\"imported\":" << (health.imported ? 1 : 0)
+       << ",\"surfaceId\":" << health.surfaceId
+       << ",\"proxyWidth\":" << health.proxyWidth
+       << ",\"proxyHeight\":" << health.proxyHeight
+       << ",\"surfaceWidth\":" << health.surfaceWidth
+       << ",\"surfaceHeight\":" << health.surfaceHeight
+       << ",\"surfacePixelFormat\":" << health.surfacePixelFormat
+       << ",\"updatedAtMs\":" << health.updatedMs
+       << "}\n";
+    (void)writeViewerMailboxAtomic(sourceRasterStatusPath(health.senderId), os.str());
+  }
+}
+
+SourceRasterHealth sourceRasterHealthForPayload(const SourceSignalPayload& source,
+                                                const std::string& status,
+                                                const std::string& reason,
+                                                bool imported) {
+  SourceRasterHealth health{};
+  health.senderId = source.senderId;
+  health.status = status;
+  health.reason = reason;
+  health.transport = source.transport;
+  health.seq = source.seq;
+  health.contentHash = source.contentHash;
+  health.surfaceId = source.surfaceId;
+  health.proxyWidth = source.proxyWidth;
+  health.proxyHeight = source.proxyHeight;
+  health.surfaceWidth = source.surfaceWidth;
+  health.surfaceHeight = source.surfaceHeight;
+  health.surfacePixelFormat = source.surfacePixelFormat;
+  health.imported = imported;
+  return health;
+}
+
+std::string sourceRasterWaitingLabel(const std::string& fallback = "Waiting for Resolve render") {
+  std::lock_guard<std::mutex> lock(gSourceRasterHealthMutex);
+  if (gSourceRasterHealth.status == "import_failed") return "Metal IOSurface import failed";
+  if (gSourceRasterHealth.status == "accepted" &&
+      gSourceRasterHealth.transport == "iosurface_metal") return "Waiting for Metal IOSurface";
+  if (gSourceRasterHealth.status == "non_active_sender") return "Raster packet non-active sender";
+  if (gSourceRasterHealth.status == "stale") return "Raster packet stale";
+  if (gSourceRasterHealth.status == "build_failed") return "Raster build failed";
+  if (gSourceRasterHealth.status == "residency_blocked") return "Raster residency blocked";
+  return fallback;
+}
+
+bool sourceRasterLabelIsWaiting(const std::string& label) {
+  return label == "Waiting for Resolve" ||
+         label == "Waiting for Resolve render" ||
+         label == "Waiting for raster" ||
+         label == "Waiting for Metal IOSurface" ||
+         label == "Metal IOSurface import failed" ||
+         label == "Raster packet non-active sender" ||
+         label == "Raster packet stale" ||
+         label == "Raster build failed" ||
+         label == "Raster residency blocked";
+}
+
+bool sourceRasterLabelIsResolveWait(const std::string& label) {
+  return label == "Waiting for Resolve" || label == "Waiting for Resolve render";
+}
+
+bool sourceRasterLabelIsRasterWait(const std::string& label) {
+  return sourceRasterLabelIsWaiting(label) && !sourceRasterLabelIsResolveWait(label);
+}
+
 std::string heartbeatJsonEscape(const std::string& value) {
   std::string out;
   out.reserve(value.size());
@@ -10665,10 +12226,25 @@ void appendViewerStateCommandFields(std::ostringstream& os,
 
 std::string heartbeatAckJson(const std::string& senderId) {
   (void)senderId;
+  SourceRasterHealth health{};
+  {
+    std::lock_guard<std::mutex> lock(gSourceRasterHealthMutex);
+    health = gSourceRasterHealth;
+  }
+  const int64_t nowMs = monotonicMillis();
+  const int64_t ageMs = health.updatedMs > 0 ? std::max<int64_t>(0, nowMs - health.updatedMs) : -1;
   std::ostringstream os;
   os << "{\"type\":\"heartbeat_ack\",\"visible\":" << gWindowVisible.load()
      << ",\"iconified\":" << gWindowIconified.load()
-     << ",\"focused\":" << gWindowFocused.load();
+     << ",\"focused\":" << gWindowFocused.load()
+     << ",\"sourceRasterStatus\":\"" << heartbeatJsonEscape(health.status) << "\""
+     << ",\"sourceRasterReason\":\"" << heartbeatJsonEscape(health.reason) << "\""
+     << ",\"sourceRasterSenderId\":\"" << heartbeatJsonEscape(health.senderId) << "\""
+     << ",\"sourceRasterTransport\":\"" << heartbeatJsonEscape(health.transport) << "\""
+     << ",\"sourceRasterSeq\":" << health.seq
+     << ",\"sourceRasterImported\":" << (health.imported ? 1 : 0)
+     << ",\"sourceRasterSurfaceId\":" << health.surfaceId
+     << ",\"sourceRasterAgeMs\":" << ageMs;
   os << "}";
   return os.str();
 }
@@ -15263,6 +16839,7 @@ bool ensureAnalyticalScopeComputeProgram(AnalyticalScopeComputeCache* cache) {
   if (cache->initAttempted) return false;
   cache->initAttempted = true;
   const ViewerGlComputeApi& api = viewerGlComputeApi();
+  if (!glAnalyticalScopeCpuReadbackFallbackEnabled()) return false;
   if (!api.available || !viewerGlBufferApi().getBufferSubData) return false;
   static const char* kSource = R"GLSL(
 #version 430
@@ -15371,6 +16948,7 @@ bool buildAnalyticalScopeDensityGlCompute(const std::vector<InputCloudSample>& s
                                           int lumaMethod,
                                           std::vector<float>* outDensity) {
   if (!outDensity || samples.empty() || width <= 0 || height <= 0) return false;
+  if (!glAnalyticalScopeCpuReadbackFallbackEnabled()) return false;
   static AnalyticalScopeComputeCache cache{};
   if (!ensureAnalyticalScopeComputeProgram(&cache)) return false;
   const ViewerGlBufferApi& bufferApi = viewerGlBufferApi();
@@ -15429,6 +17007,7 @@ bool buildAnalyticalScopeDensityGlCompute(const std::vector<InputCloudSample>& s
 }
 
 bool validateAnalyticalScopeComputeStartup() {
+  if (!glAnalyticalScopeCpuReadbackFallbackEnabled()) return false;
   const std::vector<InputCloudSample> samples = {
       {0.20f, 0.30f, 0.10f, 0.20f, 0.30f},
       {0.80f, 0.70f, 0.90f, 0.50f, 0.25f},
@@ -17095,6 +18674,9 @@ struct PlotWindowState {
   std::string viewerLassoData;
   MeshData derivedMesh{};
   MeshData overlayMesh{};
+  InputCloudComputeCache residentInputComputeCache{};
+  InputCloudSampleComputeCache residentInputSampleComputeCache{};
+  ScopeGeometryGlCache residentScopeGeometryGlCache{};
 #if defined(CHROMASPACE_VIEWER_HAS_CUDA) && !defined(__APPLE__)
   InputCloudCudaCache residentInputCudaCache{};
   InputCloudSampleCudaCache residentInputSampleCudaCache{};
@@ -17135,6 +18717,9 @@ struct PlotLayoutSlotState {
 
 void releasePlotWindowGpuCaches(PlotWindowState* window) {
   if (!window) return;
+  releaseInputCloudComputeCache(&window->residentInputComputeCache);
+  releaseInputCloudSampleComputeCache(&window->residentInputSampleComputeCache);
+  releaseScopeGeometryGlCache(&window->residentScopeGeometryGlCache);
 #if defined(CHROMASPACE_VIEWER_HAS_CUDA) && !defined(__APPLE__)
   releaseInputCloudCudaCache(&window->residentInputCudaCache);
   releaseInputCloudSampleCudaCache(&window->residentInputSampleCudaCache);
@@ -17174,7 +18759,7 @@ void setPlotWindowSyncLabel(PlotWindowState* window, const std::string& nextLabe
     window->lastHealthySyncLabelTime = now;
     return;
   }
-  if (nextLabel == "Waiting for Resolve" &&
+  if (sourceRasterLabelIsResolveWait(nextLabel) &&
       window->lastHealthySyncLabelTime >= 0.0 &&
       now - window->lastHealthySyncLabelTime <= kSyncDowngradeGraceSeconds &&
       (window->stableSyncLabel == "Live" ||
@@ -17501,8 +19086,10 @@ struct AppState {
   double lastResolveDrawScanRequest = -10.0;
   double lastResolveLivePulseWrite = -10.0;
   double lastViewerAliveLeaseWrite = -10.0;
+  double lastRasterWakeDiagnosticAt = -10.0;
   double resolveLivePulseUntil = -10.0;
   uint64_t lastResolveLivePulseRevisionSeen = 0;
+  std::string lastRasterWakeDiagnosticSummary;
   uint64_t resolveDrawScanRequestedRevision = 0;
   uint64_t resolveDrawScanCompletedRevision = 0;
   std::string resolveDrawStatusMessage;
@@ -21129,6 +22716,14 @@ std::filesystem::path viewerAppliedStatePath(const std::string& sessionId) {
   return viewerMailboxSessionPath(sessionId) / "applied_state.json";
 }
 
+std::filesystem::path viewerBridgeStatusPath(const std::string& sessionId) {
+  return viewerMailboxSessionPath(sessionId) / "bridge_status.json";
+}
+
+std::filesystem::path sourceRasterStatusPath(const std::string& sessionId) {
+  return viewerMailboxSessionPath(sessionId) / "source_raster_status.json";
+}
+
 std::filesystem::path viewerDrawInstanceScanRequestPath(const std::string& sessionId) {
   return viewerMailboxSessionPath(sessionId) / "draw_instance_scan_request.json";
 }
@@ -21165,6 +22760,42 @@ bool readSmallViewerTextFile(const std::filesystem::path& path, std::string* out
   buffer << is.rdbuf();
   *out = buffer.str();
   return true;
+}
+
+std::string compactJsonStringField(const std::string& json, const std::string& key) {
+  const std::string token = "\"" + key + "\":";
+  const size_t start = json.find(token);
+  if (start == std::string::npos) return std::string();
+  size_t pos = start + token.size();
+  while (pos < json.size() && std::isspace(static_cast<unsigned char>(json[pos]))) ++pos;
+  if (pos >= json.size() || json[pos] != '"') return std::string();
+  std::string value;
+  bool escaped = false;
+  for (size_t i = pos + 1; i < json.size(); ++i) {
+    const char c = json[i];
+    if (escaped) {
+      value.push_back(c);
+      escaped = false;
+    } else if (c == '\\') {
+      escaped = true;
+    } else if (c == '"') {
+      break;
+    } else {
+      value.push_back(c);
+    }
+  }
+  return value;
+}
+
+bool compactJsonBoolField(const std::string& json, const std::string& key, bool fallback = false) {
+  const std::string token = "\"" + key + "\":";
+  const size_t start = json.find(token);
+  if (start == std::string::npos) return fallback;
+  size_t value = start + token.size();
+  while (value < json.size() && std::isspace(static_cast<unsigned char>(json[value]))) ++value;
+  if (json.compare(value, 4, "true") == 0 || json.compare(value, 1, "1") == 0) return true;
+  if (json.compare(value, 5, "false") == 0 || json.compare(value, 1, "0") == 0) return false;
+  return fallback;
 }
 
 bool writeViewerMailboxAtomic(const std::filesystem::path& path, const std::string& text) {
@@ -23206,6 +24837,59 @@ void updateResolveLiveRefreshPulse(AppState* app) {
 #if defined(_WIN32)
   ensureResolveBridgeRunning();
 #endif
+}
+
+void logRasterWakeDiagnostic(AppState* app,
+                             const SourceSignalStore* sourceSignalStore,
+                             const ResolvedPayload& resolved,
+                             const char* reason) {
+  if (!app || app->senderId.empty() || sourceDeriveMode() != SourceDeriveMode::Raster) return;
+  const double now = glfwGetTime();
+  constexpr double kRasterWakeDiagnosticIntervalSeconds = 1.75;
+  if (now - app->lastRasterWakeDiagnosticAt < kRasterWakeDiagnosticIntervalSeconds) return;
+
+  SourceRasterHealth health{};
+  {
+    std::lock_guard<std::mutex> lock(gSourceRasterHealthMutex);
+    health = gSourceRasterHealth;
+  }
+  std::string bridgeJson;
+  const bool bridgeStatusKnown = readSmallViewerTextFile(viewerBridgeStatusPath(app->senderId), &bridgeJson);
+  const bool bridgeRefreshRequested =
+      bridgeStatusKnown && compactJsonBoolField(bridgeJson, "refreshRequested", false);
+  const bool bridgeRefreshUnavailable =
+      bridgeStatusKnown && compactJsonBoolField(bridgeJson, "refreshUnavailable", false);
+  const std::string bridgeMessage =
+      bridgeStatusKnown ? compactJsonStringField(bridgeJson, "message") : std::string("missing");
+  const auto aggregate = aggregateHostStateForWorkspace(*app);
+  const SourceSignalPayload* authoritative =
+      sourceSignalStore && sourceSignalStore->hasAuthoritative
+          ? &sourceSignalStore->authoritative
+          : nullptr;
+  std::ostringstream summary;
+  summary << "reason=" << (reason ? reason : "waiting")
+          << " sender=" << app->senderId
+          << " resolvedSender=" << resolved.senderId
+          << " status=" << health.status
+          << " rasterReason=" << health.reason
+          << " transport=" << health.transport
+          << " seq=" << health.seq
+          << " imported=" << (health.imported ? 1 : 0)
+          << " surfaceId=" << health.surfaceId
+          << " authoritative=" << (authoritative ? 1 : 0)
+          << " authoritativeSender=" << (authoritative ? authoritative->senderId : std::string())
+          << " desiredRev=" << aggregate.stateRevision
+          << " hostRefreshRev=" << aggregate.hostRefreshRequestedRevision
+          << " bridgeStatus=" << (bridgeStatusKnown ? "present" : "missing")
+          << " bridgeRefreshRequested=" << (bridgeRefreshRequested ? 1 : 0)
+          << " bridgeRefreshUnavailable=" << (bridgeRefreshUnavailable ? 1 : 0)
+          << " bridgeMessage=" << (bridgeMessage.empty() ? "none" : bridgeMessage);
+  const std::string text = summary.str();
+  if (text != app->lastRasterWakeDiagnosticSummary) {
+    logViewerEvent(std::string("Raster wake diagnostic: ") + text);
+    app->lastRasterWakeDiagnosticSummary = text;
+  }
+  app->lastRasterWakeDiagnosticAt = now;
 }
 
 uint64_t currentViewerProcessId() {
@@ -27655,6 +29339,43 @@ void drawHudTextLine(const HudTextRenderer& renderer,
   glDisable(GL_TEXTURE_2D);
 }
 
+float gHudScissorScaleX = 1.0f;
+float gHudScissorScaleY = 1.0f;
+
+void setHudScissorScale(float scaleX, float scaleY) {
+  gHudScissorScaleX = std::max(0.001f, scaleX);
+  gHudScissorScaleY = std::max(0.001f, scaleY);
+}
+
+void resetHudScissorScale() {
+  gHudScissorScaleX = 1.0f;
+  gHudScissorScaleY = 1.0f;
+}
+
+void logicalHudScissorToFramebuffer(float x,
+                                    float y,
+                                    float w,
+                                    float h,
+                                    GLint* outX,
+                                    GLint* outY,
+                                    GLsizei* outW,
+                                    GLsizei* outH) {
+  if (!outX || !outY || !outW || !outH) return;
+  *outX = static_cast<GLint>(std::floor(x * gHudScissorScaleX));
+  *outY = static_cast<GLint>(std::floor(y * gHudScissorScaleY));
+  *outW = static_cast<GLsizei>(std::max(0.0f, std::ceil(w * gHudScissorScaleX)));
+  *outH = static_cast<GLsizei>(std::max(0.0f, std::ceil(h * gHudScissorScaleY)));
+}
+
+void applyHudScissor(float x, float y, float w, float h) {
+  GLint sx = 0;
+  GLint sy = 0;
+  GLsizei sw = 0;
+  GLsizei sh = 0;
+  logicalHudScissorToFramebuffer(x, y, w, h, &sx, &sy, &sw, &sh);
+  glScissor(sx, sy, std::max<GLsizei>(1, sw), std::max<GLsizei>(1, sh));
+}
+
 float hudTextWidth(const HudTextRenderer& renderer, const std::string& text, float scale) {
   if (text.empty()) return 0.0f;
   if (renderer.available) return WorkshopText::measureTextWidth(renderer.atlas, text, scale);
@@ -27792,10 +29513,20 @@ void drawHudTextLineClipped(const HudTextRenderer& renderer,
                             ? static_cast<float>(std::max(0, renderer.atlas.descent)) * scale
                             : 4.0f * scale;
   const float clipPad = std::max(2.0f, std::ceil(1.5f * scale));
-  GLint clipX0 = static_cast<GLint>(std::floor(x));
-  GLint clipY0 = static_cast<GLint>(std::floor(baselineY - descent - clipPad));
-  GLint clipX1 = static_cast<GLint>(std::ceil(x + maxWidth));
-  GLint clipY1 = static_cast<GLint>(std::ceil(baselineY + ascent + clipPad));
+  GLint clipX0 = 0;
+  GLint clipY0 = 0;
+  GLsizei clipW = 0;
+  GLsizei clipH = 0;
+  logicalHudScissorToFramebuffer(std::floor(x),
+                                 std::floor(baselineY - descent - clipPad),
+                                 std::ceil(maxWidth),
+                                 std::ceil(ascent + descent + clipPad * 2.0f),
+                                 &clipX0,
+                                 &clipY0,
+                                 &clipW,
+                                 &clipH);
+  GLint clipX1 = clipX0 + clipW;
+  GLint clipY1 = clipY0 + clipH;
   GLboolean previousScissorEnabled = glIsEnabled(GL_SCISSOR_TEST);
   GLint previousScissor[4] = {0, 0, 0, 0};
   if (previousScissorEnabled) {
@@ -27805,8 +29536,8 @@ void drawHudTextLineClipped(const HudTextRenderer& renderer,
     clipX1 = std::min(clipX1, previousScissor[0] + previousScissor[2]);
     clipY1 = std::min(clipY1, previousScissor[1] + previousScissor[3]);
   }
-  const GLsizei clipW = static_cast<GLsizei>(std::max(0, clipX1 - clipX0));
-  const GLsizei clipH = static_cast<GLsizei>(std::max(0, clipY1 - clipY0));
+  clipW = static_cast<GLsizei>(std::max(0, clipX1 - clipX0));
+  clipH = static_cast<GLsizei>(std::max(0, clipY1 - clipY0));
   if (clipW <= 0 || clipH <= 0) return;
   glEnable(GL_SCISSOR_TEST);
   glScissor(clipX0, clipY0, clipW, clipH);
@@ -28057,6 +29788,41 @@ void drawViewerLayoutChoiceGlyph(int layoutIndex, const PlotMenuRect& rect, bool
   }
 }
 
+PlotMenuRect viewerLogicalRectToOverlayRect(const PlotMenuRect& rect, int windowHeight) {
+  const float h = static_cast<float>(std::max(1, windowHeight));
+  return {rect.x0, h - rect.y1, rect.x1, h - rect.y0};
+}
+
+// Global viewer UI is authored in GLFW logical pixels so Retina/content-scale
+// changes do not inflate rows, padding, text, or icons. GL scissor is the lone
+// exception: it is framebuffer-space, so HUD clipping paths convert explicitly.
+void beginViewerLogicalOverlay(int windowWidth, int windowHeight, int framebufferWidth, int framebufferHeight) {
+  setHudScissorScale(static_cast<float>(std::max(1, framebufferWidth)) /
+                         static_cast<float>(std::max(1, windowWidth)),
+                     static_cast<float>(std::max(1, framebufferHeight)) /
+                         static_cast<float>(std::max(1, windowHeight)));
+  glMatrixMode(GL_PROJECTION);
+  glPushMatrix();
+  glLoadIdentity();
+  glOrtho(0.0,
+          static_cast<double>(std::max(1, windowWidth)),
+          0.0,
+          static_cast<double>(std::max(1, windowHeight)),
+          -1.0,
+          1.0);
+  glMatrixMode(GL_MODELVIEW);
+  glPushMatrix();
+  glLoadIdentity();
+}
+
+void endViewerLogicalOverlay() {
+  glPopMatrix();
+  glMatrixMode(GL_PROJECTION);
+  glPopMatrix();
+  glMatrixMode(GL_MODELVIEW);
+  resetHudScissorScale();
+}
+
 void drawViewerMenuIconOverlay(const AppState& app,
                                int width,
                                int height,
@@ -28067,13 +29833,8 @@ void drawViewerMenuIconOverlay(const AppState& app,
       width <= 0 || height <= 0 || windowWidth <= 0 || windowHeight <= 0) {
     return;
   }
-  const float sx = static_cast<float>(width) / static_cast<float>(windowWidth);
-  const float sy = static_cast<float>(height) / static_cast<float>(windowHeight);
   auto scaleRect = [&](const PlotMenuRect& rect) -> PlotMenuRect {
-    return {rect.x0 * sx,
-            static_cast<float>(height) - rect.y1 * sy,
-            rect.x1 * sx,
-            static_cast<float>(height) - rect.y0 * sy};
+    return viewerLogicalRectToOverlayRect(rect, windowHeight);
   };
   const PlotMenuRect iconWindowRect = viewerMenuIconWindowRect(app, windowWidth, windowHeight);
   const PlotMenuRect iconRect = scaleRect(iconWindowRect);
@@ -28086,13 +29847,7 @@ void drawViewerMenuIconOverlay(const AppState& app,
   const bool layoutPresetHovered =
       pointInViewerWorkspaceLayoutPresetSelector(app, windowWidth, windowHeight, app.hoverX, app.hoverY);
 
-  glMatrixMode(GL_PROJECTION);
-  glPushMatrix();
-  glLoadIdentity();
-  glOrtho(0.0, static_cast<double>(width), 0.0, static_cast<double>(height), -1.0, 1.0);
-  glMatrixMode(GL_MODELVIEW);
-  glPushMatrix();
-  glLoadIdentity();
+  beginViewerLogicalOverlay(windowWidth, windowHeight, width, height);
   glDisable(GL_DEPTH_TEST);
   glEnable(GL_BLEND);
   glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
@@ -28148,10 +29903,7 @@ void drawViewerMenuIconOverlay(const AppState& app,
   }
   glDisable(GL_BLEND);
   glEnable(GL_DEPTH_TEST);
-  glPopMatrix();
-  glMatrixMode(GL_PROJECTION);
-  glPopMatrix();
-  glMatrixMode(GL_MODELVIEW);
+  endViewerLogicalOverlay();
 }
 
 void drawViewerMenuCloseButton(const PlotMenuRect& rect, bool hovered) {
@@ -28315,25 +30067,14 @@ void drawQuickPlotModelMenuOverlay(const AppState& app,
       width <= 0 || height <= 0 || windowWidth <= 0 || windowHeight <= 0) {
     return;
   }
-  const float sx = static_cast<float>(width) / static_cast<float>(windowWidth);
-  const float sy = static_cast<float>(height) / static_cast<float>(windowHeight);
   auto scaleRect = [&](const PlotMenuRect& rect) -> PlotMenuRect {
-    return {rect.x0 * sx,
-            static_cast<float>(height) - rect.y1 * sy,
-            rect.x1 * sx,
-            static_cast<float>(height) - rect.y0 * sy};
+    return viewerLogicalRectToOverlayRect(rect, windowHeight);
   };
   const PlotMenuRect menuWindowRect = quickPlotModelMenuRect(app, windowWidth, windowHeight);
   const PlotMenuRect menuRect = scaleRect(menuWindowRect);
   const ViewerUiMetrics metrics = viewerUiMetrics(app);
 
-  glMatrixMode(GL_PROJECTION);
-  glPushMatrix();
-  glLoadIdentity();
-  glOrtho(0.0, static_cast<double>(width), 0.0, static_cast<double>(height), -1.0, 1.0);
-  glMatrixMode(GL_MODELVIEW);
-  glPushMatrix();
-  glLoadIdentity();
+  beginViewerLogicalOverlay(windowWidth, windowHeight, width, height);
   glDisable(GL_DEPTH_TEST);
   glEnable(GL_BLEND);
   glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
@@ -28461,10 +30202,7 @@ void drawQuickPlotModelMenuOverlay(const AppState& app,
 
   glDisable(GL_BLEND);
   glEnable(GL_DEPTH_TEST);
-  glPopMatrix();
-  glMatrixMode(GL_PROJECTION);
-  glPopMatrix();
-  glMatrixMode(GL_MODELVIEW);
+  endViewerLogicalOverlay();
 }
 
 void drawAddPlotMenuOverlay(const AppState& app,
@@ -28477,25 +30215,14 @@ void drawAddPlotMenuOverlay(const AppState& app,
       width <= 0 || height <= 0 || windowWidth <= 0 || windowHeight <= 0) {
     return;
   }
-  const float sx = static_cast<float>(width) / static_cast<float>(windowWidth);
-  const float sy = static_cast<float>(height) / static_cast<float>(windowHeight);
   auto scaleRect = [&](const PlotMenuRect& rect) -> PlotMenuRect {
-    return {rect.x0 * sx,
-            static_cast<float>(height) - rect.y1 * sy,
-            rect.x1 * sx,
-            static_cast<float>(height) - rect.y0 * sy};
+    return viewerLogicalRectToOverlayRect(rect, windowHeight);
   };
   const PlotMenuRect menuWindowRect = addPlotMenuRect(app, windowWidth, windowHeight);
   const PlotMenuRect menuRect = scaleRect(menuWindowRect);
   const ViewerUiMetrics metrics = viewerUiMetrics(app);
 
-  glMatrixMode(GL_PROJECTION);
-  glPushMatrix();
-  glLoadIdentity();
-  glOrtho(0.0, static_cast<double>(width), 0.0, static_cast<double>(height), -1.0, 1.0);
-  glMatrixMode(GL_MODELVIEW);
-  glPushMatrix();
-  glLoadIdentity();
+  beginViewerLogicalOverlay(windowWidth, windowHeight, width, height);
   glDisable(GL_DEPTH_TEST);
   glEnable(GL_BLEND);
   glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
@@ -28600,10 +30327,7 @@ void drawAddPlotMenuOverlay(const AppState& app,
 
   glDisable(GL_BLEND);
   glEnable(GL_DEPTH_TEST);
-  glPopMatrix();
-  glMatrixMode(GL_PROJECTION);
-  glPopMatrix();
-  glMatrixMode(GL_MODELVIEW);
+  endViewerLogicalOverlay();
 }
 
 void drawLayoutMenuOverlay(const AppState& app,
@@ -28616,25 +30340,14 @@ void drawLayoutMenuOverlay(const AppState& app,
       width <= 0 || height <= 0 || windowWidth <= 0 || windowHeight <= 0) {
     return;
   }
-  const float sx = static_cast<float>(width) / static_cast<float>(windowWidth);
-  const float sy = static_cast<float>(height) / static_cast<float>(windowHeight);
   auto scaleRect = [&](const PlotMenuRect& rect) -> PlotMenuRect {
-    return {rect.x0 * sx,
-            static_cast<float>(height) - rect.y1 * sy,
-            rect.x1 * sx,
-            static_cast<float>(height) - rect.y0 * sy};
+    return viewerLogicalRectToOverlayRect(rect, windowHeight);
   };
   const PlotMenuRect menuWindowRect = layoutMenuRect(app, windowWidth, windowHeight);
   const PlotMenuRect menuRect = scaleRect(menuWindowRect);
   const ViewerUiMetrics metrics = viewerUiMetrics(app);
   const float textScale = metrics.textScale;
-  glMatrixMode(GL_PROJECTION);
-  glPushMatrix();
-  glLoadIdentity();
-  glOrtho(0.0, static_cast<double>(width), 0.0, static_cast<double>(height), -1.0, 1.0);
-  glMatrixMode(GL_MODELVIEW);
-  glPushMatrix();
-  glLoadIdentity();
+  beginViewerLogicalOverlay(windowWidth, windowHeight, width, height);
   glDisable(GL_DEPTH_TEST);
   glEnable(GL_BLEND);
   glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
@@ -28666,10 +30379,7 @@ void drawLayoutMenuOverlay(const AppState& app,
   }
   glDisable(GL_BLEND);
   glEnable(GL_DEPTH_TEST);
-  glPopMatrix();
-  glMatrixMode(GL_PROJECTION);
-  glPopMatrix();
-  glMatrixMode(GL_MODELVIEW);
+  endViewerLogicalOverlay();
 }
 
 void drawWorkspaceChoiceMenuOverlay(const AppState& app,
@@ -28691,26 +30401,15 @@ void drawWorkspaceChoiceMenuOverlay(const AppState& app,
   if (choiceItems.empty()) return;
   const PlotMenuRect choiceWindowRect = viewerChoiceMenuWindowRect(app, windowWidth, windowHeight);
   if (choiceWindowRect.x1 <= choiceWindowRect.x0 || choiceWindowRect.y1 <= choiceWindowRect.y0) return;
-  const float sx = static_cast<float>(width) / static_cast<float>(windowWidth);
-  const float sy = static_cast<float>(height) / static_cast<float>(windowHeight);
   auto scaleRect = [&](const PlotMenuRect& rect) -> PlotMenuRect {
-    return {rect.x0 * sx,
-            static_cast<float>(height) - rect.y1 * sy,
-            rect.x1 * sx,
-            static_cast<float>(height) - rect.y0 * sy};
+    return viewerLogicalRectToOverlayRect(rect, windowHeight);
   };
   const PlotMenuRect choiceRect = scaleRect(choiceWindowRect);
   const ViewerUiMetrics metrics = viewerUiMetrics(app);
   const float choiceScroll = clampf(app.viewerChoiceMenuScroll,
                                     0.0f,
                                     viewerChoiceMenuMaxScroll(app, windowWidth, windowHeight));
-  glMatrixMode(GL_PROJECTION);
-  glPushMatrix();
-  glLoadIdentity();
-  glOrtho(0.0, static_cast<double>(width), 0.0, static_cast<double>(height), -1.0, 1.0);
-  glMatrixMode(GL_MODELVIEW);
-  glPushMatrix();
-  glLoadIdentity();
+  beginViewerLogicalOverlay(windowWidth, windowHeight, width, height);
   glDisable(GL_DEPTH_TEST);
   glEnable(GL_BLEND);
   glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
@@ -28799,10 +30498,7 @@ void drawWorkspaceChoiceMenuOverlay(const AppState& app,
   }
   glDisable(GL_BLEND);
   glEnable(GL_DEPTH_TEST);
-  glPopMatrix();
-  glMatrixMode(GL_PROJECTION);
-  glPopMatrix();
-  glMatrixMode(GL_MODELVIEW);
+  endViewerLogicalOverlay();
 }
 
 void drawPlotModelMenuOverlay(const AppState& app,
@@ -28821,13 +30517,8 @@ void drawPlotModelMenuOverlay(const AppState& app,
   if (!app.plotModelMenuVisible) return;
   const float menuSlide = plotModelMenuSlideProgress(app);
   if (menuSlide <= 0.001f) return;
-  const float sx = static_cast<float>(width) / static_cast<float>(windowWidth);
-  const float sy = static_cast<float>(height) / static_cast<float>(windowHeight);
   auto scaleRect = [&](const PlotMenuRect& rect) -> PlotMenuRect {
-    return {rect.x0 * sx,
-            static_cast<float>(height) - rect.y1 * sy,
-            rect.x1 * sx,
-            static_cast<float>(height) - rect.y0 * sy};
+    return viewerLogicalRectToOverlayRect(rect, windowHeight);
   };
   const PlotMenuRect mainWindowRect = plotMenuMainRect(app, windowWidth, windowHeight);
   const PlotMenuRect mainRect = scaleRect(mainWindowRect);
@@ -28839,13 +30530,7 @@ void drawPlotModelMenuOverlay(const AppState& app,
   const ViewerMenuSection activeSection = coercedViewerMenuSection(app);
   const ViewerUiMetrics metrics = viewerUiMetrics(app);
 
-  glMatrixMode(GL_PROJECTION);
-  glPushMatrix();
-  glLoadIdentity();
-  glOrtho(0.0, static_cast<double>(width), 0.0, static_cast<double>(height), -1.0, 1.0);
-  glMatrixMode(GL_MODELVIEW);
-  glPushMatrix();
-  glLoadIdentity();
+  beginViewerLogicalOverlay(windowWidth, windowHeight, width, height);
   glTranslatef(-(mainRect.x1 - mainRect.x0) * (1.0f - menuSlide), 0.0f, 0.0f);
   glDisable(GL_DEPTH_TEST);
   glEnable(GL_BLEND);
@@ -28995,8 +30680,8 @@ void drawPlotModelMenuOverlay(const AppState& app,
       syncLabel = focused->syncLabel;
     }
   }
-  const bool waitingForResolve = syncLabel == "Waiting for Resolve";
-  const bool waitingForRaster = syncLabel == "Waiting for raster";
+  const bool waitingForResolve = sourceRasterLabelIsResolveWait(syncLabel);
+  const bool waitingForRaster = sourceRasterLabelIsRasterWait(syncLabel);
   const bool refining = syncLabel == "Refining";
   drawHudTextLineRight(renderer,
                        syncLabel,
@@ -29090,10 +30775,10 @@ void drawPlotModelMenuOverlay(const AppState& app,
       rowsClipRect.x1 > rowsClipRect.x0 + 1.0f && rowsClipRect.y1 > rowsClipRect.y0 + 1.0f;
   if (rowsClipEnabled) {
     glEnable(GL_SCISSOR_TEST);
-    glScissor(static_cast<GLint>(std::floor(rowsClipRect.x0)),
-              static_cast<GLint>(std::floor(rowsClipRect.y0)),
-              static_cast<GLsizei>(std::ceil(rowsClipRect.x1 - rowsClipRect.x0)),
-              static_cast<GLsizei>(std::ceil(rowsClipRect.y1 - rowsClipRect.y0)));
+    applyHudScissor(rowsClipRect.x0,
+                    rowsClipRect.y0,
+                    rowsClipRect.x1 - rowsClipRect.x0,
+                    rowsClipRect.y1 - rowsClipRect.y0);
   }
 
   bool hover3DGuidesInfo = false;
@@ -29392,9 +31077,9 @@ void drawPlotModelMenuOverlay(const AppState& app,
       drawHudTextLine(renderer, fittedLabel, textLabelX, singleBaseline, textScale,
                       alpha, 0.90f, 0.94f, 0.98f);
       const PlotMenuRect rowWindowRect = viewerMenuRowWindowRect(app, windowWidth, windowHeight, i);
-      // Retina/high-DPI safety: selector hit rects live in GLFW window coordinates.
-      // Draw by scaling those exact rects into framebuffer space so chips cannot
-      // drift from pointer input when framebufferSize != windowSize.
+      // Retina/high-DPI safety: selector hit rects live in GLFW logical window
+      // coordinates. Draw by y-flipping those exact rects in the logical overlay
+      // so chips cannot drift from pointer input when framebufferSize != windowSize.
       const auto windowRects = slicingVectorSelectorRects(rowWindowRect, 22.0f, 8.0f);
       const int hoverVector = row.enabled ? slicingVectorIndexAt(windowRects, app.hoverX, app.hoverY) : -1;
       for (int vector = 0; vector < kSlicingVectorCount; ++vector) {
@@ -29710,19 +31395,21 @@ void drawPlotModelMenuOverlay(const AppState& app,
     const float bodyScale = 0.82f * textScale;
     const float bodyMaxWidth = panelWidth - 24.0f;
     const std::vector<std::string> bodyLines =
-        wrapHudText(renderer, chromaticity3DGuidesInfoText(), bodyMaxWidth, bodyScale, 6);
+        wrapHudText(renderer, chromaticity3DGuidesInfoText(), bodyMaxWidth, bodyScale, 12);
     const float bodyLineStep = (renderer.available ? 17.5f : 15.5f) * metrics.textScale;
     const float panelHeight =
         62.0f * metrics.textScale +
         bodyLineStep * static_cast<float>(std::max(0, static_cast<int>(bodyLines.size()) - 1));
     float panelX0 = guidesInfoIconRect.x1 + 12.0f;
-    if (panelX0 + panelWidth > static_cast<float>(width) - 10.0f) {
+    const float logicalOverlayW = static_cast<float>(std::max(1, windowWidth));
+    const float logicalOverlayH = static_cast<float>(std::max(1, windowHeight));
+    if (panelX0 + panelWidth > logicalOverlayW - 10.0f) {
       panelX0 = guidesInfoIconRect.x0 - panelWidth - 12.0f;
     }
-    panelX0 = clampf(panelX0, 10.0f, std::max(10.0f, static_cast<float>(width) - panelWidth - 10.0f));
+    panelX0 = clampf(panelX0, 10.0f, std::max(10.0f, logicalOverlayW - panelWidth - 10.0f));
     float panelY1 = guidesInfoIconRect.y1 + 8.0f;
     if (panelY1 - panelHeight < 10.0f) panelY1 = panelHeight + 10.0f;
-    panelY1 = std::min(panelY1, static_cast<float>(height) - 10.0f);
+    panelY1 = std::min(panelY1, logicalOverlayH - 10.0f);
     const float panelY0 = panelY1 - panelHeight;
     drawPlotMenuRect(panelX0,
                      panelY0,
@@ -31055,6 +32742,9 @@ bool rebuildPlotWindowDerivedMeshIfNeeded(PlotWindowState* window,
           built = buildRasterDerivedMeshGlCompute(payload,
                                                   *rasterSource,
                                                   analyticalScope,
+                                                  sourceSignalStore,
+                                                  &window->residentInputComputeCache,
+                                                  &window->residentScopeGeometryGlCache,
                                                   &mesh,
                                                   &rasterFallbackReason);
           if (built) {
@@ -31065,13 +32755,21 @@ bool rebuildPlotWindowDerivedMeshIfNeeded(PlotWindowState* window,
             } else if (!backendFallbackReason.empty()) {
               rasterFallbackReason = backendFallbackReason;
             }
-            built = buildRasterDerivedMeshCpu(payload,
-                                              *rasterSource,
-                                              analyticalScope,
-                                              window->derivedMeshValid ? &window->derivedMesh : nullptr,
-                                              &mesh,
-                                              &app.gpuCaps);
-            rasterBackend = "cpu";
+            if (analyticalScope && !glAnalyticalScopeCpuReadbackFallbackEnabled()) {
+              rasterFallbackReason = rasterFallbackReason.empty()
+                                         ? "gl-scope-density-residency-required"
+                                         : rasterFallbackReason + ",gl-scope-density-residency-required";
+              rasterBackend = "gl-scope-residency-blocked";
+              built = false;
+            } else {
+              built = buildRasterDerivedMeshCpu(payload,
+                                                *rasterSource,
+                                                analyticalScope,
+                                                window->derivedMeshValid ? &window->derivedMesh : nullptr,
+                                                &mesh,
+                                                &app.gpuCaps);
+              rasterBackend = "cpu";
+            }
           }
         }
       }
@@ -31089,6 +32787,7 @@ bool rebuildPlotWindowDerivedMeshIfNeeded(PlotWindowState* window,
                                    : "unknown")));
       const std::string derivationResidency =
           mesh.residencyDerivationStage.empty() ? "unspecified" : mesh.residencyDerivationStage;
+      const std::string topologyResidency = meshTopologyResidencyStage(mesh);
       const std::string drawableResidency =
           mesh.residencyDrawableStage.empty() ? "unspecified" : mesh.residencyDrawableStage;
       if (built) {
@@ -31099,6 +32798,7 @@ bool rebuildPlotWindowDerivedMeshIfNeeded(PlotWindowState* window,
            << " sourceTransport=" << rasterSource->transport
            << " source=" << sourceResidency
            << " derivation=" << derivationResidency
+           << " topology=" << topologyResidency
            << " drawable=" << drawableResidency
            << " points=" << mesh.pointCount
            << " lines=" << mesh.lineVertexCount
@@ -31114,6 +32814,7 @@ bool rebuildPlotWindowDerivedMeshIfNeeded(PlotWindowState* window,
            << " backend=" << rasterBackend
            << " sourceTransport=" << rasterSource->transport
            << " source=" << sourceResidency
+           << " topology=" << topologyResidency
            << " requiredStage="
            << (rasterBackend == "metal-residency-blocked" ? "metal-iosurface-resident-drawable"
                                                            : "cuda-ipc-resident-drawable")
@@ -31170,6 +32871,12 @@ bool rebuildPlotWindowDerivedMeshIfNeeded(PlotWindowState* window,
         logViewerEvent(os.str());
       }
       if (built) {
+        publishSourceRasterHealth(
+            sourceRasterHealthForPayload(*rasterSource,
+                                         "build_ok",
+                                         rasterBackend.empty() ? "raster-built" : rasterBackend,
+                                         rasterSource->transport == "iosurface_metal" ||
+                                             rasterSource->transport == "cuda_ipc"));
         const bool intentionalEmptyAllowed = payloadAllowsIntentionalEmptyPlot(payload);
         if (!intentionalEmptyAllowed &&
             !meshHasVisibleData(mesh) &&
@@ -31184,19 +32891,34 @@ bool rebuildPlotWindowDerivedMeshIfNeeded(PlotWindowState* window,
         window->derivedMeshValid = true;
         return true;
       }
+      publishSourceRasterHealth(
+          sourceRasterHealthForPayload(*rasterSource,
+                                       (rasterBackend == "cuda-residency-blocked" ||
+                                        rasterBackend == "metal-residency-blocked")
+                                           ? "residency_blocked"
+                                           : "build_failed",
+                                       rasterFallbackReason.empty() ? rasterBackend : rasterFallbackReason,
+                                       false));
       if (plotWindowHasVisibleRasterMesh(*window)) {
-        setPlotWindowSyncLabel(window, "Waiting for raster");
+        setPlotWindowSyncLabel(window, sourceRasterWaitingLabel("Waiting for raster"));
+        logRasterWakeDiagnostic(&app, sourceSignalStore, resolved, "raster-rebuild-failed-kept-previous");
         logViewerEvent(std::string("Kept previous raster plot mesh after raster rebuild failure: window=") +
-                       std::to_string(window->windowId));
+                       std::to_string(window->windowId) +
+                       " reason=" +
+                       (rasterFallbackReason.empty() ? rasterBackend : rasterFallbackReason));
         return true;
       }
     }
     if (deriveMode == SourceDeriveMode::Raster) {
       if (!rasterAvailable && plotWindowHasVisibleRasterMesh(*window)) {
-        setPlotWindowSyncLabel(window, "Waiting for raster");
+        setPlotWindowSyncLabel(window, sourceRasterWaitingLabel("Waiting for Resolve render"));
+        logRasterWakeDiagnostic(&app, sourceSignalStore, resolved, "no-current-raster-kept-previous");
         return true;
       }
       cloud = nullptr;
+      if (!rasterAvailable) {
+        logRasterWakeDiagnostic(&app, sourceSignalStore, resolved, "no-current-raster");
+      }
     }
   }
   const auto aggregateState = aggregateHostStateForWorkspace(app);
@@ -31220,7 +32942,7 @@ bool rebuildPlotWindowDerivedMeshIfNeeded(PlotWindowState* window,
                 cloudMatchesResolved(payload, *cloud));
   setPlotWindowSyncLabel(window,
                          !cloud ? (deriveMode == SourceDeriveMode::Raster
-                                       ? "Waiting for raster"
+                                       ? sourceRasterWaitingLabel("Waiting for Resolve render")
                                        : "Waiting for Resolve")
                                 : (plotCloudLive ? "Live"
                                                  : (scopeCloudIsCurrentApproximation ? "Refining" : "Using cache")));
@@ -31527,6 +33249,9 @@ bool ensureSourceSignalTexture(SourceSignalStore* store,
     store->texture = 0;
     store->textureContentHash = 0;
     store->textureSourceKey.clear();
+    store->textureFailedSourceKey.clear();
+    store->textureFailedReason.clear();
+    store->textureFailedAt = 0.0;
     store->textureWidth = 0;
     store->textureHeight = 0;
   }
@@ -31540,26 +33265,79 @@ bool ensureSourceSignalTexture(SourceSignalStore* store,
       store->textureContentHash == source.contentHash &&
       store->textureWidth == source.proxyWidth &&
       store->textureHeight == source.proxyHeight) {
+    if (hasGpuSurface) {
+      publishSourceRasterHealth(
+          sourceRasterHealthForPayload(source, "import_ok", "iosurface-import-cache-hit", true));
+    }
     return true;
   }
 #if defined(__APPLE__)
   if (hasGpuSurface) {
+    constexpr double kIOSurfaceFailedImportRetrySeconds = 0.75;
+    const double now = glfwGetTime();
+    if (store->textureFailedSourceKey == cacheKey &&
+        now - store->textureFailedAt < kIOSurfaceFailedImportRetrySeconds) {
+      publishSourceRasterHealth(
+          sourceRasterHealthForPayload(source,
+                                       "import_failed",
+                                       store->textureFailedReason.empty()
+                                           ? "iosurface-import-retry-throttled"
+                                           : store->textureFailedReason,
+                                       false));
+      return false;
+    }
     std::string importError;
-    if (!ChromaspaceMetal::bindIOSurfaceToOpenGLTexture(source.surfaceId,
-                                                        source.surfaceWidth > 0 ? source.surfaceWidth : source.proxyWidth,
-                                                        source.surfaceHeight > 0 ? source.surfaceHeight : source.proxyHeight,
-                                                        source.surfacePixelFormat,
-                                                        store->texture,
-                                                        &importError)) {
+    bool imported = false;
+    constexpr int kIOSurfaceImportAttempts = 10;
+    constexpr int kIOSurfaceImportRetryMs = 25;
+    const int surfaceWidth = source.surfaceWidth > 0 ? source.surfaceWidth : source.proxyWidth;
+    const int surfaceHeight = source.surfaceHeight > 0 ? source.surfaceHeight : source.proxyHeight;
+    for (int attempt = 0; attempt < kIOSurfaceImportAttempts; ++attempt) {
+      importError.clear();
+      if (ChromaspaceMetal::bindIOSurfaceToOpenGLTexture(source.surfaceId,
+                                                         surfaceWidth,
+                                                         surfaceHeight,
+                                                         source.surfacePixelFormat,
+                                                         store->texture,
+                                                         &importError)) {
+        imported = true;
+        if (attempt > 0) {
+          logViewerEvent(std::string("Source Signal IOSurface import recovered after retry attempts=") +
+                         std::to_string(attempt + 1) +
+                         " surfaceId=" + std::to_string(source.surfaceId));
+        }
+        break;
+      }
+      if (attempt + 1 < kIOSurfaceImportAttempts) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(kIOSurfaceImportRetryMs));
+      }
+    }
+    if (!imported) {
       logViewerEvent(std::string("Source Signal IOSurface import failed: ") +
-                     (importError.empty() ? "unknown" : importError));
+                     (importError.empty() ? "unknown" : importError) +
+                     " surfaceId=" + std::to_string(source.surfaceId) +
+                     " surface=" + std::to_string(surfaceWidth) + "x" + std::to_string(surfaceHeight) +
+                     " format=" + std::to_string(source.surfacePixelFormat));
+      publishSourceRasterHealth(
+          sourceRasterHealthForPayload(source,
+                                       "import_failed",
+                                       importError.empty() ? "iosurface-import-failed" : importError,
+                                       false));
+      store->textureFailedSourceKey = cacheKey;
+      store->textureFailedReason = importError.empty() ? "iosurface-import-failed" : importError;
+      store->textureFailedAt = glfwGetTime();
       return false;
     }
     store->textureContentHash = source.contentHash;
     store->textureSourceKey = cacheKey;
+    store->textureFailedSourceKey.clear();
+    store->textureFailedReason.clear();
+    store->textureFailedAt = 0.0;
     store->textureWidth = source.proxyWidth;
     store->textureHeight = source.proxyHeight;
     store->textureTarget = GL_TEXTURE_RECTANGLE;
+    publishSourceRasterHealth(
+        sourceRasterHealthForPayload(source, "import_ok", "iosurface-imported", true));
     return true;
   }
 #endif
@@ -32306,6 +34084,41 @@ void drawAnalyticalScopePlot(PlotWindowState& window,
   }
 #endif
   if (!drewResidentScopeGeometry &&
+      mesh.residentScopeGeometryDrawable &&
+      mesh.scopeFillVertexCount > 0 &&
+      mesh.lineVertexCount > 0 &&
+      window.residentScopeGeometryGlCache.available &&
+      window.residentScopeGeometryGlCache.builtSerial == mesh.serial &&
+      window.residentScopeGeometryGlCache.fillVerts != 0 &&
+      window.residentScopeGeometryGlCache.fillColors != 0 &&
+      window.residentScopeGeometryGlCache.lineVerts != 0 &&
+      window.residentScopeGeometryGlCache.lineColors != 0 &&
+      static_cast<size_t>(std::max(window.residentScopeGeometryGlCache.fillVertexCount, 0)) >= mesh.scopeFillVertexCount &&
+      static_cast<size_t>(std::max(window.residentScopeGeometryGlCache.lineVertexCount, 0)) >= mesh.lineVertexCount) {
+    const ViewerGlBufferApi& bufferApi = viewerGlBufferApi();
+    glEnableClientState(GL_VERTEX_ARRAY);
+    glEnableClientState(GL_COLOR_ARRAY);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    bufferApi.bindBuffer(GL_ARRAY_BUFFER, window.residentScopeGeometryGlCache.fillVerts);
+    glVertexPointer(3, GL_FLOAT, 0, nullptr);
+    bufferApi.bindBuffer(GL_ARRAY_BUFFER, window.residentScopeGeometryGlCache.fillColors);
+    glColorPointer(4, GL_FLOAT, 0, nullptr);
+    glDrawArrays(GL_TRIANGLES, 0, static_cast<GLsizei>(mesh.scopeFillVertexCount));
+    glEnable(GL_LINE_SMOOTH);
+    glLineWidth(1.6f);
+    bufferApi.bindBuffer(GL_ARRAY_BUFFER, window.residentScopeGeometryGlCache.lineVerts);
+    glVertexPointer(3, GL_FLOAT, 0, nullptr);
+    bufferApi.bindBuffer(GL_ARRAY_BUFFER, window.residentScopeGeometryGlCache.lineColors);
+    glColorPointer(4, GL_FLOAT, 0, nullptr);
+    glDrawArrays(GL_LINES, 0, static_cast<GLsizei>(mesh.lineVertexCount));
+    glLineWidth(1.0f);
+    glDisable(GL_LINE_SMOOTH);
+    bufferApi.bindBuffer(GL_ARRAY_BUFFER, 0);
+    glDisableClientState(GL_COLOR_ARRAY);
+    glDisableClientState(GL_VERTEX_ARRAY);
+    drewResidentScopeGeometry = true;
+  }
+  if (!drewResidentScopeGeometry &&
       mesh.scopeFillVertexCount > 0 && !mesh.scopeFillVerts.empty() &&
       !mesh.scopeFillColors.empty()) {
     glEnableClientState(GL_VERTEX_ARRAY);
@@ -32453,8 +34266,7 @@ void drawAnalyticalScopePlot(PlotWindowState& window,
                       0.90f);
     }
   }
-  if (window.syncLabel == "Waiting for Resolve" ||
-      window.syncLabel == "Waiting for raster") {
+  if (sourceRasterLabelIsWaiting(window.syncLabel)) {
     const std::string waiting = window.syncLabel;
     drawHudTextLine(renderer,
                     waiting,
@@ -32595,6 +34407,8 @@ void drawSecondaryPlotWindow(AppState* app,
   PointDrawBuffers sampledPointDraw;
   ResidentFieldSurfaceDraw residentGlossProjectionSurface;
   bool activePointUsesGpuBuffers = false;
+  bool activePointUsesCudaBuffers = false;
+  bool activePointUsesGlComputeBuffers = false;
   bool drawingMetalGlossProjectionSurface = false;
   const bool directRasterPointSource =
       window->derivedMesh.directRasterSourceDrawable &&
@@ -32643,6 +34457,7 @@ void drawSecondaryPlotWindow(AppState* app,
       activePointColors = nullptr;
       activePointCount = residentPointDraw.pointCount;
       activePointUsesGpuBuffers = true;
+      activePointUsesCudaBuffers = true;
     } else
 #endif
     if (meshRequiresGpuGlossResidency(window->derivedMesh) &&
@@ -32683,6 +34498,7 @@ void drawSecondaryPlotWindow(AppState* app,
                                          &residentPointDraw)) {
           activePointCount = residentPointDraw.pointCount;
           activePointUsesGpuBuffers = true;
+          activePointUsesCudaBuffers = true;
         }
 #endif
       }
@@ -32698,8 +34514,17 @@ void drawSecondaryPlotWindow(AppState* app,
                                      &residentPointDraw)) {
       activePointCount = residentPointDraw.pointCount;
       activePointUsesGpuBuffers = true;
+      activePointUsesCudaBuffers = true;
     }
 #endif
+    if (!activePointUsesGpuBuffers &&
+        residentGlComputePointDrawBuffers(window->derivedMesh,
+                                          window->residentInputComputeCache,
+                                          &residentPointDraw)) {
+      activePointCount = residentPointDraw.pointCount;
+      activePointUsesGpuBuffers = true;
+      activePointUsesGlComputeBuffers = true;
+    }
   }
 
   const float densityForView = std::max(0.35f, payload.pointDensity);
@@ -32727,11 +34552,36 @@ void drawSecondaryPlotWindow(AppState* app,
           sampledPointDraw.available = true;
           activePointCount = sampledPointDraw.pointCount;
           sampledOnGpu = true;
+          activePointUsesCudaBuffers = true;
         } else if (!reason.empty()) {
           logViewerDiagnostic(true, std::string("Resident CUDA thinning fallback: ") + reason);
         }
       }
 #endif
+      if (!sampledOnGpu &&
+          activePointUsesGlComputeBuffers &&
+          window->residentInputComputeCache.available &&
+          window->residentInputComputeCache.builtSerial == pointSelection.sourceSerial) {
+        std::string reason;
+        if (buildInputCloudSampledGlBuffers(window->residentInputComputeCache,
+                                           &window->residentInputSampleComputeCache,
+                                           pointSelection,
+                                           &reason)) {
+          sampledPointDraw.verts = window->residentInputSampleComputeCache.verts;
+          sampledPointDraw.colors = window->residentInputSampleComputeCache.colors;
+          sampledPointDraw.pointCount = pointSelection.visiblePointCount;
+          sampledPointDraw.sourceSerial = pointSelection.sourceSerial;
+          sampledPointDraw.visiblePointCount = pointSelection.visiblePointCount;
+          sampledPointDraw.visibleGlossBodyPointCount = pointSelection.visibleGlossBodyPointCount;
+          sampledPointDraw.visibleGlossHighlightPointCount = pointSelection.visibleGlossHighlightPointCount;
+          sampledPointDraw.available = true;
+          activePointCount = sampledPointDraw.pointCount;
+          sampledOnGpu = true;
+          activePointUsesGlComputeBuffers = true;
+        } else if (!reason.empty()) {
+          logViewerDiagnostic(true, std::string("Resident GL thinning fallback: ") + reason);
+        }
+      }
       if (sampledOnGpu) {
         activePointUsesGpuBuffers = true;
       } else if (meshRequiresCudaPointResidency(window->derivedMesh) &&
@@ -32861,16 +34711,18 @@ void drawSecondaryPlotWindow(AppState* app,
 
   if (activePointCount > 0 &&
       (directRasterPointSource || (activePointVerts && activePointColors) || activePointUsesGpuBuffers)) {
-    const bool useResidentCudaDraw = activePointUsesGpuBuffers && !sampledPointDraw.available;
-    const bool useSampledCudaDraw = activePointUsesGpuBuffers && sampledPointDraw.available;
+    const bool useResidentCudaDraw = activePointUsesCudaBuffers && !sampledPointDraw.available;
+    const bool useSampledCudaDraw = activePointUsesCudaBuffers && sampledPointDraw.available;
+    const bool useResidentGlComputeDraw = activePointUsesGlComputeBuffers && !sampledPointDraw.available;
+    const bool useSampledGlComputeDraw = activePointUsesGlComputeBuffers && sampledPointDraw.available;
     const PointDrawSourceAudit drawAudit =
         classifyPointDrawSource(window->derivedMesh,
                                 directRasterPointSource,
                                 useResidentCudaDraw,
-                                false,
+                                useResidentGlComputeDraw,
                                 false,
                                 useSampledCudaDraw,
-                                false,
+                                useSampledGlComputeDraw,
                                 false,
                                 activePointVerts != nullptr && activePointColors != nullptr);
     const std::string drawSourceLabel = drawAudit.source + "|" + drawAudit.residency;
@@ -32885,6 +34737,7 @@ void drawSecondaryPlotWindow(AppState* app,
          << " meshSerial=" << window->derivedMesh.serial
          << " meshPoints=" << activePointCount
          << " source=" << drawAudit.source
+         << " topology=" << meshTopologyResidencyStage(window->derivedMesh)
          << " drawResidency=" << drawAudit.residency
          << " cudaResidentRequired=" << (drawAudit.cudaResidentRequired ? 1 : 0)
          << " sourceTransport="
@@ -33902,13 +35755,8 @@ void drawIdentityReadMenuOverlay(const AppState& app,
   (void)windowHeight;
   (void)renderer;
   return;
-  const float sx = static_cast<float>(width) / static_cast<float>(windowWidth);
-  const float sy = static_cast<float>(height) / static_cast<float>(windowHeight);
   auto scaleRect = [&](const PlotMenuRect& rect) -> PlotMenuRect {
-    return {rect.x0 * sx,
-            static_cast<float>(height) - rect.y1 * sy,
-            rect.x1 * sx,
-            static_cast<float>(height) - rect.y0 * sy};
+    return viewerLogicalRectToOverlayRect(rect, windowHeight);
   };
   auto rowRect = [&](const PlotMenuRect& menuRect, int row) -> PlotMenuRect {
     const float top = menuRect.y0 + kPlotMenuPad + kIdentityReadMenuRowHeight * static_cast<float>(row);
@@ -33954,8 +35802,8 @@ void drawIdentityReadMenuOverlay(const AppState& app,
   if (hovered) drawPlotMenuRect(rr.x0, rr.y0, rr.x1, rr.y1, 0.18f, 0.30f, 0.42f, 0.58f);
   drawHudTextLine(renderer, "Resolution", rr.x0 + 16.0f, rr.y0 + (renderer.available ? 11.0f : 11.0f),
                   textScale, 0.88f, 0.90f, 0.94f, 0.98f);
-  const float sliderX0 = rr.x0 + 130.0f * sx;
-  const float sliderX1 = rr.x1 - 12.0f * sx;
+  const float sliderX0 = rr.x0 + 130.0f;
+  const float sliderX1 = rr.x1 - 12.0f;
   const float sliderY = (rr.y0 + rr.y1) * 0.5f;
   drawPlotMenuRect(sliderX0, sliderY - 1.5f, sliderX1, sliderY + 1.5f, 0.65f, 0.72f, 0.80f, 0.40f);
   const float t = clampf((static_cast<float>(std::clamp(payload.identityReadResolution, 4, 65)) - 4.0f) / 61.0f,
@@ -37748,6 +39596,8 @@ int main() {
                  " rasterGpu=" + viewerEnvFlagLabel("CHROMASPACE_RASTER_GPU") +
                  " overlayCompute=" + viewerEnvFlagLabel("CHROMASPACE_OVERLAY_COMPUTE") +
                  " inputCompute=" + viewerEnvFlagLabel("CHROMASPACE_INPUT_COMPUTE") +
+                 " glRasterComputeCpuReadbackFallback=" + viewerEnvFlagLabel("CHROMASPACE_GL_RASTER_COMPUTE_CPU_READBACK_FALLBACK") +
+                 " glScopeDensityCpuReadbackFallback=" + viewerEnvFlagLabel("CHROMASPACE_GL_SCOPE_DENSITY_CPU_READBACK_FALLBACK") +
                  " metalCompactScopeFallback=" + viewerEnvFlagLabel("CHROMASPACE_METAL_COMPACT_SCOPE_FALLBACK") +
                  " metalIOSurfaceCpuRasterFallback=" + viewerEnvFlagLabel("CHROMASPACE_METAL_IOSURFACE_CPU_RASTER_FALLBACK") +
                  " metalGlossCpuFallback=" + viewerEnvFlagLabel("CHROMASPACE_METAL_GLOSS_CPU_FALLBACK") +
@@ -37875,8 +39725,8 @@ int main() {
     logViewerEvent(os.str());
   }
   if (gpuCaps.glComputeShaders) {
-    logViewerEvent(std::string("Analytical scope compute startup validation: ") +
-                   (validateAnalyticalScopeComputeStartup() ? "ready" : "failed; using CPU reference"));
+    logViewerEvent(std::string("Analytical scope GL density readback fallback validation: ") +
+                   (validateAnalyticalScopeComputeStartup() ? "ready" : "disabled-or-unavailable"));
   }
 
   AppState app{};
@@ -38450,16 +40300,27 @@ int main() {
            << " coverage=" << sp.coverage
            << " tier=" << sp.tierLabel
            << " transport=" << sp.transport;
+        if (sp.transport == "iosurface_metal") {
+          os << " surfaceId=" << sp.surfaceId
+             << " surface=" << sp.surfaceWidth << "x" << sp.surfaceHeight
+             << " surfaceFormat=" << sp.surfacePixelFormat;
+        }
         logViewerEvent(os.str());
         if (!senderMatchesCurrent(resolved.senderId, sp.senderId)) {
+          publishSourceRasterHealth(
+              sourceRasterHealthForPayload(sp, "non_active_sender", "sender-mismatch", false));
           logViewerEvent("Ignored source signal from non-active sender.");
         } else if (sp.seq <= lastSourceSignalSeq) {
+          publishSourceRasterHealth(
+              sourceRasterHealthForPayload(sp, "stale", "stale-sequence", false));
           logViewerEvent("Ignored stale source signal sequence.");
         } else if (sp.coverage == "partial-preview") {
           app.sourceSignalSourceWidth = sp.sourceWidth;
           app.sourceSignalSourceHeight = sp.sourceHeight;
           app.sourceSignalProxyWidth = sp.proxyWidth;
           app.sourceSignalProxyHeight = sp.proxyHeight;
+          publishSourceRasterHealth(
+              sourceRasterHealthForPayload(sp, "preview", "partial-preview", false));
           sourceSignalStore.preview = std::move(sp);
           sourceSignalStore.hasPreview = true;
           lastSourceSignalSeq = pendingSourceSignal.seq;
@@ -38474,10 +40335,13 @@ int main() {
                sp.cudaIpcHandle != sourceSignalStore.authoritative.cudaIpcHandle ||
                sp.cudaIpcByteSize != sourceSignalStore.authoritative.cudaIpcByteSize);
           if (replacingCudaIpc) releaseSourceSignalStoreGpuResources(&sourceSignalStore);
+          const SourceSignalPayload statusPayload = sp;
           sourceSignalStore.authoritative = std::move(sp);
           sourceSignalStore.hasAuthoritative = true;
           sourceSignalStore.lastSeq = sourceSignalStore.authoritative.seq;
           lastSourceSignalSeq = sourceSignalStore.authoritative.seq;
+          publishSourceRasterHealth(
+              sourceRasterHealthForPayload(statusPayload, "accepted", "authoritative-source", false));
         }
       }
     }
@@ -39377,6 +41241,7 @@ int main() {
          << " meshSerial=" << mesh.serial
          << " meshPoints=" << activePointCount
          << " source=" << drawAudit.source
+         << " topology=" << meshTopologyResidencyStage(mesh)
          << " drawResidency=" << drawAudit.residency
          << " cudaResidentRequired=" << (drawAudit.cudaResidentRequired ? 1 : 0)
          << " sourceTransport=" << (mesh.sourceTransport.empty() ? std::string("unknown") : mesh.sourceTransport);
@@ -39960,8 +41825,8 @@ int main() {
         const bool hasVisibleMesh = mesh.serial != 0 && (mesh.pointCount > 0 || mesh.hasGlossField);
         if (sourceDeriveMode() == SourceDeriveMode::Raster) {
           if (!hasVisibleMesh) {
-            setPlotWindowSyncLabel(focusedStatusWindow, "Waiting for raster");
-          } else if (focusedStatusWindow->syncLabel != "Waiting for raster" &&
+            setPlotWindowSyncLabel(focusedStatusWindow, sourceRasterWaitingLabel("Waiting for Resolve render"));
+          } else if (!sourceRasterLabelIsRasterWait(focusedStatusWindow->syncLabel) &&
                      focusedStatusWindow->syncLabel != "Proxy") {
             setPlotWindowSyncLabel(focusedStatusWindow, "Live");
           }

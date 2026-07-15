@@ -798,6 +798,15 @@ struct ViewerProbeResult {
   int identityReadResolutionCommand = 29;
   bool hasClearImageLassoCommand = false;
   uint64_t clearImageLassoRequestedRevision = 0;
+  bool hasSourceRasterStatus = false;
+  std::string sourceRasterStatus;
+  std::string sourceRasterReason;
+  std::string sourceRasterSenderId;
+  std::string sourceRasterTransport;
+  uint64_t sourceRasterSeq = 0;
+  uint32_t sourceRasterSurfaceId = 0;
+  bool sourceRasterImported = false;
+  int sourceRasterAgeMs = -1;
 };
 
 std::mutex gSharedViewerCommandMutex;
@@ -1781,6 +1790,10 @@ std::filesystem::path viewerAppliedStatePath(const std::string& sessionId) {
   return viewerMailboxSessionPath(sessionId) / "applied_state.json";
 }
 
+std::filesystem::path viewerSourceRasterStatusPath(const std::string& sessionId) {
+  return viewerMailboxSessionPath(sessionId) / "source_raster_status.json";
+}
+
 bool readSmallTextFile(const std::filesystem::path& path, std::string* out) {
   if (!out) return false;
   std::error_code ec;
@@ -2305,6 +2318,14 @@ bool extractJsonBoolField(const std::string& json, const std::string& key, bool*
     return true;
   }
   if (json.compare(pos, 5, "false") == 0) {
+    *out = false;
+    return true;
+  }
+  if (pos < json.size() && json[pos] == '1') {
+    *out = true;
+    return true;
+  }
+  if (pos < json.size() && json[pos] == '0') {
     *out = false;
     return true;
   }
@@ -3117,6 +3138,7 @@ class ChromaspaceEffect : public ImageEffect {
   // viewer-side mesh code.
   void render(const RenderArguments& args) override {
     flushStatusLabelToHost();
+    consumeViewerSourceRasterStatusFromHostCallback("render");
     consumeViewerMailboxFromHostCallback(args.time, "render");
     syncIdentityOverlayGroupOpenState(args.time);
     std::unique_ptr<Image> dst(dstClip_->fetchImage(args.time));
@@ -3582,7 +3604,9 @@ class ChromaspaceEffect : public ImageEffect {
   // which keeps Resolve interaction more stable than background param writes.
   void changedParam(const InstanceChangedArgs& args, const std::string& paramName) override {
     flushStatusLabelToHost();
-    consumeViewerMailboxFromHostCallback(args.time, std::string("changedParam/") + paramName);
+    const std::string hostAction = std::string("changedParam/") + paramName;
+    consumeViewerSourceRasterStatusFromHostCallback(hostAction);
+    consumeViewerMailboxFromHostCallback(args.time, hostAction);
     if (suppressChromaspacePresetChangedHandling_) return;
     if (paramName == "cubeViewerLiveTick" || paramName == "cubeViewerHostRefresh") {
       cubeViewerDebugLog(std::string("changedParam(") + paramName + ") consumed viewer refresh dirty signal");
@@ -4339,6 +4363,7 @@ class ChromaspaceEffect : public ImageEffect {
   std::chrono::steady_clock::time_point lastCloudScheduleTraceAt_{};
   std::chrono::steady_clock::time_point lastHeartbeatAt_{};
   ViewerProbeResult lastLoggedHeartbeatProbe_{};
+  std::string lastLoggedViewerSourceRasterStatus_;
   bool hasLoggedHeartbeatProbe_ = false;
   std::string lastCloudSourceId_;
   std::string lastCloudSettingsKey_;
@@ -5489,6 +5514,56 @@ class ChromaspaceEffect : public ImageEffect {
       stateCommand.viewerStateCommand.isolateIdentityData = false;
     }
     applyViewerRuntimeStateCommand(time, stateCommand, allowHostRefreshRequest);
+  }
+
+  bool consumeViewerSourceRasterStatusFromHostCallback(const std::string& hostAction) {
+    if (!viewerSessionRequested() || senderId_.empty()) return false;
+    std::string json;
+    const std::filesystem::path statusPath = viewerSourceRasterStatusPath(senderId_);
+    if (!readSmallTextFile(statusPath, &json)) return false;
+    std::string status;
+    if (!extractJsonStringField(json, "status", &status) || status.empty()) return false;
+    std::string rasterSender;
+    (void)extractJsonStringField(json, "senderId", &rasterSender);
+    if (!rasterSender.empty() && rasterSender != senderId_) return false;
+    std::string reason;
+    std::string transport;
+    (void)extractJsonStringField(json, "reason", &reason);
+    (void)extractJsonStringField(json, "transport", &transport);
+    int seq = 0;
+    int surfaceId = 0;
+    int proxyWidth = 0;
+    int proxyHeight = 0;
+    int surfaceWidth = 0;
+    int surfaceHeight = 0;
+    int surfacePixelFormat = -1;
+    bool imported = false;
+    (void)extractJsonIntField(json, "seq", &seq);
+    (void)extractJsonIntField(json, "surfaceId", &surfaceId);
+    (void)extractJsonIntField(json, "proxyWidth", &proxyWidth);
+    (void)extractJsonIntField(json, "proxyHeight", &proxyHeight);
+    (void)extractJsonIntField(json, "surfaceWidth", &surfaceWidth);
+    (void)extractJsonIntField(json, "surfaceHeight", &surfaceHeight);
+    (void)extractJsonIntField(json, "surfacePixelFormat", &surfacePixelFormat);
+    (void)extractJsonBoolField(json, "imported", &imported);
+
+    std::ostringstream summary;
+    summary << "status=" << status
+            << " reason=" << reason
+            << " action=" << (hostAction.empty() ? "hostCallback" : hostAction)
+            << " transport=" << transport
+            << " seq=" << seq
+            << " imported=" << (imported ? 1 : 0)
+            << " surfaceId=" << surfaceId
+            << " proxy=" << proxyWidth << "x" << proxyHeight
+            << " surface=" << surfaceWidth << "x" << surfaceHeight
+            << " surfaceFormat=" << surfacePixelFormat;
+    const std::string text = summary.str();
+    if (text != lastLoggedViewerSourceRasterStatus_) {
+      cubeViewerDebugLog(std::string("Viewer source-raster status: ") + text);
+      lastLoggedViewerSourceRasterStatus_ = text;
+    }
+    return true;
   }
 
   bool consumeViewerMailboxFromHostCallback(double time, const std::string& hostAction) {
@@ -12008,6 +12083,13 @@ class ChromaspaceEffect : public ImageEffect {
                                                        args.pMetalCmdQ,
                                                        &surface,
                                                        &surfaceError)) {
+        cubeViewerDebugLog(std::string("Source Signal Metal IOSurface generated surfaceId=") +
+                           std::to_string(surface.surfaceId) +
+                           " proxy=" + std::to_string(surface.width) + "x" +
+                           std::to_string(surface.height) +
+                           " source=" + std::to_string(width) + "x" + std::to_string(height) +
+                           " bytes=" + std::to_string(surface.byteSize) +
+                           " format=" + std::to_string(surface.pixelFormat));
         SourceSignalBuildResult surfacePayload =
             buildSourceSignalPayloadFromSharedSurface(surface,
                                                       width,
@@ -12652,23 +12734,26 @@ class ChromaspaceEffect : public ImageEffect {
   void retainSentCloudTransportBlob(const std::shared_ptr<ViewerCloudTransportBlob>& blob) {
     if (!blob) return;
     const auto now = std::chrono::steady_clock::now();
-    const bool retainingCudaIpc = blob->transport == "cuda_ipc";
+    const bool retainingResidentSource =
+        blob->transport == "cuda_ipc" || blob->transport == "iosurface_metal";
     constexpr std::size_t kGeneralTransportRetainedBlobs = 8u;
-    constexpr std::size_t kCudaIpcRetainedBlobs = 24u;
-    constexpr std::size_t kCudaIpcRetainedBytes = 1024ull * 1024ull * 1024ull;
+    constexpr std::size_t kResidentSourceRetainedBlobs = 24u;
+    constexpr std::size_t kResidentSourceRetainedBytes = 1024ull * 1024ull * 1024ull;
     const auto keepUntil =
-        now + std::chrono::seconds(retainingCudaIpc ? 60 : 8);
+        now + std::chrono::seconds(retainingResidentSource ? 60 : 8);
 
-    // CUDA IPC handles are views of exporter-owned device allocations, not
-    // owning payloads. Keep those allocations alive well beyond socket send so
-    // the viewer can safely display/cache the imported source until newer CUDA
-    // source frames replace it. Plain shm/mmap transports keep the shorter
-    // historical retention because the viewer copies/imports their metadata.
+    // CUDA IPC handles and Metal IOSurface IDs are views of exporter-owned
+    // resident allocations, not self-owning payloads. Keep those allocations
+    // alive well beyond socket send so the separate viewer process can import
+    // and keep drawing the current source when Resolve stops rendering. Plain
+    // shm/mmap transports keep the shorter historical retention because the
+    // viewer copies/imports their bytes immediately.
     std::lock_guard<std::mutex> lock(ioMutex_);
     sentCloudBlobs_.emplace_back(keepUntil, blob);
 
-    auto isCudaIpcBlob = [](const std::shared_ptr<ViewerCloudTransportBlob>& retained) {
-      return retained && retained->transport == "cuda_ipc";
+    auto isResidentSourceBlob = [](const std::shared_ptr<ViewerCloudTransportBlob>& retained) {
+      return retained &&
+             (retained->transport == "cuda_ipc" || retained->transport == "iosurface_metal");
     };
     auto eraseAt = [&](decltype(sentCloudBlobs_)::iterator it) {
       sentCloudBlobs_.erase(it);
@@ -12682,12 +12767,12 @@ class ChromaspaceEffect : public ImageEffect {
     }
 
     std::size_t generalCount = 0;
-    std::size_t cudaCount = 0;
-    std::size_t cudaBytes = 0;
+    std::size_t residentCount = 0;
+    std::size_t residentBytes = 0;
     for (const auto& retained : sentCloudBlobs_) {
-      if (isCudaIpcBlob(retained.second)) {
-        ++cudaCount;
-        cudaBytes += retained.second->byteSize;
+      if (isResidentSourceBlob(retained.second)) {
+        ++residentCount;
+        residentBytes += retained.second->byteSize;
       } else {
         ++generalCount;
       }
@@ -12696,7 +12781,7 @@ class ChromaspaceEffect : public ImageEffect {
     while (generalCount > kGeneralTransportRetainedBlobs) {
       auto eraseIt = sentCloudBlobs_.end();
       for (auto it = sentCloudBlobs_.begin(); it != sentCloudBlobs_.end(); ++it) {
-        if (!isCudaIpcBlob(it->second)) {
+        if (!isResidentSourceBlob(it->second)) {
           eraseIt = it;
           break;
         }
@@ -12706,20 +12791,21 @@ class ChromaspaceEffect : public ImageEffect {
       --generalCount;
     }
 
-    while ((cudaCount > kCudaIpcRetainedBlobs || cudaBytes > kCudaIpcRetainedBytes) &&
-           cudaCount > 1u) {
+    while ((residentCount > kResidentSourceRetainedBlobs ||
+            residentBytes > kResidentSourceRetainedBytes) &&
+           residentCount > 1u) {
       auto eraseIt = sentCloudBlobs_.end();
       for (auto it = sentCloudBlobs_.begin(); it != sentCloudBlobs_.end(); ++it) {
-        if (isCudaIpcBlob(it->second) && it->second != blob) {
+        if (isResidentSourceBlob(it->second) && it->second != blob) {
           eraseIt = it;
           break;
         }
       }
       if (eraseIt == sentCloudBlobs_.end()) break;
       const std::size_t erasedBytes = eraseIt->second ? eraseIt->second->byteSize : 0u;
-      cudaBytes = erasedBytes < cudaBytes ? cudaBytes - erasedBytes : 0u;
+      residentBytes = erasedBytes < residentBytes ? residentBytes - erasedBytes : 0u;
       eraseAt(eraseIt);
-      --cudaCount;
+      --residentCount;
     }
   }
 
@@ -13654,12 +13740,46 @@ class ChromaspaceEffect : public ImageEffect {
     result.visible = reply.find("\"visible\":0") == std::string::npos;
     result.iconified = reply.find("\"iconified\":1") != std::string::npos;
     result.focused = reply.find("\"focused\":0") == std::string::npos;
+    result.hasSourceRasterStatus =
+        extractJsonStringField(reply, "sourceRasterStatus", &result.sourceRasterStatus);
+    (void)extractJsonStringField(reply, "sourceRasterReason", &result.sourceRasterReason);
+    (void)extractJsonStringField(reply, "sourceRasterSenderId", &result.sourceRasterSenderId);
+    (void)extractJsonStringField(reply, "sourceRasterTransport", &result.sourceRasterTransport);
+    int sourceRasterInt = 0;
+    if (extractJsonIntField(reply, "sourceRasterSeq", &sourceRasterInt) && sourceRasterInt > 0) {
+      result.sourceRasterSeq = static_cast<uint64_t>(sourceRasterInt);
+    }
+    sourceRasterInt = 0;
+    if (extractJsonIntField(reply, "sourceRasterSurfaceId", &sourceRasterInt) && sourceRasterInt > 0) {
+      result.sourceRasterSurfaceId = static_cast<uint32_t>(sourceRasterInt);
+    }
+    sourceRasterInt = -1;
+    if (extractJsonIntField(reply, "sourceRasterAgeMs", &sourceRasterInt)) {
+      result.sourceRasterAgeMs = sourceRasterInt;
+    }
+    (void)extractJsonBoolField(reply, "sourceRasterImported", &result.sourceRasterImported);
     if (result.ok && (!hasLoggedHeartbeatProbe_ || !sameViewerProbeState(result, lastLoggedHeartbeatProbe_))) {
       cubeViewerDebugLog(std::string("Heartbeat ok visible=") + (result.visible ? "1" : "0") +
                          " iconified=" + (result.iconified ? "1" : "0") +
                          " focused=" + (result.focused ? "1" : "0"));
       lastLoggedHeartbeatProbe_ = result;
       hasLoggedHeartbeatProbe_ = true;
+    }
+    if (result.ok && result.hasSourceRasterStatus) {
+      std::ostringstream status;
+      status << "status=" << result.sourceRasterStatus
+             << " reason=" << result.sourceRasterReason
+             << " sender=" << result.sourceRasterSenderId
+             << " transport=" << result.sourceRasterTransport
+             << " seq=" << result.sourceRasterSeq
+             << " imported=" << (result.sourceRasterImported ? 1 : 0)
+             << " surfaceId=" << result.sourceRasterSurfaceId
+             << " ageMs=" << result.sourceRasterAgeMs;
+      const std::string summary = status.str();
+      if (summary != lastLoggedViewerSourceRasterStatus_) {
+        cubeViewerDebugLog(std::string("Viewer source-raster heartbeat ack: ") + summary);
+        lastLoggedViewerSourceRasterStatus_ = summary;
+      }
     }
     return result;
   }

@@ -2857,40 +2857,45 @@ float4 glossSurfaceUnderlayColor(const device float* meanR,
   return float4(clamp(color, 0.0, 1.0), alpha);
 }
 
-float4 glossSurfaceDisplayColor(const device float* meanR,
-                                const device float* meanG,
-                                const device float* meanB,
-                                const device float* carrierY,
-                                const device float* carrierMax,
-                                const device float* carrierMin,
-                                const device float* neutrality,
-                                const device float* body,
-                                const device float* positive,
-                                const device float* negative,
-                                const device float* boundary,
-                                const device float* congruence,
-                                const device float* confidence,
-                                const device float* signal,
-                                constant GlossFieldSurfaceUniforms& u,
-                                uint idx) {
-  float base = clamp(body[idx], 0.0, 1.0);
-  float pos = clamp(positive[idx], 0.0, 1.0);
-  float neg = clamp(negative[idx], 0.0, 1.0);
-  if (u.debugMode != 0) {
+float4 glossSurfaceDisplayColorValues(float meanRValue,
+                                      float meanGValue,
+                                      float meanBValue,
+                                      float carrierYValue,
+                                      float carrierMaxValue,
+                                      float carrierMinValue,
+                                      float neutralityValue,
+                                      float bodyValueIn,
+                                      float positiveValue,
+                                      float negativeValue,
+                                      float boundaryValueIn,
+                                      float congruenceValueIn,
+                                      float confidenceValueIn,
+                                      float signalValue,
+                                      int colorMode,
+                                      int debugMode,
+                                      int diagnosticMode,
+                                      float colorSaturation,
+                                      float glossBodyOpacity,
+                                      float glossHighlightOpacity,
+                                      float glossLiftScale) {
+  float base = clamp(bodyValueIn, 0.0, 1.0);
+  float pos = clamp(positiveValue, 0.0, 1.0);
+  float neg = clamp(negativeValue, 0.0, 1.0);
+  if (debugMode != 0) {
     float scalar = 0.0;
-    if (u.debugMode == 1) scalar = carrierMax[idx];
-    else if (u.debugMode == 2) scalar = carrierY[idx];
-    else if (u.debugMode == 3) scalar = carrierMin[idx];
-    else if (u.debugMode == 4) scalar = neutrality[idx];
+    if (debugMode == 1) scalar = carrierMaxValue;
+    else if (debugMode == 2) scalar = carrierYValue;
+    else if (debugMode == 3) scalar = carrierMinValue;
+    else if (debugMode == 4) scalar = neutralityValue;
     pos = clamp(scalar, 0.0, 1.0);
     neg = 0.0;
     base = clamp(scalar, 0.0, 1.0);
   }
-  float confidenceValue = clamp(confidence[idx], 0.0, 1.0);
-  float congruenceValue = clamp(congruence[idx], 0.0, 1.0);
-  float boundaryValue = clamp(boundary[idx], 0.0, 1.0);
+  float confidenceValue = clamp(confidenceValueIn, 0.0, 1.0);
+  float congruenceValue = clamp(congruenceValueIn, 0.0, 1.0);
+  float boundaryValue = clamp(boundaryValueIn, 0.0, 1.0);
   float ambiguity = clamp(1.0 - confidenceValue, 0.0, 1.0);
-  float signalScale = max(1.0, u.glossLiftScale);
+  float signalScale = max(1.0, glossLiftScale);
   pos = clamp(pos * signalScale, 0.0, 1.0);
   neg = clamp(neg * signalScale, 0.0, 1.0);
   float positiveDisplay = smoothstep(0.035, 1.0, pos);
@@ -2898,9 +2903,14 @@ float4 glossSurfaceDisplayColor(const device float* meanR,
   float signalPresence = max(positiveDisplay, negativeDisplay);
   float structureStrength = max(congruenceValue, boundaryValue);
   float3 color;
-  if (u.colorMode == 1) {
-    float3 sourceHue = glossSurfaceSourceHueColor(meanR, meanG, meanB, u, idx);
-    float baseMix = clamp(u.glossBodyOpacity * (0.22 + 0.78 * confidenceValue) *
+  if (colorMode == 1) {
+    float sr = 0.0;
+    float sg = 0.0;
+    float sb = 0.0;
+    mapDisplayColor(meanRValue, meanGValue, meanBValue, sr, sg, sb);
+    applyDisplaySaturation(min(3.0, colorSaturation), sr, sg, sb);
+    float3 sourceHue = float3(sr, sg, sb);
+    float baseMix = clamp(glossBodyOpacity * (0.22 + 0.78 * confidenceValue) *
                               (0.86 - 0.22 * signalPresence),
                           0.0,
                           1.0);
@@ -2913,7 +2923,7 @@ float4 glossSurfaceDisplayColor(const device float* meanR,
       float3 warm = mixGloss3(sourceHue, float3(1.0, 0.95, 0.86), 0.54);
       color = mixGloss3(color,
                         warm,
-                        clamp(u.glossHighlightOpacity * positiveDisplay * (0.22 + 0.78 * structureStrength),
+                        clamp(glossHighlightOpacity * positiveDisplay * (0.22 + 0.78 * structureStrength),
                               0.0,
                               1.0));
     }
@@ -2921,7 +2931,7 @@ float4 glossSurfaceDisplayColor(const device float* meanR,
       float3 cool = mixGloss3(sourceHue, float3(0.08, 0.14, 0.24), 0.74);
       color = mixGloss3(color,
                         cool,
-                        clamp(u.glossHighlightOpacity * negativeDisplay * (0.22 + 0.78 * structureStrength),
+                        clamp(glossHighlightOpacity * negativeDisplay * (0.22 + 0.78 * structureStrength),
                               0.0,
                               1.0));
     }
@@ -2932,21 +2942,21 @@ float4 glossSurfaceDisplayColor(const device float* meanR,
                                 0.17 + 0.60 * shaped);
     color = mixGloss3(float3(0.03, 0.03, 0.04),
                       neutralBase,
-                      clamp(u.glossBodyOpacity * (0.22 + 0.78 * confidenceValue) *
+                      clamp(glossBodyOpacity * (0.22 + 0.78 * confidenceValue) *
                                 (0.86 - 0.22 * signalPresence),
                             0.0,
                             1.0));
     if (positiveDisplay > 0.0) {
       color = mixGloss3(color,
                         float3(1.0, 0.89, 0.36),
-                        clamp(u.glossHighlightOpacity * positiveDisplay * (0.22 + 0.78 * structureStrength),
+                        clamp(glossHighlightOpacity * positiveDisplay * (0.22 + 0.78 * structureStrength),
                               0.0,
                               1.0));
     }
     if (negativeDisplay > 0.0) {
       color = mixGloss3(color,
                         float3(0.22, 0.76, 1.0),
-                        clamp(u.glossHighlightOpacity * negativeDisplay * (0.22 + 0.78 * structureStrength),
+                        clamp(glossHighlightOpacity * negativeDisplay * (0.22 + 0.78 * structureStrength),
                               0.0,
                               1.0));
     }
@@ -2954,23 +2964,23 @@ float4 glossSurfaceDisplayColor(const device float* meanR,
   if (boundaryValue > 0.0) {
     color = mixGloss3(color, float3(0.98, 0.98, 0.94), clamp(0.10 + 0.26 * boundaryValue, 0.0, 0.34));
   }
-  float alpha = clamp(u.glossBodyOpacity * (0.12 + 0.62 * confidenceValue) *
+  float alpha = clamp(glossBodyOpacity * (0.12 + 0.62 * confidenceValue) *
                           (0.82 - 0.18 * signalPresence) +
-                          u.glossHighlightOpacity * signalPresence * (0.16 + 0.84 * structureStrength),
+                          glossHighlightOpacity * signalPresence * (0.16 + 0.84 * structureStrength),
                       0.018,
                       1.0);
-  if (u.diagnosticMode == 1) {
+  if (diagnosticMode == 1) {
     float gray = 0.16 + 0.78 * confidenceValue;
     color = mixGloss3(color, float3(gray, gray, gray), 0.36);
     color = mixGloss3(color, float3(1.0, 1.0, 0.96), 0.10 * boundaryValue);
     alpha = clamp(alpha * (0.55 + 0.45 * confidenceValue) + 0.10 * confidenceValue, 0.018, 1.0);
-  } else if (u.diagnosticMode == 2) {
+  } else if (diagnosticMode == 2) {
     float gray = 0.12 + 0.74 * ambiguity;
     color = mixGloss3(color, float3(gray * 0.94, gray * 0.97, gray), 0.34);
     color = mixGloss3(color, float3(0.80, 0.90, 1.0), 0.10 * boundaryValue * ambiguity);
     alpha = clamp(alpha * (0.48 + 0.52 * ambiguity) + 0.08 * ambiguity, 0.018, 1.0);
   }
-  (void)signal;
+  (void)signalValue;
   return float4(clamp(color, 0.0, 1.0), alpha);
 }
 
@@ -3009,10 +3019,27 @@ kernel void glossFieldSurfaceRenderKernel(texture2d<float, access::write> outTex
     return;
   }
   float4 underlay = glossSurfaceUnderlayColor(meanR, meanG, meanB, body, confidence, u, idx);
-  float4 display = glossSurfaceDisplayColor(meanR, meanG, meanB,
-                                            carrierY, carrierMax, carrierMin, neutrality,
-                                            body, positive, negative, boundary, congruence,
-                                            confidence, signal, u, idx);
+  float4 display = glossSurfaceDisplayColorValues(meanR[idx],
+                                                  meanG[idx],
+                                                  meanB[idx],
+                                                  carrierY[idx],
+                                                  carrierMax[idx],
+                                                  carrierMin[idx],
+                                                  neutrality[idx],
+                                                  body[idx],
+                                                  positive[idx],
+                                                  negative[idx],
+                                                  boundary[idx],
+                                                  congruence[idx],
+                                                  confidence[idx],
+                                                  signal[idx],
+                                                  u.colorMode,
+                                                  u.debugMode,
+                                                  u.diagnosticMode,
+                                                  u.colorSaturation,
+                                                  u.glossBodyOpacity,
+                                                  u.glossHighlightOpacity,
+                                                  u.glossLiftScale);
   float4 color = overColor(underlay, display);
   outTexture.write(color, gid);
 }
@@ -3166,10 +3193,27 @@ kernel void glossProjectionSurfaceShadeKernel(texture2d<float, access::write> ou
   fieldU.glossBodyOpacity = u.glossBodyOpacity;
   fieldU.glossHighlightOpacity = u.glossHighlightOpacity;
   fieldU.glossLiftScale = u.glossLiftScale;
-  float4 display = glossSurfaceDisplayColor(meanR, meanG, meanB,
-                                            carrierY, carrierMax, carrierMin, neutrality,
-                                            body, positive, negative, boundary, congruence,
-                                            confidence, signal, fieldU, index);
+  float4 display = glossSurfaceDisplayColorValues(meanR[index],
+                                                  meanG[index],
+                                                  meanB[index],
+                                                  carrierY[index],
+                                                  carrierMax[index],
+                                                  carrierMin[index],
+                                                  neutrality[index],
+                                                  body[index],
+                                                  positive[index],
+                                                  negative[index],
+                                                  boundary[index],
+                                                  congruence[index],
+                                                  confidence[index],
+                                                  signal[index],
+                                                  fieldU.colorMode,
+                                                  fieldU.debugMode,
+                                                  fieldU.diagnosticMode,
+                                                  fieldU.colorSaturation,
+                                                  fieldU.glossBodyOpacity,
+                                                  fieldU.glossHighlightOpacity,
+                                                  fieldU.glossLiftScale);
   outTexture.write(display, gid);
 }
 
