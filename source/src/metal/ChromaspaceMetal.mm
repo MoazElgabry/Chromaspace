@@ -1651,10 +1651,17 @@ bool copySourceProxyToIOSurface(
       (__bridge NSString*)kIOSurfaceBytesPerRow: @(bytesPerRow),
       (__bridge NSString*)kIOSurfaceAllocSize: @(byteSize),
       (__bridge NSString*)kIOSurfacePixelFormat: @(sourceSignalIOSurfacePixelFormat(pixelFormat)),
+      (__bridge NSString*)CFSTR("IOSurfaceIsGlobal"): @YES,
     };
     IOSurfaceRef surface = IOSurfaceCreate((__bridge CFDictionaryRef)surfaceProperties);
     if (surface == nullptr) {
       if (error) *error = "iosurface-allocation-failed";
+      return false;
+    }
+    const std::uint32_t surfaceId = static_cast<std::uint32_t>(IOSurfaceGetID(surface));
+    if (surfaceId == 0) {
+      CFRelease(surface);
+      if (error) *error = "source-iosurface-not-global";
       return false;
     }
 
@@ -1717,7 +1724,7 @@ bool copySourceProxyToIOSurface(
       return false;
     }
 
-    out->surfaceId = static_cast<std::uint32_t>(IOSurfaceGetID(surface));
+    out->surfaceId = surfaceId;
     out->width = proxyWidth;
     out->height = proxyHeight;
     out->pixelFormat = pixelFormat;

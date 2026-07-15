@@ -461,6 +461,10 @@ bool glAnalyticalScopeCpuReadbackFallbackEnabled() {
   return viewerEnvFlagEnabled("CHROMASPACE_GL_SCOPE_DENSITY_CPU_READBACK_FALLBACK", false);
 }
 
+bool glRasterCpuFallbackEnabled() {
+  return viewerEnvFlagEnabled("CHROMASPACE_GL_RASTER_CPU_FALLBACK", false);
+}
+
 bool viewerCudaDisabled() {
   return viewerEnvFlagEnabled("CHROMASPACE_DISABLE_CUDA", false);
 }
@@ -3347,6 +3351,14 @@ struct InputCloudComputeCache {
   std::array<GLint, 16> lassoStrokeSubtractLoc{};
   std::array<GLint, 256> lassoXLoc{};
   std::array<GLint, 256> lassoYLoc{};
+  GLint excludeIdentityDataLoc = -1;
+  GLint isolateIdentityDataLoc = -1;
+  GLint readIdentityPlotLoc = -1;
+  GLint readGrayRampLoc = -1;
+  GLint identityCubeY1Loc = -1;
+  GLint identityCubeY2Loc = -1;
+  GLint identityRampY1Loc = -1;
+  GLint identityRampY2Loc = -1;
   uint64_t builtSerial = 0;
   GLsizei pointCount = 0;
   bool available = false;
@@ -3364,6 +3376,19 @@ struct RasterSignalComputeCache {
   GLint topologySourceHeightLoc = -1;
   GLint topologySampleStrideLoc = -1;
   GLint topologySampleCountXLoc = -1;
+  GLint topologyBasePointCountLoc = -1;
+  GLint topologyIdentityCubeAppendOffsetLoc = -1;
+  GLint topologyIdentityCubeAppendCountLoc = -1;
+  GLint topologyIdentityCubeAppendY1Loc = -1;
+  GLint topologyIdentityCubeAppendY2Loc = -1;
+  GLint topologyIdentityCubeAppendRowStepLoc = -1;
+  GLint topologyIdentityCubeAppendXStepLoc = -1;
+  GLint topologyIdentityRampAppendOffsetLoc = -1;
+  GLint topologyIdentityRampAppendCountLoc = -1;
+  GLint topologyIdentityRampAppendY1Loc = -1;
+  GLint topologyIdentityRampAppendY2Loc = -1;
+  GLint topologyIdentityRampAppendRowStepLoc = -1;
+  GLint topologyIdentityRampAppendXStepLoc = -1;
   bool initAttempted = false;
   bool available = false;
 };
@@ -6030,6 +6055,14 @@ uniform int uLassoStrokeCountPerStroke[16];
 uniform int uLassoStrokeSubtract[16];
 uniform float uLassoX[256];
 uniform float uLassoY[256];
+uniform int uExcludeIdentityData;
+uniform int uIsolateIdentityData;
+uniform int uReadIdentityPlot;
+uniform int uReadGrayRamp;
+uniform int uIdentityCubeY1;
+uniform int uIdentityCubeY2;
+uniform int uIdentityRampY1;
+uniform int uIdentityRampY2;
 
 const float kTau = 6.28318530717958647692;
 const float kPi = 3.14159265358979323846;
@@ -6313,6 +6346,20 @@ bool lassoAcceptsPoint(float xNorm, float yNorm) {
     inside = uLassoStrokeSubtract[stroke] == 0;
   }
   return inside;
+}
+
+bool rowInRange(int y, int y1, int y2) {
+  return y1 >= 0 && y2 > y1 && y >= y1 && y < y2;
+}
+
+bool rowInExcludedIdentityStrip(int y) {
+  return rowInRange(y, uIdentityCubeY1, uIdentityCubeY2) ||
+         rowInRange(y, uIdentityRampY1, uIdentityRampY2);
+}
+
+bool rowInRequestedIdentityStrip(int y) {
+  return (uReadIdentityPlot != 0 && rowInRange(y, uIdentityCubeY1, uIdentityCubeY2)) ||
+         (uReadGrayRamp != 0 && rowInRange(y, uIdentityRampY1, uIdentityRampY2));
 }
 
 vec2 topologySourceNorm(uint index) {
@@ -6625,6 +6672,14 @@ void main() {
   }
   bool overflowPoint = outOfBounds(r, g, b);
   bool visibleByGpuFilter = cubeSliceContains(vec3(r, g, b));
+  uint packedCoord = topologyWords[index];
+  int sourceY = int((packedCoord >> 16u) & 0xffffu);
+  if (uExcludeIdentityData != 0 && rowInExcludedIdentityStrip(sourceY)) {
+    visibleByGpuFilter = false;
+  }
+  if (uIsolateIdentityData != 0 && !rowInRequestedIdentityStrip(sourceY)) {
+    visibleByGpuFilter = false;
+  }
   if (visibleByGpuFilter && uLassoEnabled != 0) {
     vec2 sourceNorm = topologySourceNorm(index);
     visibleByGpuFilter = lassoAcceptsPoint(sourceNorm.x, sourceNorm.y);
@@ -6772,6 +6827,14 @@ void main() {
     cache->lassoYLoc[static_cast<size_t>(i)] =
         api.getUniformLocation(program, (std::string("uLassoY[") + idx + "]").c_str());
   }
+  cache->excludeIdentityDataLoc = api.getUniformLocation(program, "uExcludeIdentityData");
+  cache->isolateIdentityDataLoc = api.getUniformLocation(program, "uIsolateIdentityData");
+  cache->readIdentityPlotLoc = api.getUniformLocation(program, "uReadIdentityPlot");
+  cache->readGrayRampLoc = api.getUniformLocation(program, "uReadGrayRamp");
+  cache->identityCubeY1Loc = api.getUniformLocation(program, "uIdentityCubeY1");
+  cache->identityCubeY2Loc = api.getUniformLocation(program, "uIdentityCubeY2");
+  cache->identityRampY1Loc = api.getUniformLocation(program, "uIdentityRampY1");
+  cache->identityRampY2Loc = api.getUniformLocation(program, "uIdentityRampY2");
   cache->available = cache->pointCountLoc >= 0 &&
                      cache->showOverflowLoc >= 0 &&
                      cache->highlightOverflowLoc >= 0 &&
@@ -6808,7 +6871,15 @@ void main() {
                      cache->sourceHeightLoc >= 0 &&
                      cache->lassoEnabledLoc >= 0 &&
                      cache->lassoStrokeCountLoc >= 0 &&
-                     cache->lassoPointCountLoc >= 0;
+                     cache->lassoPointCountLoc >= 0 &&
+                     cache->excludeIdentityDataLoc >= 0 &&
+                     cache->isolateIdentityDataLoc >= 0 &&
+                     cache->readIdentityPlotLoc >= 0 &&
+                     cache->readGrayRampLoc >= 0 &&
+                     cache->identityCubeY1Loc >= 0 &&
+                     cache->identityCubeY2Loc >= 0 &&
+                     cache->identityRampY1Loc >= 0 &&
+                     cache->identityRampY2Loc >= 0;
   for (int i = 0; i < 16 && cache->available; ++i) {
     cache->available = cache->lassoStrokeFirstLoc[static_cast<size_t>(i)] >= 0 &&
                        cache->lassoStrokeCountPerStrokeLoc[static_cast<size_t>(i)] >= 0 &&
@@ -7834,8 +7905,9 @@ bool rasterGlComputeCanRepresentPayload(const ResolvedPayload& payload,
   if (classifyPlotMode(payload) == PlotModeKind::GlossLift) return reject("gloss-field-cpu-reference");
   if (viewerPlotLinearApplies(payload)) return reject("plot-linear-filter");
   if (payload.occupancyFill) return reject("occupancy-fill-filter");
-  if (payload.readGrayRamp || payload.readIdentityPlot || payload.isolateIdentityData ||
-      payload.excludeIdentityData) {
+  if (analyticalScope &&
+      (payload.readGrayRamp || payload.readIdentityPlot || payload.isolateIdentityData ||
+       payload.excludeIdentityData)) {
     return reject("identity-ramp-filter");
   }
   if (analyticalScope && payload.volumeSlicingEnabled && payload.volumeSlicingMode == "lasso") {
@@ -8238,13 +8310,71 @@ uniform int uSourceWidth;
 uniform int uSourceHeight;
 uniform int uSampleStride;
 uniform int uSampleCountX;
+uniform int uBasePointCount;
+uniform int uIdentityCubeAppendOffset;
+uniform int uIdentityCubeAppendCount;
+uniform int uIdentityCubeAppendY1;
+uniform int uIdentityCubeAppendY2;
+uniform int uIdentityCubeAppendRowStep;
+uniform int uIdentityCubeAppendXStep;
+uniform int uIdentityRampAppendOffset;
+uniform int uIdentityRampAppendCount;
+uniform int uIdentityRampAppendY1;
+uniform int uIdentityRampAppendY2;
+uniform int uIdentityRampAppendRowStep;
+uniform int uIdentityRampAppendXStep;
+
+bool appendCoord(int index,
+                 int appendOffset,
+                 int appendCount,
+                 int y1,
+                 int y2,
+                 int rowStep,
+                 int xStep,
+                 out int x,
+                 out int y) {
+  if (appendCount <= 0 || index < appendOffset || index >= appendOffset + appendCount) return false;
+  int local = index - appendOffset;
+  int safeXStep = max(xStep, 1);
+  int safeRowStep = max(rowStep, 1);
+  int samplesPerRow = max(1, (max(uSourceWidth, 0) + safeXStep - 1) / safeXStep);
+  x = clamp((local % samplesPerRow) * safeXStep, 0, max(uSourceWidth - 1, 0));
+  y = clamp(y1 + (local / samplesPerRow) * safeRowStep, max(y1, 0), max(y2 - 1, 0));
+  return true;
+}
+
 void main() {
   int index = int(gl_GlobalInvocationID.x);
   if (index >= uPointCount) return;
   int sx = max(uSampleCountX, 1);
   int stride = max(uSampleStride, 1);
-  int x = clamp((index % sx) * stride, 0, max(uSourceWidth - 1, 0));
-  int y = clamp((index / sx) * stride, 0, max(uSourceHeight - 1, 0));
+  int x = 0;
+  int y = 0;
+  int baseCount = max(uBasePointCount, 0);
+  if (index < baseCount) {
+    x = clamp((index % sx) * stride, 0, max(uSourceWidth - 1, 0));
+    y = clamp((index / sx) * stride, 0, max(uSourceHeight - 1, 0));
+  } else if (!appendCoord(index,
+                         uIdentityCubeAppendOffset,
+                         uIdentityCubeAppendCount,
+                         uIdentityCubeAppendY1,
+                         uIdentityCubeAppendY2,
+                         uIdentityCubeAppendRowStep,
+                         uIdentityCubeAppendXStep,
+                         x,
+                         y) &&
+             !appendCoord(index,
+                          uIdentityRampAppendOffset,
+                          uIdentityRampAppendCount,
+                          uIdentityRampAppendY1,
+                          uIdentityRampAppendY2,
+                          uIdentityRampAppendRowStep,
+                          uIdentityRampAppendXStep,
+                          x,
+                          y)) {
+    x = 0;
+    y = 0;
+  }
   topologyWords[index] = uint(x & 0xffff) | (uint(y & 0xffff) << 16u);
 }
 )GLSL";
@@ -8282,13 +8412,51 @@ void main() {
   cache->topologySourceHeightLoc = api.getUniformLocation(topologyProgram, "uSourceHeight");
   cache->topologySampleStrideLoc = api.getUniformLocation(topologyProgram, "uSampleStride");
   cache->topologySampleCountXLoc = api.getUniformLocation(topologyProgram, "uSampleCountX");
+  cache->topologyBasePointCountLoc = api.getUniformLocation(topologyProgram, "uBasePointCount");
+  cache->topologyIdentityCubeAppendOffsetLoc =
+      api.getUniformLocation(topologyProgram, "uIdentityCubeAppendOffset");
+  cache->topologyIdentityCubeAppendCountLoc =
+      api.getUniformLocation(topologyProgram, "uIdentityCubeAppendCount");
+  cache->topologyIdentityCubeAppendY1Loc =
+      api.getUniformLocation(topologyProgram, "uIdentityCubeAppendY1");
+  cache->topologyIdentityCubeAppendY2Loc =
+      api.getUniformLocation(topologyProgram, "uIdentityCubeAppendY2");
+  cache->topologyIdentityCubeAppendRowStepLoc =
+      api.getUniformLocation(topologyProgram, "uIdentityCubeAppendRowStep");
+  cache->topologyIdentityCubeAppendXStepLoc =
+      api.getUniformLocation(topologyProgram, "uIdentityCubeAppendXStep");
+  cache->topologyIdentityRampAppendOffsetLoc =
+      api.getUniformLocation(topologyProgram, "uIdentityRampAppendOffset");
+  cache->topologyIdentityRampAppendCountLoc =
+      api.getUniformLocation(topologyProgram, "uIdentityRampAppendCount");
+  cache->topologyIdentityRampAppendY1Loc =
+      api.getUniformLocation(topologyProgram, "uIdentityRampAppendY1");
+  cache->topologyIdentityRampAppendY2Loc =
+      api.getUniformLocation(topologyProgram, "uIdentityRampAppendY2");
+  cache->topologyIdentityRampAppendRowStepLoc =
+      api.getUniformLocation(topologyProgram, "uIdentityRampAppendRowStep");
+  cache->topologyIdentityRampAppendXStepLoc =
+      api.getUniformLocation(topologyProgram, "uIdentityRampAppendXStep");
   cache->available = cache->available &&
                      cache->topologyProgram != 0 &&
                      cache->topologyPointCountLoc >= 0 &&
                      cache->topologySourceWidthLoc >= 0 &&
                      cache->topologySourceHeightLoc >= 0 &&
                      cache->topologySampleStrideLoc >= 0 &&
-                     cache->topologySampleCountXLoc >= 0;
+                     cache->topologySampleCountXLoc >= 0 &&
+                     cache->topologyBasePointCountLoc >= 0 &&
+                     cache->topologyIdentityCubeAppendOffsetLoc >= 0 &&
+                     cache->topologyIdentityCubeAppendCountLoc >= 0 &&
+                     cache->topologyIdentityCubeAppendY1Loc >= 0 &&
+                     cache->topologyIdentityCubeAppendY2Loc >= 0 &&
+                     cache->topologyIdentityCubeAppendRowStepLoc >= 0 &&
+                     cache->topologyIdentityCubeAppendXStepLoc >= 0 &&
+                     cache->topologyIdentityRampAppendOffsetLoc >= 0 &&
+                     cache->topologyIdentityRampAppendCountLoc >= 0 &&
+                     cache->topologyIdentityRampAppendY1Loc >= 0 &&
+                     cache->topologyIdentityRampAppendY2Loc >= 0 &&
+                     cache->topologyIdentityRampAppendRowStepLoc >= 0 &&
+                     cache->topologyIdentityRampAppendXStepLoc >= 0;
   if (!cache->available) {
     logViewerEvent("Raster topology compute program missing uniforms; falling back to CPU.");
     return false;
@@ -9120,9 +9288,13 @@ bool buildRasterDerivedMeshGlCompute(const ResolvedPayload& resolved,
     if (fallbackReason) *fallbackReason = reason;
     return false;
   }
-  RasterSamplePlan plan = rasterSamplePlanForPayload(source, payload, analyticalScope);
-  if (plan.pointCount == 0) {
+  RasterGpuDerivationPlan gpuPlan = rasterGpuDerivationPlanForPayload(source, payload, analyticalScope);
+  if (gpuPlan.totalPointCount == 0) {
     if (fallbackReason) *fallbackReason = "empty-sample-plan";
+    return false;
+  }
+  if (gpuPlan.totalPointCount > static_cast<size_t>(std::numeric_limits<GLint>::max())) {
+    if (fallbackReason) *fallbackReason = "gl-raster-point-limit";
     return false;
   }
   if (analyticalScope) {
@@ -9134,6 +9306,8 @@ bool buildRasterDerivedMeshGlCompute(const ResolvedPayload& resolved,
                                                 out,
                                                 fallbackReason);
   }
+  RasterSamplePlan plan = gpuPlan.sample;
+  plan.pointCount = gpuPlan.totalPointCount;
   const ViewerGlBufferApi& bufferApi = viewerGlBufferApi();
   const ViewerGlComputeApi& computeApi = viewerGlComputeApi();
   const bool allowCpuReadback = glRasterComputeCpuReadbackFallbackEnabled();
@@ -9204,6 +9378,29 @@ bool buildRasterDerivedMeshGlCompute(const ResolvedPayload& resolved,
   computeApi.uniform1i(rasterCache.topologySourceHeightLoc, source.proxyHeight);
   computeApi.uniform1i(rasterCache.topologySampleStrideLoc, plan.stride);
   computeApi.uniform1i(rasterCache.topologySampleCountXLoc, plan.countX);
+  computeApi.uniform1i(rasterCache.topologyBasePointCountLoc,
+                       static_cast<GLint>(gpuPlan.basePointCount));
+  computeApi.uniform1i(rasterCache.topologyIdentityCubeAppendOffsetLoc,
+                       static_cast<GLint>(gpuPlan.basePointCount));
+  computeApi.uniform1i(rasterCache.topologyIdentityCubeAppendCountLoc,
+                       static_cast<GLint>(gpuPlan.cubeAppend.pointCount));
+  computeApi.uniform1i(rasterCache.topologyIdentityCubeAppendY1Loc, gpuPlan.cubeAppend.y1);
+  computeApi.uniform1i(rasterCache.topologyIdentityCubeAppendY2Loc, gpuPlan.cubeAppend.y2);
+  computeApi.uniform1i(rasterCache.topologyIdentityCubeAppendRowStepLoc,
+                       std::max(1, gpuPlan.cubeAppend.rowStep));
+  computeApi.uniform1i(rasterCache.topologyIdentityCubeAppendXStepLoc,
+                       std::max(1, gpuPlan.cubeAppend.xStep));
+  const size_t rampAppendOffset = gpuPlan.basePointCount + gpuPlan.cubeAppend.pointCount;
+  computeApi.uniform1i(rasterCache.topologyIdentityRampAppendOffsetLoc,
+                       static_cast<GLint>(rampAppendOffset));
+  computeApi.uniform1i(rasterCache.topologyIdentityRampAppendCountLoc,
+                       static_cast<GLint>(gpuPlan.rampAppend.pointCount));
+  computeApi.uniform1i(rasterCache.topologyIdentityRampAppendY1Loc, gpuPlan.rampAppend.y1);
+  computeApi.uniform1i(rasterCache.topologyIdentityRampAppendY2Loc, gpuPlan.rampAppend.y2);
+  computeApi.uniform1i(rasterCache.topologyIdentityRampAppendRowStepLoc,
+                       std::max(1, gpuPlan.rampAppend.rowStep));
+  computeApi.uniform1i(rasterCache.topologyIdentityRampAppendXStepLoc,
+                       std::max(1, gpuPlan.rampAppend.xStep));
   computeApi.bindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, mapCache.topology);
   computeApi.dispatchCompute(static_cast<GLuint>((plan.pointCount + 255u) / 256u), 1u, 1u);
   computeApi.memoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
@@ -9276,6 +9473,30 @@ bool buildRasterDerivedMeshGlCompute(const ResolvedPayload& resolved,
   computeApi.uniform1i(mapCache.cubeSliceMagentaLoc, remap.cubeSliceMagenta ? 1 : 0);
   computeApi.uniform1i(mapCache.sourceWidthLoc, source.proxyWidth);
   computeApi.uniform1i(mapCache.sourceHeightLoc, source.proxyHeight);
+  computeApi.uniform1i(mapCache.excludeIdentityDataLoc, payload.excludeIdentityData ? 1 : 0);
+  computeApi.uniform1i(mapCache.isolateIdentityDataLoc, payload.isolateIdentityData ? 1 : 0);
+  computeApi.uniform1i(mapCache.readIdentityPlotLoc, payload.readIdentityPlot ? 1 : 0);
+  computeApi.uniform1i(mapCache.readGrayRampLoc, payload.readGrayRamp ? 1 : 0);
+  int identityCubeY1 = -1;
+  int identityCubeY2 = -1;
+  int identityRampY1 = -1;
+  int identityRampY2 = -1;
+  int stripY1 = 0;
+  int stripY2 = 0;
+  if (source.identityStripPresent && source.identityStripDrawCube &&
+      sourceSignalRowsToProxyRange(source, source.identityCubeY1, source.identityCubeY2, &stripY1, &stripY2)) {
+    identityCubeY1 = stripY1;
+    identityCubeY2 = stripY2;
+  }
+  if (source.identityStripPresent && source.identityStripDrawRamp &&
+      sourceSignalRowsToProxyRange(source, source.identityRampY1, source.identityRampY2, &stripY1, &stripY2)) {
+    identityRampY1 = stripY1;
+    identityRampY2 = stripY2;
+  }
+  computeApi.uniform1i(mapCache.identityCubeY1Loc, identityCubeY1);
+  computeApi.uniform1i(mapCache.identityCubeY2Loc, identityCubeY2);
+  computeApi.uniform1i(mapCache.identityRampY1Loc, identityRampY1);
+  computeApi.uniform1i(mapCache.identityRampY2Loc, identityRampY2);
   computeApi.uniform1i(mapCache.lassoEnabledLoc, 0);
   computeApi.uniform1i(mapCache.lassoStrokeCountLoc, 0);
   computeApi.uniform1i(mapCache.lassoPointCountLoc, 0);
@@ -9322,12 +9543,19 @@ bool buildRasterDerivedMeshGlCompute(const ResolvedPayload& resolved,
   mesh.sourceTransport = source.transport;
   const std::string sourceResidencyStage =
       sourceUploaded ? "host-upload-to-gl-source-ssbo" : "gl-source-ssbo-cache";
+  const bool identityTopologyActive =
+      gpuPlan.cubeAppend.pointCount > 0 ||
+      gpuPlan.rampAppend.pointCount > 0 ||
+      payload.excludeIdentityData ||
+      payload.isolateIdentityData;
   setMeshResidencyAudit(&mesh,
                         sourceResidencyStage,
                         "gl-compute-raster-to-point-buffer",
-                        "gl-topology-ssbo",
+                        identityTopologyActive ? "gl-topology-ssbo-identity" : "gl-topology-ssbo",
                         "gl-buffer");
   mesh.pointCount = plan.pointCount;
+  mesh.pointCloudMayContainHiddenVerts =
+      identityTopologyActive || rasterGpuSourceRequestMayHideSamples(payload, remap);
   mesh.hasFitBounds = true;
   mesh.fitMin = Vec3{-1.8f, -1.8f, -1.8f};
   mesh.fitMax = Vec3{1.8f, 1.8f, 1.8f};
@@ -32755,11 +32983,18 @@ bool rebuildPlotWindowDerivedMeshIfNeeded(PlotWindowState* window,
             } else if (!backendFallbackReason.empty()) {
               rasterFallbackReason = backendFallbackReason;
             }
-            if (analyticalScope && !glAnalyticalScopeCpuReadbackFallbackEnabled()) {
+            const bool glScopeResidencyBlocked =
+                analyticalScope && !glAnalyticalScopeCpuReadbackFallbackEnabled();
+            const bool glPointResidencyBlocked =
+                !analyticalScope && !glRasterCpuFallbackEnabled();
+            if (glScopeResidencyBlocked || glPointResidencyBlocked) {
+              const char* requiredReason =
+                  glScopeResidencyBlocked ? "gl-scope-density-residency-required"
+                                          : "gl-raster-point-residency-required";
               rasterFallbackReason = rasterFallbackReason.empty()
-                                         ? "gl-scope-density-residency-required"
-                                         : rasterFallbackReason + ",gl-scope-density-residency-required";
-              rasterBackend = "gl-scope-residency-blocked";
+                                         ? std::string(requiredReason)
+                                         : rasterFallbackReason + "," + requiredReason;
+              rasterBackend = "gl-residency-blocked";
               built = false;
             } else {
               built = buildRasterDerivedMeshCpu(payload,
@@ -32807,17 +33042,22 @@ bool rebuildPlotWindowDerivedMeshIfNeeded(PlotWindowState* window,
         if (!rasterFallbackReason.empty()) os << " route=" << rasterFallbackReason;
         logViewerEvent(os.str());
       } else if (rasterBackend == "cuda-residency-blocked" ||
-                 rasterBackend == "metal-residency-blocked") {
+                 rasterBackend == "metal-residency-blocked" ||
+                 rasterBackend == "gl-residency-blocked") {
         std::ostringstream os;
         os << "[residency-blocked] window=" << window->windowId
            << " model=" << ChromaspaceViewer::plotModelLabel(window->viewState.plotModel)
            << " backend=" << rasterBackend
            << " sourceTransport=" << rasterSource->transport
            << " source=" << sourceResidency
+           << " derivation=" << derivationResidency
            << " topology=" << topologyResidency
            << " requiredStage="
-           << (rasterBackend == "metal-residency-blocked" ? "metal-iosurface-resident-drawable"
-                                                           : "cuda-ipc-resident-drawable")
+           << (rasterBackend == "metal-residency-blocked"
+                   ? "metal-iosurface-resident-drawable"
+                   : (rasterBackend == "cuda-residency-blocked"
+                          ? "cuda-ipc-resident-drawable"
+                          : "gl-resident-derivation-and-drawable"))
            << " fallbackSuppressed=1"
            << " reason=" << (rasterFallbackReason.empty() ? "residency-required" : rasterFallbackReason)
            << " ms=" << std::fixed << std::setprecision(3) << rasterMs;
@@ -32842,7 +33082,8 @@ bool rebuildPlotWindowDerivedMeshIfNeeded(PlotWindowState* window,
         if (!rasterFallbackReason.empty() &&
             (rasterBackend == "cpu" ||
              rasterBackend == "cuda-residency-blocked" ||
-             rasterBackend == "metal-residency-blocked")) {
+             rasterBackend == "metal-residency-blocked" ||
+             rasterBackend == "gl-residency-blocked")) {
           os << " fallback=" << rasterFallbackReason;
         }
         logViewerEvent(os.str());
@@ -32894,7 +33135,8 @@ bool rebuildPlotWindowDerivedMeshIfNeeded(PlotWindowState* window,
       publishSourceRasterHealth(
           sourceRasterHealthForPayload(*rasterSource,
                                        (rasterBackend == "cuda-residency-blocked" ||
-                                        rasterBackend == "metal-residency-blocked")
+                                        rasterBackend == "metal-residency-blocked" ||
+                                        rasterBackend == "gl-residency-blocked")
                                            ? "residency_blocked"
                                            : "build_failed",
                                        rasterFallbackReason.empty() ? rasterBackend : rasterFallbackReason,
@@ -33287,32 +33529,17 @@ bool ensureSourceSignalTexture(SourceSignalStore* store,
       return false;
     }
     std::string importError;
-    bool imported = false;
-    constexpr int kIOSurfaceImportAttempts = 10;
-    constexpr int kIOSurfaceImportRetryMs = 25;
     const int surfaceWidth = source.surfaceWidth > 0 ? source.surfaceWidth : source.proxyWidth;
     const int surfaceHeight = source.surfaceHeight > 0 ? source.surfaceHeight : source.proxyHeight;
-    for (int attempt = 0; attempt < kIOSurfaceImportAttempts; ++attempt) {
-      importError.clear();
-      if (ChromaspaceMetal::bindIOSurfaceToOpenGLTexture(source.surfaceId,
-                                                         surfaceWidth,
-                                                         surfaceHeight,
-                                                         source.surfacePixelFormat,
-                                                         store->texture,
-                                                         &importError)) {
-        imported = true;
-        if (attempt > 0) {
-          logViewerEvent(std::string("Source Signal IOSurface import recovered after retry attempts=") +
-                         std::to_string(attempt + 1) +
-                         " surfaceId=" + std::to_string(source.surfaceId));
-        }
-        break;
-      }
-      if (attempt + 1 < kIOSurfaceImportAttempts) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(kIOSurfaceImportRetryMs));
-      }
-    }
-    if (!imported) {
+    // This runs on the viewer's draw/rebuild path. Do one import attempt and
+    // retry on later frames via the failed-handle throttle below; sleeping here
+    // makes camera interaction lag even when the plot has no drawable signal yet.
+    if (!ChromaspaceMetal::bindIOSurfaceToOpenGLTexture(source.surfaceId,
+                                                        surfaceWidth,
+                                                        surfaceHeight,
+                                                        source.surfacePixelFormat,
+                                                        store->texture,
+                                                        &importError)) {
       logViewerEvent(std::string("Source Signal IOSurface import failed: ") +
                      (importError.empty() ? "unknown" : importError) +
                      " surfaceId=" + std::to_string(source.surfaceId) +
@@ -39596,6 +39823,7 @@ int main() {
                  " rasterGpu=" + viewerEnvFlagLabel("CHROMASPACE_RASTER_GPU") +
                  " overlayCompute=" + viewerEnvFlagLabel("CHROMASPACE_OVERLAY_COMPUTE") +
                  " inputCompute=" + viewerEnvFlagLabel("CHROMASPACE_INPUT_COMPUTE") +
+                 " glRasterCpuFallback=" + viewerEnvFlagLabel("CHROMASPACE_GL_RASTER_CPU_FALLBACK") +
                  " glRasterComputeCpuReadbackFallback=" + viewerEnvFlagLabel("CHROMASPACE_GL_RASTER_COMPUTE_CPU_READBACK_FALLBACK") +
                  " glScopeDensityCpuReadbackFallback=" + viewerEnvFlagLabel("CHROMASPACE_GL_SCOPE_DENSITY_CPU_READBACK_FALLBACK") +
                  " metalCompactScopeFallback=" + viewerEnvFlagLabel("CHROMASPACE_METAL_COMPACT_SCOPE_FALLBACK") +
