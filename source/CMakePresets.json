@@ -18,6 +18,48 @@
       "cacheVariables": {
         "CMAKE_INSTALL_PREFIX": "${sourceDir}/build-vs/install"
       }
+    },
+    {
+      "name": "macos-arm64-release",
+      "displayName": "macOS arm64 Release",
+      "generator": "Ninja",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Darwin"
+      },
+      "binaryDir": "${sourceDir}/build-mac-arm64",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_OSX_ARCHITECTURES": "arm64",
+        "CMAKE_OSX_DEPLOYMENT_TARGET": "13.0",
+        "BUILD_TESTING": "ON",
+        "CHROMASPACE_USE_BUNDLED_TEXT_DEPS": "ON",
+        "CHROMASPACE_MACOS_LEGACY_IOSURFACE_COMPAT": "OFF",
+        "CHROMASPACE_MACOS_OPENGL_VIEWER_COMPAT": "OFF",
+        "CHROMASPACE_PACKAGE_MACOS_EXCHANGE_HELPERS": "OFF"
+      }
+    },
+    {
+      "name": "macos-universal-release",
+      "displayName": "macOS Universal Release",
+      "generator": "Ninja",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Darwin"
+      },
+      "binaryDir": "${sourceDir}/build-mac-universal",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_OSX_ARCHITECTURES": "arm64;x86_64",
+        "CMAKE_OSX_DEPLOYMENT_TARGET": "13.0",
+        "BUILD_TESTING": "ON",
+        "CHROMASPACE_USE_BUNDLED_TEXT_DEPS": "ON",
+        "CHROMASPACE_MACOS_LEGACY_IOSURFACE_COMPAT": "OFF",
+        "CHROMASPACE_MACOS_OPENGL_VIEWER_COMPAT": "OFF",
+        "CHROMASPACE_PACKAGE_MACOS_EXCHANGE_HELPERS": "OFF"
+      }
     }
   ],
   "buildPresets": [
@@ -32,6 +74,36 @@
       "displayName": "Build Release",
       "configurePreset": "vs2026-x64",
       "configuration": "Release"
+    },
+    {
+      "name": "macos-arm64-release-build",
+      "displayName": "Build macOS arm64 Release",
+      "configurePreset": "macos-arm64-release",
+      "configuration": "Release"
+    },
+    {
+      "name": "macos-universal-release-build",
+      "displayName": "Build macOS Universal Release",
+      "configurePreset": "macos-universal-release",
+      "configuration": "Release"
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "macos-arm64-release-test",
+      "displayName": "Test macOS arm64 Release",
+      "configurePreset": "macos-arm64-release",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "macos-universal-release-test",
+      "displayName": "Test macOS Universal Release",
+      "configurePreset": "macos-universal-release",
+      "output": {
+        "outputOnFailure": true
+      }
     }
   ]
 }

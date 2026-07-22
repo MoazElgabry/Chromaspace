@@ -19,6 +19,7 @@ struct Sample {
   float b = 0.0f;
 };
 
+#if defined(CHROMASPACE_MACOS_LEGACY_IOSURFACE_COMPAT)
 struct SharedSourceSignalSurface {
   std::uint32_t surfaceId = 0;
   int width = 0;
@@ -26,7 +27,10 @@ struct SharedSourceSignalSurface {
   int pixelFormat = 0;  // 0=RGBA16F, 1=RGBA32F.
   std::size_t byteSize = 0;
   void* retainedSurface = nullptr;
+  bool global = false;
+  bool selfLookupOk = false;
 };
+#endif
 
 struct OccupancyCandidate {
   Sample sample{};
@@ -201,6 +205,37 @@ bool copySourceProxyToHost(
     size_t readbackProxyRowBytes,
     std::string* error = nullptr);
 
+using SourceProxyCompletionCallback =
+    void (*)(void* context, bool completedSuccessfully);
+
+// Warm the Source Signal proxy pipeline outside the OFX render callback.
+bool prepareSourceProxyPipeline(
+    void* metalCommandQueue,
+    std::string* error = nullptr);
+
+// Encodes a source proxy into an already allocated shareable texture, signals
+// the supplied shared event in the same command buffer, and commits without a
+// completion wait. The callback, when non-null, runs on Metal's completion
+// executor and must not call OFX host interfaces.
+bool enqueueSourceProxyToSharedTexture(
+    const void* srcMetalBuffer,
+    int sourceWidth,
+    int sourceHeight,
+    size_t srcRowBytes,
+    int originX,
+    int originY,
+    int proxyWidth,
+    int proxyHeight,
+    int pixelFormat,
+    void* destinationTexture,
+    void* sharedEvent,
+    std::uint64_t readyValue,
+    void* metalCommandQueue,
+    SourceProxyCompletionCallback completion,
+    void* completionContext,
+    std::string* error = nullptr);
+
+#if defined(CHROMASPACE_MACOS_LEGACY_IOSURFACE_COMPAT)
 bool copySourceProxyToIOSurface(
     const void* srcMetalBuffer,
     int sourceWidth,
@@ -214,6 +249,7 @@ bool copySourceProxyToIOSurface(
     void* metalCommandQueue,
     SharedSourceSignalSurface* out,
     std::string* error = nullptr);
+#endif
 
 bool copySourceRowsToHost(
     const void* srcMetalBuffer,

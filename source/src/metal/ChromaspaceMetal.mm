@@ -4,7 +4,9 @@
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
+#if defined(CHROMASPACE_MACOS_LEGACY_IOSURFACE_COMPAT)
 #import <IOSurface/IOSurface.h>
+#endif
 
 #include <algorithm>
 #include <cstring>
@@ -23,6 +25,7 @@ inline MTLPixelFormat sourceSignalMetalPixelFormat(int pixelFormat) {
   return pixelFormat == 1 ? MTLPixelFormatRGBA32Float : MTLPixelFormatRGBA16Float;
 }
 
+#if defined(CHROMASPACE_MACOS_LEGACY_IOSURFACE_COMPAT)
 inline OSType sourceSignalIOSurfacePixelFormat(int pixelFormat) {
   return pixelFormat == 1 ? static_cast<OSType>('RGBA') : static_cast<OSType>('RGhA');
 }
@@ -30,6 +33,15 @@ inline OSType sourceSignalIOSurfacePixelFormat(int pixelFormat) {
 inline size_t sourceSignalBytesPerElement(int pixelFormat) {
   return pixelFormat == 1 ? 16u : 8u;
 }
+
+bool iosurfaceBooleanValue(IOSurfaceRef surface, CFStringRef key) {
+  if (surface == nullptr || key == nullptr) return false;
+  CFTypeRef value = IOSurfaceCopyValue(surface, key);
+  const bool result = value == kCFBooleanTrue;
+  if (value != nullptr) CFRelease(value);
+  return result;
+}
+#endif
 
 inline bool validateFloatRowBytes(size_t rowBytes) {
   return rowBytes >= 4u * sizeof(float) && (rowBytes % sizeof(float)) == 0u;
@@ -1594,6 +1606,158 @@ bool copySourceProxyToHost(
   }
 }
 
+bool prepareSourceProxyPipeline(
+    void* metalCommandQueue,
+    std::string* error) {
+  if (error) error->clear();
+  if (!metalCommandQueue) {
+    if (error) *error = "invalid-source-proxy-pipeline-request";
+    return false;
+  }
+  @autoreleasepool {
+    id<MTLCommandQueue> queue =
+        (__bridge id<MTLCommandQueue>)metalCommandQueue;
+    if (queue == nil || queue.device == nil) {
+      if (error) *error = "metal-unavailable";
+      return false;
+    }
+    PipelineBundle pipelines{};
+    return ensurePipelines(queue.device, &pipelines, error) &&
+           pipelines.sourceProxyTexture != nil;
+  }
+}
+
+bool enqueueSourceProxyToSharedTexture(
+    const void* srcMetalBuffer,
+    int sourceWidth,
+    int sourceHeight,
+    size_t srcRowBytes,
+    int originX,
+    int originY,
+    int proxyWidth,
+    int proxyHeight,
+    int pixelFormat,
+    void* destinationTexture,
+    void* sharedEvent,
+    std::uint64_t readyValue,
+    void* metalCommandQueue,
+    SourceProxyCompletionCallback completion,
+    void* completionContext,
+    std::string* error) {
+  if (error) error->clear();
+  if (!srcMetalBuffer || !destinationTexture || !sharedEvent ||
+      !metalCommandQueue || sourceWidth <= 0 || sourceHeight <= 0 ||
+      proxyWidth <= 0 || proxyHeight <= 0 || readyValue == 0) {
+    if (error) *error = "invalid-shared-source-proxy-request";
+    return false;
+  }
+  if (pixelFormat != 0 && pixelFormat != 1) {
+    if (error) *error = "unsupported-shared-source-proxy-format";
+    return false;
+  }
+  if (!validateFloatRowBytes(srcRowBytes) ||
+      srcRowBytes < packedRowBytesForWidth(sourceWidth)) {
+    if (error) *error = "invalid-source-row-bytes";
+    return false;
+  }
+
+  @autoreleasepool {
+    id<MTLCommandQueue> queue =
+        (__bridge id<MTLCommandQueue>)metalCommandQueue;
+    id<MTLBuffer> src = (__bridge id<MTLBuffer>)srcMetalBuffer;
+    id<MTLTexture> texture =
+        (__bridge id<MTLTexture>)destinationTexture;
+    id<MTLSharedEvent> event =
+        (__bridge id<MTLSharedEvent>)sharedEvent;
+    if (queue == nil || queue.device == nil || src == nil ||
+        texture == nil || event == nil ||
+        src.device != queue.device ||
+        texture.device != queue.device ||
+        event.device != queue.device ||
+        texture.width != static_cast<NSUInteger>(proxyWidth) ||
+        texture.height != static_cast<NSUInteger>(proxyHeight) ||
+        texture.pixelFormat != sourceSignalMetalPixelFormat(pixelFormat) ||
+        !texture.shareable ||
+        (texture.usage & MTLTextureUsageShaderWrite) == 0) {
+      if (error) *error = "shared-source-proxy-resource-mismatch";
+      return false;
+    }
+    int sourceOriginX = originX;
+    int sourceOriginY = originY;
+    if (!chooseSourceOrigin(src,
+                            sourceWidth,
+                            sourceHeight,
+                            srcRowBytes,
+                            originX,
+                            originY,
+                            &sourceOriginX,
+                            &sourceOriginY)) {
+      if (error) *error = "shared-source-proxy-range-out-of-bounds";
+      return false;
+    }
+
+    PipelineBundle pipelines{};
+    if (!ensurePipelines(queue.device, &pipelines, error) ||
+        pipelines.sourceProxyTexture == nil) {
+      return false;
+    }
+
+    SourceProxyRequestGpu request{};
+    request.sourceWidth = sourceWidth;
+    request.sourceHeight = sourceHeight;
+    request.originX = sourceOriginX;
+    request.originY = sourceOriginY;
+    request.srcRowFloats =
+        static_cast<uint32_t>(srcRowBytes / sizeof(float));
+    request.proxyWidth = proxyWidth;
+    request.proxyHeight = proxyHeight;
+    request.proxyRowFloats = 0;
+
+    id<MTLCommandBuffer> cmd = [queue commandBuffer];
+    if (cmd == nil) {
+      if (error) *error = "shared-source-proxy-command-buffer-failed";
+      return false;
+    }
+    id<MTLComputeCommandEncoder> encoder =
+        [cmd computeCommandEncoder];
+    if (encoder == nil) {
+      if (error) *error = "shared-source-proxy-encoder-failed";
+      return false;
+    }
+    [encoder setComputePipelineState:pipelines.sourceProxyTexture];
+    [encoder setBuffer:src offset:0 atIndex:0];
+    [encoder setTexture:texture atIndex:0];
+    [encoder setBytes:&request length:sizeof(request) atIndex:1];
+    NSUInteger maxThreads =
+        pipelines.sourceProxyTexture.maxTotalThreadsPerThreadgroup;
+    if (maxThreads == 0) maxThreads = 64;
+    NSUInteger threadWidth = 1;
+    while ((threadWidth + 1u) * (threadWidth + 1u) <= maxThreads &&
+           threadWidth < 16u) {
+      ++threadWidth;
+    }
+    [encoder
+        dispatchThreads:
+            MTLSizeMake(static_cast<NSUInteger>(proxyWidth),
+                        static_cast<NSUInteger>(proxyHeight),
+                        1)
+        threadsPerThreadgroup:
+            MTLSizeMake(threadWidth, threadWidth, 1)];
+    [encoder endEncoding];
+    [cmd encodeSignalEvent:event value:readyValue];
+    if (completion != nullptr) {
+      [cmd addCompletedHandler:^(id<MTLCommandBuffer> completed) {
+        completion(
+            completionContext,
+            completed.status == MTLCommandBufferStatusCompleted);
+      }];
+    }
+    [cmd commit];
+    return true;
+  }
+}
+
+#if defined(CHROMASPACE_MACOS_LEGACY_IOSURFACE_COMPAT)
 bool copySourceProxyToIOSurface(
     const void* srcMetalBuffer,
     int sourceWidth,
@@ -1651,7 +1815,7 @@ bool copySourceProxyToIOSurface(
       (__bridge NSString*)kIOSurfaceBytesPerRow: @(bytesPerRow),
       (__bridge NSString*)kIOSurfaceAllocSize: @(byteSize),
       (__bridge NSString*)kIOSurfacePixelFormat: @(sourceSignalIOSurfacePixelFormat(pixelFormat)),
-      (__bridge NSString*)CFSTR("IOSurfaceIsGlobal"): @YES,
+      (__bridge NSString*)kIOSurfaceIsGlobal: @YES,
     };
     IOSurfaceRef surface = IOSurfaceCreate((__bridge CFDictionaryRef)surfaceProperties);
     if (surface == nullptr) {
@@ -1662,6 +1826,18 @@ bool copySourceProxyToIOSurface(
     if (surfaceId == 0) {
       CFRelease(surface);
       if (error) *error = "source-iosurface-not-global";
+      return false;
+    }
+    const bool surfaceGlobal = iosurfaceBooleanValue(surface, kIOSurfaceIsGlobal);
+    IOSurfaceRef selfLookup = IOSurfaceLookup(static_cast<IOSurfaceID>(surfaceId));
+    const bool selfLookupOk = selfLookup != nullptr;
+    if (selfLookup != nullptr) CFRelease(selfLookup);
+    if (!selfLookupOk) {
+      CFRelease(surface);
+      if (error) {
+        *error = std::string("source-iosurface-self-lookup-failed:global=") +
+                 (surfaceGlobal ? "1" : "0");
+      }
       return false;
     }
 
@@ -1730,9 +1906,12 @@ bool copySourceProxyToIOSurface(
     out->pixelFormat = pixelFormat;
     out->byteSize = byteSize;
     out->retainedSurface = surface;
+    out->global = surfaceGlobal;
+    out->selfLookupOk = selfLookupOk;
     return out->surfaceId != 0;
   }
 }
+#endif
 
 bool copySourceRowsToHost(
     const void* srcMetalBuffer,

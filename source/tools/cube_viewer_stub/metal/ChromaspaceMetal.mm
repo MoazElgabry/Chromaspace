@@ -1,23 +1,35 @@
 #import <Foundation/Foundation.h>
 #import <AppKit/AppKit.h>
 #import <Metal/Metal.h>
+#import <QuartzCore/CAMetalLayer.h>
+#if !defined(CHROMASPACE_METAL_NATIVE_ONLY)
 #import <IOSurface/IOSurface.h>
 #import <OpenGL/gl.h>
 #import <OpenGL/OpenGL.h>
+#endif
 #import <simd/simd.h>
+#import <mach-o/dyld.h>
+#import <dispatch/dispatch.h>
 
 #include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstring>
 #include <cstdint>
+#include <functional>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <sstream>
 #include <unordered_map>
+#include <utility>
+#include <vector>
 
 #include "ChromaspaceMetal.h"
+#include "ChromaspaceMetalSubmissionRetention.h"
+#include "ChromaspaceMetalTransientArena.h"
 
+#if !defined(CHROMASPACE_METAL_NATIVE_ONLY)
 #ifndef GL_TEXTURE_RECTANGLE
 #define GL_TEXTURE_RECTANGLE 0x84F5
 #endif
@@ -30,11 +42,27 @@
 #ifndef GL_HALF_FLOAT
 #define GL_HALF_FLOAT 0x140B
 #endif
+#endif
 
 namespace ChromaspaceMetal {
 namespace {
 
+using FrameFailureKind = ChromaspaceMetalFrameFailure::Kind;
+using SubmissionRetention =
+    ChromaspaceMetalSubmissionRetention::RetentionSet;
+using SubmissionRetentionKey =
+    ChromaspaceMetalSubmissionRetention::ResourceKey;
+using SubmissionRetentionKind =
+    ChromaspaceMetalSubmissionRetention::ResourceKind;
+using SubmissionRetentionStatus =
+    ChromaspaceMetalSubmissionRetention::Status;
+
+void setFrameFailure(FrameFailureKind* failure, FrameFailureKind kind) noexcept {
+  if (failure) *failure = kind;
+}
+
 struct MetalContext {
+  uint64_t runtimeContextId = 0u;
   id<MTLDevice> device = nil;
   id<MTLCommandQueue> queue = nil;
   id<MTLLibrary> library = nil;
@@ -44,6 +72,12 @@ struct MetalContext {
   id<MTLComputePipelineState> rasterOccupancyCountPipeline = nil;
   id<MTLComputePipelineState> rasterSourceTexturePipeline = nil;
   id<MTLComputePipelineState> rasterOccupancyTextureCountPipeline = nil;
+  id<MTLComputePipelineState> rasterOccupancyThresholdPipeline = nil;
+  id<MTLComputePipelineState> rasterPointCompactLocalScanPipeline = nil;
+  id<MTLComputePipelineState> rasterPointScanBlockSumsPipeline = nil;
+  id<MTLComputePipelineState> rasterPointAddBlockOffsetsPipeline = nil;
+  id<MTLComputePipelineState> rasterPointCompactScatterPipeline = nil;
+  id<MTLComputePipelineState> rasterPointFinalizeIndirectArgsPipeline = nil;
   id<MTLComputePipelineState> inputSamplePipeline = nil;
   id<MTLComputePipelineState> scopeDensityPipeline = nil;
   id<MTLComputePipelineState> rasterScopeDensityTexturePipeline = nil;
@@ -51,8 +85,12 @@ struct MetalContext {
   id<MTLComputePipelineState> rasterScopeRangeHistogramTexturePipeline = nil;
   id<MTLComputePipelineState> scopeRangeHistogramPercentilePipeline = nil;
   id<MTLComputePipelineState> scopeRangeFinalizePipeline = nil;
+  id<MTLComputePipelineState> histogramApplyRangePipeline = nil;
   id<MTLComputePipelineState> histogramMaxPipeline = nil;
   id<MTLComputePipelineState> histogramSurfaceRenderPipeline = nil;
+  id<MTLComputePipelineState> waveformApplyRangePipeline = nil;
+  id<MTLComputePipelineState> waveformMaxPipeline = nil;
+  id<MTLComputePipelineState> waveformSurfaceRenderPipeline = nil;
   id<MTLComputePipelineState> glossFieldAccumulatePipeline = nil;
   id<MTLComputePipelineState> rasterGlossFieldAccumulateTexturePipeline = nil;
   id<MTLComputePipelineState> glossFieldFinalizePipeline = nil;
@@ -71,6 +109,15 @@ struct MetalContext {
   id<MTLComputePipelineState> glossProjectionSurfaceSelectPipeline = nil;
   id<MTLComputePipelineState> glossProjectionSurfaceShadePipeline = nil;
   id<MTLComputePipelineState> plotSurfaceClearPipeline = nil;
+  id<MTLComputePipelineState> sourceSignalSurfacePipeline = nil;
+  id<MTLRenderPipelineState> plotSurfaceVectorPipeline16 = nil;
+  id<MTLRenderPipelineState> plotSurfaceVectorPipeline32 = nil;
+  id<MTLRenderPipelineState> rasterPointSurfacePipeline16 = nil;
+  id<MTLRenderPipelineState> rasterPointSurfacePipeline32 = nil;
+  id<MTLRenderPipelineState> frameSurfaceCompositePipeline = nil;
+  id<MTLRenderPipelineState> frameSolidRectPipeline = nil;
+  id<MTLRenderPipelineState> frameUiVectorPipeline = nil;
+  id<MTLRenderPipelineState> frameTextPipeline = nil;
   std::string deviceName;
   std::string initError;
   bool initAttempted = false;
@@ -78,19 +125,111 @@ struct MetalContext {
 };
 
 struct PlotSurfaceRecord {
+#if !defined(CHROMASPACE_METAL_NATIVE_ONLY)
   IOSurfaceRef surface = nullptr;
+#endif
   id<MTLTexture> texture = nil;
+  std::shared_ptr<MetalContext> context;
+  uint64_t ownerCompositorId = 0;
   int width = 0;
   int height = 0;
   int pixelFormat = 0;
   size_t byteSize = 0;
+
+  PlotSurfaceRecord() = default;
+  PlotSurfaceRecord(const PlotSurfaceRecord&) = delete;
+  PlotSurfaceRecord& operator=(const PlotSurfaceRecord&) = delete;
+  PlotSurfaceRecord(PlotSurfaceRecord&&) = delete;
+  PlotSurfaceRecord& operator=(PlotSurfaceRecord&&) = delete;
+
+  ~PlotSurfaceRecord() noexcept {
+#if !defined(CHROMASPACE_METAL_NATIVE_ONLY)
+    // The registry owns exactly one create/lookup retain.  Shared submission
+    // records keep this object alive after public-handle removal, so this is
+    // the sole final CFRelease for compatibility IOSurfaces.
+    if (surface != nullptr) {
+      CFRelease(surface);
+      surface = nullptr;
+    }
+#endif
+  }
+};
+
+struct FrameTransientArenaState {
+  std::mutex mutex;
+  ChromaspaceMetalTransientArena::TransientArena policy;
+};
+
+struct FrameCompositorRecord {
+  std::shared_ptr<MetalContext> context;
+  NSWindow* window = nil;
+  NSView* contentView = nil;
+  CALayer* previousLayer = nil;
+  CAMetalLayer* layer = nil;
+  dispatch_semaphore_t frameSlots = nullptr;
+  dispatch_group_t completionGroup = nullptr;
+  std::shared_ptr<FrameTransientArenaState> transientArena;
+  int drawableWidth = 0;
+  int drawableHeight = 0;
+  float contentsScale = 1.0f;
+  uint64_t submittedSerial = 0;
+  uint64_t completedSerial = 0;
+  uint64_t failedSubmissionCount = 0;
+  uint64_t timedSubmissionCount = 0;
+  uint64_t untimedSubmissionCount = 0;
+  double accumulatedGpuSeconds = 0.0;
+  double maximumGpuSeconds = 0.0;
+  std::string lastSubmissionError;
+  std::string pendingSubmissionError;
+  BOOL previousWantsLayer = NO;
+};
+
+struct GlossFieldResidentRecord;
+struct ImportedSourceRecord;
+
+struct FrameSubmissionTransactionRecord {
+  std::function<void()> submitted;
+  std::function<void(bool)> completed;
+  std::function<void()> abandoned;
+};
+
+struct FrameSubmissionRecord {
+  std::shared_ptr<MetalContext> context;
+  uint64_t compositorId = 0;
+  dispatch_semaphore_t frameSlots = nullptr;
+  id<MTLCommandBuffer> commandBuffer = nil;
+  std::shared_ptr<FrameTransientArenaState> transientArena;
+  NSMutableArray<id<MTLHeap>>* transientHeaps = nil;
+  std::vector<FrameSubmissionTransactionRecord> transactions;
+  SubmissionRetention retainedResources;
+  std::unordered_map<uint64_t, std::shared_ptr<ImportedSourceRecord>>
+      retainedImportedSources;
+};
+
+struct ImportedSourceRecord {
+  ImportedSourceTexture descriptor{};
+  id<MTLTexture> texture = nil;
+  id<MTLSharedEvent> readyEvent = nil;
+  std::mutex lifetimeMutex;
+  size_t inFlightSubmissionUses = 0;
+  bool retirementRequested = false;
+  ImportedSourceRetirementCallback retirementCallback = nullptr;
+  void* retirementContext = nullptr;
+};
+
+struct FrameTextAtlasRecord {
+  id<MTLTexture> texture = nil;
+  std::shared_ptr<MetalContext> context;
+  uint64_t ownerCompositorId = 0;
+  int width = 0;
+  int height = 0;
 };
 
 struct GlossFieldResidentRecord {
   int gridWidth = 0;
   int gridHeight = 0;
   uint64_t builtSerial = 0;
-  id<MTLBuffer> occupancy = nil;
+  size_t byteSize = 0u;
   id<MTLBuffer> meanR = nil;
   id<MTLBuffer> meanG = nil;
   id<MTLBuffer> meanB = nil;
@@ -98,9 +237,7 @@ struct GlossFieldResidentRecord {
   id<MTLBuffer> carrierMax = nil;
   id<MTLBuffer> carrierMin = nil;
   id<MTLBuffer> neutrality = nil;
-  id<MTLBuffer> occupancyNorm = nil;
   id<MTLBuffer> body = nil;
-  id<MTLBuffer> rawSignal = nil;
   id<MTLBuffer> positive = nil;
   id<MTLBuffer> negative = nil;
   id<MTLBuffer> boundary = nil;
@@ -114,8 +251,49 @@ struct GlossFieldResidentRecord {
   id<MTLBuffer> congruence2 = nil;
   id<MTLBuffer> confidence2 = nil;
   id<MTLBuffer> signal2 = nil;
-  id<MTLBuffer> temp = nil;
-  id<MTLBuffer> reduction = nil;
+};
+
+struct ScopeDerivedResidentRecord {
+  ScopeDerivedFamily family = ScopeDerivedFamily::Histogram;
+  uint64_t builtSerial = 0;
+  size_t byteSize = 0;
+  id<MTLBuffer> density = nil;
+  id<MTLBuffer> overflowDensity = nil;
+  id<MTLBuffer> maxDensity = nil;
+  // GPU-produced [orderedMin, orderedMax, validCount]. Retained only for
+  // auto-range derivations so presentation uniforms can be rebuilt without
+  // rescanning the source texture.
+  id<MTLBuffer> finalRange = nil;
+  // RasterPointCloud records retain stable plot-space topology and attributes.
+  // Camera, target size, point radius, background, and guides remain
+  // presentation inputs and therefore never enter this native record.
+  id<MTLBuffer> pointVertices = nil;
+  id<MTLBuffer> pointColors = nil;
+  // GPU-authored MTLDrawPrimitivesIndirectArguments. The vertex count is the
+  // compacted visible count; no CPU readback participates in presentation.
+  id<MTLBuffer> pointIndirectArguments = nil;
+  NSUInteger pointCount = 0u;
+  // Gloss uses the same queue-visibility/retirement registry while keeping
+  // its large typed buffer set behind one deep native record.
+  std::shared_ptr<GlossFieldResidentRecord> glossField;
+};
+
+enum class ScopeDerivedResidentVersionState {
+  Pending = 0,
+  Submitted,
+};
+
+struct ScopeDerivedResidentVersion {
+  uint64_t submissionId = 0;
+  ScopeDerivedResidentVersionState state =
+      ScopeDerivedResidentVersionState::Pending;
+  std::shared_ptr<ScopeDerivedResidentRecord> record;
+};
+
+struct ScopeDerivedResidentEntry {
+  uint64_t ownerCompositorId = 0;
+  std::shared_ptr<ScopeDerivedResidentRecord> committed;
+  std::vector<ScopeDerivedResidentVersion> inFlight;
 };
 
 struct OverlayUniforms {
@@ -261,11 +439,101 @@ struct HistogramSurfaceUniforms {
   int channelCount;
 };
 
+struct WaveformSurfaceUniforms {
+  int pointCount;
+  int scopeMode;
+  int width;
+  int height;
+  float rangeMin;
+  float invRange;
+  int showOverflow;
+  int highlightOverflow;
+  int lumaMethod;
+  int channelCount;
+  int includeRed;
+  int includeGreen;
+  int includeBlue;
+  int includeLuma;
+  float pointBrightness;
+  float colorSaturation;
+  float coverageAlpha;
+};
+
 struct PlotSurfaceClearUniforms {
   float r;
   float g;
   float b;
   float a;
+};
+
+struct SourceSignalSurfaceUniforms {
+  int sourceWidth;
+  int sourceHeight;
+  int outputWidth;
+  int outputHeight;
+  float backgroundR;
+  float backgroundG;
+  float backgroundB;
+  float pad0;
+};
+
+struct RasterPointSurfaceUniforms {
+  float modelView[16];
+  float projection[16];
+  float pointRadiusPixels;
+  float surfaceWidth;
+  float surfaceHeight;
+  float pad0;
+};
+
+struct SurfaceCompositeUniforms {
+  float dstX;
+  float dstY;
+  float dstW;
+  float dstH;
+  float drawableW;
+  float drawableH;
+  float opacity;
+  float pad0;
+};
+
+struct FrameSolidRectUniforms {
+  float dstX;
+  float dstY;
+  float dstW;
+  float dstH;
+  float drawableW;
+  float drawableH;
+  float r;
+  float g;
+  float b;
+  float a;
+  float pad0;
+  float pad1;
+};
+
+struct FrameUiVectorUniforms {
+  float drawableW;
+  float drawableH;
+  float pad0;
+  float pad1;
+};
+
+struct FrameTextUniforms {
+  float drawableW;
+  float drawableH;
+  float r;
+  float g;
+  float b;
+  float a;
+  float clipX;
+  float clipY;
+  float clipW;
+  float clipH;
+  float clipEnabled;
+  float pad0;
+  float pad1;
+  float pad2;
 };
 
 struct GlossFieldAccumulateUniforms {
@@ -322,18 +590,22 @@ struct PackedFloat3 {
   float z;
 };
 
+#if !defined(CHROMASPACE_METAL_NATIVE_ONLY)
 MetalContext& context() {
   static MetalContext ctx;
   return ctx;
 }
+#endif
 
 MTLPixelFormat sourceSignalMetalPixelFormat(int pixelFormat) {
   return pixelFormat == 1 ? MTLPixelFormatRGBA32Float : MTLPixelFormatRGBA16Float;
 }
 
+#if !defined(CHROMASPACE_METAL_NATIVE_ONLY)
 OSType sourceSignalIOSurfacePixelFormat(int pixelFormat) {
   return pixelFormat == 1 ? static_cast<OSType>('RGBA') : static_cast<OSType>('RGhA');
 }
+#endif
 
 size_t sourceSignalBytesPerElement(int pixelFormat) {
   return pixelFormat == 1 ? 16u : 8u;
@@ -344,26 +616,1119 @@ std::mutex& plotSurfaceMutex() {
   return mutex;
 }
 
-std::unordered_map<uint32_t, PlotSurfaceRecord>& plotSurfaceRegistry() {
-  static std::unordered_map<uint32_t, PlotSurfaceRecord> registry;
+std::unordered_map<uint32_t, std::shared_ptr<PlotSurfaceRecord>>&
+plotSurfaceRegistry() {
+  static std::unordered_map<uint32_t, std::shared_ptr<PlotSurfaceRecord>>
+      registry;
   return registry;
 }
 
-std::mutex& glossFieldRegistryMutex() {
+// Must be called while plotSurfaceMutex() is held. Plot-surface handles form
+// their own namespace and are deliberately unrelated to IOSurface IDs.
+uint32_t allocatePlotSurfaceHandleLocked() {
+  auto& registry = plotSurfaceRegistry();
+  constexpr size_t kMaximumLiveHandles =
+      static_cast<size_t>(std::numeric_limits<uint32_t>::max()) - 1u;
+  if (registry.size() >= kMaximumLiveHandles) return 0;
+
+  static uint32_t nextHandle = 1;
+  if (nextHandle == 0) nextHandle = 1;
+  const uint32_t firstCandidate = nextHandle;
+  do {
+    const uint32_t candidate = nextHandle;
+    ++nextHandle;
+    if (nextHandle == 0) nextHandle = 1;
+    if (candidate != 0 && registry.find(candidate) == registry.end()) {
+      return candidate;
+    }
+  } while (nextHandle != firstCandidate);
+  return 0;
+}
+
+std::mutex& frameCompositorMutex() {
   static std::mutex mutex;
   return mutex;
 }
 
-std::unordered_map<uint64_t, GlossFieldResidentRecord>& glossFieldRegistry() {
-  static std::unordered_map<uint64_t, GlossFieldResidentRecord> registry;
+std::unordered_map<uint64_t, FrameCompositorRecord>& frameCompositorRegistry() {
+  static std::unordered_map<uint64_t, FrameCompositorRecord> registry;
   return registry;
 }
 
-uint64_t nextGlossFieldCacheId() {
+// Runtime-context IDs are process-local generation identities and are never
+// recycled.  A device registry ID may remain stable across recreation, while
+// this ID must change whenever the device/queue/library/pipeline owner changes.
+// frameCompositorMutex() serializes allocation.
+uint64_t allocateRuntimeContextIdLocked() {
+  static uint64_t nextId = 1u;
+  if (nextId == 0u) return 0u;
+  const uint64_t result = nextId;
+  if (nextId == std::numeric_limits<uint64_t>::max()) {
+    nextId = 0u;
+  } else {
+    ++nextId;
+  }
+  return result;
+}
+
+std::mutex& frameSubmissionMutex() {
+  static std::mutex mutex;
+  return mutex;
+}
+
+std::unordered_map<uint64_t, FrameSubmissionRecord>& frameSubmissionRegistry() {
+  static std::unordered_map<uint64_t, FrameSubmissionRecord> registry;
+  return registry;
+}
+
+bool contextForCompositor(uint64_t compositorId,
+                          std::shared_ptr<MetalContext>* outContext,
+                          std::string* error) {
+  if (outContext) outContext->reset();
+  if (compositorId == 0u) {
+    if (error) *error = "invalid-metal-frame-compositor-handle";
+    return false;
+  }
+  std::lock_guard<std::mutex> lock(frameCompositorMutex());
+  const auto it = frameCompositorRegistry().find(compositorId);
+  if (it == frameCompositorRegistry().end() || !it->second.context ||
+      !it->second.context->ready ||
+      it->second.context->runtimeContextId == 0u) {
+    if (error) *error = "metal-runtime-context-not-found";
+    return false;
+  }
+  if (outContext) *outContext = it->second.context;
+  return true;
+}
+
+bool contextForFrameSubmission(const FrameSubmission& submission,
+                               std::shared_ptr<MetalContext>* outContext,
+                               std::string* error) {
+  if (outContext) outContext->reset();
+  if (submission.submissionId == 0u || submission.compositorId == 0u ||
+      submission.runtimeContextId == 0u || submission.deviceRegistryId == 0u) {
+    if (error) *error = "invalid-metal-frame-submission-context";
+    return false;
+  }
+  std::lock_guard<std::mutex> lock(frameSubmissionMutex());
+  const auto it = frameSubmissionRegistry().find(submission.submissionId);
+  if (it == frameSubmissionRegistry().end() || !it->second.context ||
+      it->second.compositorId != submission.compositorId ||
+      it->second.context->runtimeContextId != submission.runtimeContextId ||
+      it->second.context->device == nil ||
+      it->second.context->device.registryID != submission.deviceRegistryId) {
+    if (error) *error = "metal-frame-submission-context-mismatch";
+    return false;
+  }
+  if (outContext) *outContext = it->second.context;
+  return true;
+}
+
+bool submissionIdentityMatches(const FrameSubmissionRecord& record,
+                               const FrameSubmission& submission) {
+  return record.compositorId == submission.compositorId && record.context &&
+         record.context->ready && record.context->runtimeContextId != 0u &&
+         record.context->runtimeContextId == submission.runtimeContextId &&
+         record.context->device != nil && submission.deviceRegistryId != 0u &&
+         record.context->device.registryID == submission.deviceRegistryId;
+}
+
+bool contextForCommandBuffer(id<MTLCommandBuffer> commandBuffer,
+                             std::shared_ptr<MetalContext>* outOwnedContext,
+                             MetalContext** outContext,
+                             std::string* error);
+
+std::mutex& importedSourceMutex() {
+  static std::mutex mutex;
+  return mutex;
+}
+
+std::unordered_map<uint64_t, std::shared_ptr<ImportedSourceRecord>>&
+importedSourceRegistry() {
+  static std::unordered_map<uint64_t, std::shared_ptr<ImportedSourceRecord>>
+      registry;
+  return registry;
+}
+
+// Submission/resource lock order is intentionally centralized here:
+// frameCompositorMutex() -> frameSubmissionMutex() is used only for lifecycle
+// publication.  Resource acquisition takes plotSurfaceMutex(),
+// frameTextAtlasMutex(), or scopeDerivedRegistryMutex() first, releases that
+// lock, then takes frameSubmissionMutex() to install the strong hold.  No
+// callbacks run while any registry lock is held, and no helper nests a
+// resource lock under the submission lock.  This keeps teardown, encode, and
+// completion paths from introducing a lock-order inversion.
+const char* submissionRetentionDiagnostic(SubmissionRetentionStatus status) {
+  switch (status) {
+    case SubmissionRetentionStatus::InvalidKey:
+      return "metal-frame-retention-invalid-key";
+    case SubmissionRetentionStatus::NullResource:
+      return "metal-frame-retention-null-resource";
+    case SubmissionRetentionStatus::CapacityExhausted:
+      return "metal-frame-retention-capacity-exhausted";
+    case SubmissionRetentionStatus::KeyConflict:
+      return "metal-frame-retention-key-conflict";
+    case SubmissionRetentionStatus::Sealed:
+      return "metal-frame-retention-sealed";
+    case SubmissionRetentionStatus::InvalidCapacity:
+      return "metal-frame-retention-invalid-capacity";
+    case SubmissionRetentionStatus::NotFound:
+      return "metal-frame-retention-not-found";
+    case SubmissionRetentionStatus::Retained:
+    case SubmissionRetentionStatus::Duplicate:
+      return nullptr;
+  }
+  return "metal-frame-retention-invalid-status";
+}
+
+bool retainSubmissionResource(const FrameSubmission& submission,
+                              const SubmissionRetentionKey& key,
+                              const std::shared_ptr<void>& resource,
+                              std::string* error,
+                              bool* outAdded = nullptr) {
+  if (error) error->clear();
+  if (outAdded) *outAdded = false;
+  if (submission.submissionId == 0u || submission.compositorId == 0u) {
+    if (error) *error = "invalid-metal-frame-submission-retention";
+    return false;
+  }
+  if (key.ownerCompositorId != submission.compositorId) {
+    if (error) *error = "metal-frame-retention-owner-mismatch";
+    return false;
+  }
+  std::lock_guard<std::mutex> lock(frameSubmissionMutex());
+  auto submissionIt = frameSubmissionRegistry().find(submission.submissionId);
+  if (submissionIt == frameSubmissionRegistry().end()) {
+    if (error) *error = "metal-frame-submission-not-found";
+    return false;
+  }
+  if (!submissionIdentityMatches(submissionIt->second, submission)) {
+    if (error) *error = "metal-frame-submission-context-mismatch";
+    return false;
+  }
+  const SubmissionRetentionStatus status =
+      submissionIt->second.retainedResources.retain(key, resource);
+  if (ChromaspaceMetalSubmissionRetention::succeeded(status)) {
+    if (outAdded) *outAdded = status == SubmissionRetentionStatus::Retained;
+    return true;
+  }
+  if (error) *error = submissionRetentionDiagnostic(status);
+  return false;
+}
+
+bool releaseSubmissionResource(const FrameSubmission& submission,
+                               const SubmissionRetentionKey& key) {
+  if (submission.submissionId == 0u) return false;
+  std::lock_guard<std::mutex> lock(frameSubmissionMutex());
+  auto submissionIt = frameSubmissionRegistry().find(submission.submissionId);
+  if (submissionIt == frameSubmissionRegistry().end() ||
+      !submissionIdentityMatches(submissionIt->second, submission)) {
+    return false;
+  }
+  return submissionIt->second.retainedResources.release(key) ==
+         SubmissionRetentionStatus::Retained;
+}
+
+bool retainPlotSurfaceForSubmission(
+    const FrameSubmission& submission,
+    uint32_t surfaceId,
+    std::shared_ptr<PlotSurfaceRecord>* outRecord,
+    std::string* error) {
+  if (outRecord) outRecord->reset();
+  if (surfaceId == 0u) {
+    if (error) *error = "invalid-metal-plot-surface-handle";
+    return false;
+  }
+  std::shared_ptr<PlotSurfaceRecord> record;
+  {
+    std::lock_guard<std::mutex> lock(plotSurfaceMutex());
+    const auto it = plotSurfaceRegistry().find(surfaceId);
+    if (it == plotSurfaceRegistry().end() || !it->second ||
+        it->second->texture == nil) {
+      if (error) *error = "metal-plot-surface-not-found";
+      return false;
+    }
+    if (it->second->ownerCompositorId == 0u) {
+      if (error) *error = "metal-plot-surface-is-compatibility-owned";
+      return false;
+    }
+    if (it->second->ownerCompositorId != submission.compositorId) {
+      if (error) *error = "metal-plot-surface-compositor-mismatch";
+      return false;
+    }
+    record = it->second;
+  }
+  const SubmissionRetentionKey key{
+      SubmissionRetentionKind::PlotSurface,
+      static_cast<uint64_t>(surfaceId),
+      submission.compositorId};
+  bool added = false;
+  if (!retainSubmissionResource(submission, key, record, error, &added)) {
+    return false;
+  }
+  bool stillLive = false;
+  {
+    std::lock_guard<std::mutex> lock(plotSurfaceMutex());
+    const auto it = plotSurfaceRegistry().find(surfaceId);
+    stillLive = it != plotSurfaceRegistry().end() && it->second == record &&
+                it->second->ownerCompositorId == submission.compositorId &&
+                it->second->texture != nil;
+  }
+  if (!stillLive) {
+    if (added) (void)releaseSubmissionResource(submission, key);
+    if (error) *error = "metal-frame-retention-retired-during-acquire";
+    return false;
+  }
+  if (outRecord) *outRecord = std::move(record);
+  return true;
+}
+
+bool retainFrameTextAtlasForSubmission(
+    const FrameSubmission& submission,
+    uint64_t atlasId,
+    std::shared_ptr<FrameTextAtlasRecord>* outRecord,
+    std::string* error) {
+  if (outRecord) outRecord->reset();
+  if (atlasId == 0u) {
+    if (error) *error = "invalid-metal-frame-text-atlas-handle";
+    return false;
+  }
+  std::shared_ptr<FrameTextAtlasRecord> record;
+  {
+    std::lock_guard<std::mutex> lock(frameTextAtlasMutex());
+    const auto it = frameTextAtlasRegistry().find(atlasId);
+    if (it == frameTextAtlasRegistry().end() || !it->second ||
+        it->second->texture == nil) {
+      if (error) *error = "metal-frame-text-atlas-not-found";
+      return false;
+    }
+    if (it->second->ownerCompositorId == 0u) {
+      if (error) *error = "metal-frame-text-atlas-owner-zero";
+      return false;
+    }
+    if (it->second->ownerCompositorId != submission.compositorId) {
+      if (error) *error = "metal-frame-text-atlas-owner-mismatch";
+      return false;
+    }
+    record = it->second;
+  }
+  const SubmissionRetentionKey key{
+      SubmissionRetentionKind::TextAtlas, atlasId, submission.compositorId};
+  bool added = false;
+  if (!retainSubmissionResource(submission, key, record, error, &added)) {
+    return false;
+  }
+  bool stillLive = false;
+  {
+    std::lock_guard<std::mutex> lock(frameTextAtlasMutex());
+    const auto it = frameTextAtlasRegistry().find(atlasId);
+    stillLive = it != frameTextAtlasRegistry().end() && it->second == record &&
+                it->second->ownerCompositorId == submission.compositorId &&
+                it->second->texture != nil;
+  }
+  if (!stillLive) {
+    if (added) (void)releaseSubmissionResource(submission, key);
+    if (error) *error = "metal-frame-retention-retired-during-acquire";
+    return false;
+  }
+  if (outRecord) *outRecord = std::move(record);
+  return true;
+}
+
+uint64_t allocateImportedSourceIdLocked() {
+  auto& registry = importedSourceRegistry();
+  constexpr size_t kMaximumImportedSources = 32u * 3u;
+  if (registry.size() >= kMaximumImportedSources) return 0;
+  if (registry.size() >=
+      static_cast<size_t>(std::numeric_limits<uint64_t>::max()) - 1u) {
+    return 0;
+  }
+  static uint64_t nextId = 1;
+  if (nextId == 0) nextId = 1;
+  const uint64_t firstCandidate = nextId;
+  do {
+    const uint64_t candidate = nextId++;
+    if (nextId == 0) nextId = 1;
+    if (candidate != 0 && registry.find(candidate) == registry.end()) {
+      return candidate;
+    }
+  } while (nextId != firstCandidate);
+  return 0;
+}
+
+bool beginImportedSourceUse(
+    const std::shared_ptr<ImportedSourceRecord>& record) {
+  if (!record) return false;
+  std::lock_guard<std::mutex> lock(record->lifetimeMutex);
+  if (record->retirementRequested) return false;
+  ++record->inFlightSubmissionUses;
+  return true;
+}
+
+void completeImportedSourceUse(
+    const std::shared_ptr<ImportedSourceRecord>& record) {
+  if (!record) return;
+  ImportedSourceRetirementCallback callback = nullptr;
+  void* callbackContext = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(record->lifetimeMutex);
+    if (record->inFlightSubmissionUses == 0) return;
+    --record->inFlightSubmissionUses;
+    if (record->retirementRequested &&
+        record->inFlightSubmissionUses == 0) {
+      callback = record->retirementCallback;
+      callbackContext = record->retirementContext;
+      record->retirementCallback = nullptr;
+      record->retirementContext = nullptr;
+    }
+  }
+  if (callback != nullptr) callback(callbackContext);
+}
+
+constexpr int64_t kFrameSlotTimeoutNanoseconds = 250ll * 1000ll * 1000ll;
+
+uint64_t allocateFrameSubmissionIdLocked() {
+  auto& registry = frameSubmissionRegistry();
+  constexpr size_t kMaximumLiveSubmissions =
+      static_cast<size_t>(std::numeric_limits<uint64_t>::max()) - 1u;
+  if (registry.size() >= kMaximumLiveSubmissions) return 0;
+
+  static uint64_t nextId = 1;
+  if (nextId == 0) nextId = 1;
+  const uint64_t firstCandidate = nextId;
+  do {
+    const uint64_t candidate = nextId;
+    ++nextId;
+    if (nextId == 0) nextId = 1;
+    if (candidate != 0 && registry.find(candidate) == registry.end()) {
+      return candidate;
+    }
+  } while (nextId != firstCandidate);
+  return 0;
+}
+
+bool commandBufferForFrameSubmission(const FrameSubmission& submission,
+                                     id<MTLCommandBuffer>* outCommandBuffer,
+                                     std::string* error,
+                                     FrameFailureKind* failure = nullptr) {
+  if (outCommandBuffer) *outCommandBuffer = nil;
+  if (submission.submissionId == 0 || submission.compositorId == 0) {
+    if (error) *error = "invalid-metal-frame-submission";
+    setFrameFailure(failure, FrameFailureKind::InvalidState);
+    return false;
+  }
+  std::lock_guard<std::mutex> lock(frameSubmissionMutex());
+  auto it = frameSubmissionRegistry().find(submission.submissionId);
+  if (it == frameSubmissionRegistry().end()) {
+    if (error) *error = "metal-frame-submission-not-found";
+    setFrameFailure(failure, FrameFailureKind::InvariantViolation);
+    return false;
+  }
+  if (!submissionIdentityMatches(it->second, submission)) {
+    if (error) *error = "metal-frame-submission-context-mismatch";
+    setFrameFailure(failure, FrameFailureKind::InvariantViolation);
+    return false;
+  }
+  if (it->second.commandBuffer == nil) {
+    if (error) *error = "metal-frame-submission-command-buffer-unavailable";
+    setFrameFailure(failure, FrameFailureKind::CommandBufferUnavailable);
+    return false;
+  }
+  if (outCommandBuffer) *outCommandBuffer = it->second.commandBuffer;
+  return true;
+}
+
+bool importedSourceForFrameSubmission(
+    const FrameSubmission& submission,
+    uint64_t sourceId,
+    std::shared_ptr<ImportedSourceRecord>* outRecord,
+    std::string* error) {
+  if (outRecord) outRecord->reset();
+  if (sourceId == 0) {
+    if (error) *error = "invalid-imported-source-handle";
+    return false;
+  }
+
+  {
+    std::lock_guard<std::mutex> lock(frameSubmissionMutex());
+    auto submissionIt =
+        frameSubmissionRegistry().find(submission.submissionId);
+    if (submissionIt == frameSubmissionRegistry().end()) {
+      if (error) *error = "metal-frame-submission-not-found";
+      return false;
+    }
+    FrameSubmissionRecord& submissionRecord = submissionIt->second;
+    if (!submissionIdentityMatches(submissionRecord, submission)) {
+      if (error) *error = "metal-frame-submission-context-mismatch";
+      return false;
+    }
+    if (submissionRecord.commandBuffer == nil) {
+      if (error) *error = "metal-frame-submission-command-buffer-unavailable";
+      return false;
+    }
+    auto retainedIt =
+        submissionRecord.retainedImportedSources.find(sourceId);
+    if (retainedIt != submissionRecord.retainedImportedSources.end()) {
+      if (!retainedIt->second ||
+          retainedIt->second->descriptor.deviceRegistryId !=
+              submission.deviceRegistryId) {
+        if (error) *error = "imported-source-submission-device-mismatch";
+        return false;
+      }
+      if (outRecord) *outRecord = retainedIt->second;
+      return true;
+    }
+  }
+
+  std::shared_ptr<ImportedSourceRecord> record;
+  {
+    std::lock_guard<std::mutex> lock(importedSourceMutex());
+    auto it = importedSourceRegistry().find(sourceId);
+    if (it == importedSourceRegistry().end() || !it->second ||
+        it->second->texture == nil || it->second->readyEvent == nil) {
+      if (error) *error = "imported-source-not-found";
+      return false;
+    }
+    record = it->second;
+  }
+  if (record->descriptor.deviceRegistryId != submission.deviceRegistryId) {
+    if (error) *error = "imported-source-submission-device-mismatch";
+    return false;
+  }
+
+  {
+    std::lock_guard<std::mutex> lock(frameSubmissionMutex());
+    auto submissionIt =
+        frameSubmissionRegistry().find(submission.submissionId);
+    if (submissionIt == frameSubmissionRegistry().end()) {
+      if (error) *error = "metal-frame-submission-not-found";
+      return false;
+    }
+    FrameSubmissionRecord& submissionRecord = submissionIt->second;
+    if (!submissionIdentityMatches(submissionRecord, submission)) {
+      if (error) *error = "metal-frame-submission-context-mismatch";
+      return false;
+    }
+    if (submissionRecord.commandBuffer == nil) {
+      if (error) *error = "metal-frame-submission-command-buffer-unavailable";
+      return false;
+    }
+    auto retainedIt =
+        submissionRecord.retainedImportedSources.find(sourceId);
+    if (retainedIt != submissionRecord.retainedImportedSources.end()) {
+      record = retainedIt->second;
+      if (!record || record->descriptor.deviceRegistryId !=
+                         submission.deviceRegistryId) {
+        if (error) *error = "imported-source-submission-device-mismatch";
+        return false;
+      }
+    } else {
+      FrameSubmissionTransactionRecord transaction{};
+      transaction.completed =
+          [record](bool) { completeImportedSourceUse(record); };
+      transaction.abandoned =
+          [record]() { completeImportedSourceUse(record); };
+      // Allocate every frame-owned record before acquiring the GPU lifetime
+      // count. Retirement may win between the global lookup and this point;
+      // beginImportedSourceUse then fails and both records roll back before
+      // any Metal command references the source.
+      const size_t transactionCountBefore =
+          submissionRecord.transactions.size();
+      try {
+        submissionRecord.transactions.push_back(std::move(transaction));
+        submissionRecord.retainedImportedSources.emplace(sourceId, record);
+      } catch (...) {
+        if (submissionRecord.transactions.size() >
+            transactionCountBefore) {
+          submissionRecord.transactions.resize(transactionCountBefore);
+        }
+        submissionRecord.retainedImportedSources.erase(sourceId);
+        if (error) {
+          *error = "metal-frame-imported-source-retention-allocation-failed";
+        }
+        return false;
+      }
+      if (!beginImportedSourceUse(record)) {
+        submissionRecord.transactions.pop_back();
+        submissionRecord.retainedImportedSources.erase(sourceId);
+        if (error) *error = "imported-source-retirement-in-progress";
+        return false;
+      }
+      [submissionRecord.commandBuffer encodeWaitForEvent:record->readyEvent
+                                                   value:record->descriptor.readyValue];
+    }
+  }
+  if (outRecord) *outRecord = std::move(record);
+  return true;
+}
+
+bool validatePlotSurfaceOwnerForSubmission(const FrameSubmission& submission,
+                                           uint32_t surfaceId,
+                                           std::string* error) {
+  return retainPlotSurfaceForSubmission(submission, surfaceId, nullptr, error);
+}
+
+bool validateResidentDerivedOwnerForSubmission(
+    const FrameSubmission& submission,
+    uint64_t cacheId,
+    uint64_t ownerCompositorId,
+    std::string* error) {
+  if (cacheId == 0u && ownerCompositorId == 0u) return true;
+  if (cacheId == 0u || submission.compositorId == 0u ||
+      ownerCompositorId != submission.compositorId) {
+    if (error) *error = "metal-resident-derived-cache-owner-mismatch";
+    return false;
+  }
+  return true;
+}
+
+uint64_t nextFrameCompositorId() {
   static uint64_t nextId = 1;
   return nextId++;
 }
 
+std::mutex& frameTextAtlasMutex() {
+  static std::mutex mutex;
+  return mutex;
+}
+
+std::unordered_map<uint64_t, std::shared_ptr<FrameTextAtlasRecord>>&
+frameTextAtlasRegistry() {
+  static std::unordered_map<uint64_t, std::shared_ptr<FrameTextAtlasRecord>>
+      registry;
+  return registry;
+}
+
+// Must be called while frameTextAtlasMutex() is held.
+uint64_t allocateFrameTextAtlasIdLocked() {
+  auto& registry = frameTextAtlasRegistry();
+  constexpr size_t kMaximumLiveAtlases =
+      static_cast<size_t>(std::numeric_limits<uint64_t>::max()) - 1u;
+  if (registry.size() >= kMaximumLiveAtlases) return 0;
+
+  static uint64_t nextId = 1;
+  if (nextId == 0) nextId = 1;
+  const uint64_t firstCandidate = nextId;
+  do {
+    const uint64_t candidate = nextId;
+    ++nextId;
+    if (nextId == 0) nextId = 1;
+    if (candidate != 0 && registry.find(candidate) == registry.end()) {
+      return candidate;
+    }
+  } while (nextId != firstCandidate);
+  return 0;
+}
+
+std::mutex& scopeDerivedRegistryMutex() {
+  static std::mutex mutex;
+  return mutex;
+}
+
+std::unordered_map<uint64_t, ScopeDerivedResidentEntry>&
+scopeDerivedRegistry() {
+  static std::unordered_map<uint64_t, ScopeDerivedResidentEntry> registry;
+  return registry;
+}
+
+uint64_t allocateScopeDerivedCacheIdLocked() {
+  auto& registry = scopeDerivedRegistry();
+  static uint64_t nextId = 1;
+  if (nextId == 0) nextId = 1;
+  const uint64_t firstCandidate = nextId;
+  do {
+    const uint64_t candidate = nextId;
+    ++nextId;
+    if (nextId == 0) nextId = 1;
+    if (candidate != 0 && registry.find(candidate) == registry.end()) {
+      return candidate;
+    }
+  } while (nextId != firstCandidate);
+  return 0;
+}
+
+bool scopeDerivedRecordMatchesCache(
+    const ScopeDerivedResidentRecord& record,
+    const ScopeDerivedCache& cache) {
+  return record.family == cache.family &&
+         record.byteSize == cache.byteSize;
+}
+
+bool selectScopeDerivedRecordLocked(
+    uint64_t cacheId,
+    uint64_t producingSubmissionId,
+    bool allowOwnPending,
+    const ScopeDerivedCache& cache,
+    std::shared_ptr<ScopeDerivedResidentRecord>* outRecord) {
+  if (outRecord) outRecord->reset();
+  auto entryIt = scopeDerivedRegistry().find(cacheId);
+  if (entryIt == scopeDerivedRegistry().end()) return false;
+  const ScopeDerivedResidentEntry& entry = entryIt->second;
+  if (entry.ownerCompositorId != cache.ownerCompositorId) return false;
+  if (allowOwnPending && producingSubmissionId != 0) {
+    for (const auto& version : entry.inFlight) {
+      if (version.state == ScopeDerivedResidentVersionState::Pending &&
+          version.submissionId == producingSubmissionId && version.record &&
+          scopeDerivedRecordMatchesCache(*version.record, cache)) {
+        if (outRecord) *outRecord = version.record;
+        return true;
+      }
+    }
+  }
+  for (auto versionIt = entry.inFlight.rbegin();
+       versionIt != entry.inFlight.rend(); ++versionIt) {
+    if (versionIt->state == ScopeDerivedResidentVersionState::Submitted &&
+        versionIt->record &&
+        scopeDerivedRecordMatchesCache(*versionIt->record, cache)) {
+      if (outRecord) *outRecord = versionIt->record;
+      return true;
+    }
+  }
+  if (entry.committed &&
+      scopeDerivedRecordMatchesCache(*entry.committed, cache)) {
+    if (outRecord) *outRecord = entry.committed;
+    return true;
+  }
+  return false;
+}
+
+bool resolveScopeDerivedRecordLocked(
+    uint64_t cacheId,
+    uint64_t producingSubmissionId,
+    bool allowOwnPending,
+    const ScopeDerivedCache& cache,
+    ScopeDerivedResidentRecord* outRecord) {
+  std::shared_ptr<ScopeDerivedResidentRecord> selected;
+  if (!selectScopeDerivedRecordLocked(cacheId,
+                                      producingSubmissionId,
+                                      allowOwnPending,
+                                      cache,
+                                      &selected)) {
+    return false;
+  }
+  if (outRecord) *outRecord = *selected;
+  return true;
+}
+
+bool scopeDerivedRegistryContainsRecordLocked(
+    uint64_t cacheId,
+    uint64_t ownerCompositorId,
+    const std::shared_ptr<ScopeDerivedResidentRecord>& record) {
+  const auto entryIt = scopeDerivedRegistry().find(cacheId);
+  if (entryIt == scopeDerivedRegistry().end() ||
+      entryIt->second.ownerCompositorId != ownerCompositorId || !record) {
+    return false;
+  }
+  if (entryIt->second.committed == record) return true;
+  for (const auto& version : entryIt->second.inFlight) {
+    if (version.record == record) return true;
+  }
+  return false;
+}
+
+bool resolveScopeDerivedRecord(const ScopeDerivedCache& cache,
+                               uint64_t producingSubmissionId,
+                               uint64_t expectedCompositorId,
+                               bool allowOwnPending,
+                               ScopeDerivedResidentRecord* outRecord) {
+  if (cache.cacheId == 0 || cache.byteSize == 0 || !cache.available ||
+      cache.ownerCompositorId != expectedCompositorId) {
+    return false;
+  }
+  std::lock_guard<std::mutex> lock(scopeDerivedRegistryMutex());
+  return resolveScopeDerivedRecordLocked(cache.cacheId,
+                                         producingSubmissionId,
+                                         allowOwnPending,
+                                         cache,
+                                         outRecord);
+}
+
+bool resolveScopeDerivedRecordForSubmission(
+    const FrameSubmission& submission,
+    const ScopeDerivedCache& cache,
+    bool allowOwnPending,
+    ScopeDerivedResidentRecord* outRecord,
+    std::string* error) {
+  if (cache.cacheId == 0u || cache.byteSize == 0u || !cache.available) {
+    return false;
+  }
+  if (submission.submissionId == 0u || submission.compositorId == 0u) {
+    if (error) *error = "invalid-metal-frame-submission-retention";
+    return false;
+  }
+  if (cache.ownerCompositorId != submission.compositorId) {
+    if (error) *error = "metal-resident-derived-cache-owner-mismatch";
+    return false;
+  }
+
+  std::shared_ptr<ScopeDerivedResidentRecord> record;
+  {
+    std::lock_guard<std::mutex> lock(scopeDerivedRegistryMutex());
+    if (!selectScopeDerivedRecordLocked(cache.cacheId,
+                                        submission.submissionId,
+                                        allowOwnPending,
+                                        cache,
+                                        &record)) {
+      return false;
+    }
+  }
+
+  const SubmissionRetentionKey key{
+      SubmissionRetentionKind::DerivedRecord,
+      cache.cacheId,
+      submission.compositorId};
+  bool added = false;
+  if (!retainSubmissionResource(submission, key, record, error, &added)) {
+    return false;
+  }
+  bool stillLive = false;
+  {
+    std::lock_guard<std::mutex> lock(scopeDerivedRegistryMutex());
+    stillLive = scopeDerivedRegistryContainsRecordLocked(
+        cache.cacheId, submission.compositorId, record);
+  }
+  if (!stillLive) {
+    if (added) (void)releaseSubmissionResource(submission, key);
+    if (error) *error = "metal-frame-retention-retired-during-acquire";
+    return false;
+  }
+  if (outRecord) *outRecord = *record;
+  return true;
+}
+
+bool glossFieldRecordMatchesCache(const GlossFieldResidentRecord& record,
+                                  const GlossFieldCache& cache) {
+  return record.gridWidth == cache.gridWidth &&
+         record.gridHeight == cache.gridHeight &&
+         record.byteSize == cache.byteSize;
+}
+
+ScopeDerivedCache glossDerivedCache(const GlossFieldCache& cache) {
+  ScopeDerivedCache derived{};
+  derived.cacheId = cache.cacheId;
+  derived.ownerCompositorId = cache.ownerCompositorId;
+  derived.builtSerial = cache.builtSerial;
+  derived.byteSize = cache.byteSize;
+  derived.family = ScopeDerivedFamily::GlossField;
+  derived.available = cache.available;
+  return derived;
+}
+
+bool resolveGlossFieldRecord(const GlossFieldCache& cache,
+                             uint64_t producingSubmissionId,
+                             uint64_t expectedCompositorId,
+                             bool allowOwnPending,
+                             GlossFieldResidentRecord* outRecord) {
+  if (cache.cacheId == 0 || cache.gridWidth <= 0 ||
+      cache.gridHeight <= 0 || cache.builtSerial == 0 ||
+      cache.byteSize == 0u || !cache.available) {
+    return false;
+  }
+  ScopeDerivedResidentRecord derived{};
+  if (!resolveScopeDerivedRecord(glossDerivedCache(cache),
+                                 producingSubmissionId,
+                                 expectedCompositorId,
+                                 allowOwnPending,
+                                 &derived) ||
+      derived.family != ScopeDerivedFamily::GlossField ||
+      !derived.glossField ||
+      !glossFieldRecordMatchesCache(*derived.glossField, cache)) {
+    return false;
+  }
+  if (outRecord) *outRecord = *derived.glossField;
+  return true;
+}
+
+bool resolveGlossFieldRecordForSubmission(
+    const FrameSubmission& submission,
+    const GlossFieldCache& cache,
+    bool allowOwnPending,
+    GlossFieldResidentRecord* outRecord,
+    std::string* error) {
+  if (cache.cacheId == 0u || cache.gridWidth <= 0 ||
+      cache.gridHeight <= 0 || cache.builtSerial == 0u ||
+      cache.byteSize == 0u || !cache.available) {
+    return false;
+  }
+  ScopeDerivedResidentRecord derived{};
+  if (!resolveScopeDerivedRecordForSubmission(submission,
+                                               glossDerivedCache(cache),
+                                               allowOwnPending,
+                                               &derived,
+                                               error)) {
+    return false;
+  }
+  if (derived.family != ScopeDerivedFamily::GlossField ||
+      !derived.glossField ||
+      !glossFieldRecordMatchesCache(*derived.glossField, cache)) {
+    if (error) *error = "metal-gloss-field-cache-record-mismatch";
+    return false;
+  }
+  if (outRecord) *outRecord = *derived.glossField;
+  return true;
+}
+
+bool addFrameSubmissionTransaction(
+    const FrameSubmission& submission,
+    FrameSubmissionTransactionRecord transaction,
+    std::string* error) {
+  if (submission.submissionId == 0 || submission.compositorId == 0) {
+    if (error) *error = "invalid-metal-frame-submission-transaction";
+    return false;
+  }
+  std::lock_guard<std::mutex> lock(frameSubmissionMutex());
+  auto it = frameSubmissionRegistry().find(submission.submissionId);
+  if (it == frameSubmissionRegistry().end()) {
+    if (error) *error = "metal-frame-submission-not-found";
+    return false;
+  }
+  if (!submissionIdentityMatches(it->second, submission)) {
+    if (error) *error = "metal-frame-submission-transaction-mismatch";
+    return false;
+  }
+  try {
+    it->second.transactions.push_back(std::move(transaction));
+  } catch (...) {
+    if (error) *error = "metal-frame-submission-transaction-allocation-failed";
+    return false;
+  }
+  return true;
+}
+
+void markScopeDerivedVersionSubmitted(uint64_t cacheId,
+                                      uint64_t submissionId) {
+  std::lock_guard<std::mutex> lock(scopeDerivedRegistryMutex());
+  auto entryIt = scopeDerivedRegistry().find(cacheId);
+  if (entryIt == scopeDerivedRegistry().end()) return;
+  for (auto& version : entryIt->second.inFlight) {
+    if (version.submissionId == submissionId &&
+        version.state == ScopeDerivedResidentVersionState::Pending) {
+      version.state = ScopeDerivedResidentVersionState::Submitted;
+      return;
+    }
+  }
+}
+
+void abandonScopeDerivedVersion(uint64_t cacheId,
+                                uint64_t submissionId) {
+  std::lock_guard<std::mutex> lock(scopeDerivedRegistryMutex());
+  auto entryIt = scopeDerivedRegistry().find(cacheId);
+  if (entryIt == scopeDerivedRegistry().end()) return;
+  auto& versions = entryIt->second.inFlight;
+  versions.erase(
+      std::remove_if(
+          versions.begin(), versions.end(),
+          [&](const ScopeDerivedResidentVersion& version) {
+            return version.submissionId == submissionId &&
+                   version.state == ScopeDerivedResidentVersionState::Pending;
+          }),
+      versions.end());
+  if (!entryIt->second.committed && versions.empty()) {
+    scopeDerivedRegistry().erase(entryIt);
+  }
+}
+
+void completeScopeDerivedVersion(uint64_t cacheId,
+                                 uint64_t submissionId,
+                                 bool success) {
+  std::lock_guard<std::mutex> lock(scopeDerivedRegistryMutex());
+  auto entryIt = scopeDerivedRegistry().find(cacheId);
+  if (entryIt == scopeDerivedRegistry().end()) return;
+  ScopeDerivedResidentEntry& entry = entryIt->second;
+  auto versionIt = std::find_if(
+      entry.inFlight.begin(), entry.inFlight.end(),
+      [&](const ScopeDerivedResidentVersion& version) {
+        return version.submissionId == submissionId &&
+               version.state == ScopeDerivedResidentVersionState::Submitted;
+      });
+  if (versionIt == entry.inFlight.end()) return;
+  if (success && versionIt->record) entry.committed = versionIt->record;
+  entry.inFlight.erase(versionIt);
+}
+
+bool registerPendingScopeDerivedRecord(
+    const FrameSubmission& submission,
+    ScopeDerivedCache* cache,
+    ScopeDerivedResidentRecord record,
+    std::string* error) {
+  if (!cache || submission.submissionId == 0u ||
+      submission.compositorId == 0u || record.builtSerial == 0u ||
+      record.byteSize == 0u ||
+      (cache->ownerCompositorId != 0u &&
+       cache->ownerCompositorId != submission.compositorId)) {
+    if (error) *error = "invalid-metal-resident-derived-record";
+    return false;
+  }
+  uint64_t cacheId = cache->cacheId;
+  std::shared_ptr<ScopeDerivedResidentRecord> pendingRecord;
+  try {
+    pendingRecord =
+        std::make_shared<ScopeDerivedResidentRecord>(std::move(record));
+  } catch (...) {
+    if (error) *error = "metal-resident-derived-cache-record-allocation-failed";
+    return false;
+  }
+  if (cache->available && cache->byteSize != 0 &&
+      cache->byteSize != pendingRecord->byteSize) {
+    if (error) *error = "metal-resident-derived-cache-byte-size-changed";
+    return false;
+  }
+  {
+    std::lock_guard<std::mutex> lock(scopeDerivedRegistryMutex());
+    const bool cacheKnown =
+        cacheId != 0 &&
+        scopeDerivedRegistry().find(cacheId) != scopeDerivedRegistry().end();
+    if (cacheKnown &&
+        (cache->ownerCompositorId != submission.compositorId ||
+         scopeDerivedRegistry().find(cacheId)->second.ownerCompositorId !=
+             submission.compositorId)) {
+      if (error) *error = "metal-resident-derived-cache-owner-mismatch";
+      return false;
+    }
+    if (!cacheKnown) cacheId = allocateScopeDerivedCacheIdLocked();
+    if (cacheId == 0) {
+      if (error) *error = "metal-resident-derived-cache-handle-exhausted";
+      return false;
+    }
+    ScopeDerivedResidentEntry* entry = nullptr;
+    try {
+      entry = &scopeDerivedRegistry()[cacheId];
+    } catch (...) {
+      if (error) *error = "metal-resident-derived-cache-registry-allocation-failed";
+      return false;
+    }
+    if (entry->ownerCompositorId != 0u &&
+        entry->ownerCompositorId != submission.compositorId) {
+      if (error) *error = "metal-resident-derived-entry-owner-mismatch";
+      return false;
+    }
+    if (entry->committed || !entry->inFlight.empty()) {
+      if (error) *error = "metal-resident-derived-cache-already-materialized";
+      return false;
+    }
+    entry->ownerCompositorId = submission.compositorId;
+    ScopeDerivedResidentVersion version{};
+    version.submissionId = submission.submissionId;
+    version.record = pendingRecord;
+    try {
+      entry->inFlight.push_back(std::move(version));
+    } catch (...) {
+      if (!entry->committed && entry->inFlight.empty()) {
+        scopeDerivedRegistry().erase(cacheId);
+      }
+      if (error) *error = "metal-resident-derived-cache-version-allocation-failed";
+      return false;
+    }
+  }
+  const SubmissionRetentionKey retentionKey{
+      SubmissionRetentionKind::DerivedRecord,
+      cacheId,
+      submission.compositorId};
+  bool retentionAdded = false;
+  if (!retainSubmissionResource(submission,
+                                retentionKey,
+                                pendingRecord,
+                                error,
+                                &retentionAdded)) {
+    abandonScopeDerivedVersion(cacheId, submission.submissionId);
+    return false;
+  }
+  bool pendingStillLive = false;
+  {
+    std::lock_guard<std::mutex> lock(scopeDerivedRegistryMutex());
+    pendingStillLive = scopeDerivedRegistryContainsRecordLocked(
+        cacheId, submission.compositorId, pendingRecord);
+  }
+  if (!pendingStillLive) {
+    if (retentionAdded) {
+      (void)releaseSubmissionResource(submission, retentionKey);
+    }
+    abandonScopeDerivedVersion(cacheId, submission.submissionId);
+    if (error) *error = "metal-frame-retention-retired-during-acquire";
+    return false;
+  }
+  FrameSubmissionTransactionRecord transaction{};
+  transaction.submitted = [cacheId, submissionId = submission.submissionId]() {
+    markScopeDerivedVersionSubmitted(cacheId, submissionId);
+  };
+  transaction.completed =
+      [cacheId, submissionId = submission.submissionId](bool success) {
+        completeScopeDerivedVersion(cacheId, submissionId, success);
+      };
+  transaction.abandoned = [cacheId, submissionId = submission.submissionId]() {
+    abandonScopeDerivedVersion(cacheId, submissionId);
+  };
+  if (!addFrameSubmissionTransaction(submission, std::move(transaction), error)) {
+    abandonScopeDerivedVersion(cacheId, submission.submissionId);
+    if (retentionAdded) {
+      (void)releaseSubmissionResource(submission, retentionKey);
+    }
+    return false;
+  }
+  cache->cacheId = cacheId;
+  cache->ownerCompositorId = submission.compositorId;
+  cache->builtSerial = pendingRecord->builtSerial;
+  cache->byteSize = pendingRecord->byteSize;
+  cache->family = pendingRecord->family;
+  cache->available = true;
+  return true;
+}
+
+bool registerCommittedScopeDerivedRecord(
+    ScopeDerivedCache* cache,
+    ScopeDerivedResidentRecord record,
+    std::string* error) {
+  if (!cache || cache->ownerCompositorId != 0u ||
+      record.builtSerial == 0u || record.byteSize == 0u) {
+    if (error) *error = "invalid-metal-committed-derived-record";
+    return false;
+  }
+  std::shared_ptr<ScopeDerivedResidentRecord> committedRecord;
+  try {
+    committedRecord =
+        std::make_shared<ScopeDerivedResidentRecord>(std::move(record));
+  } catch (...) {
+    if (error) *error = "metal-committed-derived-record-allocation-failed";
+    return false;
+  }
+  uint64_t cacheId = cache->cacheId;
+  {
+    std::lock_guard<std::mutex> lock(scopeDerivedRegistryMutex());
+    const bool cacheKnown =
+        cacheId != 0u &&
+        scopeDerivedRegistry().find(cacheId) != scopeDerivedRegistry().end();
+    if (!cacheKnown) cacheId = allocateScopeDerivedCacheIdLocked();
+    if (cacheId == 0u) {
+      if (error) *error = "metal-committed-derived-handle-exhausted";
+      return false;
+    }
+    ScopeDerivedResidentEntry* entry = nullptr;
+    try {
+      entry = &scopeDerivedRegistry()[cacheId];
+    } catch (...) {
+      if (error) *error = "metal-committed-derived-registry-allocation-failed";
+      return false;
+    }
+    if (entry->ownerCompositorId != 0u) {
+      if (error) *error = "metal-committed-derived-owner-mismatch";
+      return false;
+    }
+    if (!entry->inFlight.empty()) {
+      if (error) *error = "metal-committed-derived-in-flight-conflict";
+      return false;
+    }
+    entry->committed = committedRecord;
+  }
+  cache->cacheId = cacheId;
+  cache->ownerCompositorId = 0u;
+  cache->builtSerial = committedRecord->builtSerial;
+  cache->byteSize = committedRecord->byteSize;
+  cache->family = committedRecord->family;
+  cache->available = true;
+  return true;
+}
+
+#if !defined(CHROMASPACE_METAL_NATIVE_ONLY)
 id<MTLTexture> makeTextureFromIOSurface(MetalContext& ctx,
                                         uint32_t surfaceId,
                                         int width,
@@ -391,2847 +1756,119 @@ id<MTLTexture> makeTextureFromIOSurface(MetalContext& ctx,
   if (texture == nil && error) *error = "iosurface-metal-texture-failed";
   return texture;
 }
+#endif
 
-const char* kMetalSource = R"MSL(
-#include <metal_stdlib>
-using namespace metal;
 
-constant float kTau = 6.28318530717958647692;
-constant float kPi = 3.14159265358979323846;
 
-struct OverlayUniforms {
-  int cubeSize;
-  int ramp;
-  int useInputPoints;
-  int pointCount;
-  float colorSaturation;
-  int plotMode;
-  int circularHsl;
-  int circularHsv;
-  int normConeNormalized;
-  int chromaticityInputTransfer;
-  int chromaticityReferenceBasis;
-  float chromaticityWhiteX;
-  float chromaticityWhiteY;
-  float chromaticityRgbToXyz[9];
-  float chromaticityXyzToRgb[9];
-};
+constexpr const char* kViewerMetalLibraryName = "ChromaspaceViewer.metallib";
 
-struct InputUniforms {
-  int pointCount;
-  int inputStride;
-  int glossView;
-  float sourceAspect;
-  float glossLiftScale;
-  int showOverflow;
-  int highlightOverflow;
-  int plotMode;
-  int circularHsl;
-  int circularHsv;
-  int normConeNormalized;
-  int chromaticityInputTransfer;
-  int chromaticityReferenceBasis;
-  float chromaticityWhiteX;
-  float chromaticityWhiteY;
-  float chromaticityRgbToXyz[9];
-  float chromaticityXyzToRgb[9];
-  float pointAlphaScale;
-  float denseAlphaBias;
-  float colorSaturation;
-};
-
-struct RasterSourceUniforms {
-  InputUniforms input;
-  int basePointCount;
-  int sourceWidth;
-  int sourceHeight;
-  int sampleStride;
-  int sampleCountX;
-  int pixelFormat;
-  int plotLinear;
-  int plotLinearTransfer;
-  int excludeIdentityData;
-  int isolateIdentityData;
-  int readIdentityPlot;
-  int readGrayRamp;
-  int identityCubeY1;
-  int identityCubeY2;
-  int identityRampY1;
-  int identityRampY2;
-  int identityCubeAppendOffset;
-  int identityCubeAppendCount;
-  int identityCubeAppendY1;
-  int identityCubeAppendY2;
-  int identityCubeAppendRowStep;
-  int identityCubeAppendXStep;
-  int identityRampAppendOffset;
-  int identityRampAppendCount;
-  int identityRampAppendY1;
-  int identityRampAppendY2;
-  int identityRampAppendRowStep;
-  int identityRampAppendXStep;
-  int occupancyFill;
-  int occupancyAppendOffset;
-  int occupancyAppendCount;
-  int occupancyCandidateCount;
-  int occupancyTargetThreshold;
-  int lassoEnabled;
-  int lassoStrokeCount;
-  int lassoPointCount;
-  int lassoStrokeFirst[16];
-  int lassoStrokeCountPerStroke[16];
-  int lassoStrokeSubtract[16];
-  float lassoX[256];
-  float lassoY[256];
-  int cubeSlicingEnabled;
-  int neutralRadiusEnabled;
-  float neutralRadius;
-  int cubeSliceRed;
-  int cubeSliceYellow;
-  int cubeSliceGreen;
-  int cubeSliceCyan;
-  int cubeSliceBlue;
-  int cubeSliceMagenta;
-};
-
-struct InputSampleUniforms {
-  int fullPointCount;
-  int visiblePointCount;
-};
-
-struct ScopeDensityUniforms {
-  int pointCount;
-  int waveform;
-  int scopeMode;
-  int width;
-  int height;
-  float rangeMin;
-  float invRange;
-  int excludeOverflow;
-  int onlyOverflow;
-  int channelCount;
-  int lumaMethod;
-};
-
-struct ScopeRangeUniforms {
-  int pointCount;
-  int waveform;
-  int scopeMode;
-  int includeRed;
-  int includeGreen;
-  int includeBlue;
-  int includeLuma;
-  int includeOverflow;
-  int lumaMethod;
-  int previousRangeValid;
-  float previousRangeMin;
-  float previousRangeMax;
-  int histogramBinCount;
-};
-
-struct HistogramSurfaceUniforms {
-  int pointCount;
-  int scopeMode;
-  int width;
-  int height;
-  float rangeMin;
-  float invRange;
-  int showOverflow;
-  int highlightOverflow;
-  int lumaMethod;
-  int channelCount;
-};
-
-struct GlossFieldAccumulateUniforms {
-  int pointCount;
-  int gridWidth;
-  int gridHeight;
-  int showOverflow;
-};
-
-struct GlossFieldCellUniforms {
-  int cellCount;
-  int gridWidth;
-  int gridHeight;
-  int neighborhoodChoice;
-};
-
-float clamp01(float v) {
-  return clamp(v, 0.0, 1.0);
+std::string utf8String(NSString* value) {
+  if (value == nil) return {};
+  const char* utf8 = [value UTF8String];
+  return utf8 != nullptr ? std::string(utf8) : std::string();
 }
 
-constant float kGlossFieldAccumScale = 1024.0;
-constant float kGlossFieldAccumInvScale = 1.0 / 1024.0;
-
-uint glossEncodeAccum(float v) {
-  return uint(clamp(v, 0.0, 2.0) * kGlossFieldAccumScale + 0.5);
-}
-
-float glossDecodeAccum(uint v) {
-  return float(v) * kGlossFieldAccumInvScale;
-}
-
-float glossCommonComponent(float r, float g, float b) {
-  return max(0.0, min(r, min(g, b)));
-}
-
-float glossNeutrality(float r, float g, float b) {
-  float common = glossCommonComponent(r, g, b);
-  float maxRgb = max(r, max(g, b));
-  return maxRgb > 1e-6 ? clamp(common / maxRgb, 0.0, 1.0) : 0.0;
-}
-
-float glossStrengthCue(float r, float g, float b) {
-  float common = glossCommonComponent(r, g, b);
-  float neutrality = glossNeutrality(r, g, b);
-  return clamp(common * (0.75 + 0.85 * neutrality), 0.0, 1.0);
-}
-
-float glossPresenceWeight(float glossCue) {
-  float t = clamp((glossCue - 0.06) / 0.22, 0.0, 1.0);
-  return t * t * (3.0 - 2.0 * t);
-}
-
-float wrapHue01(float h) {
-  h = fmod(h, 1.0);
-  if (h < 0.0) h += 1.0;
-  return h;
-}
-
-float luminanceAwareAlpha(float baseAlpha, float cr, float cg, float cb, float denseAlphaBias, bool overflowPoint,
-                          float pointAlphaScale) {
-  float alpha = baseAlpha * pointAlphaScale;
-  if (overflowPoint || denseAlphaBias <= 0.0) {
-    return clamp(alpha, 0.0, 1.0);
-  }
-  float luma = clamp(cr * 0.2126 + cg * 0.7152 + cb * 0.0722, 0.0, 1.0);
-  float maxRgb = clamp(max(cr, max(cg, cb)), 0.0, 1.0);
-  float value = mix(maxRgb, luma, 0.28);
-  float highlightKnee = clamp((value - 0.70) / 0.24, 0.0, 1.0);
-  float shadowMidProtect = 1.0 - clamp((value - 0.58) / 0.30, 0.0, 1.0);
-  float multiplier = clamp(1.0 + 0.22 * denseAlphaBias * shadowMidProtect
-                               - 0.12 * denseAlphaBias * highlightKnee,
-                           0.94, 1.18);
-  return clamp(alpha * multiplier, 0.0, 1.0);
-}
-
-float rawRgbHue01(float r, float g, float b, float cMax, float delta) {
-  if (delta <= 1e-6) return 0.0;
-  float h = 0.0;
-  if (cMax == r) {
-    h = fmod((g - b) / delta, 6.0);
-  } else if (cMax == g) {
-    h = ((b - r) / delta) + 2.0;
-  } else {
-    h = ((r - g) / delta) + 4.0;
-  }
-  return wrapHue01(h / 6.0);
-}
-
-float safeDiv(float num, float den) {
-  return fabs(den) < 1e-6 ? 0.0 : num / den;
-}
-
-float safeExp2Clamped(float value) {
-  return exp2(clamp(value, -126.0, 126.0));
-}
-
-float safePowPos(float value, float exponent) {
-  return value <= 0.0 ? 0.0 : pow(value, exponent);
-}
-
-float signPreservingPow(float value, float exponent) {
-  return value == 0.0 ? 0.0 : copysign(safePowPos(fabs(value), exponent), value);
-}
-
-float exp10Compat(float value) {
-  return safeExp2Clamped(value * 3.3219280948873626);
-}
-
-float decodeTransferChannel(float x, int tf) {
-  switch (tf) {
-    case 0: return x;
-    case 1: {
-      float a = fabs(x);
-      float decoded = (a <= 0.04045) ? safeDiv(a, 12.92) : safePowPos(safeDiv(a + 0.055, 1.055), 2.4);
-      return copysign(decoded, x);
-    }
-    case 2: return signPreservingPow(x, 2.4);
-    case 3: return x <= 0.02740668 ? safeDiv(x, 10.44426855) : safeExp2Clamped(safeDiv(x, 0.07329248) - 7.0) - 0.0075;
-    case 4: return x <= 0.155251141552511 ? safeDiv(x - 0.0729055341958355, 10.5402377416545) : safeExp2Clamped(x * 17.52 - 9.72);
-    case 5: return x < 5.367655 * 0.010591 + 0.092809 ? safeDiv(x - 0.092809, 5.367655) : safeDiv(exp10Compat(safeDiv(x - 0.385537, 0.247190)) - 0.052272, 5.555556);
-    case 6: return x < -0.7774983977293537 ? x * 0.3033266726886969 - 0.7774983977293537 : safeDiv(safeExp2Clamped(14.0 * safeDiv(x - 0.09286412512218964, 0.9071358748778103) + 6.0) - 64.0, 2231.8263090676883);
-    case 7: {
-      constexpr float kCut = 0.092864125;
-      constexpr float kScale = 0.24136077;
-      constexpr float kGain = 87.099375;
-      float decoded = x < kCut ? -safeDiv(exp10Compat(safeDiv(kCut - x, kScale)) - 1.0, kGain) : safeDiv(exp10Compat(safeDiv(x - kCut, kScale)) - 1.0, kGain);
-      return decoded * 0.9;
-    }
-    case 8: return x < 171.2102946929 / 1023.0 ? safeDiv((x * 1023.0 - 95.0) * 0.01125, 171.2102946929 - 95.0) : (exp10Compat(safeDiv(x * 1023.0 - 420.0, 261.5)) * 0.19 - 0.01);
-    case 9:
-      if (x < 0.04076162) return -safeDiv(exp10Compat(safeDiv(0.069886632 - x, 0.42889912)) - 1.0, 14.98325);
-      if (x <= 0.105357102) return safeDiv(x - 0.073059361, 2.3069815);
-      return safeDiv(exp10Compat(safeDiv(x - 0.073059361, 0.36726845)) - 1.0, 14.98325);
-    case 10: return x < 0.0 ? safeDiv(x, 15.1927) - 0.01 : safeDiv(exp10Compat(safeDiv(x, 0.224282)) - 1.0, 155.975327) - 0.01;
-    case 11: {
-      constexpr float kA = 8.283605932402494;
-      constexpr float kB = 0.09246575342465753;
-      constexpr float kC = 0.5300133392291939;
-      constexpr float kD = 0.08692876065491224;
-      constexpr float kE = 0.005494072432257808;
-      constexpr float kCut = kA * 0.005 + kB;
-      return x < kCut ? safeDiv(x - kB, kA) : exp(safeDiv(x - kC, kD)) - kE;
-    }
-    case 12: return x <= 0.14 ? safeDiv(x - 0.0929, 6.025) : safeDiv(exp10Compat(3.89616 * x - 2.27752) - 0.0108, 0.9892);
-    case 13: {
-      constexpr float kA = 0.555556;
-      constexpr float kB = 0.009468;
-      constexpr float kC = 0.344676;
-      constexpr float kD = 0.790453;
-      constexpr float kE = 8.735631;
-      constexpr float kF = 0.092864;
-      constexpr float kCut = 0.100537775223865;
-      return x >= kCut ? safeDiv(exp10Compat(safeDiv(x - kD, kC)), kA) - safeDiv(kB, kA) : safeDiv(x - kF, kE);
-    }
-    case 14: {
-      constexpr float kA = 5.555556;
-      constexpr float kB = 0.064829;
-      constexpr float kC = 0.245281;
-      constexpr float kD = 0.384316;
-      constexpr float kE = 8.799461;
-      constexpr float kF = 0.092864;
-      constexpr float kCut = 0.100686685370811;
-      return x >= kCut ? safeDiv(exp10Compat(safeDiv(x - kD, kC)), kA) - safeDiv(kB, kA) : safeDiv(x - kF, kE);
-    }
-    case 15: return x < 0.181 ? safeDiv(x - 0.125, 5.6) : exp10Compat(safeDiv(x - 0.598206, 0.241514)) - 0.00873;
-    case 16: return signPreservingPow(x, 2.2);
-    case 17: return signPreservingPow(x, 2.6);
-    default: return x;
+void appendUniqueMetalLibraryCandidate(std::vector<std::string>& candidates,
+                                       NSString* path) {
+  if (path == nil || [path length] == 0) return;
+  NSString* normalized = [[path stringByExpandingTildeInPath] stringByStandardizingPath];
+  const std::string candidate = utf8String(normalized);
+  if (candidate.empty()) return;
+  if (std::find(candidates.begin(), candidates.end(), candidate) == candidates.end()) {
+    candidates.push_back(candidate);
   }
 }
 
-float3 mulRows(constant float* m, float3 v) {
-  return float3(dot(float3(m[0], m[1], m[2]), v),
-                dot(float3(m[3], m[4], m[5]), v),
-                dot(float3(m[6], m[7], m[8]), v));
-}
-
-float3 xyToXyz(float2 xy, float Y) {
-  if (fabs(xy.y) <= 1e-8) return float3(xy.x, Y, 1.0 - xy.x);
-  return float3(xy.x * Y / xy.y, Y, (1.0 - xy.x - xy.y) * Y / xy.y);
-}
-
-float3 xyzToXyY(float3 xyz, float2 fallbackWhite) {
-  if (fabs(xyz.y) <= 1e-8) return float3(fallbackWhite.x, fallbackWhite.y, 0.0);
-  float sum = xyz.x + xyz.y + xyz.z;
-  if (fabs(sum) <= 1e-8) return float3(fallbackWhite.x, fallbackWhite.y, xyz.y);
-  return float3(xyz.x / sum, xyz.y / sum, xyz.y);
-}
-
-float3 mapChromaticityPosition(float r, float g, float b, constant InputUniforms& u) {
-  float3 linear = float3(decodeTransferChannel(r, u.chromaticityInputTransfer),
-                         decodeTransferChannel(g, u.chromaticityInputTransfer),
-                         decodeTransferChannel(b, u.chromaticityInputTransfer));
-  if (u.showOverflow == 0) linear = clamp(linear, 0.0, 1.0);
-  float3 xyz = mulRows(u.chromaticityRgbToXyz, linear);
-  float2 white = float2(u.chromaticityWhiteX, u.chromaticityWhiteY);
-  float3 xyY = xyzToXyY(xyz, white);
-  float2 xy = xyY.xy;
-  if (u.chromaticityReferenceBasis != 0) {
-    float3 basisXyz = xyToXyz(xy, 1.0);
-    float3 rgb = mulRows(u.chromaticityXyzToRgb, basisXyz);
-    xy = xyzToXyY(rgb, float2(1.0 / 3.0, 1.0 / 3.0)).xy;
+std::vector<std::string> viewerMetalLibraryCandidates() {
+  std::vector<std::string> candidates;
+  NSDictionary<NSString*, NSString*>* environment = [[NSProcessInfo processInfo] environment];
+  NSString* overridePath = environment[@"CHROMASPACE_METALLIB_PATH"];
+  if (overridePath != nil && [overridePath length] > 0) {
+    appendUniqueMetalLibraryCandidate(candidates, overridePath);
+    return candidates;
   }
-  float viewerHeight = ((u.showOverflow != 0) ? xyY.z : clamp(xyY.z, 0.0, 1.0)) * 2.0 - 1.0;
-  return float3((xy.x - (1.0 / 3.0)) * 3.0,
-                (xy.y - (1.0 / 3.0)) * 3.0,
-                viewerHeight);
-}
 
-float3 mapChromaticityPosition(float r, float g, float b, constant OverlayUniforms& u) {
-  float3 linear = float3(decodeTransferChannel(r, u.chromaticityInputTransfer),
-                         decodeTransferChannel(g, u.chromaticityInputTransfer),
-                         decodeTransferChannel(b, u.chromaticityInputTransfer));
-  linear = clamp(linear, 0.0, 1.0);
-  float3 xyz = mulRows(u.chromaticityRgbToXyz, linear);
-  float2 white = float2(u.chromaticityWhiteX, u.chromaticityWhiteY);
-  float3 xyY = xyzToXyY(xyz, white);
-  float2 xy = xyY.xy;
-  if (u.chromaticityReferenceBasis != 0) {
-    float3 basisXyz = xyToXyz(xy, 1.0);
-    float3 rgb = mulRows(u.chromaticityXyzToRgb, basisXyz);
-    xy = xyzToXyY(rgb, float2(1.0 / 3.0, 1.0 / 3.0)).xy;
-  }
-  float viewerHeight = clamp(xyY.z, 0.0, 1.0) * 2.0 - 1.0;
-  return float3((xy.x - (1.0 / 3.0)) * 3.0,
-                (xy.y - (1.0 / 3.0)) * 3.0,
-                viewerHeight);
-}
-
-float2 rgbToHsvHexconePlane(float r, float g, float b) {
-  return float2(r - 0.5 * g - 0.5 * b, 0.8660254037844386 * (g - b));
-}
-
-float3 mapPlotPosition(float r, float g, float b, int plotMode, int circularHsl, int circularHsv, int normConeNormalized, int showOverflow) {
-  if (plotMode == 1) {
-    float cMax = max(r, max(g, b));
-    float cMin = min(r, min(g, b));
-    float delta = cMax - cMin;
-    float l = 0.5 * (cMax + cMin);
-    float h = rawRgbHue01(r, g, b, cMax, delta);
-    float satDenom = 1.0 - abs(2.0 * l - 1.0);
-    if (delta > 1e-6 && satDenom < 0.0) {
-      h = wrapHue01(h + 0.5);
+  uint32_t executablePathSize = 0;
+  _NSGetExecutablePath(nullptr, &executablePathSize);
+  if (executablePathSize > 0) {
+    std::vector<char> executablePath(executablePathSize, '\0');
+    if (_NSGetExecutablePath(executablePath.data(), &executablePathSize) == 0) {
+      NSString* path = [NSString stringWithUTF8String:executablePath.data()];
+      NSString* directory = [[path stringByResolvingSymlinksInPath] stringByDeletingLastPathComponent];
+      appendUniqueMetalLibraryCandidate(candidates,
+                                        [directory stringByAppendingPathComponent:@"ChromaspaceViewer.metallib"]);
     }
-    float angle = h * kTau;
-    float radius = delta;
-    if (circularHsl != 0) {
-      float denom = satDenom;
-      if (abs(denom) <= 1e-6) {
-        denom = (denom < 0.0) ? -1e-6 : 1e-6;
-      }
-      radius = abs(delta / denom);
+  }
+
+  NSBundle* mainBundle = [NSBundle mainBundle];
+  NSURL* bundleExecutable = [mainBundle executableURL];
+  if (bundleExecutable != nil) {
+    appendUniqueMetalLibraryCandidate(
+        candidates,
+        [[[bundleExecutable URLByDeletingLastPathComponent]
+            URLByAppendingPathComponent:@"ChromaspaceViewer.metallib"] path]);
+  }
+  appendUniqueMetalLibraryCandidate(
+      candidates,
+      [[mainBundle URLForResource:@"ChromaspaceViewer" withExtension:@"metallib"] path]);
+  return candidates;
+}
+
+id<MTLLibrary> loadViewerMetalLibrary(id<MTLDevice> device, std::string* error) {
+  const std::vector<std::string> candidates = viewerMetalLibraryCandidates();
+  std::ostringstream attempts;
+  for (size_t i = 0; i < candidates.size(); ++i) {
+    if (i > 0) attempts << "; ";
+    const std::string& candidate = candidates[i];
+    NSString* path = [NSString stringWithUTF8String:candidate.c_str()];
+    BOOL isDirectory = NO;
+    if (![[NSFileManager defaultManager] fileExistsAtPath:path isDirectory:&isDirectory]) {
+      attempts << candidate << " (not found)";
+      continue;
     }
-    return float3(cos(angle) * radius, l * 2.0 - 1.0, sin(angle) * radius);
-  }
-  if (plotMode == 2) {
-    float cMax = max(r, max(g, b));
-    if (circularHsv != 0) {
-      float cMin = min(r, min(g, b));
-      float delta = cMax - cMin;
-      float h = rawRgbHue01(r, g, b, cMax, delta);
-      float sat = (delta > 1e-6 && cMax > 1e-6) ? (delta / cMax) : 0.0;
-      float angle = h * kTau;
-      return float3(cos(angle) * sat, cMax * 2.0 - 1.0, sin(angle) * sat);
+    if (isDirectory) {
+      attempts << candidate << " (is a directory)";
+      continue;
     }
-    float2 plane = rgbToHsvHexconePlane(r, g, b);
-    return float3(plane.x, cMax * 2.0 - 1.0, plane.y);
-  }
-  if (plotMode == 3) {
-    float rotX = r * 0.81649658 + g * -0.40824829 + b * -0.40824829;
-    float rotY = g * 0.70710678 + b * -0.70710678;
-    float rotZ = r * 0.57735027 + g * 0.57735027 + b * 0.57735027;
-    float azimuth = atan2(rotY, rotX);
-    float radius3 = sqrt(rotX * rotX + rotY * rotY + rotZ * rotZ);
-    float wrappedHue = azimuth < 0.0 ? azimuth + kTau : azimuth;
-    float polar = atan2(sqrt(rotX * rotX + rotY * rotY), rotZ);
-    float c = polar * 1.0467733744265997;
-    float l = radius3 * 0.5773502691896258;
-    float polarScaled = c * 0.9553166181245093;
-    float radial = l * sin(polarScaled) / 0.816496580927726;
-    float angle = wrappedHue;
-    return float3(cos(angle) * radial, l * 2.0 - 1.0, sin(angle) * radial);
-  }
-  if (plotMode == 4 || plotMode == 5) {
-    bool jpOverflow = (showOverflow != 0 && plotMode == 5);
-    float rr = jpOverflow ? r : clamp01(r);
-    float gg = jpOverflow ? g : clamp01(g);
-    float bb = jpOverflow ? b : clamp01(b);
-    float rotX = 0.81649658093 * rr - 0.40824829046 * gg - 0.40824829046 * bb;
-    float rotY = 0.70710678118 * gg - 0.70710678118 * bb;
-    float rotZ = 0.57735026919 * (rr + gg + bb);
-    float hue = atan2(rotY, rotX);
-    if (hue < 0.0) hue += kTau;
-    float radius3 = sqrt(rotX * rotX + rotY * rotY + rotZ * rotZ);
-    float polar = atan2(sqrt(rotX * rotX + rotY * rotY), rotZ);
-    float magnitude = 0.0;
-    if (plotMode == 4) {
-      magnitude = clamp(radius3 * 0.576, 0.0, 1.0);
+    NSError* libraryError = nil;
+    id<MTLLibrary> library = [device newLibraryWithURL:[NSURL fileURLWithPath:path]
+                                                error:&libraryError];
+    if (library != nil) return library;
+    attempts << candidate << " (load error: ";
+    if (libraryError != nil) {
+      attempts << utf8String([libraryError localizedDescription]);
     } else {
-      float kAsinInvSqrt2 = asin(1.0 / sqrt(2.0));
-      float kAsinInvSqrt3 = asin(1.0 / sqrt(3.0));
-      float kHueCoef1 = 1.0 / (2.0 - (kAsinInvSqrt2 / kAsinInvSqrt3));
-      float huecoef2 = 2.0 * polar * sin((2.0 * kPi / 3.0) - fmod(hue, kPi / 3.0)) / sqrt(3.0);
-      float huemag = ((acos(cos(3.0 * hue + kPi))) / (kPi * kHueCoef1) + ((kAsinInvSqrt2 / kAsinInvSqrt3) - 1.0)) * huecoef2;
-      float satmag = sin(huemag + kAsinInvSqrt3);
-      magnitude = radius3 * satmag;
-      if (jpOverflow && magnitude < 0.0) {
-        magnitude = -magnitude;
-        hue += kPi;
-        if (hue >= kTau) hue -= kTau;
-      }
-      magnitude = jpOverflow ? magnitude : clamp(magnitude, 0.0, 1.0);
+      attempts << "unknown Metal library error";
     }
-    float phiNorm = jpOverflow ? max(polar / 0.9553166181245093, 0.0) : clamp(polar / 0.9553166181245093, 0.0, 1.0);
-    float phi = phiNorm * 0.9553166181245093;
-    float radial = magnitude * sin(phi);
-    return float3(cos(hue) * radial, magnitude * cos(phi) * 2.0 - 1.0, sin(hue) * radial);
+    attempts << ")";
   }
-  if (plotMode == 6) {
-    bool normConeOverflow = (showOverflow != 0 && plotMode == 6);
-    float rr = normConeOverflow ? r : clamp(r, 0.0, 1.0);
-    float gg = normConeOverflow ? g : clamp(g, 0.0, 1.0);
-    float bb = normConeOverflow ? b : clamp(b, 0.0, 1.0);
-    float maxRgb = max(rr, max(gg, bb));
-    float rotX = 0.81649658093 * rr - 0.40824829046 * gg - 0.40824829046 * bb;
-    float rotY = 0.70710678118 * gg - 0.70710678118 * bb;
-    float rotZ = 0.57735026919 * (rr + gg + bb);
-    float hue = atan2(rotY, rotX) / kTau;
-    if (hue < 0.0) hue += 1.0;
-    float chromaRadius = sqrt(rotX * rotX + rotY * rotY);
-    float polar = atan2(chromaRadius, rotZ);
-    float chroma = polar / 0.9553166181245093;
-    if (normConeNormalized != 0) {
-      float angle = hue * kTau - kPi / 6.0;
-      float cosPolar = cos(polar);
-      float safeCos = abs(cosPolar) > 1e-6 ? cosPolar : (cosPolar < 0.0 ? -1e-6 : 1e-6);
-      float cone = (sin(polar) / safeCos) / sqrt(2.0);
-      float sinTerm = clamp(sin(3.0 * angle), -1.0, 1.0);
-      float chromaGain = 1.0 / (2.0 * cos(acos(sinTerm) / 3.0));
-      chroma = chromaGain > 1e-6 ? cone / chromaGain : 0.0;
-      if (normConeOverflow && chroma < 0.0) {
-        chroma = -chroma;
-        hue += 0.5;
-        if (hue >= 1.0) hue -= 1.0;
-      }
-    }
-    chroma = normConeOverflow ? max(chroma, 0.0) : clamp(chroma, 0.0, 1.0);
-    float value = normConeOverflow ? maxRgb : clamp(maxRgb, 0.0, 1.0);
-    float angle = hue * kTau;
-    return float3(cos(angle) * chroma, value * 2.0 - 1.0, sin(angle) * chroma);
-  }
-  if (plotMode == 7) {
-    bool reuleauxOverflow = (showOverflow != 0 && plotMode == 7);
-    float rr = reuleauxOverflow ? r : clamp01(r);
-    float gg = reuleauxOverflow ? g : clamp01(g);
-    float bb = reuleauxOverflow ? b : clamp01(b);
-    float rotX = 0.33333333333 * (2.0 * rr - gg - bb) * 0.70710678118;
-    float rotY = (gg - bb) * 0.40824829046;
-    float rotZ = (rr + gg + bb) / 3.0;
-    float hue = kPi - atan2(rotY, -rotX);
-    if (hue < 0.0) hue += kTau;
-    if (hue >= kTau) hue = fmod(hue, kTau);
-    float sat = abs(rotZ) <= 1e-6 ? 0.0 : length(float2(rotX, rotY)) / rotZ;
-    if (reuleauxOverflow && sat < 0.0) {
-      sat = -sat;
-      hue += kPi;
-      if (hue >= kTau) hue -= kTau;
-    }
-    sat = reuleauxOverflow ? sat / 1.41421356237 : clamp(sat / 1.41421356237, 0.0, 1.0);
-    float value = reuleauxOverflow ? max(rr, max(gg, bb)) : clamp(max(rr, max(gg, bb)), 0.0, 1.0);
-    return float3(cos(hue) * sat, value * 2.0 - 1.0, sin(hue) * sat);
-  }
-  return float3(r * 2.0 - 1.0, g * 2.0 - 1.0, b * 2.0 - 1.0);
-}
 
-void mapDisplayColor(float inR, float inG, float inB, thread float& outR, thread float& outG, thread float& outB) {
-  outR = pow(clamp01(inR), 1.0 / 2.2);
-  outG = pow(clamp01(inG), 1.0 / 2.2);
-  outB = pow(clamp01(inB), 1.0 / 2.2);
-}
-
-void rgbToHsl(float r, float g, float b, thread float& outH, thread float& outS, thread float& outL) {
-  float cMax = max(r, max(g, b));
-  float cMin = min(r, min(g, b));
-  float delta = cMax - cMin;
-  outL = 0.5 * (cMax + cMin);
-  outH = 0.0;
-  outS = 0.0;
-  if (delta > 1e-6) {
-    float denom = max(1e-6, 1.0 - abs(2.0 * outL - 1.0));
-    outS = delta / denom;
-    outH = rawRgbHue01(r, g, b, cMax, delta);
-  }
-}
-
-float hueToRgbChannel(float p, float q, float t) {
-  if (t < 0.0) t += 1.0;
-  if (t > 1.0) t -= 1.0;
-  if (t < 1.0 / 6.0) return p + (q - p) * 6.0 * t;
-  if (t < 1.0 / 2.0) return q;
-  if (t < 2.0 / 3.0) return p + (q - p) * (2.0 / 3.0 - t) * 6.0;
-  return p;
-}
-
-void hslToRgb(float h, float s, float l, thread float& outR, thread float& outG, thread float& outB) {
-  h = wrapHue01(h);
-  s = clamp01(s);
-  l = clamp01(l);
-  if (s <= 1e-6) {
-    outR = l;
-    outG = l;
-    outB = l;
-    return;
-  }
-  float q = l < 0.5 ? l * (1.0 + s) : l + s - l * s;
-  float p = 2.0 * l - q;
-  outR = clamp01(hueToRgbChannel(p, q, h + 1.0 / 3.0));
-  outG = clamp01(hueToRgbChannel(p, q, h));
-  outB = clamp01(hueToRgbChannel(p, q, h - 1.0 / 3.0));
-}
-
-void applyDisplaySaturation(float saturation, thread float& r, thread float& g, thread float& b) {
-  float sat = clamp(saturation, 1.0, 6.0);
-  float baseR = clamp01(r);
-  float baseG = clamp01(g);
-  float baseB = clamp01(b);
-  float luma = clamp(baseR * 0.2126 + baseG * 0.7152 + baseB * 0.0722, 0.0, 1.0);
-  if (sat <= 1.0) {
-    r = max(0.0, luma + (baseR - luma) * sat);
-    g = max(0.0, luma + (baseG - luma) * sat);
-    b = max(0.0, luma + (baseB - luma) * sat);
-  } else {
-    float h = 0.0;
-    float s = 0.0;
-    float l = 0.0;
-    rgbToHsl(baseR, baseG, baseB, h, s, l);
-    if (s <= 1e-5) {
-      r = baseR;
-      g = baseG;
-      b = baseB;
+  if (error != nullptr) {
+    std::ostringstream message;
+    message << "Failed to load precompiled Metal library " << kViewerMetalLibraryName << ". Attempts: ";
+    if (candidates.empty()) {
+      message << "no executable or bundle candidate could be resolved";
     } else {
-      float t = clamp((sat - 1.0) / 5.0, 0.0, 1.0);
-      float shaped = pow(t, 0.55);
-      float targetS = clamp(s + (1.0 - s) * (0.32 + 0.68 * shaped), 0.0, 1.0);
-      float highlight = clamp((l - 0.58) / 0.34, 0.0, 1.0);
-      float targetL = clamp(l - highlight * (0.08 + 0.10 * shaped), 0.0, 1.0);
-      float boostedR = baseR;
-      float boostedG = baseG;
-      float boostedB = baseB;
-      hslToRgb(h, targetS, targetL, boostedR, boostedG, boostedB);
-      float mixAmount = clamp(0.24 + 0.76 * shaped, 0.0, 1.0);
-      r = max(0.0, baseR * (1.0 - mixAmount) + boostedR * mixAmount);
-      g = max(0.0, baseG * (1.0 - mixAmount) + boostedG * mixAmount);
-      b = max(0.0, baseB * (1.0 - mixAmount) + boostedB * mixAmount);
+      message << attempts.str();
     }
+    *error = message.str();
   }
-  float peak = max(r, max(g, b));
-  if (peak > 1.0) {
-    r /= peak;
-    g /= peak;
-    b /= peak;
-  }
-  r = clamp(r, 0.0, 1.0);
-  g = clamp(g, 0.0, 1.0);
-  b = clamp(b, 0.0, 1.0);
+  return nil;
 }
 
-bool pointOverflowsCube(float r, float g, float b) {
-  return r < 0.0 || r > 1.0 || g < 0.0 || g > 1.0 || b < 0.0 || b > 1.0;
-}
-
-void writeHiddenInputPoint(device packed_float3* vertVals, device float4* colorVals, uint index) {
-  vertVals[index] = packed_float3(0.0, 0.0, 0.0);
-  colorVals[index] = float4(0.0, 0.0, 0.0, 0.0);
-}
-
-void writeMappedInputPoint(device packed_float3* vertVals,
-                           device float4* colorVals,
-                           uint index,
-                           float xNorm,
-                           float yNorm,
-                           float r,
-                           float g,
-                           float b,
-                           constant InputUniforms& u) {
-  bool overflowPoint = pointOverflowsCube(r, g, b);
-  float plotR = (u.showOverflow != 0) ? r : clamp01(r);
-  float plotG = (u.showOverflow != 0) ? g : clamp01(g);
-  float plotB = (u.showOverflow != 0) ? b : clamp01(b);
-  float3 pos = mapPlotPosition(plotR, plotG, plotB, u.plotMode, u.circularHsl, u.circularHsv, u.normConeNormalized, u.showOverflow);
-  if (u.plotMode == 8) {
-    pos = mapChromaticityPosition(r, g, b, u);
-  }
-  if (u.glossView != 0) {
-    float aspect = clamp(u.sourceAspect, 0.25, 4.0);
-    float halfWidth = aspect >= 1.0 ? 1.22 : (1.22 * aspect);
-    float halfDepth = aspect >= 1.0 ? (1.22 / aspect) : 1.22;
-    float common = glossCommonComponent(plotR, plotG, plotB);
-    float bodyR = max(plotR - common, 0.0);
-    float bodyG = max(plotG - common, 0.0);
-    float bodyB = max(plotB - common, 0.0);
-    float bodyLuma = clamp(bodyR * 0.2126 + bodyG * 0.7152 + bodyB * 0.0722, 0.0, 1.0);
-    float glossCue = glossStrengthCue(plotR, plotG, plotB);
-    float glossPresence = glossPresenceWeight(glossCue);
-    float xPos = -halfWidth + (2.0 * halfWidth * xNorm);
-    float zPos = halfDepth - (2.0 * halfDepth * yNorm);
-    float yPos = -0.92 + bodyLuma * 0.92 + glossCue * glossPresence * u.glossLiftScale * 1.34;
-    pos = float3(xPos, yPos, zPos);
-  }
-  vertVals[index] = packed_float3(pos.x, pos.y, pos.z);
-  float cr;
-  float cg;
-  float cb;
-  if (u.showOverflow != 0 && u.highlightOverflow != 0 && overflowPoint) {
-    cr = 1.0;
-    cg = 0.0;
-    cb = 0.0;
-  } else {
-    mapDisplayColor(r, g, b, cr, cg, cb);
-    applyDisplaySaturation(u.colorSaturation, cr, cg, cb);
-    if (u.glossView != 0) {
-      float glossPresence = glossPresenceWeight(glossStrengthCue(plotR, plotG, plotB));
-      float neutralBlend = clamp(0.08 + 0.52 * glossPresence, 0.0, 0.62);
-      float brightnessGain = 1.18 + 1.20 * glossPresence;
-      cr = clamp((cr * (1.0 - neutralBlend) + neutralBlend) * brightnessGain, 0.0, 1.0);
-      cg = clamp((cg * (1.0 - neutralBlend) + neutralBlend) * brightnessGain, 0.0, 1.0);
-      cb = clamp((cb * (1.0 - neutralBlend) + neutralBlend) * brightnessGain, 0.0, 1.0);
-    }
-  }
-  bool overflowHighlighted = (u.showOverflow != 0 && u.highlightOverflow != 0 && overflowPoint);
-  float baseAlpha = overflowHighlighted ? 0.95 : 0.72;
-  if (u.glossView != 0 && !overflowHighlighted) {
-    float glossPresence = glossPresenceWeight(glossStrengthCue(plotR, plotG, plotB));
-    baseAlpha = 0.01 + 0.97 * glossPresence;
-  }
-  colorVals[index] = float4(cr, cg, cb,
-                            luminanceAwareAlpha(baseAlpha,
-                                                cr,
-                                                cg,
-                                                cb,
-                                                u.denseAlphaBias,
-                                                overflowHighlighted,
-                                                u.pointAlphaScale));
-}
-
-bool rasterSourceRowInRange(int y, int y1, int y2) {
-  return y1 >= 0 && y2 > y1 && y >= y1 && y < y2;
-}
-
-bool rasterSourceRowInCube(constant RasterSourceUniforms& u, int y) {
-  return rasterSourceRowInRange(y, u.identityCubeY1, u.identityCubeY2);
-}
-
-bool rasterSourceRowInRamp(constant RasterSourceUniforms& u, int y) {
-  return rasterSourceRowInRange(y, u.identityRampY1, u.identityRampY2);
-}
-
-bool rasterAppendSampleCoords(uint index,
-                              int offset,
-                              int count,
-                              int y1,
-                              int y2,
-                              int rowStep,
-                              int xStep,
-                              int sourceWidth,
-                              thread int* outX,
-                              thread int* outY) {
-  if (count <= 0 || index < uint(max(offset, 0)) || index >= uint(max(offset + count, offset))) {
+bool initializeMetalContext(MetalContext* context, std::string* error) {
+  if (context == nullptr) {
+    if (error) *error = "metal-context-output-missing";
     return false;
   }
-  int local = int(index) - offset;
-  int safeXStep = max(xStep, 1);
-  int safeRowStep = max(rowStep, 1);
-  int samplesPerRow = max(1, (max(sourceWidth, 0) + safeXStep - 1) / safeXStep);
-  int rowIndex = local / samplesPerRow;
-  int xIndex = local - rowIndex * samplesPerRow;
-  *outX = min(max(xIndex * safeXStep, 0), max(sourceWidth - 1, 0));
-  *outY = min(max(y1 + rowIndex * safeRowStep, y1), max(y2 - 1, y1));
-  return true;
-}
-
-float rasterHalton(uint index, uint base) {
-  float f = 1.0;
-  float r = 0.0;
-  while (index > 0u) {
-    f /= float(base);
-    r += f * float(index % base);
-    index /= base;
-  }
-  return r;
-}
-
-bool rasterOccupancySampleCoords(uint index, constant RasterSourceUniforms& u, thread int* outX, thread int* outY) {
-  if (u.occupancyAppendCount <= 0 || index < uint(max(u.occupancyAppendOffset, 0)) ||
-      index >= uint(max(u.occupancyAppendOffset + u.occupancyAppendCount, u.occupancyAppendOffset))) {
-    return false;
-  }
-  uint local = index - uint(max(u.occupancyAppendOffset, 0));
-  uint attemptCount = uint(max(u.occupancyCandidateCount, u.occupancyAppendCount));
-  uint attempt = attemptCount > 0u ? (local * max(attemptCount, 1u)) / uint(max(u.occupancyAppendCount, 1)) : local;
-  float xNorm = rasterHalton(attempt + 1u, 2u);
-  float yNorm = rasterHalton(attempt + 1u, 3u);
-  *outX = min(max(int(xNorm * float(max(u.sourceWidth, 1))), 0), max(u.sourceWidth - 1, 0));
-  *outY = min(max(int(yNorm * float(max(u.sourceHeight, 1))), 0), max(u.sourceHeight - 1, 0));
-  return true;
-}
-
-bool rasterLassoPointInStroke(constant RasterSourceUniforms& u, int strokeIndex, float xNorm, float yNorm) {
-  if (strokeIndex < 0 || strokeIndex >= min(max(u.lassoStrokeCount, 0), 16)) return false;
-  int first = u.lassoStrokeFirst[strokeIndex];
-  int count = u.lassoStrokeCountPerStroke[strokeIndex];
-  if (count < 3 || first < 0 || first + count > min(max(u.lassoPointCount, 0), 256)) return false;
-  bool inside = false;
-  for (int i = 0, j = count - 1; i < count; j = i++) {
-    float xi = u.lassoX[first + i];
-    float yi = u.lassoY[first + i];
-    float xj = u.lassoX[first + j];
-    float yj = u.lassoY[first + j];
-    bool intersects = ((yi > yNorm) != (yj > yNorm)) &&
-                      (xNorm < (xj - xi) * (yNorm - yi) / ((yj - yi) + 1.0e-12) + xi);
-    if (intersects) inside = !inside;
-  }
-  return inside;
-}
-
-bool rasterLassoContainsPoint(constant RasterSourceUniforms& u, float xNorm, float yNorm) {
-  bool inside = false;
-  int strokeCount = min(max(u.lassoStrokeCount, 0), 16);
-  for (int stroke = 0; stroke < strokeCount; ++stroke) {
-    if (!rasterLassoPointInStroke(u, stroke, xNorm, yNorm)) continue;
-    inside = u.lassoStrokeSubtract[stroke] == 0;
-  }
-  return inside;
-}
-
-float rasterNeutralRadius(float r, float g, float b, constant RasterSourceUniforms& u) {
-  const float kRgbAxisMaxRadius = 0.8164965809277260;
-  const float kPolarMax = 0.9553166181245093;
-  const float kChenPolarScale = 1.0467733744265997;
-  int mode = u.input.plotMode;
-  if (mode == 1) {
-    float cMax = max(r, max(g, b));
-    float cMin = min(r, min(g, b));
-    if (u.input.circularHsl != 0) {
-      float l = 0.5 * (cMax + cMin);
-      float denom = 1.0 - abs(2.0 * l - 1.0);
-      if (abs(denom) <= 1e-6) denom = denom < 0.0 ? -1e-6 : 1e-6;
-      return clamp01(abs((cMax - cMin) / denom));
-    }
-    return clamp01(cMax - cMin);
-  }
-  if (mode == 2) {
-    if (u.input.circularHsv != 0) {
-      float cMax = max(r, max(g, b));
-      float cMin = min(r, min(g, b));
-      float delta = cMax - cMin;
-      return (delta > 1e-6 && cMax > 1e-6) ? clamp01(delta / cMax) : 0.0;
-    }
-    float x = r - 0.5 * g - 0.5 * b;
-    float z = 0.8660254037844386 * (g - b);
-    return clamp01(sqrt(x * x + z * z));
-  }
-  bool overflowMode = u.input.showOverflow != 0 && (mode == 5 || mode == 6 || mode == 7);
-  float rr = overflowMode ? r : clamp01(r);
-  float gg = overflowMode ? g : clamp01(g);
-  float bb = overflowMode ? b : clamp01(b);
-  float rotX = 0.81649658093 * rr - 0.40824829046 * gg - 0.40824829046 * bb;
-  float rotY = 0.70710678118 * gg - 0.70710678118 * bb;
-  float rotZ = 0.57735026919 * (rr + gg + bb);
-  float chromaRadius = sqrt(rotX * rotX + rotY * rotY);
-  if (mode == 3) {
-    float radius3 = sqrt(rotX * rotX + rotY * rotY + rotZ * rotZ);
-    float polar = atan2(chromaRadius, max(rotZ, 1e-8));
-    float light = radius3 * 0.5773502691896258;
-    float radial = light * sin(polar * kChenPolarScale) / kRgbAxisMaxRadius;
-    return clamp01(radial);
-  }
-  if (mode == 4 || mode == 5) {
-    float radius3 = sqrt(rotX * rotX + rotY * rotY + rotZ * rotZ);
-    float polar = atan2(chromaRadius, rotZ);
-    float radial = radius3 * sin((polar / kPolarMax) * kPolarMax);
-    return clamp01(radial / sin(kPolarMax));
-  }
-  if (mode == 6) {
-    float polar = atan2(chromaRadius, rotZ);
-    return clamp01(polar / kPolarMax);
-  }
-  if (mode == 7) {
-    float rotZAvg = (rr + gg + bb) / 3.0;
-    float rx = 0.33333333333 * (2.0 * rr - gg - bb) * 0.70710678118;
-    float ry = (gg - bb) * 0.40824829046;
-    float sat = abs(rotZAvg) <= 1e-6 ? 0.0 : sqrt(rx * rx + ry * ry) / rotZAvg;
-    return clamp01(abs(sat) / 1.41421356237);
-  }
-  return clamp01(sqrt(rotX * rotX + rotY * rotY) / kRgbAxisMaxRadius);
-}
-
-bool rasterCubeSliceContains(float r, float g, float b, constant RasterSourceUniforms& u) {
-  if (u.neutralRadiusEnabled != 0 && u.input.plotMode != 8 && u.input.showOverflow == 0) {
-    float threshold = clamp01(u.neutralRadius) * clamp01(u.neutralRadius);
-    if (rasterNeutralRadius(r, g, b, u) > threshold + 1.0e-6) return false;
-  }
-  if (u.cubeSlicingEnabled == 0) return true;
-  bool anySelected = u.cubeSliceRed || u.cubeSliceYellow || u.cubeSliceGreen ||
-                     u.cubeSliceCyan || u.cubeSliceBlue || u.cubeSliceMagenta;
-  if (!anySelected) return false;
-  if (u.input.plotMode == 0 || u.input.glossView != 0) {
-    const float kEps = 1.0e-6;
-    bool geRG = r + kEps >= g;
-    bool geGB = g + kEps >= b;
-    bool geGR = g + kEps >= r;
-    bool geRB = r + kEps >= b;
-    bool geBG = b + kEps >= g;
-    bool geBR = b + kEps >= r;
-    if (u.cubeSliceRed && geRG && geGB) return true;
-    if (u.cubeSliceYellow && geGR && geRB) return true;
-    if (u.cubeSliceGreen && geGB && geBR) return true;
-    if (u.cubeSliceCyan && geBG && geGR) return true;
-    if (u.cubeSliceBlue && geBR && geRG) return true;
-    if (u.cubeSliceMagenta && geRB && geBG) return true;
-    return false;
-  }
-  float cMax = max(r, max(g, b));
-  float cMin = min(r, min(g, b));
-  float delta = cMax - cMin;
-  if (delta <= 1.0e-6) return false;
-  float hue = wrapHue01(rawRgbHue01(r, g, b, cMax, delta));
-  int sector = int(floor((hue + (1.0 / 12.0)) * 6.0)) % 6;
-  if (sector == 0) return u.cubeSliceRed != 0;
-  if (sector == 1) return u.cubeSliceYellow != 0;
-  if (sector == 2) return u.cubeSliceGreen != 0;
-  if (sector == 3) return u.cubeSliceCyan != 0;
-  if (sector == 4) return u.cubeSliceBlue != 0;
-  return u.cubeSliceMagenta != 0;
-}
-
-void readRasterSourceRgb(const device half4* source16,
-                         const device float4* source32,
-                         constant RasterSourceUniforms& u,
-                         int x,
-                         int y,
-                         thread float& r,
-                         thread float& g,
-                         thread float& b) {
-  x = min(max(x, 0), max(u.sourceWidth - 1, 0));
-  y = min(max(y, 0), max(u.sourceHeight - 1, 0));
-  uint pixel = uint(y * u.sourceWidth + x);
-  if (u.pixelFormat == 1) {
-    float4 v = source32[pixel];
-    r = v.x;
-    g = v.y;
-    b = v.z;
-  } else {
-    half4 v = source16[pixel];
-    r = float(v.x);
-    g = float(v.y);
-    b = float(v.z);
-  }
-}
-
-int rasterOccupancyComponentBin(float value) {
-  if (value < 0.0) return 0;
-  if (value > 1.0) return 17;
-  return 1 + min(max(int(floor(value * 16.0)), 0), 15);
-}
-
-int rasterOccupancyBinIndex(float r, float g, float b) {
-  return (rasterOccupancyComponentBin(r) * 18 + rasterOccupancyComponentBin(g)) * 18 +
-         rasterOccupancyComponentBin(b);
-}
-
-bool rasterSampleVisible(constant RasterSourceUniforms& u,
-                         int x,
-                         int y,
-                         float xNorm,
-                         float yNorm,
-                         float r,
-                         float g,
-                         float b) {
-  bool inCubeStrip = rasterSourceRowInCube(u, y);
-  bool inRampStrip = rasterSourceRowInRamp(u, y);
-  bool inAnyIdentityStrip = inCubeStrip || inRampStrip;
-  bool visible = true;
-  if (u.excludeIdentityData != 0 && inAnyIdentityStrip) {
-    visible = false;
-  } else if (u.isolateIdentityData != 0) {
-    visible = (u.readIdentityPlot != 0 && inCubeStrip) || (u.readGrayRamp != 0 && inRampStrip);
-  }
-  if (visible && u.lassoEnabled != 0 && !rasterLassoContainsPoint(u, xNorm, yNorm)) {
-    visible = false;
-  }
-  if (visible && !rasterCubeSliceContains(r, g, b, u)) {
-    visible = false;
-  }
-  (void)x;
-  return visible;
-}
-
-void rasterReadTransformedSample(const device half4* source16,
-                                 const device float4* source32,
-                                 constant RasterSourceUniforms& u,
-                                 int x,
-                                 int y,
-                                 thread float& r,
-                                 thread float& g,
-                                 thread float& b) {
-  readRasterSourceRgb(source16, source32, u, x, y, r, g, b);
-  if (u.plotLinear != 0 && u.input.plotMode != 8) {
-    r = decodeTransferChannel(r, u.plotLinearTransfer);
-    g = decodeTransferChannel(g, u.plotLinearTransfer);
-    b = decodeTransferChannel(b, u.plotLinearTransfer);
-  }
-}
-
-void rasterReadTransformedSampleTexture(texture2d<float, access::read> sourceTexture,
-                                        constant RasterSourceUniforms& u,
-                                        int x,
-                                        int y,
-                                        thread float& r,
-                                        thread float& g,
-                                        thread float& b) {
-  x = min(max(x, 0), max(u.sourceWidth - 1, 0));
-  y = min(max(y, 0), max(u.sourceHeight - 1, 0));
-  float4 v = sourceTexture.read(uint2(uint(x), uint(y)));
-  r = v.x;
-  g = v.y;
-  b = v.z;
-  if (u.plotLinear != 0 && u.input.plotMode != 8) {
-    r = decodeTransferChannel(r, u.plotLinearTransfer);
-    g = decodeTransferChannel(g, u.plotLinearTransfer);
-    b = decodeTransferChannel(b, u.plotLinearTransfer);
-  }
-}
-
-kernel void rasterOccupancyCountKernel(const device half4* source16 [[buffer(0)]],
-                                       const device float4* source32 [[buffer(1)]],
-                                       device atomic_uint* occupancyBins [[buffer(2)]],
-                                       device atomic_uint* visibleCount [[buffer(3)]],
-                                       constant RasterSourceUniforms& u [[buffer(4)]],
-                                       uint index [[thread_position_in_grid]]) {
-  uint total = uint(max(u.basePointCount, 0));
-  if (index >= total) return;
-  int sampleCountX = max(u.sampleCountX, 1);
-  int stride = max(u.sampleStride, 1);
-  int x = int(index % uint(sampleCountX)) * stride;
-  int y = int(index / uint(sampleCountX)) * stride;
-  x = min(max(x, 0), max(u.sourceWidth - 1, 0));
-  y = min(max(y, 0), max(u.sourceHeight - 1, 0));
-  float xNorm = (float(x) + 0.5) / float(max(u.sourceWidth, 1));
-  float yNorm = (float(y) + 0.5) / float(max(u.sourceHeight, 1));
-  float r = 0.0;
-  float g = 0.0;
-  float b = 0.0;
-  rasterReadTransformedSample(source16, source32, u, x, y, r, g, b);
-  if (!rasterSampleVisible(u, x, y, xNorm, yNorm, r, g, b)) return;
-  atomic_fetch_add_explicit(&occupancyBins[rasterOccupancyBinIndex(r, g, b)], 1u, memory_order_relaxed);
-  atomic_fetch_add_explicit(&visibleCount[0], 1u, memory_order_relaxed);
-}
-
-kernel void rasterSourceKernel(const device half4* source16 [[buffer(0)]],
-                               const device float4* source32 [[buffer(1)]],
-                               device packed_float3* vertVals [[buffer(2)]],
-                               device float4* colorVals [[buffer(3)]],
-                               device atomic_uint* occupancyBins [[buffer(4)]],
-                               constant RasterSourceUniforms& u [[buffer(5)]],
-                               uint index [[thread_position_in_grid]]) {
-  uint total = uint(max(u.input.pointCount, 0));
-  if (index >= total) return;
-  int sampleCountX = max(u.sampleCountX, 1);
-  int stride = max(u.sampleStride, 1);
-  int x = int(index % uint(sampleCountX)) * stride;
-  int y = int(index / uint(sampleCountX)) * stride;
-  bool occupancyCandidate = false;
-  if (!rasterOccupancySampleCoords(index, u, &x, &y)) {
-    if (!rasterAppendSampleCoords(index,
-                                  u.identityCubeAppendOffset,
-                                  u.identityCubeAppendCount,
-                                  u.identityCubeAppendY1,
-                                  u.identityCubeAppendY2,
-                                  u.identityCubeAppendRowStep,
-                                  u.identityCubeAppendXStep,
-                                  u.sourceWidth,
-                                  &x,
-                                  &y)) {
-      rasterAppendSampleCoords(index,
-                               u.identityRampAppendOffset,
-                               u.identityRampAppendCount,
-                               u.identityRampAppendY1,
-                               u.identityRampAppendY2,
-                               u.identityRampAppendRowStep,
-                               u.identityRampAppendXStep,
-                               u.sourceWidth,
-                               &x,
-                               &y);
-    }
-  } else {
-    occupancyCandidate = true;
-  }
-  x = min(max(x, 0), max(u.sourceWidth - 1, 0));
-  y = min(max(y, 0), max(u.sourceHeight - 1, 0));
-  float xNorm = (float(x) + 0.5) / float(max(u.sourceWidth, 1));
-  float yNorm = (float(y) + 0.5) / float(max(u.sourceHeight, 1));
-  float r = 0.0;
-  float g = 0.0;
-  float b = 0.0;
-  rasterReadTransformedSample(source16, source32, u, x, y, r, g, b);
-  bool visible = rasterSampleVisible(u, x, y, xNorm, yNorm, r, g, b);
-  if (visible && occupancyCandidate) {
-    uint binCount = atomic_load_explicit(&occupancyBins[rasterOccupancyBinIndex(r, g, b)], memory_order_relaxed);
-    visible = int(binCount) <= max(u.occupancyTargetThreshold, 0);
-  }
-  if (!visible) {
-    writeHiddenInputPoint(vertVals, colorVals, index);
-    return;
-  }
-  writeMappedInputPoint(vertVals, colorVals, index, xNorm, yNorm, r, g, b, u.input);
-}
-
-kernel void rasterOccupancyTextureCountKernel(texture2d<float, access::read> sourceTexture [[texture(0)]],
-                                              device atomic_uint* occupancyBins [[buffer(0)]],
-                                              device atomic_uint* visibleCount [[buffer(1)]],
-                                              constant RasterSourceUniforms& u [[buffer(2)]],
-                                              uint index [[thread_position_in_grid]]) {
-  uint total = uint(max(u.basePointCount, 0));
-  if (index >= total) return;
-  int sampleCountX = max(u.sampleCountX, 1);
-  int stride = max(u.sampleStride, 1);
-  int x = int(index % uint(sampleCountX)) * stride;
-  int y = int(index / uint(sampleCountX)) * stride;
-  x = min(max(x, 0), max(u.sourceWidth - 1, 0));
-  y = min(max(y, 0), max(u.sourceHeight - 1, 0));
-  float xNorm = (float(x) + 0.5) / float(max(u.sourceWidth, 1));
-  float yNorm = (float(y) + 0.5) / float(max(u.sourceHeight, 1));
-  float r = 0.0;
-  float g = 0.0;
-  float b = 0.0;
-  rasterReadTransformedSampleTexture(sourceTexture, u, x, y, r, g, b);
-  if (!rasterSampleVisible(u, x, y, xNorm, yNorm, r, g, b)) return;
-  atomic_fetch_add_explicit(&occupancyBins[rasterOccupancyBinIndex(r, g, b)], 1u, memory_order_relaxed);
-  atomic_fetch_add_explicit(&visibleCount[0], 1u, memory_order_relaxed);
-}
-
-kernel void rasterSourceTextureKernel(texture2d<float, access::read> sourceTexture [[texture(0)]],
-                                      device packed_float3* vertVals [[buffer(0)]],
-                                      device float4* colorVals [[buffer(1)]],
-                                      device atomic_uint* occupancyBins [[buffer(2)]],
-                                      constant RasterSourceUniforms& u [[buffer(3)]],
-                                      uint index [[thread_position_in_grid]]) {
-  uint total = uint(max(u.input.pointCount, 0));
-  if (index >= total) return;
-  int sampleCountX = max(u.sampleCountX, 1);
-  int stride = max(u.sampleStride, 1);
-  int x = int(index % uint(sampleCountX)) * stride;
-  int y = int(index / uint(sampleCountX)) * stride;
-  bool occupancyCandidate = false;
-  if (!rasterOccupancySampleCoords(index, u, &x, &y)) {
-    if (!rasterAppendSampleCoords(index,
-                                  u.identityCubeAppendOffset,
-                                  u.identityCubeAppendCount,
-                                  u.identityCubeAppendY1,
-                                  u.identityCubeAppendY2,
-                                  u.identityCubeAppendRowStep,
-                                  u.identityCubeAppendXStep,
-                                  u.sourceWidth,
-                                  &x,
-                                  &y)) {
-      rasterAppendSampleCoords(index,
-                               u.identityRampAppendOffset,
-                               u.identityRampAppendCount,
-                               u.identityRampAppendY1,
-                               u.identityRampAppendY2,
-                               u.identityRampAppendRowStep,
-                               u.identityRampAppendXStep,
-                               u.sourceWidth,
-                               &x,
-                               &y);
-    }
-  } else {
-    occupancyCandidate = true;
-  }
-  x = min(max(x, 0), max(u.sourceWidth - 1, 0));
-  y = min(max(y, 0), max(u.sourceHeight - 1, 0));
-  float xNorm = (float(x) + 0.5) / float(max(u.sourceWidth, 1));
-  float yNorm = (float(y) + 0.5) / float(max(u.sourceHeight, 1));
-  float r = 0.0;
-  float g = 0.0;
-  float b = 0.0;
-  rasterReadTransformedSampleTexture(sourceTexture, u, x, y, r, g, b);
-  bool visible = rasterSampleVisible(u, x, y, xNorm, yNorm, r, g, b);
-  if (visible && occupancyCandidate) {
-    uint binCount = atomic_load_explicit(&occupancyBins[rasterOccupancyBinIndex(r, g, b)], memory_order_relaxed);
-    visible = int(binCount) <= max(u.occupancyTargetThreshold, 0);
-  }
-  if (!visible) {
-    writeHiddenInputPoint(vertVals, colorVals, index);
-    return;
-  }
-  writeMappedInputPoint(vertVals, colorVals, index, xNorm, yNorm, r, g, b, u.input);
-}
-
-kernel void overlayKernel(const device float4* inputVals [[buffer(0)]],
-                          device packed_float3* vertVals [[buffer(1)]],
-                          device float4* colorVals [[buffer(2)]],
-                          constant OverlayUniforms& u [[buffer(3)]],
-                          uint index [[thread_position_in_grid]]) {
-  uint cubeSize = uint(max(u.cubeSize, 1));
-  uint cubePoints = cubeSize * cubeSize * cubeSize;
-  uint rampPoints = (u.ramp != 0) ? (cubeSize * cubeSize) : 0u;
-  uint uploadedPoints = uint(max(u.pointCount, 0));
-  uint total = (u.useInputPoints != 0) ? uploadedPoints : (cubePoints + rampPoints);
-  if (index >= total) return;
-
-  float r;
-  float g;
-  float b;
-  float alpha;
-  if (u.useInputPoints != 0) {
-    float4 p = inputVals[index];
-    r = p.x;
-    g = p.y;
-    b = p.z;
-    alpha = p.w;
-  } else if (index < cubePoints) {
-    uint denom = max(cubeSize - 1u, 1u);
-    uint rx = index % cubeSize;
-    uint gy = (index / cubeSize) % cubeSize;
-    uint bz = index / (cubeSize * cubeSize);
-    r = float(rx) / float(denom);
-    g = float(gy) / float(denom);
-    b = float(bz) / float(denom);
-    alpha = 0.24;
-  } else {
-    uint rampIndex = index - cubePoints;
-    uint rampCount = max(rampPoints, 1u);
-    float t = float(rampIndex) / float(max(rampCount - 1u, 1u));
-    r = t;
-    g = t;
-    b = t;
-    alpha = 0.92;
-  }
-
-  float3 pos = u.plotMode == 8
-                   ? mapChromaticityPosition(r, g, b, u)
-                   : mapPlotPosition(r, g, b, u.plotMode, u.circularHsl, u.circularHsv, u.normConeNormalized, 0);
-  vertVals[index] = packed_float3(pos.x, pos.y, pos.z);
-  float cr;
-  float cg;
-  float cb;
-  mapDisplayColor(r, g, b, cr, cg, cb);
-  applyDisplaySaturation(u.colorSaturation, cr, cg, cb);
-  colorVals[index] = float4(cr, cg, cb, alpha);
-}
-
-kernel void inputKernel(const device float* inputVals [[buffer(0)]],
-                        device packed_float3* vertVals [[buffer(1)]],
-                        device float4* colorVals [[buffer(2)]],
-                        constant InputUniforms& u [[buffer(3)]],
-                        uint index [[thread_position_in_grid]]) {
-  uint total = uint(max(u.pointCount, 0));
-  if (index >= total) return;
-  uint stride = uint(max(u.inputStride, 3));
-  uint base = index * stride;
-  float xNorm = 0.5;
-  float yNorm = 0.5;
-  float r = inputVals[base + 0];
-  float g = inputVals[base + 1];
-  float b = inputVals[base + 2];
-  if (u.glossView != 0 && stride >= 6) {
-    xNorm = clamp(inputVals[base + 0], 0.0, 1.0);
-    yNorm = clamp(inputVals[base + 1], 0.0, 1.0);
-    r = inputVals[base + 3];
-    g = inputVals[base + 4];
-    b = inputVals[base + 5];
-  }
-  bool overflowPoint = pointOverflowsCube(r, g, b);
-  float plotR = (u.showOverflow != 0) ? r : clamp01(r);
-  float plotG = (u.showOverflow != 0) ? g : clamp01(g);
-  float plotB = (u.showOverflow != 0) ? b : clamp01(b);
-  float3 pos = mapPlotPosition(plotR, plotG, plotB, u.plotMode, u.circularHsl, u.circularHsv, u.normConeNormalized, u.showOverflow);
-  if (u.plotMode == 8) {
-    pos = mapChromaticityPosition(r, g, b, u);
-  }
-  if (u.glossView != 0) {
-    float aspect = clamp(u.sourceAspect, 0.25, 4.0);
-    float halfWidth = aspect >= 1.0 ? 1.22 : (1.22 * aspect);
-    float halfDepth = aspect >= 1.0 ? (1.22 / aspect) : 1.22;
-    float common = glossCommonComponent(plotR, plotG, plotB);
-    float bodyR = max(plotR - common, 0.0);
-    float bodyG = max(plotG - common, 0.0);
-    float bodyB = max(plotB - common, 0.0);
-    float bodyLuma = clamp(bodyR * 0.2126 + bodyG * 0.7152 + bodyB * 0.0722, 0.0, 1.0);
-    float glossCue = glossStrengthCue(plotR, plotG, plotB);
-    float glossPresence = glossPresenceWeight(glossCue);
-    float xPos = -halfWidth + (2.0 * halfWidth * xNorm);
-    float zPos = halfDepth - (2.0 * halfDepth * yNorm);
-    float yPos = -0.92 + bodyLuma * 0.92 + glossCue * glossPresence * u.glossLiftScale * 1.34;
-    pos = float3(xPos, yPos, zPos);
-  }
-  vertVals[index] = packed_float3(pos.x, pos.y, pos.z);
-  float cr;
-  float cg;
-  float cb;
-  if (u.showOverflow != 0 && u.highlightOverflow != 0 && overflowPoint) {
-    cr = 1.0;
-    cg = 0.0;
-    cb = 0.0;
-  } else {
-    mapDisplayColor(r, g, b, cr, cg, cb);
-    applyDisplaySaturation(u.colorSaturation, cr, cg, cb);
-    if (u.glossView != 0) {
-      float glossPresence = glossPresenceWeight(glossStrengthCue(plotR, plotG, plotB));
-      float neutralBlend = clamp(0.08 + 0.52 * glossPresence, 0.0, 0.62);
-      float brightnessGain = 1.18 + 1.20 * glossPresence;
-      cr = clamp((cr * (1.0 - neutralBlend) + neutralBlend) * brightnessGain, 0.0, 1.0);
-      cg = clamp((cg * (1.0 - neutralBlend) + neutralBlend) * brightnessGain, 0.0, 1.0);
-      cb = clamp((cb * (1.0 - neutralBlend) + neutralBlend) * brightnessGain, 0.0, 1.0);
-    }
-  }
-  bool overflowHighlighted = (u.showOverflow != 0 && u.highlightOverflow != 0 && overflowPoint);
-  float baseAlpha = overflowHighlighted ? 0.95 : 0.72;
-  if (u.glossView != 0 && !overflowHighlighted) {
-    float glossPresence = glossPresenceWeight(glossStrengthCue(plotR, plotG, plotB));
-    baseAlpha = 0.01 + 0.97 * glossPresence;
-  }
-  colorVals[index] = float4(cr, cg, cb,
-                            luminanceAwareAlpha(baseAlpha,
-                                                cr,
-                                                cg,
-                                                cb,
-                                                u.denseAlphaBias,
-                                                overflowHighlighted,
-                                                u.pointAlphaScale));
-}
-
-kernel void inputSampleKernel(const device packed_float3* srcVerts [[buffer(0)]],
-                              const device float4* srcColors [[buffer(1)]],
-                              device packed_float3* dstVerts [[buffer(2)]],
-                              device float4* dstColors [[buffer(3)]],
-                              constant InputSampleUniforms& u [[buffer(4)]],
-                              uint index [[thread_position_in_grid]]) {
-  uint visible = uint(max(u.visiblePointCount, 0));
-  uint full = uint(max(u.fullPointCount, 0));
-  if (index >= visible) return;
-  uint srcIndex = 0u;
-  if (visible > 1u && full > 1u) {
-    float t = float(index) / float(visible - 1u);
-    srcIndex = min(uint(floor(t * float(full - 1u) + 0.5)), full - 1u);
-  }
-  packed_float3 src = srcVerts[srcIndex];
-  dstVerts[index] = packed_float3(src.x, src.y, src.z);
-  dstColors[index] = srcColors[srcIndex];
-}
-
-void accumulateScopeDensity(device atomic_uint* density,
-                            constant ScopeDensityUniforms& u,
-                            int channel,
-                            float xNorm,
-                            float value) {
-  int channelCount = max(u.channelCount, 1);
-  if (channel < 0 || channel >= channelCount) return;
-  bool overflow = (value < 0.0 || value > 1.0);
-  if (u.onlyOverflow != 0 && !overflow) return;
-  if (u.excludeOverflow != 0 && (value < 0.0 || value > 1.0)) return;
-  int x = clamp(int(xNorm * float(u.width)), 0, max(u.width - 1, 0));
-  int signalBins = u.waveform != 0 ? u.height : u.width;
-  int y = clamp(int((value - u.rangeMin) * u.invRange * float(signalBins)),
-                0,
-                max(signalBins - 1, 0));
-  int binIndex = u.waveform != 0
-      ? (channel * u.width + x) * u.height + y
-      : channel * u.width + y;
-  atomic_fetch_add_explicit(&density[binIndex], 1u, memory_order_relaxed);
-}
-
-float scopeLuma(float r, float g, float b, int method) {
-  switch (method) {
-    case 1:
-      return 0.2627 * r + 0.6780 * g + 0.0593 * b;
-    case 2:
-      return 0.2990 * r + 0.5870 * g + 0.1140 * b;
-    case 3:
-      return (r + g + b) / 3.0;
-    default:
-      return 0.2126 * r + 0.7152 * g + 0.0722 * b;
-  }
-}
-
-uint orderedUintFromFloat(float value) {
-  uint bits = as_type<uint>(value);
-  return (bits & 0x80000000u) != 0u ? ~bits : (bits ^ 0x80000000u);
-}
-
-float floatFromOrderedUint(uint value) {
-  uint bits = (value & 0x80000000u) != 0u ? (value ^ 0x80000000u) : ~value;
-  return as_type<float>(bits);
-}
-
-void includeScopeRangeValue(float value,
-                            constant ScopeRangeUniforms& range,
-                            device atomic_uint* rangeBits) {
-  if (rangeBits == nullptr) return;
-  if (range.includeOverflow == 0 && (value < 0.0 || value > 1.0)) return;
-  uint ordered = orderedUintFromFloat(value);
-  atomic_fetch_min_explicit(&rangeBits[0], ordered, memory_order_relaxed);
-  atomic_fetch_max_explicit(&rangeBits[1], ordered, memory_order_relaxed);
-  atomic_fetch_add_explicit(&rangeBits[2], 1u, memory_order_relaxed);
-}
-
-void includeScopeRangeValues(float r,
-                             float g,
-                             float b,
-                             constant ScopeRangeUniforms& range,
-                             device atomic_uint* rangeBits) {
-  bool lumaOnly = (range.waveform != 0 && range.scopeMode == 2) ||
-                  (range.waveform == 0 && range.scopeMode == 1);
-  if (lumaOnly) {
-    includeScopeRangeValue(scopeLuma(r, g, b, range.lumaMethod), range, rangeBits);
-    return;
-  }
-  if (range.includeRed != 0) includeScopeRangeValue(r, range, rangeBits);
-  if (range.includeGreen != 0) includeScopeRangeValue(g, range, rangeBits);
-  if (range.includeBlue != 0) includeScopeRangeValue(b, range, rangeBits);
-  if (range.waveform != 0 && range.scopeMode == 1 && range.includeLuma != 0) {
-    includeScopeRangeValue(scopeLuma(r, g, b, range.lumaMethod), range, rangeBits);
-  }
-}
-
-void includeScopeRangeHistogramValue(float value,
-                                     constant ScopeRangeUniforms& range,
-                                     float minValue,
-                                     float invRange,
-                                     device atomic_uint* histogram) {
-  if (histogram == nullptr || range.histogramBinCount <= 0) return;
-  if (range.includeOverflow == 0 && (value < 0.0 || value > 1.0)) return;
-  int bin = clamp(int(floor((value - minValue) * invRange * float(range.histogramBinCount))),
-                  0,
-                  max(range.histogramBinCount - 1, 0));
-  atomic_fetch_add_explicit(&histogram[uint(bin)], 1u, memory_order_relaxed);
-}
-
-void includeScopeRangeHistogramValues(float r,
-                                      float g,
-                                      float b,
-                                      constant ScopeRangeUniforms& range,
-                                      float minValue,
-                                      float invRange,
-                                      device atomic_uint* histogram) {
-  bool lumaOnly = (range.waveform != 0 && range.scopeMode == 2) ||
-                  (range.waveform == 0 && range.scopeMode == 1);
-  if (lumaOnly) {
-    includeScopeRangeHistogramValue(scopeLuma(r, g, b, range.lumaMethod),
-                                    range,
-                                    minValue,
-                                    invRange,
-                                    histogram);
-    return;
-  }
-  if (range.includeRed != 0) {
-    includeScopeRangeHistogramValue(r, range, minValue, invRange, histogram);
-  }
-  if (range.includeGreen != 0) {
-    includeScopeRangeHistogramValue(g, range, minValue, invRange, histogram);
-  }
-  if (range.includeBlue != 0) {
-    includeScopeRangeHistogramValue(b, range, minValue, invRange, histogram);
-  }
-  if (range.waveform != 0 && range.scopeMode == 1 && range.includeLuma != 0) {
-    includeScopeRangeHistogramValue(scopeLuma(r, g, b, range.lumaMethod),
-                                    range,
-                                    minValue,
-                                    invRange,
-                                    histogram);
-  }
-}
-
-bool rasterScopeSampleFromTexture(texture2d<float, access::read> sourceTexture,
-                                  constant RasterSourceUniforms& raster,
-                                  uint index,
-                                  thread float* outXNorm,
-                                  thread float* outYNorm,
-                                  thread float* outR,
-                                  thread float* outG,
-                                  thread float* outB) {
-  int sampleCountX = max(raster.sampleCountX, 1);
-  int stride = max(raster.sampleStride, 1);
-  int x = int(index % uint(sampleCountX)) * stride;
-  int y = int(index / uint(sampleCountX)) * stride;
-  bool haveCoords = index < uint(max(raster.basePointCount, 0));
-  if (!haveCoords) {
-    haveCoords = rasterAppendSampleCoords(index,
-                                          raster.identityCubeAppendOffset,
-                                          raster.identityCubeAppendCount,
-                                          raster.identityCubeAppendY1,
-                                          raster.identityCubeAppendY2,
-                                          raster.identityCubeAppendRowStep,
-                                          raster.identityCubeAppendXStep,
-                                          raster.sourceWidth,
-                                          &x,
-                                          &y);
-    if (!haveCoords) {
-      haveCoords = rasterAppendSampleCoords(index,
-                                            raster.identityRampAppendOffset,
-                                            raster.identityRampAppendCount,
-                                            raster.identityRampAppendY1,
-                                            raster.identityRampAppendY2,
-                                            raster.identityRampAppendRowStep,
-                                            raster.identityRampAppendXStep,
-                                            raster.sourceWidth,
-                                            &x,
-                                            &y);
-    }
-  }
-  if (!haveCoords) return false;
-  x = min(max(x, 0), max(raster.sourceWidth - 1, 0));
-  y = min(max(y, 0), max(raster.sourceHeight - 1, 0));
-  float xNorm = (float(x) + 0.5) / float(max(raster.sourceWidth, 1));
-  float yNorm = (float(y) + 0.5) / float(max(raster.sourceHeight, 1));
-  if (outXNorm != nullptr) *outXNorm = xNorm;
-  if (outYNorm != nullptr) *outYNorm = yNorm;
-  rasterReadTransformedSampleTexture(sourceTexture, raster, x, y, *outR, *outG, *outB);
-  return rasterSampleVisible(raster, x, y, xNorm, yNorm, *outR, *outG, *outB);
-}
-
-kernel void scopeDensityKernel(const device float* samples [[buffer(0)]],
-                               device atomic_uint* density [[buffer(1)]],
-                               constant ScopeDensityUniforms& u [[buffer(2)]],
-                               uint index [[thread_position_in_grid]]) {
-  uint total = uint(max(u.pointCount, 0));
-  if (index >= total || u.width <= 0 || u.height <= 0) return;
-  uint base = index * 5u;
-  float xNorm = clamp(samples[base + 0u], 0.0, 1.0);
-  float r = samples[base + 2u];
-  float g = samples[base + 3u];
-  float b = samples[base + 4u];
-  bool lumaOnly = (u.waveform != 0 && u.scopeMode == 2) ||
-                  (u.waveform == 0 && u.scopeMode == 1);
-  if (lumaOnly) {
-    accumulateScopeDensity(density, u, 0, xNorm, scopeLuma(r, g, b, u.lumaMethod));
-  } else {
-    accumulateScopeDensity(density, u, 0, xNorm, r);
-    accumulateScopeDensity(density, u, 1, xNorm, g);
-    accumulateScopeDensity(density, u, 2, xNorm, b);
-    if (u.waveform != 0 && u.scopeMode == 1 && u.channelCount >= 4) {
-      accumulateScopeDensity(density, u, 3, xNorm, scopeLuma(r, g, b, u.lumaMethod));
-    }
-  }
-}
-
-kernel void rasterScopeDensityTextureKernel(texture2d<float, access::read> sourceTexture [[texture(0)]],
-                                            device atomic_uint* density [[buffer(0)]],
-                                            constant RasterSourceUniforms& raster [[buffer(1)]],
-                                            constant ScopeDensityUniforms& scope [[buffer(2)]],
-                                            uint index [[thread_position_in_grid]]) {
-  uint total = uint(max(raster.input.pointCount, 0));
-  if (index >= total || scope.width <= 0 || scope.height <= 0 || density == nullptr) return;
-  float xNorm = 0.5;
-  float r = 0.0;
-  float g = 0.0;
-  float b = 0.0;
-  if (!rasterScopeSampleFromTexture(sourceTexture, raster, index, &xNorm, nullptr, &r, &g, &b)) return;
-
-  bool lumaOnly = (scope.waveform != 0 && scope.scopeMode == 2) ||
-                  (scope.waveform == 0 && scope.scopeMode == 1);
-  if (lumaOnly) {
-    accumulateScopeDensity(density, scope, 0, xNorm, scopeLuma(r, g, b, scope.lumaMethod));
-  } else {
-    accumulateScopeDensity(density, scope, 0, xNorm, r);
-    accumulateScopeDensity(density, scope, 1, xNorm, g);
-    accumulateScopeDensity(density, scope, 2, xNorm, b);
-    if (scope.waveform != 0 && scope.scopeMode == 1 && scope.channelCount >= 4) {
-      accumulateScopeDensity(density, scope, 3, xNorm, scopeLuma(r, g, b, scope.lumaMethod));
-    }
-  }
-}
-
-kernel void rasterScopeRangeTextureKernel(texture2d<float, access::read> sourceTexture [[texture(0)]],
-                                          device atomic_uint* rangeBits [[buffer(0)]],
-                                          constant RasterSourceUniforms& raster [[buffer(1)]],
-                                          constant ScopeRangeUniforms& range [[buffer(2)]],
-                                          uint index [[thread_position_in_grid]]) {
-  uint total = uint(max(raster.input.pointCount, 0));
-  if (index >= total || rangeBits == nullptr) return;
-  float r = 0.0;
-  float g = 0.0;
-  float b = 0.0;
-  if (!rasterScopeSampleFromTexture(sourceTexture, raster, index, nullptr, nullptr, &r, &g, &b)) return;
-  includeScopeRangeValues(r, g, b, range, rangeBits);
-}
-
-kernel void rasterScopeRangeHistogramTextureKernel(texture2d<float, access::read> sourceTexture [[texture(0)]],
-                                                   device atomic_uint* histogram [[buffer(0)]],
-                                                   const device atomic_uint* rangeBits [[buffer(1)]],
-                                                   constant RasterSourceUniforms& raster [[buffer(2)]],
-                                                   constant ScopeRangeUniforms& range [[buffer(3)]],
-                                                   uint index [[thread_position_in_grid]]) {
-  uint total = uint(max(raster.input.pointCount, 0));
-  if (index >= total || histogram == nullptr || rangeBits == nullptr) return;
-  uint validCount = atomic_load_explicit(&rangeBits[2], memory_order_relaxed);
-  if (validCount == 0u) return;
-  float minValue = floatFromOrderedUint(atomic_load_explicit(&rangeBits[0], memory_order_relaxed));
-  float maxValue = floatFromOrderedUint(atomic_load_explicit(&rangeBits[1], memory_order_relaxed));
-  float invRange = 1.0 / max(1.0e-7, maxValue - minValue);
-  float r = 0.0;
-  float g = 0.0;
-  float b = 0.0;
-  if (!rasterScopeSampleFromTexture(sourceTexture, raster, index, nullptr, nullptr, &r, &g, &b)) return;
-  includeScopeRangeHistogramValues(r, g, b, range, minValue, invRange, histogram);
-}
-
-kernel void rasterGlossFieldAccumulateTextureKernel(texture2d<float, access::read> sourceTexture [[texture(0)]],
-                                                    device atomic_uint* occupancyCounts [[buffer(0)]],
-                                                    device atomic_uint* sumR [[buffer(1)]],
-                                                    device atomic_uint* sumG [[buffer(2)]],
-                                                    device atomic_uint* sumB [[buffer(3)]],
-                                                    device atomic_uint* sumY [[buffer(4)]],
-                                                    device atomic_uint* sumMax [[buffer(5)]],
-                                                    device atomic_uint* sumMin [[buffer(6)]],
-                                                    device atomic_uint* sumNeutrality [[buffer(7)]],
-                                                    constant RasterSourceUniforms& raster [[buffer(8)]],
-                                                    constant GlossFieldAccumulateUniforms& u [[buffer(9)]],
-                                                    uint index [[thread_position_in_grid]]) {
-  uint total = uint(max(raster.input.pointCount, 0));
-  if (index >= total) return;
-  float xNorm = 0.5;
-  float yNorm = 0.5;
-  float r = 0.0;
-  float g = 0.0;
-  float b = 0.0;
-  if (!rasterScopeSampleFromTexture(sourceTexture, raster, index, &xNorm, &yNorm, &r, &g, &b)) return;
-  if (u.showOverflow == 0) {
-    r = clamp01(r);
-    g = clamp01(g);
-    b = clamp01(b);
-  }
-  float maxRgb = clamp(max(r, max(g, b)), 0.0, 1.0);
-  float minRgb = clamp(max(0.0, min(r, min(g, b))), 0.0, 1.0);
-  float neutralityValue = maxRgb > 1e-6 ? clamp(minRgb / maxRgb, 0.0, 1.0) : 0.0;
-  float luma = clamp(r * 0.2126 + g * 0.7152 + b * 0.0722, 0.0, 1.0);
-  int x = clamp(int(xNorm * float(u.gridWidth)), 0, max(u.gridWidth - 1, 0));
-  int y = clamp(int((1.0 - yNorm) * float(u.gridHeight)), 0, max(u.gridHeight - 1, 0));
-  uint cellIndex = uint(y * u.gridWidth + x);
-  atomic_fetch_add_explicit(&occupancyCounts[cellIndex], 1u, memory_order_relaxed);
-  atomic_fetch_add_explicit(&sumR[cellIndex], glossEncodeAccum(r), memory_order_relaxed);
-  atomic_fetch_add_explicit(&sumG[cellIndex], glossEncodeAccum(g), memory_order_relaxed);
-  atomic_fetch_add_explicit(&sumB[cellIndex], glossEncodeAccum(b), memory_order_relaxed);
-  atomic_fetch_add_explicit(&sumY[cellIndex], glossEncodeAccum(luma), memory_order_relaxed);
-  atomic_fetch_add_explicit(&sumMax[cellIndex], glossEncodeAccum(maxRgb), memory_order_relaxed);
-  atomic_fetch_add_explicit(&sumMin[cellIndex], glossEncodeAccum(minRgb), memory_order_relaxed);
-  atomic_fetch_add_explicit(&sumNeutrality[cellIndex], glossEncodeAccum(neutralityValue), memory_order_relaxed);
-}
-
-kernel void scopeRangeHistogramPercentileKernel(const device atomic_uint* histogram [[buffer(0)]],
-                                                const device atomic_uint* rangeBits [[buffer(1)]],
-                                                device atomic_uint* percentileBits [[buffer(2)]],
-                                                constant ScopeRangeUniforms& range [[buffer(3)]],
-                                                uint index [[thread_position_in_grid]]) {
-  if (index != 0u || histogram == nullptr || rangeBits == nullptr ||
-      percentileBits == nullptr || range.histogramBinCount <= 0) return;
-  uint totalCount = atomic_load_explicit(&rangeBits[2], memory_order_relaxed);
-  if (totalCount == 0u) {
-    atomic_store_explicit(&percentileBits[0], orderedUintFromFloat(0.0), memory_order_relaxed);
-    atomic_store_explicit(&percentileBits[1], orderedUintFromFloat(1.0), memory_order_relaxed);
-    return;
-  }
-  float minValue = floatFromOrderedUint(atomic_load_explicit(&rangeBits[0], memory_order_relaxed));
-  float maxValue = floatFromOrderedUint(atomic_load_explicit(&rangeBits[1], memory_order_relaxed));
-  ulong lowTarget = ulong(totalCount) / 1000ul;
-  ulong highTarget = (ulong(totalCount) * 999ul) / 1000ul;
-  ulong accumulated = 0ul;
-  float lowValue = minValue;
-  float highValue = maxValue;
-  bool foundLow = false;
-  bool foundHigh = false;
-  float span = maxValue - minValue;
-  for (int bin = 0; bin < range.histogramBinCount; ++bin) {
-    accumulated += ulong(atomic_load_explicit(&histogram[uint(bin)], memory_order_relaxed));
-    if (!foundLow && accumulated > lowTarget) {
-      float t = (float(bin) + 0.5) / float(range.histogramBinCount);
-      lowValue = minValue + t * span;
-      foundLow = true;
-    }
-    if (!foundHigh && accumulated > highTarget) {
-      float t = (float(bin) + 0.5) / float(range.histogramBinCount);
-      highValue = minValue + t * span;
-      foundHigh = true;
-      break;
-    }
-  }
-  atomic_store_explicit(&percentileBits[0], orderedUintFromFloat(lowValue), memory_order_relaxed);
-  atomic_store_explicit(&percentileBits[1], orderedUintFromFloat(highValue), memory_order_relaxed);
-}
-
-kernel void scopeRangeFinalizeKernel(const device atomic_uint* percentileBits [[buffer(0)]],
-                                     const device atomic_uint* rangeBits [[buffer(1)]],
-                                     device atomic_uint* finalRangeBits [[buffer(2)]],
-                                     constant ScopeRangeUniforms& range [[buffer(3)]],
-                                     uint index [[thread_position_in_grid]]) {
-  if (index != 0u || percentileBits == nullptr || rangeBits == nullptr || finalRangeBits == nullptr) return;
-  uint validCount = atomic_load_explicit(&rangeBits[2], memory_order_relaxed);
-  if (validCount == 0u) {
-    atomic_store_explicit(&finalRangeBits[0], orderedUintFromFloat(0.0), memory_order_relaxed);
-    atomic_store_explicit(&finalRangeBits[1], orderedUintFromFloat(1.0), memory_order_relaxed);
-    atomic_store_explicit(&finalRangeBits[2], 0u, memory_order_relaxed);
-    return;
-  }
-  float rangeMin = min(0.0, floatFromOrderedUint(atomic_load_explicit(&percentileBits[0], memory_order_relaxed)));
-  float rangeMax = max(1.0, floatFromOrderedUint(atomic_load_explicit(&percentileBits[1], memory_order_relaxed)));
-  float pad = max(0.02, (rangeMax - rangeMin) * 0.04);
-  rangeMin -= pad;
-  rangeMax += pad;
-  if (!(rangeMax > rangeMin + 1.0e-5)) {
-    rangeMin = 0.0;
-    rangeMax = 1.0;
-  }
-  if (range.previousRangeValid != 0 && range.previousRangeMax > range.previousRangeMin + 1.0e-5) {
-    rangeMin = rangeMin < range.previousRangeMin
-                   ? rangeMin
-                   : range.previousRangeMin + (rangeMin - range.previousRangeMin) * 0.16;
-    rangeMax = rangeMax > range.previousRangeMax
-                   ? rangeMax
-                   : range.previousRangeMax + (rangeMax - range.previousRangeMax) * 0.16;
-  }
-  atomic_store_explicit(&finalRangeBits[0], orderedUintFromFloat(rangeMin), memory_order_relaxed);
-  atomic_store_explicit(&finalRangeBits[1], orderedUintFromFloat(rangeMax), memory_order_relaxed);
-  atomic_store_explicit(&finalRangeBits[2], validCount, memory_order_relaxed);
-}
-
-uint histogramDensityAt(const device atomic_uint* density, int channel, int bin, int width) {
-  if (density == nullptr || channel < 0 || bin < 0 || width <= 0) return 0u;
-  return atomic_load_explicit(&density[uint(channel * width + bin)], memory_order_relaxed);
-}
-
-float smoothedHistogramDensity(const device atomic_uint* density, int channel, int bin, int width) {
-  constexpr float weights[5] = {1.0, 4.0, 6.0, 4.0, 1.0};
-  float sum = 0.0;
-  float weightSum = 0.0;
-  for (int tap = -2; tap <= 2; ++tap) {
-    int sourceBin = clamp(bin + tap, 0, max(width - 1, 0));
-    float weight = weights[tap + 2];
-    sum += float(histogramDensityAt(density, channel, sourceBin, width)) * weight;
-    weightSum += weight;
-  }
-  return weightSum > 0.0 ? sum / weightSum : 0.0;
-}
-
-kernel void histogramSurfaceMaxKernel(const device atomic_uint* density [[buffer(0)]],
-                                      device atomic_uint* maxDensity [[buffer(1)]],
-                                      constant HistogramSurfaceUniforms& u [[buffer(2)]],
-                                      uint index [[thread_position_in_grid]]) {
-  int width = max(u.width, 1);
-  int channelCount = max(u.channelCount, 1);
-  uint total = uint(width * channelCount);
-  if (index >= total || density == nullptr || maxDensity == nullptr) return;
-  int channel = int(index / uint(width));
-  int bin = int(index % uint(width));
-  uint smoothed = uint(round(smoothedHistogramDensity(density, channel, bin, width)));
-  atomic_fetch_max_explicit(&maxDensity[0], smoothed, memory_order_relaxed);
-}
-
-float4 overColor(float4 dst, float4 src) {
-  float invA = 1.0 - clamp(src.a, 0.0, 1.0);
-  return float4(src.rgb * src.a + dst.rgb * invA, src.a + dst.a * invA);
-}
-
-float4 histogramChannelColor(int channel, bool lumaOnly, bool overflow, bool highlightOverflow) {
-  if (overflow) {
-    if (highlightOverflow) return float4(0.78, 0.30, 1.0, 0.94);
-    if (lumaOnly) return float4(0.74, 0.82, 0.90, 0.72);
-    if (channel == 0) return float4(1.0, 0.24, 0.18, 0.76);
-    if (channel == 1) return float4(0.26, 1.0, 0.36, 0.76);
-    return float4(0.32, 0.58, 1.0, 0.76);
-  }
-  if (lumaOnly) return float4(0.88, 0.92, 0.96, 0.88);
-  if (channel == 0) return float4(1.0, 0.16, 0.12, 0.76);
-  if (channel == 1) return float4(0.20, 1.0, 0.28, 0.76);
-  return float4(0.24, 0.52, 1.0, 0.76);
-}
-
-kernel void histogramSurfaceRenderKernel(texture2d<float, access::write> outTexture [[texture(0)]],
-                                         const device atomic_uint* density [[buffer(0)]],
-                                         const device atomic_uint* overflowDensity [[buffer(1)]],
-                                         const device atomic_uint* maxDensity [[buffer(2)]],
-                                         constant HistogramSurfaceUniforms& u [[buffer(3)]],
-                                         uint2 gid [[thread_position_in_grid]]) {
-  uint outWidth = outTexture.get_width();
-  uint outHeight = outTexture.get_height();
-  if (gid.x >= outWidth || gid.y >= outHeight) return;
-  float2 uv = float2((float(gid.x) + 0.5) / float(max(outWidth, 1u)),
-                     (float(gid.y) + 0.5) / float(max(outHeight, 1u)));
-  int width = max(u.width, 1);
-  int bin = clamp(int(floor(uv.x * float(width))), 0, width - 1);
-  int channelCount = max(u.channelCount, 1);
-  bool lumaOnly = u.scopeMode == 1 || channelCount == 1;
-  uint maxValue = maxDensity == nullptr ? 1u : atomic_load_explicit(&maxDensity[0], memory_order_relaxed);
-  float invMax = 1.0 / max(1.0, float(maxValue));
-  float4 color = float4(0.0);
-  float lineThickness = max(1.5 / float(max(outHeight, 1u)), 0.003);
-  for (int channel = 0; channel < channelCount; ++channel) {
-    float densityValue = smoothedHistogramDensity(density, channel, bin, width);
-    if (densityValue > 0.0) {
-      float curve = sqrt(clamp(densityValue * invMax, 0.0, 1.0)) * 0.965;
-      float fillAlpha = uv.y <= curve ? (lumaOnly ? 0.14 : 0.10) : 0.0;
-      float lineAlpha = 1.0 - smoothstep(lineThickness, lineThickness * 2.5, abs(uv.y - curve));
-      float4 base = histogramChannelColor(channel, lumaOnly, false, false);
-      if (fillAlpha > 0.0) color = overColor(color, float4(base.rgb, fillAlpha));
-      if (lineAlpha > 0.0) color = overColor(color, float4(base.rgb, base.a * lineAlpha));
-    }
-    if (u.showOverflow != 0 && overflowDensity != nullptr) {
-      float overflowValue = smoothedHistogramDensity(overflowDensity, channel, bin, width);
-      if (overflowValue > 0.0) {
-        float curve = sqrt(clamp(overflowValue * invMax, 0.0, 1.0)) * 0.965;
-        float fillAlpha = uv.y <= curve ? 0.16 : 0.0;
-        float lineAlpha = 1.0 - smoothstep(lineThickness, lineThickness * 2.5, abs(uv.y - curve));
-        float4 base = histogramChannelColor(channel, lumaOnly, true, u.highlightOverflow != 0);
-        if (fillAlpha > 0.0) color = overColor(color, float4(base.rgb, fillAlpha));
-        if (lineAlpha > 0.0) color = overColor(color, float4(base.rgb, base.a * lineAlpha));
-      }
-    }
-  }
-  outTexture.write(color, gid);
-}
-
-int glossNeighborhoodRadiusCells(int neighborhoodChoice) {
-  switch (clamp(neighborhoodChoice, 0, 2)) {
-    case 0: return 1;
-    case 2: return 3;
-    case 1:
-    default: return 2;
-  }
-}
-
-int glossAnalysisRadiusCells(int neighborhoodChoice) {
-  return max(2, glossNeighborhoodRadiusCells(neighborhoodChoice) * 2);
-}
-
-float sampleGridClamped(const device float* values, int width, int height, int x, int y) {
-  if (values == nullptr || width <= 0 || height <= 0) return 0.0;
-  x = clamp(x, 0, width - 1);
-  y = clamp(y, 0, height - 1);
-  return values[uint(y * width + x)];
-}
-
-float glossGradientMagnitude(const device float* values, int width, int height, int x, int y) {
-  float gx = 0.5 * (sampleGridClamped(values, width, height, x + 1, y) -
-                    sampleGridClamped(values, width, height, x - 1, y));
-  float gy = 0.5 * (sampleGridClamped(values, width, height, x, y + 1) -
-                    sampleGridClamped(values, width, height, x, y - 1));
-  return sqrt(gx * gx + gy * gy);
-}
-
-kernel void glossFieldAccumulateKernel(const device float* packedPoints [[buffer(0)]],
-                                       device atomic_uint* occupancyCounts [[buffer(1)]],
-                                       device atomic_uint* sumR [[buffer(2)]],
-                                       device atomic_uint* sumG [[buffer(3)]],
-                                       device atomic_uint* sumB [[buffer(4)]],
-                                       device atomic_uint* sumY [[buffer(5)]],
-                                       device atomic_uint* sumMax [[buffer(6)]],
-                                       device atomic_uint* sumMin [[buffer(7)]],
-                                       device atomic_uint* sumNeutrality [[buffer(8)]],
-                                       constant GlossFieldAccumulateUniforms& u [[buffer(9)]],
-                                       uint index [[thread_position_in_grid]]) {
-  uint total = uint(max(u.pointCount, 0));
-  if (index >= total) return;
-  uint base = index * 6u;
-  float xNorm = clamp(packedPoints[base + 0u], 0.0, 1.0);
-  float yNorm = clamp(packedPoints[base + 1u], 0.0, 1.0);
-  float r = packedPoints[base + 3u];
-  float g = packedPoints[base + 4u];
-  float b = packedPoints[base + 5u];
-  if (u.showOverflow == 0) {
-    r = clamp01(r);
-    g = clamp01(g);
-    b = clamp01(b);
-  }
-  float maxRgb = clamp(max(r, max(g, b)), 0.0, 1.0);
-  float minRgb = clamp(max(0.0, min(r, min(g, b))), 0.0, 1.0);
-  float neutralityValue = maxRgb > 1e-6 ? clamp(minRgb / maxRgb, 0.0, 1.0) : 0.0;
-  float luma = clamp(r * 0.2126 + g * 0.7152 + b * 0.0722, 0.0, 1.0);
-  int x = clamp(int(xNorm * float(u.gridWidth)), 0, max(u.gridWidth - 1, 0));
-  int y = clamp(int((1.0 - yNorm) * float(u.gridHeight)), 0, max(u.gridHeight - 1, 0));
-  uint cellIndex = uint(y * u.gridWidth + x);
-  atomic_fetch_add_explicit(&occupancyCounts[cellIndex], 1u, memory_order_relaxed);
-  atomic_fetch_add_explicit(&sumR[cellIndex], glossEncodeAccum(r), memory_order_relaxed);
-  atomic_fetch_add_explicit(&sumG[cellIndex], glossEncodeAccum(g), memory_order_relaxed);
-  atomic_fetch_add_explicit(&sumB[cellIndex], glossEncodeAccum(b), memory_order_relaxed);
-  atomic_fetch_add_explicit(&sumY[cellIndex], glossEncodeAccum(luma), memory_order_relaxed);
-  atomic_fetch_add_explicit(&sumMax[cellIndex], glossEncodeAccum(maxRgb), memory_order_relaxed);
-  atomic_fetch_add_explicit(&sumMin[cellIndex], glossEncodeAccum(minRgb), memory_order_relaxed);
-  atomic_fetch_add_explicit(&sumNeutrality[cellIndex], glossEncodeAccum(neutralityValue), memory_order_relaxed);
-}
-
-kernel void glossFieldFinalizeKernel(const device atomic_uint* occupancyCounts [[buffer(0)]],
-                                     const device atomic_uint* sumR [[buffer(1)]],
-                                     const device atomic_uint* sumG [[buffer(2)]],
-                                     const device atomic_uint* sumB [[buffer(3)]],
-                                     const device atomic_uint* sumY [[buffer(4)]],
-                                     const device atomic_uint* sumMax [[buffer(5)]],
-                                     const device atomic_uint* sumMin [[buffer(6)]],
-                                     const device atomic_uint* sumNeutrality [[buffer(7)]],
-                                     device float* occupancy [[buffer(8)]],
-                                     device float* meanR [[buffer(9)]],
-                                     device float* meanG [[buffer(10)]],
-                                     device float* meanB [[buffer(11)]],
-                                     device float* carrierY [[buffer(12)]],
-                                     device float* carrierMax [[buffer(13)]],
-                                     device float* carrierMin [[buffer(14)]],
-                                     device float* neutrality [[buffer(15)]],
-                                     constant GlossFieldCellUniforms& u [[buffer(16)]],
-                                     uint index [[thread_position_in_grid]]) {
-  uint total = uint(max(u.cellCount, 0));
-  if (index >= total) return;
-  uint count = atomic_load_explicit(&occupancyCounts[index], memory_order_relaxed);
-  occupancy[index] = float(count);
-  if (count == 0u) {
-    meanR[index] = 0.0;
-    meanG[index] = 0.0;
-    meanB[index] = 0.0;
-    carrierY[index] = 0.0;
-    carrierMax[index] = 0.0;
-    carrierMin[index] = 0.0;
-    neutrality[index] = 0.0;
-    return;
-  }
-  float invCount = 1.0 / float(count);
-  meanR[index] = glossDecodeAccum(atomic_load_explicit(&sumR[index], memory_order_relaxed)) * invCount;
-  meanG[index] = glossDecodeAccum(atomic_load_explicit(&sumG[index], memory_order_relaxed)) * invCount;
-  meanB[index] = glossDecodeAccum(atomic_load_explicit(&sumB[index], memory_order_relaxed)) * invCount;
-  carrierY[index] = glossDecodeAccum(atomic_load_explicit(&sumY[index], memory_order_relaxed)) * invCount;
-  carrierMax[index] = glossDecodeAccum(atomic_load_explicit(&sumMax[index], memory_order_relaxed)) * invCount;
-  carrierMin[index] = glossDecodeAccum(atomic_load_explicit(&sumMin[index], memory_order_relaxed)) * invCount;
-  neutrality[index] = glossDecodeAccum(atomic_load_explicit(&sumNeutrality[index], memory_order_relaxed)) * invCount;
-}
-
-kernel void glossFieldMaxKernel(const device float* values [[buffer(0)]],
-                                device atomic_uint* outBits [[buffer(1)]],
-                                constant GlossFieldCellUniforms& u [[buffer(2)]],
-                                uint index [[thread_position_in_grid]]) {
-  uint total = uint(max(u.cellCount, 0));
-  if (index >= total) return;
-  atomic_fetch_max_explicit(&outBits[0], as_type<uint>(max(values[index], 0.0)), memory_order_relaxed);
-}
-
-kernel void glossFieldNormalizeKernel(const device float* src [[buffer(0)]],
-                                      device float* dst [[buffer(1)]],
-                                      const device atomic_uint* maxBits [[buffer(2)]],
-                                      constant GlossFieldCellUniforms& u [[buffer(3)]],
-                                      uint index [[thread_position_in_grid]]) {
-  uint total = uint(max(u.cellCount, 0));
-  if (index >= total) return;
-  float denom = max(as_type<float>(atomic_load_explicit(&maxBits[0], memory_order_relaxed)), 1e-5);
-  dst[index] = clamp(src[index] / denom, 0.0, 1.0);
-}
-
-kernel void glossFieldBlurKernel(const device float* src [[buffer(0)]],
-                                 device float* dst [[buffer(1)]],
-                                 constant GlossFieldCellUniforms& u [[buffer(2)]],
-                                 uint index [[thread_position_in_grid]]) {
-  uint total = uint(max(u.cellCount, 0));
-  if (index >= total) return;
-  int x = int(index % uint(u.gridWidth));
-  int y = int(index / uint(u.gridWidth));
-  float accum = 0.0;
-  float weight = 0.0;
-  for (int oy = -1; oy <= 1; ++oy) {
-    int yy = y + oy;
-    if (yy < 0 || yy >= u.gridHeight) continue;
-    for (int ox = -1; ox <= 1; ++ox) {
-      int xx = x + ox;
-      if (xx < 0 || xx >= u.gridWidth) continue;
-      float tapWeight = (ox == 0 && oy == 0) ? 0.30 : ((ox == 0 || oy == 0) ? 0.13 : 0.08);
-      accum += src[uint(yy * u.gridWidth + xx)] * tapWeight;
-      weight += tapWeight;
-    }
-  }
-  dst[index] = weight > 1e-6 ? (accum / weight) : 0.0;
-}
-
-kernel void glossFieldBodyKernel(const device float* occupancy [[buffer(0)]],
-                                 const device float* meanR [[buffer(1)]],
-                                 const device float* meanG [[buffer(2)]],
-                                 const device float* meanB [[buffer(3)]],
-                                 const device float* carrierMax [[buffer(4)]],
-                                 device float* body [[buffer(5)]],
-                                 constant GlossFieldCellUniforms& u [[buffer(6)]],
-                                 uint index [[thread_position_in_grid]]) {
-  uint total = uint(max(u.cellCount, 0));
-  if (index >= total) return;
-  if (occupancy[index] <= 0.5) {
-    body[index] = 0.0;
-    return;
-  }
-  int x = int(index % uint(u.gridWidth));
-  int y = int(index / uint(u.gridWidth));
-  int radiusCells = glossNeighborhoodRadiusCells(u.neighborhoodChoice);
-  const int kMaxNeighborhood = 49;
-  float carriers[kMaxNeighborhood];
-  int neighborIndices[kMaxNeighborhood];
-  int count = 0;
-  float centerCarrier = carrierMax[index];
-  float centerR = meanR[index];
-  float centerG = meanG[index];
-  float centerB = meanB[index];
-  for (int oy = -radiusCells; oy <= radiusCells; ++oy) {
-    int yy = y + oy;
-    if (yy < 0 || yy >= u.gridHeight) continue;
-    for (int ox = -radiusCells; ox <= radiusCells; ++ox) {
-      int xx = x + ox;
-      if (xx < 0 || xx >= u.gridWidth) continue;
-      uint neighborIndex = uint(yy * u.gridWidth + xx);
-      if (occupancy[neighborIndex] <= 0.5) continue;
-      float carrier = carrierMax[neighborIndex];
-      float dr = meanR[neighborIndex] - centerR;
-      float dg = meanG[neighborIndex] - centerG;
-      float db = meanB[neighborIndex] - centerB;
-      float colorDistance = sqrt(dr * dr + dg * dg + db * db);
-      if (abs(carrier - centerCarrier) > 0.26 && colorDistance > 0.20) continue;
-      if (count < kMaxNeighborhood) {
-        carriers[count] = carrier;
-        neighborIndices[count] = int(neighborIndex);
-        ++count;
-      }
-    }
-  }
-  if (count <= 0) {
-    body[index] = centerCarrier;
-    return;
-  }
-  for (int i = 1; i < count; ++i) {
-    float keyCarrier = carriers[i];
-    int keyIndex = neighborIndices[i];
-    int j = i - 1;
-    while (j >= 0 && (carriers[j] > keyCarrier || (carriers[j] == keyCarrier && neighborIndices[j] > keyIndex))) {
-      carriers[j + 1] = carriers[j];
-      neighborIndices[j + 1] = neighborIndices[j];
-      --j;
-    }
-    carriers[j + 1] = keyCarrier;
-    neighborIndices[j + 1] = keyIndex;
-  }
-  int trim = count >= 6 ? max(1, count / 6) : 0;
-  int begin = min(trim, count);
-  int end = max(begin + 1, count - trim);
-  float bodySum = 0.0;
-  float bodyWeight = 0.0;
-  for (int i = begin; i < end; ++i) {
-    int neighborIndex = neighborIndices[i];
-    int neighborX = neighborIndex % u.gridWidth;
-    int neighborY = neighborIndex / u.gridWidth;
-    float dx = float(neighborX - x);
-    float dy = float(neighborY - y);
-    float spatialWeight = 1.0 / (1.0 + dx * dx + dy * dy);
-    bodySum += carriers[i] * spatialWeight;
-    bodyWeight += spatialWeight;
-  }
-  body[index] = bodyWeight > 1e-6 ? (bodySum / bodyWeight) : centerCarrier;
-}
-
-kernel void glossFieldRawSignalKernel(const device float* occupancy [[buffer(0)]],
-                                      const device float* carrierMax [[buffer(1)]],
-                                      const device float* body [[buffer(2)]],
-                                      device float* rawSignal [[buffer(3)]],
-                                      device atomic_uint* maxBits [[buffer(4)]],
-                                      constant GlossFieldCellUniforms& u [[buffer(5)]],
-                                      uint index [[thread_position_in_grid]]) {
-  uint total = uint(max(u.cellCount, 0));
-  if (index >= total) return;
-  if (occupancy[index] <= 0.5) {
-    rawSignal[index] = 0.0;
-    return;
-  }
-  float bodyValue = max(body[index], 0.0);
-  float rawPositive = max(0.0, carrierMax[index] - bodyValue);
-  float rawNegative = max(0.0, bodyValue - carrierMax[index]);
-  rawSignal[index] = rawPositive - rawNegative;
-  atomic_fetch_max_explicit(&maxBits[0], as_type<uint>(bodyValue), memory_order_relaxed);
-}
-
-kernel void glossFieldWeightedSignalKernel(const device float* occupancyNorm [[buffer(0)]],
-                                           const device float* body [[buffer(1)]],
-                                           const device float* rawSignal [[buffer(2)]],
-                                           device float* positive [[buffer(3)]],
-                                           device float* negative [[buffer(4)]],
-                                           device float* boundary [[buffer(5)]],
-                                           device float* congruence [[buffer(6)]],
-                                           device float* confidence [[buffer(7)]],
-                                           device float* signal [[buffer(8)]],
-                                           device atomic_uint* maxBits [[buffer(9)]],
-                                           constant GlossFieldCellUniforms& u [[buffer(10)]],
-                                           uint index [[thread_position_in_grid]]) {
-  uint total = uint(max(u.cellCount, 0));
-  if (index >= total) return;
-  int x = int(index % uint(u.gridWidth));
-  int y = int(index / uint(u.gridWidth));
-  float occCenter = sampleGridClamped(occupancyNorm, u.gridWidth, u.gridHeight, x, y);
-  if (occCenter <= 0.0) {
-    positive[index] = 0.0;
-    negative[index] = 0.0;
-    boundary[index] = 0.0;
-    congruence[index] = 0.0;
-    confidence[index] = 0.0;
-    signal[index] = 0.0;
-    return;
-  }
-  float gxCarrier = sampleGridClamped(body, u.gridWidth, u.gridHeight, x + 1, y) -
-                    sampleGridClamped(body, u.gridWidth, u.gridHeight, x - 1, y);
-  float gyCarrier = sampleGridClamped(body, u.gridWidth, u.gridHeight, x, y + 1) -
-                    sampleGridClamped(body, u.gridWidth, u.gridHeight, x, y - 1);
-  float gxSignal = sampleGridClamped(rawSignal, u.gridWidth, u.gridHeight, x + 1, y) -
-                   sampleGridClamped(rawSignal, u.gridWidth, u.gridHeight, x - 1, y);
-  float gySignal = sampleGridClamped(rawSignal, u.gridWidth, u.gridHeight, x, y + 1) -
-                   sampleGridClamped(rawSignal, u.gridWidth, u.gridHeight, x, y - 1);
-  float magCarrier = sqrt(gxCarrier * gxCarrier + gyCarrier * gyCarrier);
-  float magSignal = sqrt(gxSignal * gxSignal + gySignal * gySignal);
-  float localCongruence = 0.0;
-  if (magCarrier > 1e-6 && magSignal > 1e-6) {
-    localCongruence = abs((gxCarrier * gxSignal + gyCarrier * gySignal) / (magCarrier * magSignal));
-  } else if (magSignal > 1e-6) {
-    localCongruence = 0.35;
-  }
-  float occNeighborhood =
-      (occCenter +
-       sampleGridClamped(occupancyNorm, u.gridWidth, u.gridHeight, x + 1, y) +
-       sampleGridClamped(occupancyNorm, u.gridWidth, u.gridHeight, x - 1, y) +
-       sampleGridClamped(occupancyNorm, u.gridWidth, u.gridHeight, x, y + 1) +
-       sampleGridClamped(occupancyNorm, u.gridWidth, u.gridHeight, x, y - 1)) / 5.0;
-  float localConfidence = clamp(sqrt(occCenter) * clamp(0.28 + 0.72 * occNeighborhood, 0.0, 1.0), 0.0, 1.0);
-  float posWeighted = max(0.0, rawSignal[index]) * (0.30 + 0.70 * localCongruence) * localConfidence;
-  float negWeighted = max(0.0, -rawSignal[index]) * (0.30 + 0.70 * localCongruence) * localConfidence;
-  float boundaryValue = clamp(magSignal * 4.0, 0.0, 1.0) * localConfidence;
-  positive[index] = posWeighted;
-  negative[index] = negWeighted;
-  boundary[index] = boundaryValue;
-  congruence[index] = localCongruence;
-  confidence[index] = localConfidence;
-  signal[index] = posWeighted - negWeighted;
-  atomic_fetch_max_explicit(&maxBits[0], as_type<uint>(max(posWeighted, 0.0)), memory_order_relaxed);
-  atomic_fetch_max_explicit(&maxBits[1], as_type<uint>(max(negWeighted, 0.0)), memory_order_relaxed);
-  atomic_fetch_max_explicit(&maxBits[2], as_type<uint>(max(boundaryValue, 0.0)), memory_order_relaxed);
-}
-
-kernel void glossFieldMergeMaxBitsKernel(const device atomic_uint* bodyMaxBits [[buffer(0)]],
-                                         const device atomic_uint* weightedMaxBits [[buffer(1)]],
-                                         device atomic_uint* finalMaxBits [[buffer(2)]],
-                                         uint index [[thread_position_in_grid]]) {
-  if (index != 0u) return;
-  atomic_store_explicit(&finalMaxBits[0],
-                        atomic_load_explicit(&bodyMaxBits[0], memory_order_relaxed),
-                        memory_order_relaxed);
-  atomic_store_explicit(&finalMaxBits[1],
-                        atomic_load_explicit(&weightedMaxBits[0], memory_order_relaxed),
-                        memory_order_relaxed);
-  atomic_store_explicit(&finalMaxBits[2],
-                        atomic_load_explicit(&weightedMaxBits[1], memory_order_relaxed),
-                        memory_order_relaxed);
-  atomic_store_explicit(&finalMaxBits[3],
-                        atomic_load_explicit(&weightedMaxBits[2], memory_order_relaxed),
-                        memory_order_relaxed);
-}
-
-kernel void glossFieldFinalNormalizeKernel(device float* body [[buffer(0)]],
-                                           device float* signal [[buffer(1)]],
-                                           device float* positive [[buffer(2)]],
-                                           device float* negative [[buffer(3)]],
-                                           device float* boundary [[buffer(4)]],
-                                           const device atomic_uint* maxBits [[buffer(5)]],
-                                           constant GlossFieldCellUniforms& u [[buffer(6)]],
-                                           uint index [[thread_position_in_grid]]) {
-  uint total = uint(max(u.cellCount, 0));
-  if (index >= total) return;
-  float maxBody = max(as_type<float>(atomic_load_explicit(&maxBits[0], memory_order_relaxed)), 1e-5);
-  float maxPositive = max(as_type<float>(atomic_load_explicit(&maxBits[1], memory_order_relaxed)), 1e-5);
-  float maxNegative = max(as_type<float>(atomic_load_explicit(&maxBits[2], memory_order_relaxed)), 1e-5);
-  float maxBoundary = max(as_type<float>(atomic_load_explicit(&maxBits[3], memory_order_relaxed)), 1e-5);
-  float maxAbsSignal = max(max(maxPositive, maxNegative), 1e-5);
-  body[index] = clamp(body[index] / maxBody, 0.0, 1.0);
-  positive[index] = clamp(positive[index] / maxPositive, 0.0, 1.0);
-  negative[index] = clamp(negative[index] / maxNegative, 0.0, 1.0);
-  signal[index] = clamp(signal[index] / maxAbsSignal, -1.0, 1.0);
-  boundary[index] = clamp(boundary[index] / maxBoundary, 0.0, 1.0);
-}
-
-kernel void glossFieldLocalPercentileKernel(const device float* values [[buffer(0)]],
-                                            const device float* occupancy [[buffer(1)]],
-                                            device float* outValues [[buffer(2)]],
-                                            constant GlossFieldCellUniforms& u [[buffer(3)]],
-                                            constant float& percentile [[buffer(4)]],
-                                            uint index [[thread_position_in_grid]]) {
-  uint total = uint(max(u.cellCount, 0));
-  if (index >= total) return;
-  int x = int(index % uint(u.gridWidth));
-  int y = int(index / uint(u.gridWidth));
-  if (occupancy != nullptr && occupancy[index] <= 0.5) {
-    outValues[index] = 0.0;
-    return;
-  }
-  int radius = max(1, glossAnalysisRadiusCells(u.neighborhoodChoice));
-  int bins[96];
-  for (int i = 0; i < 96; ++i) bins[i] = 0;
-  int count = 0;
-  float minValue = 1.0e20;
-  float maxValue = -1.0e20;
-  for (int yy = max(0, y - radius); yy <= min(u.gridHeight - 1, y + radius); ++yy) {
-    for (int xx = max(0, x - radius); xx <= min(u.gridWidth - 1, x + radius); ++xx) {
-      uint nidx = uint(yy * u.gridWidth + xx);
-      if (occupancy != nullptr && occupancy[nidx] <= 0.5) continue;
-      float v = values[nidx];
-      minValue = min(minValue, v);
-      maxValue = max(maxValue, v);
-      ++count;
-    }
-  }
-  if (count <= 0 || maxValue - minValue <= 1e-7) {
-    outValues[index] = values[index];
-    return;
-  }
-  float invRange = 1.0 / (maxValue - minValue);
-  for (int yy = max(0, y - radius); yy <= min(u.gridHeight - 1, y + radius); ++yy) {
-    for (int xx = max(0, x - radius); xx <= min(u.gridWidth - 1, x + radius); ++xx) {
-      uint nidx = uint(yy * u.gridWidth + xx);
-      if (occupancy != nullptr && occupancy[nidx] <= 0.5) continue;
-      int bin = min(95,
-                    max(0, int((values[nidx] - minValue) * invRange *
-                               95.0 + 0.5)));
-      bins[bin] += 1;
-    }
-  }
-  int target = min(count - 1,
-                   max(0, int(floor(clamp(percentile / 100.0, 0.0, 1.0) *
-                                    float(count - 1) + 0.5))));
-  int accumulated = 0;
-  int chosen = 0;
-  for (int i = 0; i < 96; ++i) {
-    accumulated += bins[i];
-    if (accumulated > target) {
-      chosen = i;
-      break;
-    }
-  }
-  outValues[index] = minValue + (float(chosen) / 95.0) * (maxValue - minValue);
-}
-
-kernel void glossFieldCandidate2RawKernel(const device float* occupancy [[buffer(0)]],
-                                          const device float* occupancySupport [[buffer(1)]],
-                                          const device float* meanR [[buffer(2)]],
-                                          const device float* meanG [[buffer(3)]],
-                                          const device float* meanB [[buffer(4)]],
-                                          const device float* carrier [[buffer(5)]],
-                                          const device float* viewerBody [[buffer(6)]],
-                                          const device float* bodyCore [[buffer(7)]],
-                                          const device float* bodyContext [[buffer(8)]],
-                                          const device float* retinexBody [[buffer(9)]],
-                                          const device float* dogLow [[buffer(10)]],
-                                          const device float* dogHigh [[buffer(11)]],
-                                          device float* adaptiveBody [[buffer(12)]],
-                                          device float* positiveRaw [[buffer(13)]],
-                                          device float* negativeRaw [[buffer(14)]],
-                                          device float* confidence [[buffer(15)]],
-                                          device float* agreement [[buffer(16)]],
-                                          constant GlossFieldCellUniforms& u [[buffer(17)]],
-                                          uint index [[thread_position_in_grid]]) {
-  uint total = uint(max(u.cellCount, 0));
-  if (index >= total) return;
-  if (occupancy[index] <= 0.5) {
-    adaptiveBody[index] = 0.0;
-    positiveRaw[index] = 0.0;
-    negativeRaw[index] = 0.0;
-    confidence[index] = 0.0;
-    agreement[index] = 0.0;
-    return;
-  }
-  int x = int(index % uint(u.gridWidth));
-  int y = int(index / uint(u.gridWidth));
-  int analysisRadius = glossAnalysisRadiusCells(u.neighborhoodChoice);
-  float hybridBody = 0.65 * bodyCore[index] + 0.35 * bodyContext[index];
-  float viewerPositive = max(0.0, carrier[index] - viewerBody[index]);
-  float viewerNegative = max(0.0, viewerBody[index] - carrier[index]);
-  float hybridPositive = max(0.0, carrier[index] - bodyCore[index]);
-  float hybridNegative = max(0.0, bodyContext[index] - carrier[index]);
-  float chromaSpread = max(meanR[index], max(meanG[index], meanB[index])) -
-                       min(meanR[index], min(meanG[index], meanB[index]));
-  float shapeSupport = clamp(glossGradientMagnitude(bodyContext, u.gridWidth, u.gridHeight, x, y) * 8.0, 0.0, 1.0);
-  float chromaSupport = clamp(chromaSpread * 2.5, 0.0, 1.0);
-  float ambiguity = clamp(1.0 - (0.72 * shapeSupport + 0.28 * chromaSupport), 0.0, 1.0);
-  float body = ambiguity * viewerBody[index] + (1.0 - ambiguity) * hybridBody;
-  float bodyAgreement = clamp(1.0 - abs(viewerBody[index] - hybridBody), 0.0, 1.0);
-  float positiveAgreement = clamp(1.0 - abs(viewerPositive - hybridPositive) * 4.0, 0.0, 1.0);
-  float localPositiveSupport = 0.0;
-  float supportWeight = 0.0;
-  for (int oy = -analysisRadius; oy <= analysisRadius; ++oy) {
-    for (int ox = -analysisRadius; ox <= analysisRadius; ++ox) {
-      int xx = clamp(x + ox, 0, u.gridWidth - 1);
-      int yy = clamp(y + oy, 0, u.gridHeight - 1);
-      uint nidx = uint(yy * u.gridWidth + xx);
-      float distSq = float(ox * ox + oy * oy);
-      float w = 1.0 / (1.0 + distSq);
-      localPositiveSupport += max(0.0, carrier[nidx] - bodyCore[nidx]) * w;
-      supportWeight += w;
-    }
-  }
-  localPositiveSupport = clamp((supportWeight > 1e-6 ? localPositiveSupport / supportWeight : 0.0) * 4.0, 0.0, 1.0);
-  float permission = clamp(0.32 * positiveAgreement +
-                           0.24 * bodyAgreement +
-                           0.24 * shapeSupport +
-                           0.20 * localPositiveSupport,
-                           0.0,
-                           1.0);
-  float consensusPositive = viewerPositive * (0.25 + 0.75 * clamp(hybridPositive * 4.0, 0.0, 1.0));
-  float panelMix = clamp(sqrt(max(0.0, ambiguity)) * (0.55 + 0.45 * positiveAgreement), 0.0, 1.0);
-  float retinexResidual = carrier[index] - retinexBody[index];
-  float dogResidual = dogLow[index] - dogHigh[index];
-  float dogPositive = max(0.0, dogResidual);
-  float dogNegative = max(0.0, -dogResidual);
-  float dogPositiveAgreement = clamp(1.0 - abs(dogPositive - hybridPositive) * 4.0, 0.0, 1.0);
-  float dogNegativeAgreement = clamp(1.0 - abs(dogNegative - hybridNegative) * 4.0, 0.0, 1.0);
-  float positiveRetinexGate = clamp(0.18 + 0.34 * permission + 0.18 * positiveAgreement +
-                                    0.16 * shapeSupport + 0.14 * localPositiveSupport,
-                                    0.0,
-                                    1.0);
-  float negativeRetinexGate = clamp(0.30 + 0.40 * (1.0 - ambiguity) +
-                                    0.18 * bodyAgreement + 0.12 * permission,
-                                    0.0,
-                                    1.0);
-  float dogPositiveGate = clamp(0.16 + 0.30 * permission + 0.18 * positiveAgreement +
-                                0.16 * shapeSupport + 0.12 * dogPositiveAgreement +
-                                0.08 * localPositiveSupport,
-                                0.0,
-                                1.0);
-  float dogNegativeGate = clamp(0.30 + 0.36 * (1.0 - ambiguity) +
-                                0.20 * bodyAgreement + 0.14 * dogNegativeAgreement,
-                                0.0,
-                                1.0);
-  float pos = (1.0 - panelMix) * hybridPositive +
-              panelMix * consensusPositive +
-              0.20 * positiveRetinexGate * max(0.0, retinexResidual) +
-              0.18 * dogPositiveGate * dogPositive;
-  float neg = (1.0 - ambiguity) * hybridNegative +
-              ambiguity * (0.55 * hybridNegative + 0.45 * viewerNegative) +
-              0.16 * negativeRetinexGate * max(0.0, -retinexResidual) +
-              0.12 * dogNegativeGate * dogNegative;
-  adaptiveBody[index] = body;
-  positiveRaw[index] = pos;
-  negativeRaw[index] = neg;
-  float attachment = clamp(0.31 * shapeSupport +
-                           0.21 * localPositiveSupport +
-                           0.20 * permission +
-                           0.20 * positiveAgreement +
-                           0.08 * bodyAgreement,
-                           0.0,
-                           1.0);
-  float support = sqrt(clamp(occupancySupport[index], 0.0, 1.0));
-  confidence[index] = clamp((0.10 + 0.90 * (0.28 * bodyAgreement +
-                                            0.22 * positiveAgreement +
-                                            0.20 * permission +
-                                            0.15 * (1.0 - ambiguity) +
-                                            0.15 * attachment)) *
-                            (0.30 + 0.70 * support),
-                            0.0,
-                            1.0);
-  agreement[index] = clamp(0.40 * bodyAgreement + 0.35 * positiveAgreement + 0.25 * permission, 0.0, 1.0);
-}
-
-kernel void glossFieldAssembleUnifiedKernel(const device float* bodyRaw [[buffer(0)]],
-                                            const device float* positiveRaw [[buffer(1)]],
-                                            const device float* negativeRaw [[buffer(2)]],
-                                            const device float* confidenceRaw [[buffer(3)]],
-                                            const device float* agreementRaw [[buffer(4)]],
-                                            device float* body [[buffer(5)]],
-                                            device float* signal [[buffer(6)]],
-                                            device float* positive [[buffer(7)]],
-                                            device float* negative [[buffer(8)]],
-                                            device float* boundary [[buffer(9)]],
-                                            device float* congruence [[buffer(10)]],
-                                            device float* confidence [[buffer(11)]],
-                                            device atomic_uint* maxBits [[buffer(12)]],
-                                            constant GlossFieldCellUniforms& u [[buffer(13)]],
-                                            uint index [[thread_position_in_grid]]) {
-  uint total = uint(max(u.cellCount, 0));
-  if (index >= total) return;
-  int x = int(index % uint(u.gridWidth));
-  int y = int(index / uint(u.gridWidth));
-  float gxBody = 0.5 * (sampleGridClamped(bodyRaw, u.gridWidth, u.gridHeight, x + 1, y) -
-                        sampleGridClamped(bodyRaw, u.gridWidth, u.gridHeight, x - 1, y));
-  float gyBody = 0.5 * (sampleGridClamped(bodyRaw, u.gridWidth, u.gridHeight, x, y + 1) -
-                        sampleGridClamped(bodyRaw, u.gridWidth, u.gridHeight, x, y - 1));
-  float signalXp = sampleGridClamped(positiveRaw, u.gridWidth, u.gridHeight, x + 1, y) -
-                   sampleGridClamped(negativeRaw, u.gridWidth, u.gridHeight, x + 1, y);
-  float signalXm = sampleGridClamped(positiveRaw, u.gridWidth, u.gridHeight, x - 1, y) -
-                   sampleGridClamped(negativeRaw, u.gridWidth, u.gridHeight, x - 1, y);
-  float signalYp = sampleGridClamped(positiveRaw, u.gridWidth, u.gridHeight, x, y + 1) -
-                   sampleGridClamped(negativeRaw, u.gridWidth, u.gridHeight, x, y + 1);
-  float signalYm = sampleGridClamped(positiveRaw, u.gridWidth, u.gridHeight, x, y - 1) -
-                   sampleGridClamped(negativeRaw, u.gridWidth, u.gridHeight, x, y - 1);
-  float gxSignal = 0.5 * (signalXp - signalXm);
-  float gySignal = 0.5 * (signalYp - signalYm);
-  float magBody = sqrt(gxBody * gxBody + gyBody * gyBody);
-  float magSignal = sqrt(gxSignal * gxSignal + gySignal * gySignal);
-  float localCongruence = 0.0;
-  if (magBody > 1e-6 && magSignal > 1e-6) {
-    localCongruence = clamp(abs((gxBody * gxSignal + gyBody * gySignal) / (magBody * magSignal)), 0.0, 1.0);
-  } else if (magSignal > 1e-6) {
-    localCongruence = 0.35;
-  }
-  float localBoundary = magSignal * 4.0;
-  float weight = (0.35 + 0.65 * clamp(localCongruence, 0.0, 1.0)) *
-                 (0.45 + 0.55 * clamp(confidenceRaw[index], 0.0, 1.0));
-  body[index] = max(0.0, bodyRaw[index]);
-  positive[index] = max(0.0, positiveRaw[index]) * weight;
-  negative[index] = max(0.0, negativeRaw[index]) * weight;
-  signal[index] = positive[index] - negative[index];
-  boundary[index] = max(0.0, localBoundary);
-  congruence[index] = localCongruence;
-  confidence[index] = confidenceRaw[index];
-  atomic_fetch_max_explicit(&maxBits[0], as_type<uint>(max(body[index], 0.0)), memory_order_relaxed);
-  atomic_fetch_max_explicit(&maxBits[1], as_type<uint>(max(positive[index], 0.0)), memory_order_relaxed);
-  atomic_fetch_max_explicit(&maxBits[2], as_type<uint>(max(negative[index], 0.0)), memory_order_relaxed);
-  atomic_fetch_max_explicit(&maxBits[3], as_type<uint>(max(boundary[index], 0.0)), memory_order_relaxed);
-}
-
-struct PlotSurfaceClearUniforms {
-  float r;
-  float g;
-  float b;
-  float a;
-};
-
-struct GlossFieldSurfaceUniforms {
-  int gridWidth;
-  int gridHeight;
-  int surfaceWidth;
-  int surfaceHeight;
-  int algorithm;
-  int colorMode;
-  int debugMode;
-  int diagnosticMode;
-  float colorSaturation;
-  float glossBodyOpacity;
-  float glossHighlightOpacity;
-  float glossLiftScale;
-};
-
-struct GlossProjectionSurfaceUniforms {
-  int gridWidth;
-  int gridHeight;
-  int surfaceWidth;
-  int surfaceHeight;
-  int algorithm;
-  int colorMode;
-  int debugMode;
-  int diagnosticMode;
-  float sourceAspect;
-  float colorSaturation;
-  float glossBodyOpacity;
-  float glossHighlightOpacity;
-  float glossLiftScale;
-  float pointRadiusPixels;
-  float modelView[16];
-  float projection[16];
-};
-
-float3 mixGloss3(float3 a, float3 b, float t) {
-  float k = clamp(t, 0.0, 1.0);
-  return a + (b - a) * k;
-}
-
-float glossSourcePresence(const device float* meanR,
-                          const device float* meanG,
-                          const device float* meanB,
-                          uint idx) {
-  return clamp(max(meanR[idx], max(meanG[idx], meanB[idx])), 0.0, 1.0);
-}
-
-float3 glossSurfaceSourceHueColor(const device float* meanR,
-                                  const device float* meanG,
-                                  const device float* meanB,
-                                  constant GlossFieldSurfaceUniforms& u,
-                                  uint idx) {
-  float sr = 0.0;
-  float sg = 0.0;
-  float sb = 0.0;
-  mapDisplayColor(meanR[idx], meanG[idx], meanB[idx], sr, sg, sb);
-  applyDisplaySaturation(min(3.0, u.colorSaturation), sr, sg, sb);
-  return float3(sr, sg, sb);
-}
-
-float4 glossSurfaceUnderlayColor(const device float* meanR,
-                                 const device float* meanG,
-                                 const device float* meanB,
-                                 const device float* body,
-                                 const device float* confidence,
-                                 constant GlossFieldSurfaceUniforms& u,
-                                 uint idx) {
-  float sr = 0.0;
-  float sg = 0.0;
-  float sb = 0.0;
-  mapDisplayColor(meanR[idx], meanG[idx], meanB[idx], sr, sg, sb);
-  float sourceLuma = clamp(0.2126 * sr + 0.7152 * sg + 0.0722 * sb, 0.0, 1.0);
-  float sourcePresence = glossSourcePresence(meanR, meanG, meanB, idx);
-  float confidenceValue = clamp(confidence[idx], 0.0, 1.0);
-  float bodyValue = clamp(body[idx], 0.0, 1.0);
-  float structure = max(sqrt(confidenceValue), sqrt(sourcePresence));
-  float bodyGain = 0.34 + 0.66 * clamp(u.glossBodyOpacity, 0.0, 1.0);
-  float3 color;
-  if (u.colorMode == 1) {
-    float3 sourceHue = glossSurfaceSourceHueColor(meanR, meanG, meanB, u, idx);
-    float shaped = pow(max(sourceLuma, 0.0), 0.85);
-    float3 neutralBase = float3(0.10 + 0.52 * shaped,
-                                0.10 + 0.50 * shaped,
-                                0.11 + 0.46 * shaped);
-    color = mixGloss3(neutralBase, sourceHue, 0.42);
-  } else {
-    float gray = 0.11 + 0.62 * pow(max(sourceLuma, 0.35 * bodyValue), 0.84);
-    color = float3(gray * 0.98, gray * 0.985, gray);
-  }
-  float alpha = clamp((0.10 + 0.48 * structure) * bodyGain, 0.0, 0.68);
-  return float4(clamp(color, 0.0, 1.0), alpha);
-}
-
-float4 glossSurfaceDisplayColorValues(float meanRValue,
-                                      float meanGValue,
-                                      float meanBValue,
-                                      float carrierYValue,
-                                      float carrierMaxValue,
-                                      float carrierMinValue,
-                                      float neutralityValue,
-                                      float bodyValueIn,
-                                      float positiveValue,
-                                      float negativeValue,
-                                      float boundaryValueIn,
-                                      float congruenceValueIn,
-                                      float confidenceValueIn,
-                                      float signalValue,
-                                      int colorMode,
-                                      int debugMode,
-                                      int diagnosticMode,
-                                      float colorSaturation,
-                                      float glossBodyOpacity,
-                                      float glossHighlightOpacity,
-                                      float glossLiftScale) {
-  float base = clamp(bodyValueIn, 0.0, 1.0);
-  float pos = clamp(positiveValue, 0.0, 1.0);
-  float neg = clamp(negativeValue, 0.0, 1.0);
-  if (debugMode != 0) {
-    float scalar = 0.0;
-    if (debugMode == 1) scalar = carrierMaxValue;
-    else if (debugMode == 2) scalar = carrierYValue;
-    else if (debugMode == 3) scalar = carrierMinValue;
-    else if (debugMode == 4) scalar = neutralityValue;
-    pos = clamp(scalar, 0.0, 1.0);
-    neg = 0.0;
-    base = clamp(scalar, 0.0, 1.0);
-  }
-  float confidenceValue = clamp(confidenceValueIn, 0.0, 1.0);
-  float congruenceValue = clamp(congruenceValueIn, 0.0, 1.0);
-  float boundaryValue = clamp(boundaryValueIn, 0.0, 1.0);
-  float ambiguity = clamp(1.0 - confidenceValue, 0.0, 1.0);
-  float signalScale = max(1.0, glossLiftScale);
-  pos = clamp(pos * signalScale, 0.0, 1.0);
-  neg = clamp(neg * signalScale, 0.0, 1.0);
-  float positiveDisplay = smoothstep(0.035, 1.0, pos);
-  float negativeDisplay = smoothstep(0.035, 1.0, neg);
-  float signalPresence = max(positiveDisplay, negativeDisplay);
-  float structureStrength = max(congruenceValue, boundaryValue);
-  float3 color;
-  if (colorMode == 1) {
-    float sr = 0.0;
-    float sg = 0.0;
-    float sb = 0.0;
-    mapDisplayColor(meanRValue, meanGValue, meanBValue, sr, sg, sb);
-    applyDisplaySaturation(min(3.0, colorSaturation), sr, sg, sb);
-    float3 sourceHue = float3(sr, sg, sb);
-    float baseMix = clamp(glossBodyOpacity * (0.22 + 0.78 * confidenceValue) *
-                              (0.86 - 0.22 * signalPresence),
-                          0.0,
-                          1.0);
-    float shaped = pow(max(base, 0.0), 0.78);
-    float3 neutralBase = float3(0.16 + 0.60 * shaped,
-                                0.16 + 0.58 * shaped,
-                                0.17 + 0.54 * shaped);
-    color = mixGloss3(float3(0.03, 0.03, 0.04), mixGloss3(neutralBase, sourceHue, 0.68), baseMix);
-    if (positiveDisplay > 0.0) {
-      float3 warm = mixGloss3(sourceHue, float3(1.0, 0.95, 0.86), 0.54);
-      color = mixGloss3(color,
-                        warm,
-                        clamp(glossHighlightOpacity * positiveDisplay * (0.22 + 0.78 * structureStrength),
-                              0.0,
-                              1.0));
-    }
-    if (negativeDisplay > 0.0) {
-      float3 cool = mixGloss3(sourceHue, float3(0.08, 0.14, 0.24), 0.74);
-      color = mixGloss3(color,
-                        cool,
-                        clamp(glossHighlightOpacity * negativeDisplay * (0.22 + 0.78 * structureStrength),
-                              0.0,
-                              1.0));
-    }
-  } else {
-    float shaped = pow(max(base, 0.0), 0.78);
-    float3 neutralBase = float3(0.16 + 0.64 * shaped,
-                                0.16 + 0.64 * shaped,
-                                0.17 + 0.60 * shaped);
-    color = mixGloss3(float3(0.03, 0.03, 0.04),
-                      neutralBase,
-                      clamp(glossBodyOpacity * (0.22 + 0.78 * confidenceValue) *
-                                (0.86 - 0.22 * signalPresence),
-                            0.0,
-                            1.0));
-    if (positiveDisplay > 0.0) {
-      color = mixGloss3(color,
-                        float3(1.0, 0.89, 0.36),
-                        clamp(glossHighlightOpacity * positiveDisplay * (0.22 + 0.78 * structureStrength),
-                              0.0,
-                              1.0));
-    }
-    if (negativeDisplay > 0.0) {
-      color = mixGloss3(color,
-                        float3(0.22, 0.76, 1.0),
-                        clamp(glossHighlightOpacity * negativeDisplay * (0.22 + 0.78 * structureStrength),
-                              0.0,
-                              1.0));
-    }
-  }
-  if (boundaryValue > 0.0) {
-    color = mixGloss3(color, float3(0.98, 0.98, 0.94), clamp(0.10 + 0.26 * boundaryValue, 0.0, 0.34));
-  }
-  float alpha = clamp(glossBodyOpacity * (0.12 + 0.62 * confidenceValue) *
-                          (0.82 - 0.18 * signalPresence) +
-                          glossHighlightOpacity * signalPresence * (0.16 + 0.84 * structureStrength),
-                      0.018,
-                      1.0);
-  if (diagnosticMode == 1) {
-    float gray = 0.16 + 0.78 * confidenceValue;
-    color = mixGloss3(color, float3(gray, gray, gray), 0.36);
-    color = mixGloss3(color, float3(1.0, 1.0, 0.96), 0.10 * boundaryValue);
-    alpha = clamp(alpha * (0.55 + 0.45 * confidenceValue) + 0.10 * confidenceValue, 0.018, 1.0);
-  } else if (diagnosticMode == 2) {
-    float gray = 0.12 + 0.74 * ambiguity;
-    color = mixGloss3(color, float3(gray * 0.94, gray * 0.97, gray), 0.34);
-    color = mixGloss3(color, float3(0.80, 0.90, 1.0), 0.10 * boundaryValue * ambiguity);
-    alpha = clamp(alpha * (0.48 + 0.52 * ambiguity) + 0.08 * ambiguity, 0.018, 1.0);
-  }
-  (void)signalValue;
-  return float4(clamp(color, 0.0, 1.0), alpha);
-}
-
-kernel void glossFieldSurfaceRenderKernel(texture2d<float, access::write> outTexture [[texture(0)]],
-                                          const device float* meanR [[buffer(0)]],
-                                          const device float* meanG [[buffer(1)]],
-                                          const device float* meanB [[buffer(2)]],
-                                          const device float* carrierY [[buffer(3)]],
-                                          const device float* carrierMax [[buffer(4)]],
-                                          const device float* carrierMin [[buffer(5)]],
-                                          const device float* neutrality [[buffer(6)]],
-                                          const device float* body [[buffer(7)]],
-                                          const device float* positive [[buffer(8)]],
-                                          const device float* negative [[buffer(9)]],
-                                          const device float* boundary [[buffer(10)]],
-                                          const device float* congruence [[buffer(11)]],
-                                          const device float* confidence [[buffer(12)]],
-                                          const device float* signal [[buffer(13)]],
-                                          constant GlossFieldSurfaceUniforms& u [[buffer(14)]],
-                                          uint2 gid [[thread_position_in_grid]]) {
-  uint outWidth = outTexture.get_width();
-  uint outHeight = outTexture.get_height();
-  if (gid.x >= outWidth || gid.y >= outHeight ||
-      u.gridWidth <= 0 || u.gridHeight <= 0 ||
-      u.surfaceWidth <= 0 || u.surfaceHeight <= 0) return;
-  float2 uv = float2((float(gid.x) + 0.5) / float(max(outWidth, 1u)),
-                     (float(gid.y) + 0.5) / float(max(outHeight, 1u)));
-  int x = clamp(int(floor(uv.x * float(u.gridWidth))), 0, u.gridWidth - 1);
-  int yFromBottom = clamp(int(floor(uv.y * float(u.gridHeight))), 0, u.gridHeight - 1);
-  int y = u.gridHeight - 1 - yFromBottom;
-  uint idx = uint(y * u.gridWidth + x);
-  float sourcePresence = glossSourcePresence(meanR, meanG, meanB, idx);
-  float confidenceValue = clamp(confidence[idx], 0.0, 1.0);
-  if (sourcePresence <= 0.01 && confidenceValue <= 0.01) {
-    outTexture.write(float4(0.0), gid);
-    return;
-  }
-  float4 underlay = glossSurfaceUnderlayColor(meanR, meanG, meanB, body, confidence, u, idx);
-  float4 display = glossSurfaceDisplayColorValues(meanR[idx],
-                                                  meanG[idx],
-                                                  meanB[idx],
-                                                  carrierY[idx],
-                                                  carrierMax[idx],
-                                                  carrierMin[idx],
-                                                  neutrality[idx],
-                                                  body[idx],
-                                                  positive[idx],
-                                                  negative[idx],
-                                                  boundary[idx],
-                                                  congruence[idx],
-                                                  confidence[idx],
-                                                  signal[idx],
-                                                  u.colorMode,
-                                                  u.debugMode,
-                                                  u.diagnosticMode,
-                                                  u.colorSaturation,
-                                                  u.glossBodyOpacity,
-                                                  u.glossHighlightOpacity,
-                                                  u.glossLiftScale);
-  float4 color = overColor(underlay, display);
-  outTexture.write(color, gid);
-}
-
-float4 multiplyProjectionMatrix(constant float* m, float4 v) {
-  return float4(m[0] * v.x + m[4] * v.y + m[8] * v.z + m[12] * v.w,
-                m[1] * v.x + m[5] * v.y + m[9] * v.z + m[13] * v.w,
-                m[2] * v.x + m[6] * v.y + m[10] * v.z + m[14] * v.w,
-                m[3] * v.x + m[7] * v.y + m[11] * v.z + m[15] * v.w);
-}
-
-bool glossProjectionCellScreenPosition(const device float* carrierY,
-                                       const device float* carrierMax,
-                                       const device float* carrierMin,
-                                       const device float* neutrality,
-                                       const device float* signal,
-                                       constant GlossProjectionSurfaceUniforms& u,
-                                       uint index,
-                                       thread int* outPx,
-                                       thread int* outPy,
-                                       thread float* outNdcZ) {
-  if (outPx == nullptr || outPy == nullptr || outNdcZ == nullptr) return false;
-  int x = int(index % uint(u.gridWidth));
-  int y = int(index / uint(u.gridWidth));
-  float aspect = clamp(u.sourceAspect, 0.25, 4.0);
-  const float kMajorHalf = 1.22;
-  float halfWidth = aspect >= 1.0 ? kMajorHalf : kMajorHalf * aspect;
-  float halfDepth = aspect >= 1.0 ? kMajorHalf / aspect : kMajorHalf;
-  float xNorm = (float(x) + 0.5) / float(u.gridWidth);
-  float yNormInv = (float(y) + 0.5) / float(u.gridHeight);
-  float xPos = -halfWidth + 2.0 * halfWidth * xNorm;
-  float imageY = halfDepth - 2.0 * halfDepth * yNormInv;
-
-  float signedValue = signal[index];
-  if (u.debugMode == 1) {
-    signedValue = clamp(carrierMax[index], 0.0, 1.0);
-  } else if (u.debugMode == 2) {
-    signedValue = clamp(carrierY[index], 0.0, 1.0);
-  } else if (u.debugMode == 3) {
-    signedValue = clamp(carrierMin[index], 0.0, 1.0);
-  } else if (u.debugMode == 4) {
-    signedValue = clamp(neutrality[index], 0.0, 1.0);
-  }
-  float zPos = u.debugMode == 0 ? signedValue : max(0.0, signedValue);
-
-  float4 world = float4(xPos, imageY, zPos, 1.0);
-  float4 eye = multiplyProjectionMatrix(u.modelView, world);
-  float4 clip = multiplyProjectionMatrix(u.projection, eye);
-  if (abs(clip.w) <= 1e-6) return false;
-  float invW = 1.0 / clip.w;
-  float ndcX = clip.x * invW;
-  float ndcY = clip.y * invW;
-  float ndcZ = clip.z * invW;
-  if (ndcX < -1.12 || ndcX > 1.12 || ndcY < -1.12 || ndcY > 1.12 || ndcZ < -1.25 || ndcZ > 1.25) {
-    return false;
-  }
-  *outPx = int(round((ndcX * 0.5 + 0.5) * float(u.surfaceWidth - 1)));
-  int py = int(round((ndcY * 0.5 + 0.5) * float(u.surfaceHeight - 1)));
-  *outPy = u.surfaceHeight - 1 - py;
-  *outNdcZ = ndcZ;
-  return true;
-}
-
-kernel void glossProjectionSurfaceSelectKernel(device atomic_uint* selection [[buffer(0)]],
-                                               const device float* meanR [[buffer(1)]],
-                                               const device float* meanG [[buffer(2)]],
-                                               const device float* meanB [[buffer(3)]],
-                                               const device float* carrierY [[buffer(4)]],
-                                               const device float* carrierMax [[buffer(5)]],
-                                               const device float* carrierMin [[buffer(6)]],
-                                               const device float* neutrality [[buffer(7)]],
-                                               const device float* confidence [[buffer(8)]],
-                                               const device float* signal [[buffer(9)]],
-                                               constant GlossProjectionSurfaceUniforms& u [[buffer(10)]],
-                                               uint index [[thread_position_in_grid]]) {
-  uint cellCount = uint(max(u.gridWidth * u.gridHeight, 0));
-  if (index >= cellCount || u.surfaceWidth <= 0 || u.surfaceHeight <= 0) return;
-  float sourcePresence = glossSourcePresence(meanR, meanG, meanB, index);
-  float confidenceValue = clamp(confidence[index], 0.0, 1.0);
-  if (sourcePresence <= 0.01 && confidenceValue <= 0.01) return;
-  int px = 0;
-  int py = 0;
-  float ndcZ = 0.0;
-  if (!glossProjectionCellScreenPosition(carrierY, carrierMax, carrierMin, neutrality, signal,
-                                         u, index, &px, &py, &ndcZ)) {
-    return;
-  }
-  float radius = clamp(u.pointRadiusPixels * (0.75 + 0.45 * confidenceValue), 1.0, 5.0);
-  int r = int(ceil(radius));
-  uint depthPriority = uint(clamp((1.25 - ndcZ) / 2.5, 0.0, 1.0) * 4095.0) + 1u;
-  uint cellBits = min(index + 1u, 0x000FFFFFu);
-  uint packed = (depthPriority << 20) | cellBits;
-  for (int oy = -r; oy <= r; ++oy) {
-    for (int ox = -r; ox <= r; ++ox) {
-      float dist = sqrt(float(ox * ox + oy * oy));
-      if (dist > radius) continue;
-      int sx = px + ox;
-      int sy = py + oy;
-      if (sx < 0 || sx >= u.surfaceWidth || sy < 0 || sy >= u.surfaceHeight) continue;
-      uint pixelIndex = uint(sy * u.surfaceWidth + sx);
-      atomic_fetch_max_explicit(&selection[pixelIndex], packed, memory_order_relaxed);
-    }
-  }
-}
-
-kernel void glossProjectionSurfaceShadeKernel(texture2d<float, access::write> outTexture [[texture(0)]],
-                                              device atomic_uint* selection [[buffer(0)]],
-                                              const device float* meanR [[buffer(1)]],
-                                              const device float* meanG [[buffer(2)]],
-                                              const device float* meanB [[buffer(3)]],
-                                              const device float* carrierY [[buffer(4)]],
-                                              const device float* carrierMax [[buffer(5)]],
-                                              const device float* carrierMin [[buffer(6)]],
-                                              const device float* neutrality [[buffer(7)]],
-                                              const device float* body [[buffer(8)]],
-                                              const device float* positive [[buffer(9)]],
-                                              const device float* negative [[buffer(10)]],
-                                              const device float* boundary [[buffer(11)]],
-                                              const device float* congruence [[buffer(12)]],
-                                              const device float* confidence [[buffer(13)]],
-                                              const device float* signal [[buffer(14)]],
-                                              constant GlossProjectionSurfaceUniforms& u [[buffer(15)]],
-                                              uint2 gid [[thread_position_in_grid]]) {
-  if (gid.x >= outTexture.get_width() || gid.y >= outTexture.get_height() ||
-      u.surfaceWidth <= 0 || u.surfaceHeight <= 0) {
-    return;
-  }
-  uint pixelIndex = gid.y * uint(u.surfaceWidth) + gid.x;
-  uint packed = atomic_load_explicit(&selection[pixelIndex], memory_order_relaxed);
-  uint cellIndex = packed & 0x000FFFFFu;
-  if (cellIndex == 0u) {
-    outTexture.write(float4(0.0), gid);
-    return;
-  }
-  uint index = cellIndex - 1u;
-  uint cellCount = uint(max(u.gridWidth * u.gridHeight, 0));
-  if (index >= cellCount) {
-    outTexture.write(float4(0.0), gid);
-    return;
-  }
-  GlossFieldSurfaceUniforms fieldU;
-  fieldU.gridWidth = u.gridWidth;
-  fieldU.gridHeight = u.gridHeight;
-  fieldU.surfaceWidth = u.surfaceWidth;
-  fieldU.surfaceHeight = u.surfaceHeight;
-  fieldU.algorithm = u.algorithm;
-  fieldU.colorMode = u.colorMode;
-  fieldU.debugMode = u.debugMode;
-  fieldU.diagnosticMode = u.diagnosticMode;
-  fieldU.colorSaturation = u.colorSaturation;
-  fieldU.glossBodyOpacity = u.glossBodyOpacity;
-  fieldU.glossHighlightOpacity = u.glossHighlightOpacity;
-  fieldU.glossLiftScale = u.glossLiftScale;
-  float4 display = glossSurfaceDisplayColorValues(meanR[index],
-                                                  meanG[index],
-                                                  meanB[index],
-                                                  carrierY[index],
-                                                  carrierMax[index],
-                                                  carrierMin[index],
-                                                  neutrality[index],
-                                                  body[index],
-                                                  positive[index],
-                                                  negative[index],
-                                                  boundary[index],
-                                                  congruence[index],
-                                                  confidence[index],
-                                                  signal[index],
-                                                  fieldU.colorMode,
-                                                  fieldU.debugMode,
-                                                  fieldU.diagnosticMode,
-                                                  fieldU.colorSaturation,
-                                                  fieldU.glossBodyOpacity,
-                                                  fieldU.glossHighlightOpacity,
-                                                  fieldU.glossLiftScale);
-  outTexture.write(display, gid);
-}
-
-kernel void plotSurfaceClearKernel(texture2d<float, access::write> outTexture [[texture(0)]],
-                                   constant PlotSurfaceClearUniforms& u [[buffer(0)]],
-                                   uint2 gid [[thread_position_in_grid]]) {
-  if (gid.x >= outTexture.get_width() || gid.y >= outTexture.get_height()) return;
-  outTexture.write(float4(u.r, u.g, u.b, u.a), gid);
-}
-)MSL";
-
-bool ensureContext(std::string* error) {
-  static std::once_flag once;
-  MetalContext& ctx = context();
-  std::call_once(once, []() {
+  MetalContext& c = *context;
+  if (c.initAttempted) {
+    if (!c.ready && error) *error = c.initError;
+    return c.ready;
+  }
+  c.initAttempted = true;
+  try {
     @autoreleasepool {
-      MetalContext& c = context();
-      c.initAttempted = true;
       c.device = MTLCreateSystemDefaultDevice();
       if (c.device == nil) {
         c.initError = "No Metal device available.";
@@ -3243,11 +1880,8 @@ bool ensureContext(std::string* error) {
         c.initError = "Failed to create Metal command queue.";
         return;
       }
-      NSError* libraryError = nil;
-      NSString* source = [NSString stringWithUTF8String:kMetalSource];
-      c.library = [c.device newLibraryWithSource:source options:nil error:&libraryError];
+      c.library = loadViewerMetalLibrary(c.device, &c.initError);
       if (c.library == nil) {
-        c.initError = libraryError != nil ? [[libraryError localizedDescription] UTF8String] : "Failed to compile Metal library.";
         return;
       }
       NSError* pipelineError = nil;
@@ -3317,6 +1951,23 @@ bool ensureContext(std::string* error) {
         return;
       }
       pipelineError = nil;
+      id<MTLFunction> rasterOccupancyThresholdFn =
+          [c.library newFunctionWithName:@"rasterOccupancyThresholdKernel"];
+      if (rasterOccupancyThresholdFn == nil) {
+        c.initError = "Missing raster occupancy threshold Metal kernel.";
+        return;
+      }
+      c.rasterOccupancyThresholdPipeline =
+          [c.device newComputePipelineStateWithFunction:rasterOccupancyThresholdFn
+                                                 error:&pipelineError];
+      if (c.rasterOccupancyThresholdPipeline == nil) {
+        c.initError =
+            pipelineError != nil
+                ? [[pipelineError localizedDescription] UTF8String]
+                : "Failed to create raster occupancy threshold Metal pipeline.";
+        return;
+      }
+      pipelineError = nil;
       id<MTLFunction> inputSampleFn = [c.library newFunctionWithName:@"inputSampleKernel"];
       if (inputSampleFn == nil) {
         c.initError = "Missing input sample Metal kernel.";
@@ -3341,6 +1992,41 @@ bool ensureContext(std::string* error) {
         }
         return pipeline;
       };
+      c.rasterPointCompactLocalScanPipeline =
+          buildPipeline(@"rasterPointCompactLocalScanKernel",
+                        "Missing raster point compact local-scan Metal kernel.",
+                        "Failed to create raster point compact local-scan Metal pipeline.");
+      if (c.rasterPointCompactLocalScanPipeline == nil) {
+        return;
+      }
+      c.rasterPointScanBlockSumsPipeline =
+          buildPipeline(@"rasterPointScanBlockSumsKernel",
+                        "Missing raster point block-scan Metal kernel.",
+                        "Failed to create raster point block-scan Metal pipeline.");
+      if (c.rasterPointScanBlockSumsPipeline == nil) {
+        return;
+      }
+      c.rasterPointAddBlockOffsetsPipeline =
+          buildPipeline(@"rasterPointAddBlockOffsetsKernel",
+                        "Missing raster point block-offset Metal kernel.",
+                        "Failed to create raster point block-offset Metal pipeline.");
+      if (c.rasterPointAddBlockOffsetsPipeline == nil) {
+        return;
+      }
+      c.rasterPointCompactScatterPipeline =
+          buildPipeline(@"rasterPointCompactScatterKernel",
+                        "Missing raster point compact-scatter Metal kernel.",
+                        "Failed to create raster point compact-scatter Metal pipeline.");
+      if (c.rasterPointCompactScatterPipeline == nil) {
+        return;
+      }
+      c.rasterPointFinalizeIndirectArgsPipeline =
+          buildPipeline(@"rasterPointFinalizeIndirectArgsKernel",
+                        "Missing raster point indirect-args Metal kernel.",
+                        "Failed to create raster point indirect-args Metal pipeline.");
+      if (c.rasterPointFinalizeIndirectArgsPipeline == nil) {
+        return;
+      }
       c.scopeDensityPipeline = buildPipeline(@"scopeDensityKernel",
                                              "Missing scope density Metal kernel.",
                                              "Failed to create scope density Metal pipeline.");
@@ -3379,6 +2065,13 @@ bool ensureContext(std::string* error) {
       if (c.scopeRangeFinalizePipeline == nil) {
         return;
       }
+      c.histogramApplyRangePipeline =
+          buildPipeline(@"histogramSurfaceApplyRangeKernel",
+                        "Missing histogram surface apply-range Metal kernel.",
+                        "Failed to create histogram surface apply-range Metal pipeline.");
+      if (c.histogramApplyRangePipeline == nil) {
+        return;
+      }
       c.histogramMaxPipeline = buildPipeline(@"histogramSurfaceMaxKernel",
                                              "Missing histogram surface max Metal kernel.",
                                              "Failed to create histogram surface max Metal pipeline.");
@@ -3389,6 +2082,25 @@ bool ensureContext(std::string* error) {
                                                        "Missing histogram surface render Metal kernel.",
                                                        "Failed to create histogram surface render Metal pipeline.");
       if (c.histogramSurfaceRenderPipeline == nil) {
+        return;
+      }
+      c.waveformApplyRangePipeline =
+          buildPipeline(@"waveformSurfaceApplyRangeKernel",
+                        "Missing waveform surface apply-range Metal kernel.",
+                        "Failed to create waveform surface apply-range Metal pipeline.");
+      if (c.waveformApplyRangePipeline == nil) {
+        return;
+      }
+      c.waveformMaxPipeline = buildPipeline(@"waveformSurfaceMaxKernel",
+                                            "Missing waveform surface max Metal kernel.",
+                                            "Failed to create waveform surface max Metal pipeline.");
+      if (c.waveformMaxPipeline == nil) {
+        return;
+      }
+      c.waveformSurfaceRenderPipeline = buildPipeline(@"waveformSurfaceRenderKernel",
+                                                      "Missing waveform surface render Metal kernel.",
+                                                      "Failed to create waveform surface render Metal pipeline.");
+      if (c.waveformSurfaceRenderPipeline == nil) {
         return;
       }
       c.glossFieldAccumulatePipeline = buildPipeline(@"glossFieldAccumulateKernel",
@@ -3500,11 +2212,202 @@ bool ensureContext(std::string* error) {
       if (c.plotSurfaceClearPipeline == nil) {
         return;
       }
+      c.sourceSignalSurfacePipeline = buildPipeline(@"sourceSignalSurfaceRenderKernel",
+                                                    "Missing source signal surface Metal kernel.",
+                                                    "Failed to create source signal surface Metal pipeline.");
+      if (c.sourceSignalSurfacePipeline == nil) {
+        return;
+      }
+      id<MTLFunction> plotSurfaceVectorVertexFn = [c.library newFunctionWithName:@"frameUiVectorVertex"];
+      id<MTLFunction> plotSurfaceVectorFragmentFn = [c.library newFunctionWithName:@"frameUiVectorFragment"];
+      if (plotSurfaceVectorVertexFn == nil || plotSurfaceVectorFragmentFn == nil) {
+        c.initError = "Missing plot surface vector Metal shaders.";
+        return;
+      }
+      auto buildPlotSurfaceVectorPipeline =
+          [&](MTLPixelFormat pixelFormat, const char* label, bool required) -> id<MTLRenderPipelineState> {
+        NSError* renderPipelineError = nil;
+        MTLRenderPipelineDescriptor* desc = [[MTLRenderPipelineDescriptor alloc] init];
+        desc.vertexFunction = plotSurfaceVectorVertexFn;
+        desc.fragmentFunction = plotSurfaceVectorFragmentFn;
+        desc.colorAttachments[0].pixelFormat = pixelFormat;
+        desc.colorAttachments[0].blendingEnabled = YES;
+        desc.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorSourceAlpha;
+        desc.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+        desc.colorAttachments[0].rgbBlendOperation = MTLBlendOperationAdd;
+        desc.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
+        desc.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+        desc.colorAttachments[0].alphaBlendOperation = MTLBlendOperationAdd;
+        id<MTLRenderPipelineState> pipeline =
+            [c.device newRenderPipelineStateWithDescriptor:desc error:&renderPipelineError];
+        if (pipeline == nil && required) {
+          if (renderPipelineError != nil) {
+            c.initError = [[renderPipelineError localizedDescription] UTF8String];
+          } else {
+            c.initError = std::string("Failed to create ") + label + " plot surface vector pipeline.";
+          }
+        }
+        return pipeline;
+      };
+      c.plotSurfaceVectorPipeline16 =
+          buildPlotSurfaceVectorPipeline(MTLPixelFormatRGBA16Float, "RGBA16F", true);
+      if (c.plotSurfaceVectorPipeline16 == nil) {
+        return;
+      }
+      c.plotSurfaceVectorPipeline32 =
+          buildPlotSurfaceVectorPipeline(MTLPixelFormatRGBA32Float, "RGBA32F", false);
+      id<MTLFunction> rasterPointVertexFn = [c.library newFunctionWithName:@"rasterPointSurfaceVertex"];
+      id<MTLFunction> rasterPointFragmentFn = [c.library newFunctionWithName:@"rasterPointSurfaceFragment"];
+      if (rasterPointVertexFn == nil || rasterPointFragmentFn == nil) {
+        c.initError = "Missing raster point surface Metal shaders.";
+        return;
+      }
+      auto buildRasterPointSurfacePipeline =
+          [&](MTLPixelFormat pixelFormat, const char* label, bool required) -> id<MTLRenderPipelineState> {
+        NSError* renderPipelineError = nil;
+        MTLRenderPipelineDescriptor* desc = [[MTLRenderPipelineDescriptor alloc] init];
+        desc.vertexFunction = rasterPointVertexFn;
+        desc.fragmentFunction = rasterPointFragmentFn;
+        desc.colorAttachments[0].pixelFormat = pixelFormat;
+        desc.colorAttachments[0].blendingEnabled = YES;
+        desc.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorSourceAlpha;
+        desc.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+        desc.colorAttachments[0].rgbBlendOperation = MTLBlendOperationAdd;
+        desc.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
+        desc.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+        desc.colorAttachments[0].alphaBlendOperation = MTLBlendOperationAdd;
+        id<MTLRenderPipelineState> pipeline =
+            [c.device newRenderPipelineStateWithDescriptor:desc error:&renderPipelineError];
+        if (pipeline == nil && required) {
+          if (renderPipelineError != nil) {
+            c.initError = [[renderPipelineError localizedDescription] UTF8String];
+          } else {
+            c.initError = std::string("Failed to create ") + label + " raster point surface pipeline.";
+          }
+        }
+        return pipeline;
+      };
+      c.rasterPointSurfacePipeline16 =
+          buildRasterPointSurfacePipeline(MTLPixelFormatRGBA16Float, "RGBA16F", true);
+      if (c.rasterPointSurfacePipeline16 == nil) {
+        return;
+      }
+      c.rasterPointSurfacePipeline32 =
+          buildRasterPointSurfacePipeline(MTLPixelFormatRGBA32Float, "RGBA32F", false);
+      id<MTLFunction> compositeVertexFn = [c.library newFunctionWithName:@"frameSurfaceCompositeVertex"];
+      id<MTLFunction> compositeFragmentFn = [c.library newFunctionWithName:@"frameSurfaceCompositeFragment"];
+      if (compositeVertexFn == nil || compositeFragmentFn == nil) {
+        c.initError = "Missing frame surface composite Metal shaders.";
+        return;
+      }
+      MTLRenderPipelineDescriptor* compositeDesc = [[MTLRenderPipelineDescriptor alloc] init];
+      compositeDesc.vertexFunction = compositeVertexFn;
+      compositeDesc.fragmentFunction = compositeFragmentFn;
+      compositeDesc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+      compositeDesc.colorAttachments[0].blendingEnabled = YES;
+      compositeDesc.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorSourceAlpha;
+      compositeDesc.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+      compositeDesc.colorAttachments[0].rgbBlendOperation = MTLBlendOperationAdd;
+      compositeDesc.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
+      compositeDesc.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+      compositeDesc.colorAttachments[0].alphaBlendOperation = MTLBlendOperationAdd;
+      c.frameSurfaceCompositePipeline =
+          [c.device newRenderPipelineStateWithDescriptor:compositeDesc error:&pipelineError];
+      if (c.frameSurfaceCompositePipeline == nil) {
+        c.initError = pipelineError != nil ? [[pipelineError localizedDescription] UTF8String]
+                                           : "Failed to create frame surface composite Metal pipeline.";
+        return;
+      }
+      pipelineError = nil;
+      id<MTLFunction> solidRectVertexFn = [c.library newFunctionWithName:@"frameSolidRectVertex"];
+      id<MTLFunction> solidRectFragmentFn = [c.library newFunctionWithName:@"frameSolidRectFragment"];
+      if (solidRectVertexFn == nil || solidRectFragmentFn == nil) {
+        c.initError = "Missing frame solid-rect Metal shaders.";
+        return;
+      }
+      MTLRenderPipelineDescriptor* solidRectDesc = [[MTLRenderPipelineDescriptor alloc] init];
+      solidRectDesc.vertexFunction = solidRectVertexFn;
+      solidRectDesc.fragmentFunction = solidRectFragmentFn;
+      solidRectDesc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+      solidRectDesc.colorAttachments[0].blendingEnabled = YES;
+      solidRectDesc.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorSourceAlpha;
+      solidRectDesc.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+      solidRectDesc.colorAttachments[0].rgbBlendOperation = MTLBlendOperationAdd;
+      solidRectDesc.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
+      solidRectDesc.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+      solidRectDesc.colorAttachments[0].alphaBlendOperation = MTLBlendOperationAdd;
+      c.frameSolidRectPipeline =
+          [c.device newRenderPipelineStateWithDescriptor:solidRectDesc error:&pipelineError];
+      if (c.frameSolidRectPipeline == nil) {
+        c.initError = pipelineError != nil ? [[pipelineError localizedDescription] UTF8String]
+                                           : "Failed to create frame solid-rect Metal pipeline.";
+        return;
+      }
+      pipelineError = nil;
+      id<MTLFunction> uiVectorVertexFn = [c.library newFunctionWithName:@"frameUiVectorVertex"];
+      id<MTLFunction> uiVectorFragmentFn = [c.library newFunctionWithName:@"frameUiVectorFragment"];
+      if (uiVectorVertexFn == nil || uiVectorFragmentFn == nil) {
+        c.initError = "Missing frame UI-vector Metal shaders.";
+        return;
+      }
+      MTLRenderPipelineDescriptor* uiVectorDesc = [[MTLRenderPipelineDescriptor alloc] init];
+      uiVectorDesc.vertexFunction = uiVectorVertexFn;
+      uiVectorDesc.fragmentFunction = uiVectorFragmentFn;
+      uiVectorDesc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+      uiVectorDesc.colorAttachments[0].blendingEnabled = YES;
+      uiVectorDesc.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorSourceAlpha;
+      uiVectorDesc.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+      uiVectorDesc.colorAttachments[0].rgbBlendOperation = MTLBlendOperationAdd;
+      uiVectorDesc.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
+      uiVectorDesc.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+      uiVectorDesc.colorAttachments[0].alphaBlendOperation = MTLBlendOperationAdd;
+      c.frameUiVectorPipeline =
+          [c.device newRenderPipelineStateWithDescriptor:uiVectorDesc error:&pipelineError];
+      if (c.frameUiVectorPipeline == nil) {
+        c.initError = pipelineError != nil ? [[pipelineError localizedDescription] UTF8String]
+                                           : "Failed to create frame UI-vector Metal pipeline.";
+        return;
+      }
+      pipelineError = nil;
+      id<MTLFunction> textVertexFn = [c.library newFunctionWithName:@"frameTextVertex"];
+      id<MTLFunction> textFragmentFn = [c.library newFunctionWithName:@"frameTextFragment"];
+      if (textVertexFn == nil || textFragmentFn == nil) {
+        c.initError = "Missing frame text Metal shaders.";
+        return;
+      }
+      MTLRenderPipelineDescriptor* textDesc = [[MTLRenderPipelineDescriptor alloc] init];
+      textDesc.vertexFunction = textVertexFn;
+      textDesc.fragmentFunction = textFragmentFn;
+      textDesc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+      textDesc.colorAttachments[0].blendingEnabled = YES;
+      textDesc.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorSourceAlpha;
+      textDesc.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+      textDesc.colorAttachments[0].rgbBlendOperation = MTLBlendOperationAdd;
+      textDesc.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
+      textDesc.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+      textDesc.colorAttachments[0].alphaBlendOperation = MTLBlendOperationAdd;
+      c.frameTextPipeline =
+          [c.device newRenderPipelineStateWithDescriptor:textDesc error:&pipelineError];
+      if (c.frameTextPipeline == nil) {
+        c.initError = pipelineError != nil ? [[pipelineError localizedDescription] UTF8String]
+                                           : "Failed to create frame text Metal pipeline.";
+        return;
+      }
       c.ready = true;
     }
-  });
-  if (!ctx.ready && error) *error = ctx.initError;
-  return ctx.ready;
+  } catch (...) {
+    c.ready = false;
+    if (c.initError.empty()) {
+      c.initError = "metal-context-initialization-exception";
+    }
+  }
+  if (!c.ready && error) *error = c.initError;
+  return c.ready;
+}
+
+#if !defined(CHROMASPACE_METAL_NATIVE_ONLY)
+bool ensureContext(std::string* error) {
+  return initializeMetalContext(&context(), error);
 }
 
 bool runCompute(id<MTLComputePipelineState> pipeline,
@@ -3642,7 +2545,81 @@ bool runComputeBuffers(id<MTLComputePipelineState> pipeline,
   }
   return true;
 }
+#endif
 
+template <size_t N>
+bool encodeComputeBuffersOnCommandBuffer(
+    id<MTLCommandBuffer> commandBuffer,
+    id<MTLComputePipelineState> pipeline,
+    const std::array<id<MTLBuffer>, N>& buffers,
+    NSUInteger threadCount,
+    std::string* error) {
+  if (commandBuffer == nil || pipeline == nil || threadCount == 0u) {
+    if (error && error->empty()) {
+      *error = "Metal compute encoder unavailable.";
+    }
+    return false;
+  }
+  id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
+  if (encoder == nil) {
+    if (error) *error = "Failed to create Metal compute encoder.";
+    return false;
+  }
+  [encoder setComputePipelineState:pipeline];
+  for (NSUInteger i = 0; i < N; ++i) {
+    if (buffers[i] != nil) [encoder setBuffer:buffers[i] offset:0 atIndex:i];
+  }
+  NSUInteger width = pipeline.maxTotalThreadsPerThreadgroup;
+  if (width == 0) width = 64;
+  width = std::min<NSUInteger>(width, 64);
+  [encoder dispatchThreads:MTLSizeMake(threadCount, 1, 1)
+     threadsPerThreadgroup:MTLSizeMake(width, 1, 1)];
+  [encoder endEncoding];
+  return true;
+}
+
+bool encodeBufferClearOnCommandBuffer(id<MTLCommandBuffer> commandBuffer,
+                                      id<MTLBuffer> buffer,
+                                      std::string* error) {
+  if (commandBuffer == nil || buffer == nil || [buffer length] == 0u) {
+    if (error) *error = "metal-buffer-clear-encode-unavailable";
+    return false;
+  }
+  id<MTLBlitCommandEncoder> encoder = [commandBuffer blitCommandEncoder];
+  if (encoder == nil) {
+    if (error) *error = "metal-buffer-clear-encoder-failed";
+    return false;
+  }
+  [encoder fillBuffer:buffer range:NSMakeRange(0, [buffer length]) value:0];
+  [encoder endEncoding];
+  return true;
+}
+
+bool encodeBufferCopyOnCommandBuffer(id<MTLCommandBuffer> commandBuffer,
+                                     id<MTLBuffer> src,
+                                     id<MTLBuffer> dst,
+                                     NSUInteger bytes,
+                                     std::string* error) {
+  if (commandBuffer == nil || src == nil || dst == nil || bytes == 0u ||
+      [src length] < bytes || [dst length] < bytes) {
+    if (error) *error = "metal-buffer-copy-encode-unavailable";
+    return false;
+  }
+  id<MTLBlitCommandEncoder> encoder = [commandBuffer blitCommandEncoder];
+  if (encoder == nil) {
+    if (error) *error = "metal-buffer-copy-encoder-failed";
+    return false;
+  }
+  [encoder copyFromBuffer:src
+             sourceOffset:0
+                 toBuffer:dst
+        destinationOffset:0
+                     size:bytes];
+  [encoder endEncoding];
+  return true;
+}
+
+#if !defined(CHROMASPACE_METAL_NATIVE_ONLY)
 bool copyBufferOnDevice(id<MTLBuffer> src, id<MTLBuffer> dst, NSUInteger bytes, std::string* error) {
   MetalContext& ctx = context();
   if (!ctx.ready || src == nil || dst == nil || bytes == 0u ||
@@ -3673,10 +2650,12 @@ bool copyBufferOnDevice(id<MTLBuffer> src, id<MTLBuffer> dst, NSUInteger bytes, 
   }
   return true;
 }
+#endif
 
 template <typename T>
-id<MTLBuffer> makeSharedBuffer(const T* values, size_t count) {
-  MetalContext& ctx = context();
+id<MTLBuffer> makeSharedBuffer(MetalContext& ctx,
+                               const T* values,
+                               size_t count) {
   if (!ctx.ready) return nil;
   const NSUInteger bytes = static_cast<NSUInteger>(count * sizeof(T));
   return [ctx.device newBufferWithBytes:(values != nullptr ? values : nullptr)
@@ -3684,16 +2663,149 @@ id<MTLBuffer> makeSharedBuffer(const T* values, size_t count) {
                                 options:MTLResourceStorageModeShared];
 }
 
-id<MTLBuffer> makeEmptySharedBuffer(NSUInteger bytes) {
-  MetalContext& ctx = context();
+id<MTLBuffer> makeEmptySharedBuffer(MetalContext& ctx, NSUInteger bytes) {
   if (!ctx.ready) return nil;
   return [ctx.device newBufferWithLength:bytes options:MTLResourceStorageModeShared];
 }
 
-id<MTLBuffer> makeEmptyPrivateBuffer(NSUInteger bytes) {
-  MetalContext& ctx = context();
+id<MTLBuffer> makeEmptyPrivateBuffer(MetalContext& ctx, NSUInteger bytes) {
   if (!ctx.ready) return nil;
   return [ctx.device newBufferWithLength:bytes options:MTLResourceStorageModePrivate];
+}
+
+#if !defined(CHROMASPACE_METAL_NATIVE_ONLY)
+template <typename T>
+id<MTLBuffer> makeSharedBuffer(const T* values, size_t count) {
+  return makeSharedBuffer(context(), values, count);
+}
+
+id<MTLBuffer> makeEmptySharedBuffer(NSUInteger bytes) {
+  return makeEmptySharedBuffer(context(), bytes);
+}
+
+id<MTLBuffer> makeEmptyPrivateBuffer(NSUInteger bytes) {
+  return makeEmptyPrivateBuffer(context(), bytes);
+}
+#endif
+
+id<MTLBuffer> makeSubmissionTransientPrivateBuffer(
+    id<MTLCommandBuffer> commandBuffer,
+    NSUInteger bytes,
+    std::string* error) {
+  if (commandBuffer == nil || bytes == 0u) {
+    if (error) *error = "metal-transient-buffer-request-invalid";
+    return nil;
+  }
+  std::shared_ptr<MetalContext> runtimeContext;
+  MetalContext* contextPointer = nullptr;
+  if (!contextForCommandBuffer(commandBuffer,
+                               &runtimeContext,
+                               &contextPointer,
+                               error) ||
+      contextPointer == nullptr) {
+    return nil;
+  }
+  MetalContext& ctx = *contextPointer;
+  if (!ctx.ready || ctx.device == nil) {
+    if (error) *error = "metal-transient-buffer-device-unavailable";
+    return nil;
+  }
+
+  constexpr MTLResourceOptions kPrivateTrackedOptions =
+      static_cast<MTLResourceOptions>(
+          MTLResourceStorageModePrivate |
+          MTLResourceHazardTrackingModeTracked);
+  const MTLSizeAndAlign requirement =
+      [ctx.device heapBufferSizeAndAlignWithLength:bytes
+                                           options:kPrivateTrackedOptions];
+  if (requirement.size == 0u || requirement.align == 0u) {
+    if (error) *error = "metal-transient-buffer-heap-requirement-invalid";
+    return nil;
+  }
+
+  std::lock_guard<std::mutex> submissionLock(frameSubmissionMutex());
+  uint64_t submissionId = 0u;
+  FrameSubmissionRecord* submissionRecord = nullptr;
+  for (auto& item : frameSubmissionRegistry()) {
+    if (item.second.commandBuffer == commandBuffer) {
+      submissionId = item.first;
+      submissionRecord = &item.second;
+      break;
+    }
+  }
+  if (!submissionRecord || !submissionRecord->transientArena ||
+      submissionRecord->transientHeaps == nil) {
+#if !defined(CHROMASPACE_METAL_NATIVE_ONLY)
+    return makeEmptyPrivateBuffer(ctx, bytes);
+#else
+    if (error) *error = "metal-transient-buffer-submission-unregistered";
+    return nil;
+#endif
+  }
+
+  auto recordLogicalBuffer = [&](id<MTLBuffer> buffer) -> id<MTLBuffer> {
+    if (buffer == nil) return nil;
+    std::lock_guard<std::mutex> arenaLock(
+        submissionRecord->transientArena->mutex);
+    const auto status = submissionRecord->transientArena->policy.recordBuffer(
+        submissionId, static_cast<uint64_t>(bytes));
+    if (!ChromaspaceMetalTransientArena::succeeded(status)) {
+      if (error) {
+        *error = std::string("metal-transient-buffer-accounting-failed:") +
+                 ChromaspaceMetalTransientArena::statusLabel(status);
+      }
+      return nil;
+    }
+    return buffer;
+  };
+
+  for (id<MTLHeap> heap in submissionRecord->transientHeaps) {
+    if (heap != nil &&
+        [heap maxAvailableSizeWithAlignment:requirement.align] >=
+            requirement.size) {
+      id<MTLBuffer> buffer =
+          [heap newBufferWithLength:bytes options:kPrivateTrackedOptions];
+      if (buffer != nil) return recordLogicalBuffer(buffer);
+    }
+  }
+
+  constexpr NSUInteger kMinimumTransientHeapPageBytes = 16u * 1024u * 1024u;
+  const NSUInteger requestedPageBytes =
+      std::max(kMinimumTransientHeapPageBytes, requirement.size);
+  MTLHeapDescriptor* descriptor = [[MTLHeapDescriptor alloc] init];
+  descriptor.size = requestedPageBytes;
+  descriptor.storageMode = MTLStorageModePrivate;
+  descriptor.cpuCacheMode = MTLCPUCacheModeDefaultCache;
+  descriptor.hazardTrackingMode = MTLHazardTrackingModeTracked;
+  descriptor.type = MTLHeapTypeAutomatic;
+  id<MTLHeap> heap = [ctx.device newHeapWithDescriptor:descriptor];
+  if (heap == nil || heap.size == 0u) {
+    if (error) *error = "metal-transient-heap-page-allocation-failed";
+    return nil;
+  }
+
+  {
+    std::lock_guard<std::mutex> arenaLock(
+        submissionRecord->transientArena->mutex);
+    const auto reserveStatus =
+        submissionRecord->transientArena->policy.reservePage(
+            submissionId, static_cast<uint64_t>(heap.size));
+    if (!ChromaspaceMetalTransientArena::succeeded(reserveStatus)) {
+      if (error) {
+        *error = std::string("metal-transient-heap-budget-rejected:") +
+                 ChromaspaceMetalTransientArena::statusLabel(reserveStatus);
+      }
+      return nil;
+    }
+  }
+  [submissionRecord->transientHeaps addObject:heap];
+  id<MTLBuffer> buffer =
+      [heap newBufferWithLength:bytes options:kPrivateTrackedOptions];
+  if (buffer == nil) {
+    if (error) *error = "metal-transient-heap-buffer-allocation-failed";
+    return nil;
+  }
+  return recordLogicalBuffer(buffer);
 }
 
 void clearSharedBuffer(id<MTLBuffer> buffer) {
@@ -3701,6 +2813,7 @@ void clearSharedBuffer(id<MTLBuffer> buffer) {
   std::memset([buffer contents], 0, static_cast<size_t>([buffer length]));
 }
 
+#if !defined(CHROMASPACE_METAL_NATIVE_ONLY)
 bool clearBufferOnDevice(id<MTLBuffer> buffer, std::string* error) {
   MetalContext& ctx = context();
   if (!ctx.ready || buffer == nil) {
@@ -3739,8 +2852,187 @@ void copySharedBuffer(id<MTLBuffer> buffer, size_t count, std::vector<float>* ou
   out->resize(count * sizeof(T) / sizeof(float));
   std::memcpy(out->data(), [buffer contents], count * sizeof(T));
 }
+#endif
 
 }  // namespace
+
+bool importSharedSourceTexture(const SharedSourceImportRequest& request,
+                               ImportedSourceTexture* outSource,
+                               std::string* error) {
+  if (outSource) *outSource = ImportedSourceTexture{};
+  if (error) error->clear();
+  if (!outSource || request.sharedTextureHandle == nullptr ||
+      request.sharedEventHandle == nullptr) {
+    if (error) *error = "invalid-shared-source-import-handles";
+    return false;
+  }
+  constexpr size_t kMaximumDimension = 16384;
+  constexpr size_t kMaximumSurfaceBytes =
+      1024ull * 1024ull * 1024ull;
+  if (request.senderId.empty() || request.senderId.size() > 256 ||
+      request.deviceRegistryId == 0 || request.senderGeneration == 0 ||
+      request.sequence == 0 || request.slotIndex >= 3 ||
+      request.slotGeneration == 0 || request.readyValue == 0 ||
+      request.contentHash == 0 || request.width <= 0 ||
+      request.height <= 0 ||
+      !ChromaspaceSourceExchange::validSourceSemanticMetadata(
+          request.semantics) ||
+      static_cast<size_t>(request.width) > kMaximumDimension ||
+      static_cast<size_t>(request.height) > kMaximumDimension ||
+      (request.pixelFormat != 0 && request.pixelFormat != 1)) {
+    if (error) *error = "invalid-shared-source-import-metadata";
+    return false;
+  }
+  const size_t bytesPerPixel = request.pixelFormat == 0 ? 8u : 16u;
+  if (static_cast<size_t>(request.width) >
+      std::numeric_limits<size_t>::max() / bytesPerPixel) {
+    if (error) *error = "shared-source-row-byte-overflow";
+    return false;
+  }
+  const size_t minimumRowBytes =
+      static_cast<size_t>(request.width) * bytesPerPixel;
+  if (request.bytesPerRow < minimumRowBytes ||
+      request.bytesPerRow >
+          std::numeric_limits<size_t>::max() /
+              static_cast<size_t>(request.height) ||
+      request.byteSize <
+          request.bytesPerRow * static_cast<size_t>(request.height) ||
+      request.byteSize > kMaximumSurfaceBytes) {
+    if (error) *error = "invalid-shared-source-import-byte-bounds";
+    return false;
+  }
+
+  @autoreleasepool {
+    MTLSharedTextureHandle* textureHandle =
+        (__bridge MTLSharedTextureHandle*)request.sharedTextureHandle;
+    MTLSharedEventHandle* eventHandle =
+        (__bridge MTLSharedEventHandle*)request.sharedEventHandle;
+    if (textureHandle == nil || eventHandle == nil ||
+        textureHandle.device == nil ||
+        textureHandle.device.registryID != request.deviceRegistryId) {
+      if (error) *error = "shared-source-handle-device-mismatch";
+      return false;
+    }
+    id<MTLDevice> importDevice = textureHandle.device;
+    id<MTLTexture> texture =
+        [importDevice newSharedTextureWithHandle:textureHandle];
+    id<MTLSharedEvent> readyEvent =
+        [importDevice newSharedEventWithHandle:eventHandle];
+    const MTLPixelFormat expectedFormat =
+        sourceSignalMetalPixelFormat(request.pixelFormat);
+    if (texture == nil || readyEvent == nil ||
+        readyEvent.device.registryID != request.deviceRegistryId) {
+      if (error) *error = "shared-source-handle-reconstruction-failed";
+      return false;
+    }
+    if (texture.textureType != MTLTextureType2D ||
+        texture.width != static_cast<NSUInteger>(request.width) ||
+        texture.height != static_cast<NSUInteger>(request.height) ||
+        texture.depth != 1 || texture.arrayLength != 1 ||
+        texture.mipmapLevelCount != 1 || texture.sampleCount != 1 ||
+        texture.pixelFormat != expectedFormat ||
+        (texture.usage & MTLTextureUsageShaderRead) == 0) {
+      if (error) *error = "shared-source-texture-metadata-mismatch";
+      return false;
+    }
+
+    auto record = std::make_shared<ImportedSourceRecord>();
+    record->texture = texture;
+    record->readyEvent = readyEvent;
+    record->descriptor.senderId = request.senderId;
+    record->descriptor.deviceRegistryId = request.deviceRegistryId;
+    record->descriptor.senderGeneration = request.senderGeneration;
+    record->descriptor.sequence = request.sequence;
+    record->descriptor.slotIndex = request.slotIndex;
+    record->descriptor.slotGeneration = request.slotGeneration;
+    record->descriptor.readyValue = request.readyValue;
+    record->descriptor.contentHash = request.contentHash;
+    record->descriptor.width = request.width;
+    record->descriptor.height = request.height;
+    record->descriptor.pixelFormat = request.pixelFormat;
+    record->descriptor.bytesPerRow = request.bytesPerRow;
+    record->descriptor.byteSize = request.byteSize;
+    record->descriptor.semantics = request.semantics;
+
+    {
+      std::lock_guard<std::mutex> lock(importedSourceMutex());
+      const uint64_t sourceId = allocateImportedSourceIdLocked();
+      if (sourceId == 0) {
+        if (error) *error = "imported-source-handle-space-exhausted";
+        return false;
+      }
+      record->descriptor.sourceId = sourceId;
+      importedSourceRegistry().emplace(sourceId, record);
+    }
+    *outSource = record->descriptor;
+    return true;
+  }
+}
+
+void releaseImportedSourceTexture(uint64_t sourceId) {
+  (void)retireImportedSourceTexture(
+      sourceId, nullptr, nullptr, nullptr);
+}
+
+bool retireImportedSourceTexture(
+    uint64_t sourceId,
+    ImportedSourceRetirementCallback callback,
+    void* callbackContext,
+    std::string* error) {
+  if (error) error->clear();
+  if (sourceId == 0) {
+    if (error) *error = "invalid-imported-source-handle";
+    return false;
+  }
+  std::shared_ptr<ImportedSourceRecord> record;
+  {
+    std::lock_guard<std::mutex> lock(importedSourceMutex());
+    auto it = importedSourceRegistry().find(sourceId);
+    if (it == importedSourceRegistry().end() || !it->second) {
+      if (error) *error = "imported-source-not-found";
+      return false;
+    }
+    record = it->second;
+    importedSourceRegistry().erase(it);
+  }
+
+  ImportedSourceRetirementCallback callbackNow = nullptr;
+  void* callbackContextNow = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(record->lifetimeMutex);
+    if (record->retirementRequested) {
+      if (error) *error = "imported-source-retirement-already-requested";
+      return false;
+    }
+    record->retirementRequested = true;
+    record->retirementCallback = callback;
+    record->retirementContext = callbackContext;
+    if (record->inFlightSubmissionUses == 0) {
+      callbackNow = record->retirementCallback;
+      callbackContextNow = record->retirementContext;
+      record->retirementCallback = nullptr;
+      record->retirementContext = nullptr;
+    }
+  }
+  if (callbackNow != nullptr) callbackNow(callbackContextNow);
+  return true;
+}
+
+GlossFieldCacheState glossFieldCacheState(const GlossFieldCache& cache) {
+  if (cache.cacheId == 0 || cache.gridWidth <= 0 || cache.gridHeight <= 0 ||
+      cache.builtSerial == 0 || cache.byteSize == 0u || !cache.available) {
+    return GlossFieldCacheState::Missing;
+  }
+  switch (residentDerivedCacheState(glossDerivedCache(cache))) {
+    case ResidentDerivedCacheState::Pending:
+      return GlossFieldCacheState::Pending;
+    case ResidentDerivedCacheState::Ready:
+      return GlossFieldCacheState::Ready;
+    case ResidentDerivedCacheState::Missing:
+      return GlossFieldCacheState::Missing;
+  }
+  return GlossFieldCacheState::Missing;
+}
 
 bool activateWindow(void* nativeWindow) {
   if (nativeWindow == nullptr) return false;
@@ -3769,18 +3061,29 @@ uint32_t currentModifierFlags() {
 ProbeResult probe() {
   ProbeResult result{};
   std::string error;
-  result.available = ensureContext(&error);
+  MetalContext localContext{};
+#if !defined(CHROMASPACE_METAL_NATIVE_ONLY)
   MetalContext& ctx = context();
+#else
+  MetalContext& ctx = localContext;
+#endif
+  result.available = initializeMetalContext(&ctx, &error);
   result.queueReady = (ctx.queue != nil);
-  result.deviceName = ctx.deviceName.c_str();
+  static thread_local std::string deviceName;
+  deviceName = ctx.deviceName;
+  result.deviceName = deviceName.c_str();
   return result;
 }
 
-ResidentReadiness residentReadiness() {
+ResidentReadiness residentReadinessFromContext(const MetalContext& ctx,
+                                               const std::string& error) {
   ResidentReadiness result{};
-  std::string error;
-  result.contextReady = ensureContext(&error);
-  MetalContext& ctx = context();
+  result.contextReady = ctx.ready;
+  result.deviceReady = ctx.device != nil;
+  result.queueReady = ctx.queue != nil;
+  result.deviceRegistryId =
+      ctx.device != nil ? ctx.device.registryID : 0;
+  result.deviceName = ctx.deviceName;
   auto markMissing = [&](const char* name, bool ready) {
     if (ready) return;
     if (!result.missing.empty()) result.missing += ",";
@@ -3793,7 +3096,8 @@ ResidentReadiness residentReadiness() {
   }
   result.rasterSourceTextureReady =
       ctx.rasterSourceTexturePipeline != nil &&
-      ctx.rasterOccupancyTextureCountPipeline != nil;
+      ctx.rasterOccupancyTextureCountPipeline != nil &&
+      ctx.rasterOccupancyThresholdPipeline != nil;
   result.analyticalScopeReady =
       ctx.rasterScopeDensityTexturePipeline != nil &&
       ctx.rasterScopeRangeTexturePipeline != nil &&
@@ -3802,8 +3106,14 @@ ResidentReadiness residentReadiness() {
       ctx.scopeRangeFinalizePipeline != nil;
   result.histogramSurfaceReady =
       result.analyticalScopeReady &&
+      ctx.histogramApplyRangePipeline != nil &&
       ctx.histogramMaxPipeline != nil &&
       ctx.histogramSurfaceRenderPipeline != nil;
+  result.waveformSurfaceReady =
+      result.analyticalScopeReady &&
+      ctx.waveformApplyRangePipeline != nil &&
+      ctx.waveformMaxPipeline != nil &&
+      ctx.waveformSurfaceRenderPipeline != nil;
   result.glossFieldCacheReady =
       ctx.rasterGlossFieldAccumulateTexturePipeline != nil &&
       ctx.glossFieldFinalizePipeline != nil &&
@@ -3826,14 +3136,108 @@ ResidentReadiness residentReadiness() {
                                        ctx.glossProjectionSurfaceShadePipeline != nil &&
                                        ctx.plotSurfaceClearPipeline != nil;
   result.plotSurfaceReady = ctx.plotSurfaceClearPipeline != nil;
+  result.plotSurfaceVectorReady = ctx.plotSurfaceVectorPipeline16 != nil;
+  result.rasterPointSurfaceReady =
+      result.rasterSourceTextureReady &&
+      ctx.rasterPointSurfacePipeline16 != nil &&
+      ctx.rasterPointCompactLocalScanPipeline != nil &&
+      ctx.rasterPointScanBlockSumsPipeline != nil &&
+      ctx.rasterPointAddBlockOffsetsPipeline != nil &&
+      ctx.rasterPointCompactScatterPipeline != nil &&
+      ctx.rasterPointFinalizeIndirectArgsPipeline != nil;
+  result.sourceSignalSurfaceReady = ctx.sourceSignalSurfacePipeline != nil;
+  result.frameSurfaceCompositeReady =
+      ctx.frameSurfaceCompositePipeline != nil && ctx.frameSolidRectPipeline != nil;
+  result.frameUiVectorReady = ctx.frameUiVectorPipeline != nil;
+  result.frameTextReady = ctx.frameTextPipeline != nil;
   markMissing("raster-source-texture", result.rasterSourceTextureReady);
   markMissing("analytical-scope", result.analyticalScopeReady);
   markMissing("histogram-surface", result.histogramSurfaceReady);
+  markMissing("waveform-surface", result.waveformSurfaceReady);
   markMissing("gloss-field-cache", result.glossFieldCacheReady);
   markMissing("gloss-field-surface", result.glossFieldSurfaceReady);
   markMissing("gloss-projection-surface", result.glossProjectionSurfaceReady);
   markMissing("plot-surface", result.plotSurfaceReady);
+  markMissing("plot-surface-vector", result.plotSurfaceVectorReady);
+  markMissing("raster-point-surface", result.rasterPointSurfaceReady);
+  markMissing("source-signal-surface", result.sourceSignalSurfaceReady);
+  markMissing("frame-surface-composite", result.frameSurfaceCompositeReady);
+  markMissing("frame-ui-vector", result.frameUiVectorReady);
+  markMissing("frame-text", result.frameTextReady);
   return result;
+}
+
+ResidentReadiness residentReadiness() {
+  std::string error;
+  MetalContext localContext{};
+#if !defined(CHROMASPACE_METAL_NATIVE_ONLY)
+  MetalContext& ctx = context();
+#else
+  MetalContext& ctx = localContext;
+#endif
+  (void)initializeMetalContext(&ctx, &error);
+  return residentReadinessFromContext(ctx, error);
+}
+
+ResidentReadiness residentReadiness(uint64_t compositorId) {
+  std::shared_ptr<MetalContext> runtimeContext;
+  std::string error;
+  if (!contextForCompositor(compositorId, &runtimeContext, &error) ||
+      !runtimeContext) {
+    ResidentReadiness result{};
+    result.missing = error.empty() ? "metal-runtime-context" : error;
+    return result;
+  }
+  return residentReadinessFromContext(*runtimeContext, {});
+}
+
+bool contextForCommandBuffer(id<MTLCommandBuffer> commandBuffer,
+                             std::shared_ptr<MetalContext>* outOwnedContext,
+                             MetalContext** outContext,
+                             std::string* error) {
+  if (outOwnedContext) outOwnedContext->reset();
+  if (outContext) *outContext = nullptr;
+  if (commandBuffer == nil) {
+    if (error) *error = "metal-command-buffer-context-missing";
+    return false;
+  }
+  {
+    std::lock_guard<std::mutex> lock(frameSubmissionMutex());
+    for (const auto& item : frameSubmissionRegistry()) {
+      const FrameSubmissionRecord& record = item.second;
+      if (record.commandBuffer != commandBuffer) continue;
+      if (!record.context || !record.context->ready ||
+          record.context->runtimeContextId == 0u ||
+          record.context->device == nil || commandBuffer.device == nil ||
+          record.context->device.registryID != commandBuffer.device.registryID) {
+        if (error) *error = "metal-command-buffer-context-mismatch";
+        return false;
+      }
+      if (outOwnedContext) *outOwnedContext = record.context;
+      if (outContext) *outContext = record.context.get();
+      return true;
+    }
+  }
+#if !defined(CHROMASPACE_METAL_NATIVE_ONLY)
+  std::string localError;
+  if (!ensureContext(&localError)) {
+    if (error) {
+      *error = localError.empty() ? "metal-context-unavailable" : localError;
+    }
+    return false;
+  }
+  MetalContext& compatibility = context();
+  if (compatibility.device == nil || commandBuffer.device == nil ||
+      compatibility.device.registryID != commandBuffer.device.registryID) {
+    if (error) *error = "metal-command-buffer-compatibility-context-mismatch";
+    return false;
+  }
+  if (outContext) *outContext = &compatibility;
+  return true;
+#else
+  if (error) *error = "metal-command-buffer-not-owned-by-submission";
+  return false;
+#endif
 }
 
 std::string residentPipelineUnavailableReason(const char* stage) {
@@ -3848,11 +3252,1329 @@ std::string residentPipelineUnavailableReason(const char* stage) {
   return reason;
 }
 
-bool createPlotSurface(int width,
-                       int height,
-                       int pixelFormat,
-                       PlotSurface* outSurface,
-                       std::string* error) {
+std::string residentPipelineUnavailableReason(const MetalContext& ctx,
+                                              const char* stage) {
+  std::string reason =
+      stage && stage[0] != '\0' ? stage : "metal-resident-pipeline";
+  reason += "-pipeline-unavailable";
+  if (!ctx.ready) {
+    reason += ":context";
+  }
+  if (!ctx.initError.empty()) {
+    reason += ":" + ctx.initError;
+  }
+  return reason;
+}
+
+bool createFrameCompositor(void* nativeWindow,
+                           int drawableWidth,
+                           int drawableHeight,
+                           float contentsScale,
+                           FrameCompositor* outCompositor,
+                           std::string* error) {
+  if (outCompositor) *outCompositor = FrameCompositor{};
+  if (error) error->clear();
+  if (nativeWindow == nullptr || drawableWidth <= 0 || drawableHeight <= 0) {
+    if (error) *error = "invalid-metal-frame-compositor-request";
+    return false;
+  }
+  std::shared_ptr<MetalContext> runtimeContext;
+  try {
+    runtimeContext = std::make_shared<MetalContext>();
+  } catch (...) {
+    if (error) *error = "metal-runtime-context-allocation-failed";
+    return false;
+  }
+  std::string localError;
+  if (!initializeMetalContext(runtimeContext.get(), &localError)) {
+    if (error) *error = localError.empty() ? "metal-context-unavailable" : localError;
+    return false;
+  }
+  MetalContext& ctx = *runtimeContext;
+  @autoreleasepool {
+    NSWindow* window = (__bridge NSWindow*)nativeWindow;
+    if (window == nil) {
+      if (error) *error = "invalid-native-window";
+      return false;
+    }
+    NSView* contentView = [window contentView];
+    if (contentView == nil) {
+      if (error) *error = "native-window-missing-content-view";
+      return false;
+    }
+    const float resolvedScale =
+        contentsScale > 0.0f ? contentsScale : static_cast<float>([window backingScaleFactor]);
+    CAMetalLayer* layer = [CAMetalLayer layer];
+    layer.device = ctx.device;
+    layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
+    layer.framebufferOnly = YES;
+    layer.opaque = YES;
+    layer.contentsScale = resolvedScale;
+    if (@available(macOS 10.13, *)) {
+      layer.maximumDrawableCount = 3;
+      layer.allowsNextDrawableTimeout = YES;
+    }
+    layer.drawableSize =
+        CGSizeMake(static_cast<CGFloat>(drawableWidth), static_cast<CGFloat>(drawableHeight));
+    layer.frame = [contentView bounds];
+    layer.autoresizingMask = kCALayerWidthSizable | kCALayerHeightSizable;
+    CALayer* previousLayer = [contentView layer];
+    const BOOL previousWantsLayer = [contentView wantsLayer];
+    [contentView setWantsLayer:YES];
+    [contentView setLayer:layer];
+
+    FrameCompositorRecord record{};
+    record.context = runtimeContext;
+    record.window = window;
+    record.contentView = contentView;
+    record.previousLayer = previousLayer;
+    record.layer = layer;
+    record.frameSlots = dispatch_semaphore_create(3);
+    record.completionGroup = dispatch_group_create();
+    try {
+      record.transientArena = std::make_shared<FrameTransientArenaState>();
+    } catch (...) {
+      record.transientArena.reset();
+    }
+    if (record.frameSlots == nullptr ||
+        record.completionGroup == nullptr || !record.transientArena ||
+        !record.transientArena->policy.configValid()) {
+      [contentView setLayer:previousLayer];
+      [contentView setWantsLayer:previousWantsLayer];
+      if (error) *error = "metal-frame-compositor-runtime-allocation-failed";
+      return false;
+    }
+    record.drawableWidth = drawableWidth;
+    record.drawableHeight = drawableHeight;
+    record.contentsScale = resolvedScale;
+    record.previousWantsLayer = previousWantsLayer;
+    const uint64_t compositorId = nextFrameCompositorId();
+    uint64_t runtimeContextId = 0u;
+    bool published = false;
+    {
+      std::lock_guard<std::mutex> lock(frameCompositorMutex());
+      runtimeContextId = allocateRuntimeContextIdLocked();
+      if (runtimeContextId != 0u) {
+        runtimeContext->runtimeContextId = runtimeContextId;
+        try {
+          published = frameCompositorRegistry()
+                          .emplace(compositorId, std::move(record))
+                          .second;
+        } catch (...) {
+          published = false;
+        }
+      }
+    }
+    if (!published) {
+      [contentView setLayer:previousLayer];
+      [contentView setWantsLayer:previousWantsLayer];
+      if (error) {
+        *error = runtimeContextId == 0u
+                     ? "metal-runtime-context-handle-space-exhausted"
+                     : "metal-frame-compositor-registry-allocation-failed";
+      }
+      return false;
+    }
+    if (outCompositor) {
+      outCompositor->compositorId = compositorId;
+      outCompositor->runtimeContextId = runtimeContextId;
+      outCompositor->deviceRegistryId = ctx.device.registryID;
+      outCompositor->drawableWidth = drawableWidth;
+      outCompositor->drawableHeight = drawableHeight;
+      outCompositor->contentsScale = resolvedScale;
+    }
+    return true;
+  }
+}
+
+bool drainFrameCompositor(uint64_t compositorId,
+                          uint32_t timeoutMilliseconds,
+                          std::string* error) {
+  if (error) error->clear();
+  if (compositorId == 0 || timeoutMilliseconds == 0) {
+    if (error) *error = "invalid-metal-frame-compositor-drain";
+    return false;
+  }
+  dispatch_group_t completionGroup = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(frameCompositorMutex());
+    auto it = frameCompositorRegistry().find(compositorId);
+    if (it == frameCompositorRegistry().end() ||
+        it->second.completionGroup == nullptr) {
+      if (error) *error = "metal-frame-compositor-not-found";
+      return false;
+    }
+    completionGroup = it->second.completionGroup;
+  }
+  const int64_t timeoutNanoseconds =
+      static_cast<int64_t>(timeoutMilliseconds) *
+      static_cast<int64_t>(NSEC_PER_MSEC);
+  if (dispatch_group_wait(
+          completionGroup,
+          dispatch_time(DISPATCH_TIME_NOW, timeoutNanoseconds)) !=
+      0) {
+    if (error) *error = "metal-frame-compositor-drain-timeout";
+    return false;
+  }
+  return true;
+}
+
+bool frameTransientMemoryStats(uint64_t compositorId,
+                               FrameTransientMemoryStats* outStats,
+                               std::string* error) {
+  if (outStats) *outStats = FrameTransientMemoryStats{};
+  if (error) error->clear();
+  if (compositorId == 0u || outStats == nullptr) {
+    if (error) *error = "invalid-metal-frame-transient-stats-request";
+    return false;
+  }
+
+  std::shared_ptr<FrameTransientArenaState> transientArena;
+  {
+    std::lock_guard<std::mutex> lock(frameCompositorMutex());
+    const auto it = frameCompositorRegistry().find(compositorId);
+    if (it == frameCompositorRegistry().end() ||
+        !it->second.transientArena) {
+      if (error) *error = "metal-frame-compositor-not-found";
+      return false;
+    }
+    transientArena = it->second.transientArena;
+  }
+
+  ChromaspaceMetalTransientArena::ArenaSnapshot snapshot{};
+  {
+    std::lock_guard<std::mutex> arenaLock(transientArena->mutex);
+    snapshot = transientArena->policy.snapshot();
+  }
+  if (snapshot.configStatus !=
+      ChromaspaceMetalTransientArena::Status::Ok) {
+    if (error) *error = "metal-frame-transient-arena-invalid";
+    return false;
+  }
+
+  outStats->available = true;
+  outStats->activeSubmissionCount = snapshot.activeCount;
+  outStats->encodingCount = snapshot.encodingCount;
+  outStats->submittedCount = snapshot.submittedCount;
+  outStats->inFlightReservedBytes = snapshot.inFlightReservedBytes;
+  outStats->inFlightLogicalBytes = snapshot.inFlightLogicalBytes;
+  outStats->peakInFlightReservedBytes =
+      snapshot.peakInFlightReservedBytes;
+  outStats->peakInFlightLogicalBytes = snapshot.peakInFlightLogicalBytes;
+  outStats->peakActiveSubmissionCount =
+      snapshot.peakActiveSubmissionCount;
+  outStats->maxInFlightBytes = snapshot.config.maxInFlightBytes;
+  outStats->maxBytesPerSubmission =
+      snapshot.config.maxBytesPerSubmission;
+  outStats->maxSubmissions = snapshot.config.maxSubmissions;
+  return true;
+}
+
+bool frameCompletionStats(uint64_t compositorId,
+                          FrameCompletionStats* outStats,
+                          std::string* error) {
+  if (outStats) *outStats = FrameCompletionStats{};
+  if (error) error->clear();
+  if (compositorId == 0u || outStats == nullptr) {
+    if (error) *error = "invalid-metal-frame-completion-stats-request";
+    return false;
+  }
+  std::lock_guard<std::mutex> lock(frameCompositorMutex());
+  const auto it = frameCompositorRegistry().find(compositorId);
+  if (it == frameCompositorRegistry().end()) {
+    if (error) *error = "metal-frame-compositor-not-found";
+    return false;
+  }
+  const FrameCompositorRecord& record = it->second;
+  outStats->available = true;
+  outStats->submittedSerial = record.submittedSerial;
+  outStats->completedSerial = record.completedSerial;
+  outStats->failedSubmissionCount = record.failedSubmissionCount;
+  outStats->timedSubmissionCount = record.timedSubmissionCount;
+  outStats->untimedSubmissionCount = record.untimedSubmissionCount;
+  outStats->accumulatedGpuSeconds = record.accumulatedGpuSeconds;
+  outStats->maximumGpuSeconds = record.maximumGpuSeconds;
+  outStats->lastSubmissionError = record.lastSubmissionError;
+  return true;
+}
+
+bool resizeFrameCompositor(uint64_t compositorId,
+                           int drawableWidth,
+                           int drawableHeight,
+                           float contentsScale,
+                           std::string* error) {
+  if (error) error->clear();
+  if (compositorId == 0 || drawableWidth <= 0 || drawableHeight <= 0) {
+    if (error) *error = "invalid-metal-frame-compositor-resize";
+    return false;
+  }
+  @autoreleasepool {
+    std::lock_guard<std::mutex> lock(frameCompositorMutex());
+    auto it = frameCompositorRegistry().find(compositorId);
+    if (it == frameCompositorRegistry().end() || it->second.layer == nil) {
+      if (error) *error = "metal-frame-compositor-not-found";
+      return false;
+    }
+    FrameCompositorRecord& record = it->second;
+    const float resolvedScale =
+        contentsScale > 0.0f
+            ? contentsScale
+            : (record.window != nil ? static_cast<float>([record.window backingScaleFactor]) : 1.0f);
+    record.layer.contentsScale = resolvedScale;
+    record.layer.drawableSize =
+        CGSizeMake(static_cast<CGFloat>(drawableWidth), static_cast<CGFloat>(drawableHeight));
+    if (record.contentView != nil) record.layer.frame = [record.contentView bounds];
+    record.drawableWidth = drawableWidth;
+    record.drawableHeight = drawableHeight;
+    record.contentsScale = resolvedScale;
+    return true;
+  }
+}
+
+bool clearFrameCompositor(uint64_t compositorId,
+                          float r,
+                          float g,
+                          float b,
+                          float a,
+                          std::string* error) {
+  if (error) error->clear();
+  if (compositorId == 0) {
+    if (error) *error = "invalid-metal-frame-compositor-clear";
+    return false;
+  }
+  std::shared_ptr<MetalContext> runtimeContext;
+  if (!contextForCompositor(compositorId, &runtimeContext, error)) {
+    return false;
+  }
+  CAMetalLayer* layer = nil;
+  {
+    std::lock_guard<std::mutex> lock(frameCompositorMutex());
+    auto it = frameCompositorRegistry().find(compositorId);
+    if (it == frameCompositorRegistry().end() || it->second.layer == nil) {
+      if (error) *error = "metal-frame-compositor-not-found";
+      return false;
+    }
+    layer = it->second.layer;
+  }
+  MetalContext& ctx = *runtimeContext;
+  @autoreleasepool {
+    id<CAMetalDrawable> drawable = [layer nextDrawable];
+    if (drawable == nil) {
+      if (error) *error = "metal-frame-compositor-next-drawable-failed";
+      return false;
+    }
+    id<MTLCommandBuffer> commandBuffer = [ctx.queue commandBuffer];
+    if (commandBuffer == nil) {
+      if (error) *error = "metal-frame-compositor-command-buffer-failed";
+      return false;
+    }
+    MTLRenderPassDescriptor* pass = [MTLRenderPassDescriptor renderPassDescriptor];
+    pass.colorAttachments[0].texture = drawable.texture;
+    pass.colorAttachments[0].loadAction = MTLLoadActionClear;
+    pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+    pass.colorAttachments[0].clearColor =
+        MTLClearColorMake(static_cast<double>(r),
+                          static_cast<double>(g),
+                          static_cast<double>(b),
+                          static_cast<double>(a));
+    id<MTLRenderCommandEncoder> encoder = [commandBuffer renderCommandEncoderWithDescriptor:pass];
+    if (encoder == nil) {
+      if (error) *error = "metal-frame-compositor-render-encoder-failed";
+      return false;
+    }
+    [encoder endEncoding];
+    [commandBuffer presentDrawable:drawable];
+    [commandBuffer commit];
+    return true;
+  }
+}
+
+bool beginFrameSubmission(uint64_t compositorId,
+                          FrameSubmission* outSubmission,
+                          std::string* error,
+                          FrameFailureKind* failure) {
+  if (outSubmission) *outSubmission = FrameSubmission{};
+  if (error) error->clear();
+  setFrameFailure(failure, FrameFailureKind::None);
+  if (!outSubmission || compositorId == 0) {
+    if (error) *error = "invalid-metal-frame-submission-request";
+    setFrameFailure(failure, FrameFailureKind::InvalidState);
+    return false;
+  }
+  dispatch_semaphore_t frameSlots = nullptr;
+  std::shared_ptr<FrameTransientArenaState> transientArena;
+  std::shared_ptr<MetalContext> runtimeContext;
+  std::string previousSubmissionError;
+  {
+    std::lock_guard<std::mutex> lock(frameCompositorMutex());
+    auto it = frameCompositorRegistry().find(compositorId);
+    if (it == frameCompositorRegistry().end() ||
+        it->second.layer == nil ||
+        it->second.frameSlots == nullptr || !it->second.context ||
+        !it->second.context->ready) {
+      if (error) *error = "metal-frame-compositor-not-found";
+      setFrameFailure(failure, FrameFailureKind::CompositorUnavailable);
+      return false;
+    }
+    frameSlots = it->second.frameSlots;
+    transientArena = it->second.transientArena;
+    runtimeContext = it->second.context;
+    if (!it->second.pendingSubmissionError.empty()) {
+      previousSubmissionError = it->second.pendingSubmissionError;
+      it->second.pendingSubmissionError.clear();
+    }
+  }
+  if (!transientArena || !runtimeContext || runtimeContext->queue == nil ||
+      runtimeContext->runtimeContextId == 0u ||
+      runtimeContext->device == nil) {
+    if (error) *error = "metal-frame-transient-arena-unavailable";
+    setFrameFailure(failure, FrameFailureKind::InvariantViolation);
+    return false;
+  }
+  if (!previousSubmissionError.empty()) {
+    if (error) {
+      *error = std::string("metal-frame-previous-submission-failed:") +
+               previousSubmissionError;
+    }
+    setFrameFailure(failure, FrameFailureKind::PriorGpuSubmissionFailure);
+    return false;
+  }
+
+  const long slotWait =
+      dispatch_semaphore_wait(frameSlots,
+                              dispatch_time(DISPATCH_TIME_NOW,
+                                            kFrameSlotTimeoutNanoseconds));
+  if (slotWait != 0) {
+    if (error) *error = "metal-frame-compositor-backpressure-timeout";
+    setFrameFailure(failure, FrameFailureKind::BackpressureTimeout);
+    return false;
+  }
+
+  MetalContext& ctx = *runtimeContext;
+  id<MTLCommandBuffer> commandBuffer = [ctx.queue commandBuffer];
+  if (commandBuffer == nil) {
+    dispatch_semaphore_signal(frameSlots);
+    if (error) *error = "metal-frame-submission-command-buffer-failed";
+    setFrameFailure(failure, FrameFailureKind::CommandBufferUnavailable);
+    return false;
+  }
+
+  uint64_t submissionId = 0;
+  std::string registrationError;
+  FrameFailureKind registrationFailure = FrameFailureKind::InvariantViolation;
+  {
+    std::scoped_lock lock(frameCompositorMutex(), frameSubmissionMutex());
+    auto compositorIt = frameCompositorRegistry().find(compositorId);
+    if (compositorIt == frameCompositorRegistry().end() ||
+        compositorIt->second.frameSlots != frameSlots ||
+        compositorIt->second.context != runtimeContext) {
+      registrationError = "metal-frame-compositor-released-before-submission";
+      registrationFailure = FrameFailureKind::CompositorUnavailable;
+    } else {
+      submissionId = allocateFrameSubmissionIdLocked();
+      if (submissionId == 0) {
+        registrationError = "metal-frame-submission-handle-space-exhausted";
+        registrationFailure = FrameFailureKind::InvariantViolation;
+      } else {
+        ChromaspaceMetalTransientArena::Status arenaStatus;
+        {
+          std::lock_guard<std::mutex> arenaLock(transientArena->mutex);
+          arenaStatus = transientArena->policy.begin(submissionId);
+        }
+        if (!ChromaspaceMetalTransientArena::succeeded(arenaStatus)) {
+          registrationError =
+              std::string("metal-frame-transient-arena-begin-failed:") +
+              ChromaspaceMetalTransientArena::statusLabel(arenaStatus);
+          registrationFailure = FrameFailureKind::BackpressureTimeout;
+        } else {
+          FrameSubmissionRecord record{};
+          record.context = runtimeContext;
+          record.compositorId = compositorId;
+          record.frameSlots = frameSlots;
+          record.commandBuffer = commandBuffer;
+          record.transientArena = transientArena;
+          record.transientHeaps = [NSMutableArray array];
+          if (record.transientHeaps == nil) {
+            std::lock_guard<std::mutex> arenaLock(transientArena->mutex);
+            transientArena->policy.abandon(submissionId);
+            registrationError =
+                "metal-frame-transient-heap-list-allocation-failed";
+            registrationFailure = FrameFailureKind::CommandBufferUnavailable;
+          } else {
+            try {
+              frameSubmissionRegistry().emplace(submissionId,
+                                                std::move(record));
+            } catch (...) {
+              std::lock_guard<std::mutex> arenaLock(transientArena->mutex);
+              transientArena->policy.abandon(submissionId);
+              registrationError =
+                  "metal-frame-submission-registry-allocation-failed";
+              registrationFailure = FrameFailureKind::CommandBufferUnavailable;
+            }
+          }
+        }
+      }
+    }
+  }
+  if (!registrationError.empty()) {
+    dispatch_semaphore_signal(frameSlots);
+    if (error) *error = registrationError;
+    setFrameFailure(failure, registrationFailure);
+    return false;
+  }
+
+  outSubmission->submissionId = submissionId;
+  outSubmission->compositorId = compositorId;
+  outSubmission->runtimeContextId = runtimeContext->runtimeContextId;
+  outSubmission->deviceRegistryId = runtimeContext->device.registryID;
+  return true;
+}
+
+void abandonFrameSubmission(FrameSubmission* submission) {
+  if (!submission || submission->submissionId == 0) {
+    if (submission) *submission = FrameSubmission{};
+    return;
+  }
+  dispatch_semaphore_t frameSlots = nullptr;
+  std::shared_ptr<FrameTransientArenaState> transientArena;
+  uint64_t transientSubmissionId = 0u;
+  std::vector<FrameSubmissionTransactionRecord> transactions;
+  SubmissionRetention retainedResources;
+  {
+    std::lock_guard<std::mutex> lock(frameSubmissionMutex());
+    auto it = frameSubmissionRegistry().find(submission->submissionId);
+    if (it != frameSubmissionRegistry().end() &&
+        submissionIdentityMatches(it->second, *submission)) {
+      frameSlots = it->second.frameSlots;
+      transientArena = it->second.transientArena;
+      transientSubmissionId = submission->submissionId;
+      transactions = std::move(it->second.transactions);
+      retainedResources = std::move(it->second.retainedResources);
+      frameSubmissionRegistry().erase(it);
+    }
+  }
+  for (auto& transaction : transactions) {
+    if (transaction.abandoned) transaction.abandoned();
+  }
+  retainedResources.reset();
+  if (transientArena && transientSubmissionId != 0u) {
+    std::lock_guard<std::mutex> arenaLock(transientArena->mutex);
+    transientArena->policy.abandon(transientSubmissionId);
+  }
+  if (frameSlots != nullptr) dispatch_semaphore_signal(frameSlots);
+  *submission = FrameSubmission{};
+}
+
+bool compositeFrameSurfaces(uint64_t compositorId,
+                            const SurfaceCompositeItem* items,
+                            size_t itemCount,
+                            float clearR,
+                            float clearG,
+                            float clearB,
+                            float clearA,
+                            std::string* error) {
+  return compositeFrameSurfacesAndOverlayRects(compositorId,
+                                               items,
+                                               itemCount,
+                                               nullptr,
+                                               0,
+                                               clearR,
+                                               clearG,
+                                               clearB,
+                                               clearA,
+                                               error);
+}
+
+bool compositeFrameSurfacesAndOverlayRects(uint64_t compositorId,
+                                           const SurfaceCompositeItem* items,
+                                           size_t itemCount,
+                                           const FrameOverlayRect* overlayRects,
+                                           size_t overlayRectCount,
+                                           float clearR,
+                                           float clearG,
+                                           float clearB,
+                                           float clearA,
+                                           std::string* error) {
+  return compositeFrameSurfacesOverlayRectsAndText(compositorId,
+                                                   items,
+                                                   itemCount,
+                                                   overlayRects,
+                                                   overlayRectCount,
+                                                   nullptr,
+                                                   0,
+                                                   nullptr,
+                                                   0,
+                                                   nullptr,
+                                                   0,
+                                                   clearR,
+                                                   clearG,
+                                                   clearB,
+                                                   clearA,
+                                                   error);
+}
+
+bool submitFrameSubmissionSurfacesOverlayRectsAndText(
+    FrameSubmission* submission,
+    const SurfaceCompositeItem* items,
+    size_t itemCount,
+    const FrameOverlayRect* overlayRects,
+    size_t overlayRectCount,
+    const FrameVectorVertex* vectorVertices,
+    size_t vectorVertexCount,
+    const FrameTextVertex* textVertices,
+    size_t textVertexCount,
+    const FrameTextRun* textRuns,
+    size_t textRunCount,
+    float clearR,
+    float clearG,
+    float clearB,
+    float clearA,
+    std::string* error,
+    FrameFailureKind* failure) {
+  if (error) error->clear();
+  setFrameFailure(failure, FrameFailureKind::None);
+  if (!submission ||
+      submission->submissionId == 0 ||
+      submission->compositorId == 0 ||
+      submission->runtimeContextId == 0 ||
+      submission->deviceRegistryId == 0) {
+    if (error) *error = "invalid-metal-frame-submission-submit";
+    setFrameFailure(failure, FrameFailureKind::InvalidState);
+    return false;
+  }
+  const uint64_t submissionId = submission->submissionId;
+  const uint64_t compositorId = submission->compositorId;
+  id<MTLCommandBuffer> commandBuffer = nil;
+  if (!commandBufferForFrameSubmission(*submission, &commandBuffer, error,
+                                        failure)) {
+    return false;
+  }
+  std::shared_ptr<MetalContext> runtimeContext;
+  if (!contextForFrameSubmission(*submission, &runtimeContext, error)) {
+    setFrameFailure(failure, FrameFailureKind::MetalContextUnavailable);
+    return false;
+  }
+  MetalContext& ctx = *runtimeContext;
+  if (ctx.frameSurfaceCompositePipeline == nil || ctx.frameSolidRectPipeline == nil) {
+    if (error) *error = "metal-frame-surface-composite-pipeline-unavailable";
+    setFrameFailure(failure, FrameFailureKind::EncodingFailure);
+    return false;
+  }
+  const bool hasVectors = vectorVertices != nullptr && vectorVertexCount > 0;
+  if (hasVectors && ctx.frameUiVectorPipeline == nil) {
+    if (error) *error = "metal-frame-ui-vector-pipeline-unavailable";
+    setFrameFailure(failure, FrameFailureKind::EncodingFailure);
+    return false;
+  }
+  const bool hasText = textVertices != nullptr && textVertexCount > 0 &&
+                       textRuns != nullptr && textRunCount > 0;
+  if (hasText && ctx.frameTextPipeline == nil) {
+    if (error) *error = "metal-frame-text-pipeline-unavailable";
+    setFrameFailure(failure, FrameFailureKind::EncodingFailure);
+    return false;
+  }
+  CAMetalLayer* layer = nil;
+  int drawableWidth = 0;
+  int drawableHeight = 0;
+  {
+    std::lock_guard<std::mutex> lock(frameCompositorMutex());
+    auto it = frameCompositorRegistry().find(compositorId);
+    if (it == frameCompositorRegistry().end() || it->second.layer == nil ||
+        it->second.context != runtimeContext) {
+      if (error) *error = "metal-frame-compositor-not-found";
+      setFrameFailure(failure, FrameFailureKind::CompositorUnavailable);
+      return false;
+    }
+    layer = it->second.layer;
+    drawableWidth = it->second.drawableWidth;
+    drawableHeight = it->second.drawableHeight;
+  }
+  struct DrawableItem {
+    id<MTLTexture> texture = nil;
+    std::shared_ptr<PlotSurfaceRecord> record;
+    uint32_t surfaceId = 0u;
+    SurfaceCompositeUniforms uniforms{};
+  };
+  struct DrawableTextRun {
+    id<MTLTexture> texture = nil;
+    std::shared_ptr<FrameTextAtlasRecord> record;
+    uint64_t atlasId = 0u;
+    FrameTextUniforms uniforms{};
+    uint32_t firstVertex = 0;
+    uint32_t vertexCount = 0;
+  };
+  std::vector<FrameSolidRectUniforms> rectItems;
+  rectItems.reserve(overlayRectCount);
+  const size_t usableOverlayRectCount = overlayRects != nullptr ? overlayRectCount : 0;
+  for (size_t i = 0; i < usableOverlayRectCount; ++i) {
+    const FrameOverlayRect& rect = overlayRects[i];
+    if (rect.w <= 0.0f || rect.h <= 0.0f || rect.a <= 0.0f) continue;
+    FrameSolidRectUniforms uniforms{};
+    uniforms.dstX = rect.x;
+    uniforms.dstY = rect.y;
+    uniforms.dstW = rect.w;
+    uniforms.dstH = rect.h;
+    uniforms.drawableW = static_cast<float>(std::max(drawableWidth, 1));
+    uniforms.drawableH = static_cast<float>(std::max(drawableHeight, 1));
+    uniforms.r = std::max(0.0f, std::min(rect.r, 1.0f));
+    uniforms.g = std::max(0.0f, std::min(rect.g, 1.0f));
+    uniforms.b = std::max(0.0f, std::min(rect.b, 1.0f));
+    uniforms.a = std::max(0.0f, std::min(rect.a, 1.0f));
+    rectItems.push_back(uniforms);
+  }
+  std::vector<DrawableItem> drawItems;
+  drawItems.reserve(itemCount);
+  std::string resourceError;
+  {
+    std::lock_guard<std::mutex> lock(plotSurfaceMutex());
+    for (size_t i = 0; i < itemCount; ++i) {
+      const SurfaceCompositeItem& item = items[i];
+      if (item.surfaceId == 0 || item.dstW <= 0.0f || item.dstH <= 0.0f || item.opacity <= 0.0f) continue;
+      auto surfaceIt = plotSurfaceRegistry().find(item.surfaceId);
+      if (surfaceIt == plotSurfaceRegistry().end() || !surfaceIt->second ||
+          surfaceIt->second->texture == nil) {
+        resourceError = "metal-frame-composite-plot-surface-not-found id=" +
+                        std::to_string(item.surfaceId);
+        break;
+      }
+      if (surfaceIt->second->ownerCompositorId != compositorId ||
+          surfaceIt->second->context != runtimeContext) {
+        resourceError = "metal-frame-composite-plot-surface-owner-mismatch id=" +
+                        std::to_string(item.surfaceId);
+        break;
+      }
+      DrawableItem drawable{};
+      drawable.surfaceId = item.surfaceId;
+      drawable.record = surfaceIt->second;
+      drawable.texture = drawable.record->texture;
+      drawable.uniforms.dstX = item.dstX;
+      drawable.uniforms.dstY = item.dstY;
+      drawable.uniforms.dstW = item.dstW;
+      drawable.uniforms.dstH = item.dstH;
+      drawable.uniforms.drawableW = static_cast<float>(std::max(drawableWidth, 1));
+      drawable.uniforms.drawableH = static_cast<float>(std::max(drawableHeight, 1));
+      drawable.uniforms.opacity = std::max(0.0f, std::min(item.opacity, 1.0f));
+      drawItems.push_back(drawable);
+    }
+  }
+  if (!resourceError.empty()) {
+    if (error) *error = resourceError;
+    setFrameFailure(failure, FrameFailureKind::InvariantViolation);
+    return false;
+  }
+  for (const DrawableItem& item : drawItems) {
+    const SubmissionRetentionKey key{
+        SubmissionRetentionKind::PlotSurface,
+        static_cast<std::uint64_t>(item.surfaceId),
+        compositorId};
+    bool added = false;
+    if (!retainSubmissionResource(*submission, key,
+                                  item.record,
+                                  &resourceError,
+                                  &added)) {
+      if (error) *error = resourceError;
+      setFrameFailure(failure, FrameFailureKind::InvariantViolation);
+      return false;
+    }
+    bool stillLive = false;
+    {
+      std::lock_guard<std::mutex> lock(plotSurfaceMutex());
+      const auto it = plotSurfaceRegistry().find(item.surfaceId);
+      stillLive = it != plotSurfaceRegistry().end() && it->second == item.record &&
+                  it->second->ownerCompositorId == compositorId;
+    }
+    if (!stillLive) {
+      if (added) (void)releaseSubmissionResource(*submission, key);
+      if (error) *error = "metal-frame-retention-retired-during-acquire";
+      setFrameFailure(failure, FrameFailureKind::InvariantViolation);
+      return false;
+    }
+  }
+  std::vector<DrawableTextRun> textItems;
+  textItems.reserve(hasText ? textRunCount : 0);
+  if (hasText) {
+    std::lock_guard<std::mutex> lock(frameTextAtlasMutex());
+    for (size_t i = 0; i < textRunCount; ++i) {
+      const FrameTextRun& run = textRuns[i];
+      if (run.atlasId == 0 || run.vertexCount == 0 || run.a <= 0.0f) continue;
+      const size_t first = static_cast<size_t>(run.firstVertex);
+      const size_t count = static_cast<size_t>(run.vertexCount);
+      if (first >= textVertexCount || count > textVertexCount - first) continue;
+      auto atlasIt = frameTextAtlasRegistry().find(run.atlasId);
+      if (atlasIt == frameTextAtlasRegistry().end() || !atlasIt->second ||
+          atlasIt->second->texture == nil) {
+        resourceError = "metal-frame-text-atlas-not-found id=" +
+                        std::to_string(run.atlasId);
+        break;
+      }
+      if (atlasIt->second->ownerCompositorId != compositorId ||
+          atlasIt->second->context != runtimeContext) {
+        resourceError = "metal-frame-text-atlas-owner-mismatch id=" +
+                        std::to_string(run.atlasId);
+        break;
+      }
+      DrawableTextRun item{};
+      item.atlasId = run.atlasId;
+      item.record = atlasIt->second;
+      item.texture = item.record->texture;
+      item.firstVertex = run.firstVertex;
+      item.vertexCount = run.vertexCount;
+      item.uniforms.drawableW = static_cast<float>(std::max(drawableWidth, 1));
+      item.uniforms.drawableH = static_cast<float>(std::max(drawableHeight, 1));
+      item.uniforms.r = std::max(0.0f, std::min(run.r, 1.0f));
+      item.uniforms.g = std::max(0.0f, std::min(run.g, 1.0f));
+      item.uniforms.b = std::max(0.0f, std::min(run.b, 1.0f));
+      item.uniforms.a = std::max(0.0f, std::min(run.a, 1.0f));
+      item.uniforms.clipX = std::max(0.0f, run.clipX);
+      item.uniforms.clipY = std::max(0.0f, run.clipY);
+      item.uniforms.clipW = std::max(0.0f, run.clipW);
+      item.uniforms.clipH = std::max(0.0f, run.clipH);
+      item.uniforms.clipEnabled = run.clipEnabled != 0 ? 1.0f : 0.0f;
+      textItems.push_back(item);
+    }
+  }
+  if (!resourceError.empty()) {
+    if (error) *error = resourceError;
+    setFrameFailure(failure, FrameFailureKind::InvariantViolation);
+    return false;
+  }
+  for (size_t index = 0u; index < textItems.size(); ++index) {
+    const SubmissionRetentionKey key{
+        SubmissionRetentionKind::TextAtlas, textItems[index].atlasId,
+        compositorId};
+    bool added = false;
+    if (!retainSubmissionResource(*submission, key, textItems[index].record,
+                                  &resourceError, &added)) {
+      if (error) *error = resourceError;
+      setFrameFailure(failure, FrameFailureKind::InvariantViolation);
+      return false;
+    }
+    bool stillLive = false;
+    {
+      std::lock_guard<std::mutex> lock(frameTextAtlasMutex());
+      const auto it = frameTextAtlasRegistry().find(textItems[index].atlasId);
+      stillLive = it != frameTextAtlasRegistry().end() &&
+                  it->second == textItems[index].record &&
+                  it->second->ownerCompositorId == compositorId;
+    }
+    if (!stillLive) {
+      if (added) (void)releaseSubmissionResource(*submission, key);
+      if (error) *error = "metal-frame-retention-retired-during-acquire";
+      setFrameFailure(failure, FrameFailureKind::InvariantViolation);
+      return false;
+    }
+  }
+  @autoreleasepool {
+    id<MTLBuffer> vectorVertexBuffer = nil;
+    if (hasVectors) {
+      const size_t vectorBytes = vectorVertexCount * sizeof(FrameVectorVertex);
+      vectorVertexBuffer = [ctx.device newBufferWithBytes:vectorVertices
+                                                    length:static_cast<NSUInteger>(vectorBytes)
+                                                   options:MTLResourceStorageModeShared];
+      if (vectorVertexBuffer == nil) {
+        if (error) *error = "metal-frame-ui-vector-vertex-buffer-failed";
+        setFrameFailure(failure, FrameFailureKind::CommandBufferUnavailable);
+        return false;
+      }
+    }
+    id<MTLBuffer> textVertexBuffer = nil;
+    if (!textItems.empty()) {
+      const size_t vertexBytes = textVertexCount * sizeof(FrameTextVertex);
+      textVertexBuffer = [ctx.device newBufferWithBytes:textVertices
+                                                  length:static_cast<NSUInteger>(vertexBytes)
+                                                 options:MTLResourceStorageModeShared];
+      if (textVertexBuffer == nil) {
+        if (error) *error = "metal-frame-text-vertex-buffer-failed";
+        setFrameFailure(failure, FrameFailureKind::CommandBufferUnavailable);
+        return false;
+      }
+    }
+    id<CAMetalDrawable> drawable = [layer nextDrawable];
+    if (drawable == nil) {
+      if (error) *error = "metal-frame-compositor-next-drawable-failed";
+      setFrameFailure(failure, FrameFailureKind::DrawableUnavailable);
+      return false;
+    }
+    MTLRenderPassDescriptor* pass = [MTLRenderPassDescriptor renderPassDescriptor];
+    pass.colorAttachments[0].texture = drawable.texture;
+    pass.colorAttachments[0].loadAction = MTLLoadActionClear;
+    pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+    pass.colorAttachments[0].clearColor =
+        MTLClearColorMake(static_cast<double>(clearR),
+                          static_cast<double>(clearG),
+                          static_cast<double>(clearB),
+                          static_cast<double>(clearA));
+    id<MTLRenderCommandEncoder> encoder = [commandBuffer renderCommandEncoderWithDescriptor:pass];
+    if (encoder == nil) {
+      if (error) *error = "metal-frame-compositor-render-encoder-failed";
+      setFrameFailure(failure, FrameFailureKind::EncodingFailure);
+      return false;
+    }
+    [encoder setRenderPipelineState:ctx.frameSurfaceCompositePipeline];
+    for (const DrawableItem& item : drawItems) {
+      SurfaceCompositeUniforms uniforms = item.uniforms;
+      [encoder setVertexBytes:&uniforms length:sizeof(uniforms) atIndex:0];
+      [encoder setFragmentBytes:&uniforms length:sizeof(uniforms) atIndex:0];
+      [encoder setFragmentTexture:item.texture atIndex:0];
+      [encoder drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
+    }
+    if (!rectItems.empty()) {
+      [encoder setRenderPipelineState:ctx.frameSolidRectPipeline];
+      for (const FrameSolidRectUniforms& uniforms : rectItems) {
+        FrameSolidRectUniforms localUniforms = uniforms;
+        [encoder setVertexBytes:&localUniforms length:sizeof(localUniforms) atIndex:0];
+        [encoder setFragmentBytes:&localUniforms length:sizeof(localUniforms) atIndex:0];
+        [encoder drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
+      }
+    }
+    if (vectorVertexBuffer != nil && vectorVertexCount > 0) {
+      FrameUiVectorUniforms uniforms{};
+      uniforms.drawableW = static_cast<float>(std::max(drawableWidth, 1));
+      uniforms.drawableH = static_cast<float>(std::max(drawableHeight, 1));
+      [encoder setRenderPipelineState:ctx.frameUiVectorPipeline];
+      [encoder setVertexBuffer:vectorVertexBuffer offset:0 atIndex:0];
+      [encoder setVertexBytes:&uniforms length:sizeof(uniforms) atIndex:1];
+      [encoder drawPrimitives:MTLPrimitiveTypeTriangle
+                  vertexStart:0
+                  vertexCount:static_cast<NSUInteger>(vectorVertexCount)];
+    }
+    if (!textItems.empty()) {
+      [encoder setRenderPipelineState:ctx.frameTextPipeline];
+      [encoder setVertexBuffer:textVertexBuffer offset:0 atIndex:0];
+      for (const DrawableTextRun& item : textItems) {
+        FrameTextUniforms uniforms = item.uniforms;
+        [encoder setVertexBytes:&uniforms length:sizeof(uniforms) atIndex:1];
+        [encoder setFragmentBytes:&uniforms length:sizeof(uniforms) atIndex:0];
+        [encoder setFragmentTexture:item.texture atIndex:0];
+        [encoder drawPrimitives:MTLPrimitiveTypeTriangle
+                    vertexStart:static_cast<NSUInteger>(item.firstVertex)
+                    vertexCount:static_cast<NSUInteger>(item.vertexCount)];
+      }
+    }
+    [encoder endEncoding];
+    uint64_t submissionSerial = 0;
+    dispatch_semaphore_t completionSlots = nullptr;
+    dispatch_group_t completionGroup = nullptr;
+    std::shared_ptr<FrameTransientArenaState> completionTransientArena;
+    NSArray<id<MTLHeap>>* completionTransientHeaps = nil;
+    std::shared_ptr<std::vector<FrameSubmissionTransactionRecord>>
+        completionTransactions;
+    std::shared_ptr<SubmissionRetention> completionRetention;
+    try {
+      completionTransactions =
+          std::make_shared<
+              std::vector<FrameSubmissionTransactionRecord>>();
+      completionRetention = std::make_shared<SubmissionRetention>();
+    } catch (...) {
+      if (error) {
+        *error =
+            "metal-frame-submission-completion-allocation-failed";
+      }
+      setFrameFailure(failure, FrameFailureKind::CommandBufferUnavailable);
+      return false;
+    }
+    std::string consumeError;
+    FrameFailureKind consumeFailure = FrameFailureKind::InvariantViolation;
+    {
+      std::scoped_lock lock(frameCompositorMutex(), frameSubmissionMutex());
+      auto submissionIt =
+          frameSubmissionRegistry().find(submissionId);
+      if (submissionIt == frameSubmissionRegistry().end()) {
+        consumeError = "metal-frame-submission-not-found";
+        consumeFailure = FrameFailureKind::InvariantViolation;
+      } else if (!submissionIdentityMatches(submissionIt->second,
+                                            *submission)) {
+        consumeError = "metal-frame-submission-context-mismatch";
+        consumeFailure = FrameFailureKind::InvariantViolation;
+      } else if (submissionIt->second.commandBuffer != commandBuffer) {
+        consumeError = "metal-frame-submission-command-buffer-mismatch";
+        consumeFailure = FrameFailureKind::InvariantViolation;
+      } else {
+        auto compositorIt = frameCompositorRegistry().find(compositorId);
+        if (compositorIt == frameCompositorRegistry().end() ||
+            compositorIt->second.frameSlots != submissionIt->second.frameSlots ||
+            compositorIt->second.context != runtimeContext) {
+          consumeError = "metal-frame-compositor-released-before-submit";
+          consumeFailure = FrameFailureKind::CompositorUnavailable;
+        } else {
+          completionTransientArena = submissionIt->second.transientArena;
+          ChromaspaceMetalTransientArena::Status transientSubmitStatus =
+              ChromaspaceMetalTransientArena::Status::InvalidConfig;
+          if (completionTransientArena) {
+            std::lock_guard<std::mutex> arenaLock(
+                completionTransientArena->mutex);
+            transientSubmitStatus =
+                completionTransientArena->policy.submit(submissionId);
+          }
+          if (!ChromaspaceMetalTransientArena::succeeded(
+                  transientSubmitStatus)) {
+            consumeError =
+                std::string("metal-frame-transient-arena-submit-failed:") +
+                ChromaspaceMetalTransientArena::statusLabel(
+                    transientSubmitStatus);
+            consumeFailure = FrameFailureKind::InvariantViolation;
+          } else {
+            completionTransientHeaps =
+                [submissionIt->second.transientHeaps copy];
+            completionSlots = submissionIt->second.frameSlots;
+            completionGroup = compositorIt->second.completionGroup;
+            submissionSerial = ++compositorIt->second.submittedSerial;
+            *completionTransactions =
+                std::move(submissionIt->second.transactions);
+            submissionIt->second.retainedResources.seal();
+            *completionRetention =
+                std::move(submissionIt->second.retainedResources);
+            // Publish the accepted committed-frame obligation while both
+            // registries are locked. A control-plane drain cannot observe an
+            // empty group after this submission has left the registry.
+            dispatch_group_enter(completionGroup);
+            frameSubmissionRegistry().erase(submissionIt);
+          }
+        }
+      }
+    }
+    if (!consumeError.empty()) {
+      if (error) *error = consumeError;
+      setFrameFailure(failure, consumeFailure);
+      return false;
+    }
+    try {
+      for (auto& transaction : *completionTransactions) {
+        if (transaction.submitted) transaction.submitted();
+      }
+    } catch (...) {
+      for (auto& transaction : *completionTransactions) {
+        if (transaction.abandoned) transaction.abandoned();
+      }
+      if (completionTransientArena) {
+        std::lock_guard<std::mutex> arenaLock(
+            completionTransientArena->mutex);
+        completionTransientArena->policy.abandon(submissionId);
+      }
+      dispatch_semaphore_signal(completionSlots);
+      dispatch_group_leave(completionGroup);
+      if (error) {
+        *error =
+            "metal-frame-submission-transaction-submit-failed";
+      }
+      setFrameFailure(failure, FrameFailureKind::EncodingFailure);
+      return false;
+    }
+    const std::shared_ptr<MetalContext> completionContext = runtimeContext;
+    [commandBuffer addCompletedHandler:^(id<MTLCommandBuffer> completedBuffer) {
+      (void)completionContext;
+      (void)completionTransientHeaps;
+      std::string completionError;
+      NSError* commandError = completedBuffer.error;
+      const double gpuStartTime = completedBuffer.GPUStartTime;
+      const double gpuEndTime = completedBuffer.GPUEndTime;
+      const bool gpuTimingAvailable =
+          std::isfinite(gpuStartTime) && std::isfinite(gpuEndTime) &&
+          gpuStartTime > 0.0 && gpuEndTime >= gpuStartTime;
+      const double gpuSeconds =
+          gpuTimingAvailable ? gpuEndTime - gpuStartTime : 0.0;
+      if (commandError != nil) {
+        NSString* description = [commandError localizedDescription];
+        const char* descriptionUtf8 =
+            description != nil ? [description UTF8String] : nullptr;
+        completionError = descriptionUtf8 != nullptr
+                              ? std::string(descriptionUtf8)
+                              : std::string("unknown-metal-command-buffer-error");
+      }
+      if (completionTransactions) {
+        const bool success = completionError.empty();
+        for (auto& transaction : *completionTransactions) {
+          if (transaction.completed) transaction.completed(success);
+        }
+      }
+      if (completionTransientArena) {
+        std::lock_guard<std::mutex> arenaLock(
+            completionTransientArena->mutex);
+        completionTransientArena->policy.complete(submissionId);
+      }
+      {
+        std::lock_guard<std::mutex> lock(frameCompositorMutex());
+        auto it = frameCompositorRegistry().find(compositorId);
+        if (it != frameCompositorRegistry().end() &&
+            it->second.frameSlots == completionSlots) {
+          it->second.completedSerial =
+              std::max(it->second.completedSerial, submissionSerial);
+          if (gpuTimingAvailable && std::isfinite(gpuSeconds)) {
+            ++it->second.timedSubmissionCount;
+            const double nextAccumulated =
+                it->second.accumulatedGpuSeconds + gpuSeconds;
+            if (std::isfinite(nextAccumulated)) {
+              it->second.accumulatedGpuSeconds = nextAccumulated;
+            }
+            it->second.maximumGpuSeconds =
+                std::max(it->second.maximumGpuSeconds, gpuSeconds);
+          } else {
+            ++it->second.untimedSubmissionCount;
+          }
+          if (!completionError.empty() &&
+              it->second.pendingSubmissionError.empty()) {
+            it->second.pendingSubmissionError =
+                std::string("serial=") + std::to_string(submissionSerial) +
+                ":" + completionError;
+          }
+          if (!completionError.empty()) {
+            ++it->second.failedSubmissionCount;
+            it->second.lastSubmissionError =
+                std::string("serial=") + std::to_string(submissionSerial) +
+                ":" + completionError;
+          }
+        }
+      }
+      dispatch_semaphore_signal(completionSlots);
+      dispatch_group_leave(completionGroup);
+      // Keep completionRetention alive through all callback/statistics work;
+      // releasing this final shared owner retires every native resource hold.
+      if (completionRetention) completionRetention->reset();
+    }];
+    [commandBuffer presentDrawable:drawable];
+    [commandBuffer commit];
+    *submission = FrameSubmission{};
+    return true;
+  }
+}
+
+bool compositeFrameSurfacesOverlayRectsAndText(uint64_t compositorId,
+                                               const SurfaceCompositeItem* items,
+                                               size_t itemCount,
+                                               const FrameOverlayRect* overlayRects,
+                                               size_t overlayRectCount,
+                                               const FrameVectorVertex* vectorVertices,
+                                               size_t vectorVertexCount,
+                                               const FrameTextVertex* textVertices,
+                                               size_t textVertexCount,
+                                               const FrameTextRun* textRuns,
+                                               size_t textRunCount,
+                                               float clearR,
+                                               float clearG,
+                                               float clearB,
+                                               float clearA,
+                                               std::string* error) {
+  FrameSubmission submission{};
+  if (!beginFrameSubmission(compositorId, &submission, error, nullptr)) {
+    return false;
+  }
+  if (!submitFrameSubmissionSurfacesOverlayRectsAndText(
+          &submission,
+          items,
+          itemCount,
+          overlayRects,
+          overlayRectCount,
+          vectorVertices,
+          vectorVertexCount,
+          textVertices,
+          textVertexCount,
+          textRuns,
+          textRunCount,
+          clearR,
+          clearG,
+          clearB,
+          clearA,
+          error,
+          nullptr)) {
+    abandonFrameSubmission(&submission);
+    return false;
+  }
+  return true;
+}
+
+void releaseFrameCompositor(uint64_t compositorId) {
+  if (compositorId == 0) return;
+  @autoreleasepool {
+    NSView* contentView = nil;
+    CALayer* layer = nil;
+    CALayer* previousLayer = nil;
+    dispatch_semaphore_t retainedFrameSlots = nullptr;
+    BOOL previousWantsLayer = NO;
+    std::vector<dispatch_semaphore_t> abandonedSlots;
+    std::vector<FrameSubmissionTransactionRecord> abandonedTransactions;
+    std::vector<std::pair<std::shared_ptr<FrameTransientArenaState>, uint64_t>>
+        abandonedTransientSubmissions;
+    {
+      std::scoped_lock lock(frameCompositorMutex(), frameSubmissionMutex());
+      auto compositorIt = frameCompositorRegistry().find(compositorId);
+      if (compositorIt == frameCompositorRegistry().end()) return;
+      contentView = compositorIt->second.contentView;
+      layer = compositorIt->second.layer;
+      previousLayer = compositorIt->second.previousLayer;
+      retainedFrameSlots = compositorIt->second.frameSlots;
+      previousWantsLayer = compositorIt->second.previousWantsLayer;
+      for (auto it = frameSubmissionRegistry().begin();
+           it != frameSubmissionRegistry().end();) {
+        if (it->second.compositorId == compositorId) {
+          if (it->second.frameSlots != nullptr) {
+            abandonedSlots.push_back(it->second.frameSlots);
+          }
+          for (auto& transaction : it->second.transactions) {
+            abandonedTransactions.push_back(std::move(transaction));
+          }
+          if (it->second.transientArena) {
+            abandonedTransientSubmissions.emplace_back(
+                it->second.transientArena, it->first);
+          }
+          it = frameSubmissionRegistry().erase(it);
+        } else {
+          ++it;
+        }
+      }
+      frameCompositorRegistry().erase(compositorIt);
+    }
+    {
+      std::lock_guard<std::mutex> lock(plotSurfaceMutex());
+      auto& registry = plotSurfaceRegistry();
+      for (auto it = registry.begin(); it != registry.end();) {
+        if (it->second && it->second->ownerCompositorId == compositorId) {
+          it = registry.erase(it);
+        } else {
+          ++it;
+        }
+      }
+    }
+    {
+      std::lock_guard<std::mutex> lock(frameTextAtlasMutex());
+      auto& registry = frameTextAtlasRegistry();
+      for (auto it = registry.begin(); it != registry.end();) {
+        if (it->second && it->second->ownerCompositorId == compositorId) {
+          it = registry.erase(it);
+        } else {
+          ++it;
+        }
+      }
+    }
+    {
+      std::lock_guard<std::mutex> lock(scopeDerivedRegistryMutex());
+      auto& registry = scopeDerivedRegistry();
+      for (auto it = registry.begin(); it != registry.end();) {
+        if (it->second.ownerCompositorId == compositorId) {
+          it = registry.erase(it);
+        } else {
+          ++it;
+        }
+      }
+    }
+    for (auto& transaction : abandonedTransactions) {
+      if (transaction.abandoned) transaction.abandoned();
+    }
+    for (const auto& transient : abandonedTransientSubmissions) {
+      if (!transient.first || transient.second == 0u) continue;
+      std::lock_guard<std::mutex> arenaLock(transient.first->mutex);
+      transient.first->policy.abandon(transient.second);
+    }
+    if (contentView != nil && [contentView layer] == layer) {
+      [contentView setLayer:previousLayer];
+      [contentView setWantsLayer:previousWantsLayer];
+    }
+    for (dispatch_semaphore_t frameSlots : abandonedSlots) {
+      dispatch_semaphore_signal(frameSlots);
+    }
+    (void)retainedFrameSlots;
+  }
+}
+
+bool createFrameTextAtlas(uint64_t compositorId,
+                          int width,
+                          int height,
+                          const unsigned char* alphaPixels,
+                          FrameTextAtlas* outAtlas,
+                          std::string* error) {
+  if (outAtlas) *outAtlas = FrameTextAtlas{};
+  if (error) error->clear();
+  if (!outAtlas) {
+    if (error) *error = "missing-frame-text-atlas-output";
+    return false;
+  }
+  if (compositorId == 0 || width <= 0 || height <= 0 ||
+      alphaPixels == nullptr) {
+    if (error) *error = "invalid-frame-text-atlas-request";
+    return false;
+  }
+  std::shared_ptr<MetalContext> runtimeContext;
+  if (!contextForCompositor(compositorId, &runtimeContext, error)) {
+    return false;
+  }
+  MetalContext& ctx = *runtimeContext;
+  @autoreleasepool {
+    MTLTextureDescriptor* desc =
+        [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR8Unorm
+                                                           width:static_cast<NSUInteger>(width)
+                                                          height:static_cast<NSUInteger>(height)
+                                                       mipmapped:NO];
+    desc.usage = MTLTextureUsageShaderRead;
+    id<MTLTexture> texture = [ctx.device newTextureWithDescriptor:desc];
+    if (texture == nil) {
+      if (error) *error = "frame-text-atlas-texture-allocation-failed";
+      return false;
+    }
+    MTLRegion region = MTLRegionMake2D(0, 0,
+                                       static_cast<NSUInteger>(width),
+                                       static_cast<NSUInteger>(height));
+    [texture replaceRegion:region
+               mipmapLevel:0
+                 withBytes:alphaPixels
+               bytesPerRow:static_cast<NSUInteger>(width)];
+    std::shared_ptr<FrameTextAtlasRecord> record;
+    try {
+      record = std::make_shared<FrameTextAtlasRecord>();
+    } catch (...) {
+      if (error) *error = "frame-text-atlas-record-allocation-failed";
+      return false;
+    }
+    record->texture = texture;
+    record->context = runtimeContext;
+    record->ownerCompositorId = compositorId;
+    record->width = width;
+    record->height = height;
+    uint64_t atlasId = 0;
+    {
+      std::scoped_lock lock(frameCompositorMutex(), frameTextAtlasMutex());
+      auto compositorIt = frameCompositorRegistry().find(compositorId);
+      if (compositorIt == frameCompositorRegistry().end() ||
+          compositorIt->second.layer == nil ||
+          compositorIt->second.context != runtimeContext) {
+        if (error) *error = "frame-text-atlas-compositor-not-found";
+        return false;
+      }
+      atlasId = allocateFrameTextAtlasIdLocked();
+      if (atlasId == 0) {
+        if (error) *error = "frame-text-atlas-handle-space-exhausted";
+        return false;
+      }
+      try {
+        frameTextAtlasRegistry().emplace(atlasId, record);
+      } catch (...) {
+        if (error) *error = "frame-text-atlas-registry-allocation-failed";
+        return false;
+      }
+    }
+    outAtlas->atlasId = atlasId;
+    outAtlas->width = width;
+    outAtlas->height = height;
+    return true;
+  }
+}
+
+void releaseFrameTextAtlas(uint64_t compositorId, uint64_t atlasId) {
+  if (compositorId == 0 || atlasId == 0) return;
+  std::lock_guard<std::mutex> lock(frameTextAtlasMutex());
+  auto atlasIt = frameTextAtlasRegistry().find(atlasId);
+  if (atlasIt == frameTextAtlasRegistry().end() ||
+      !atlasIt->second || atlasIt->second->ownerCompositorId != compositorId) {
+    return;
+  }
+  frameTextAtlasRegistry().erase(atlasIt);
+}
+
+static bool createPlotSurfaceInternal(uint64_t ownerCompositorId,
+                                      int width,
+                                      int height,
+                                      int pixelFormat,
+                                      bool iosurfaceBacked,
+                                      PlotSurface* outSurface,
+                                      std::string* error) {
   if (outSurface) *outSurface = PlotSurface{};
   if (error) error->clear();
   if (!outSurface) {
@@ -3863,63 +4585,149 @@ bool createPlotSurface(int width,
     if (error) *error = "invalid-plot-surface-size";
     return false;
   }
+  if (!iosurfaceBacked && ownerCompositorId == 0) {
+    if (error) *error = "private-plot-surface-owner-required";
+    return false;
+  }
+#if defined(CHROMASPACE_METAL_NATIVE_ONLY)
+  if (iosurfaceBacked) {
+    if (error) *error = "iosurface-plot-surfaces-unavailable-in-native-only-mode";
+    return false;
+  }
+#else
+  if (iosurfaceBacked && ownerCompositorId != 0) {
+    if (error) *error = "compatibility-plot-surface-owner-must-be-zero";
+    return false;
+  }
+#endif
   if (pixelFormat != 0 && pixelFormat != 1) {
     if (error) *error = "unsupported-plot-surface-format";
     return false;
   }
-  std::string localError;
-  if (!ensureContext(&localError)) {
-    if (error) *error = localError.empty() ? "metal-context-unavailable" : localError;
+  std::shared_ptr<MetalContext> runtimeContext;
+  MetalContext* contextPointer = nullptr;
+  if (ownerCompositorId != 0u) {
+    if (!contextForCompositor(ownerCompositorId, &runtimeContext, error)) {
+      return false;
+    }
+    contextPointer = runtimeContext.get();
+  } else {
+#if !defined(CHROMASPACE_METAL_NATIVE_ONLY)
+    std::string localError;
+    if (!ensureContext(&localError)) {
+      if (error) {
+        *error = localError.empty() ? "metal-context-unavailable" : localError;
+      }
+      return false;
+    }
+    contextPointer = &context();
+#else
+    if (error) *error = "private-plot-surface-owner-required";
     return false;
+#endif
   }
-  MetalContext& ctx = context();
+  MetalContext& ctx = *contextPointer;
   @autoreleasepool {
     const size_t bytesPerElement = sourceSignalBytesPerElement(pixelFormat);
     const size_t bytesPerRow = static_cast<size_t>(width) * bytesPerElement;
     const size_t byteSize = bytesPerRow * static_cast<size_t>(height);
-    NSDictionary* surfaceProperties = @{
-      (__bridge NSString*)kIOSurfaceWidth: @(width),
-      (__bridge NSString*)kIOSurfaceHeight: @(height),
-      (__bridge NSString*)kIOSurfaceBytesPerElement: @(bytesPerElement),
-      (__bridge NSString*)kIOSurfaceBytesPerRow: @(bytesPerRow),
-      (__bridge NSString*)kIOSurfaceAllocSize: @(byteSize),
-      (__bridge NSString*)kIOSurfacePixelFormat: @(sourceSignalIOSurfacePixelFormat(pixelFormat)),
-    };
-    IOSurfaceRef surface = IOSurfaceCreate((__bridge CFDictionaryRef)surfaceProperties);
-    if (surface == nullptr) {
-      if (error) *error = "plot-surface-iosurface-allocation-failed";
-      return false;
+#if !defined(CHROMASPACE_METAL_NATIVE_ONLY)
+    IOSurfaceRef surface = nullptr;
+    if (iosurfaceBacked) {
+      NSDictionary* surfaceProperties = @{
+        (__bridge NSString*)kIOSurfaceWidth: @(width),
+        (__bridge NSString*)kIOSurfaceHeight: @(height),
+        (__bridge NSString*)kIOSurfaceBytesPerElement: @(bytesPerElement),
+        (__bridge NSString*)kIOSurfaceBytesPerRow: @(bytesPerRow),
+        (__bridge NSString*)kIOSurfaceAllocSize: @(byteSize),
+        (__bridge NSString*)kIOSurfacePixelFormat: @(sourceSignalIOSurfacePixelFormat(pixelFormat)),
+      };
+      surface = IOSurfaceCreate((__bridge CFDictionaryRef)surfaceProperties);
+      if (surface == nullptr) {
+        if (error) *error = "plot-surface-iosurface-allocation-failed";
+        return false;
+      }
     }
+#endif
     MTLTextureDescriptor* desc =
         [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:sourceSignalMetalPixelFormat(pixelFormat)
                                                            width:static_cast<NSUInteger>(width)
                                                           height:static_cast<NSUInteger>(height)
                                                        mipmapped:NO];
-    desc.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
-    desc.storageMode = MTLStorageModeShared;
-    id<MTLTexture> texture = [ctx.device newTextureWithDescriptor:desc iosurface:surface plane:0];
+    desc.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite | MTLTextureUsageRenderTarget;
+#if defined(CHROMASPACE_METAL_NATIVE_ONLY)
+    desc.storageMode = MTLStorageModePrivate;
+    id<MTLTexture> texture = [ctx.device newTextureWithDescriptor:desc];
+#else
+    desc.storageMode = iosurfaceBacked ? MTLStorageModeShared : MTLStorageModePrivate;
+    id<MTLTexture> texture =
+        iosurfaceBacked
+            ? [ctx.device newTextureWithDescriptor:desc iosurface:surface plane:0]
+            : [ctx.device newTextureWithDescriptor:desc];
+#endif
     if (texture == nil) {
-      CFRelease(surface);
-      if (error) *error = "plot-surface-metal-texture-failed";
+#if !defined(CHROMASPACE_METAL_NATIVE_ONLY)
+      if (surface) CFRelease(surface);
+#endif
+      if (error) {
+        *error = iosurfaceBacked ? "plot-surface-metal-iosurface-texture-failed"
+                                 : "plot-surface-private-metal-texture-failed";
+      }
       return false;
     }
-    const uint32_t surfaceId = static_cast<uint32_t>(IOSurfaceGetID(surface));
-    {
+    std::shared_ptr<PlotSurfaceRecord> record;
+    try {
+      record = std::make_shared<PlotSurfaceRecord>();
+    } catch (...) {
+#if !defined(CHROMASPACE_METAL_NATIVE_ONLY)
+      if (surface) CFRelease(surface);
+#endif
+      if (error) *error = "plot-surface-record-allocation-failed";
+      return false;
+    }
+#if !defined(CHROMASPACE_METAL_NATIVE_ONLY)
+    record->surface = surface;
+    surface = nullptr;
+#endif
+    record->texture = texture;
+    record->context = runtimeContext;
+    record->ownerCompositorId = ownerCompositorId;
+    record->width = width;
+    record->height = height;
+    record->pixelFormat = pixelFormat;
+    record->byteSize = byteSize;
+    uint32_t surfaceId = 0;
+    if (ownerCompositorId == 0) {
       std::lock_guard<std::mutex> lock(plotSurfaceMutex());
-      auto& registry = plotSurfaceRegistry();
-      auto existing = registry.find(surfaceId);
-      if (existing != registry.end()) {
-        if (existing->second.surface) CFRelease(existing->second.surface);
-        registry.erase(existing);
+      surfaceId = allocatePlotSurfaceHandleLocked();
+      if (surfaceId != 0) {
+        try {
+          plotSurfaceRegistry().emplace(surfaceId, record);
+        } catch (...) {
+          surfaceId = 0;
+        }
       }
-      PlotSurfaceRecord record{};
-      record.surface = surface;
-      record.texture = texture;
-      record.width = width;
-      record.height = height;
-      record.pixelFormat = pixelFormat;
-      record.byteSize = byteSize;
-      registry.emplace(surfaceId, record);
+    } else {
+      std::scoped_lock lock(frameCompositorMutex(), plotSurfaceMutex());
+      auto compositorIt = frameCompositorRegistry().find(ownerCompositorId);
+      if (compositorIt == frameCompositorRegistry().end() ||
+          compositorIt->second.layer == nil ||
+          compositorIt->second.context != runtimeContext) {
+        if (error) *error = "private-plot-surface-compositor-not-found";
+        return false;
+      }
+      surfaceId = allocatePlotSurfaceHandleLocked();
+      if (surfaceId != 0) {
+        try {
+          plotSurfaceRegistry().emplace(surfaceId, record);
+        } catch (...) {
+          surfaceId = 0;
+        }
+      }
+    }
+    if (surfaceId == 0) {
+      if (error) *error = "plot-surface-handle-space-exhausted";
+      return false;
     }
     if (outSurface) {
       outSurface->surfaceId = surfaceId;
@@ -3932,16 +4740,41 @@ bool createPlotSurface(int width,
   }
 }
 
-bool clearPlotSurface(uint32_t surfaceId,
-                      int width,
-                      int height,
-                      int pixelFormat,
-                      float r,
-                      float g,
-                      float b,
-                      float a,
-                      std::string* error) {
+#if !defined(CHROMASPACE_METAL_NATIVE_ONLY)
+bool createPlotSurface(int width,
+                       int height,
+                       int pixelFormat,
+                       PlotSurface* outSurface,
+                       std::string* error) {
+  return createPlotSurfaceInternal(0, width, height, pixelFormat, true, outSurface, error);
+}
+#endif
+
+bool createPrivatePlotSurface(uint64_t compositorId,
+                              int width,
+                              int height,
+                              int pixelFormat,
+                              PlotSurface* outSurface,
+                              std::string* error) {
+  return createPlotSurfaceInternal(
+      compositorId, width, height, pixelFormat, false, outSurface, error);
+}
+
+static bool encodePlotSurfaceClearOnCommandBuffer(id<MTLCommandBuffer> commandBuffer,
+                                                  uint32_t surfaceId,
+                                                  int width,
+                                                  int height,
+                                                  int pixelFormat,
+                                                  float r,
+                                                  float g,
+                                                  float b,
+                                                  float a,
+                                                  std::string* error) {
   if (error) error->clear();
+  if (commandBuffer == nil) {
+    if (error) *error = "plot-surface-clear-command-buffer-unavailable";
+    return false;
+  }
   if (surfaceId == 0 || width <= 0 || height <= 0) {
     if (error) *error = "invalid-plot-surface-clear-request";
     return false;
@@ -3950,14 +4783,18 @@ bool clearPlotSurface(uint32_t surfaceId,
     if (error) *error = "unsupported-plot-surface-format";
     return false;
   }
-  std::string localError;
-  if (!ensureContext(&localError)) {
-    if (error) *error = localError.empty() ? "metal-context-unavailable" : localError;
+  std::shared_ptr<MetalContext> runtimeContext;
+  MetalContext* contextPointer = nullptr;
+  if (!contextForCommandBuffer(commandBuffer, &runtimeContext,
+                               &contextPointer, error) ||
+      contextPointer == nullptr) {
     return false;
   }
-  MetalContext& ctx = context();
+  MetalContext& ctx = *contextPointer;
   if (ctx.plotSurfaceClearPipeline == nil) {
-    if (error) *error = residentPipelineUnavailableReason("plot-surface-clear");
+    if (error) {
+      *error = residentPipelineUnavailableReason(ctx, "plot-surface-clear");
+    }
     return false;
   }
   id<MTLTexture> texture = nil;
@@ -3965,16 +4802,17 @@ bool clearPlotSurface(uint32_t surfaceId,
     std::lock_guard<std::mutex> lock(plotSurfaceMutex());
     auto& registry = plotSurfaceRegistry();
     auto it = registry.find(surfaceId);
-    if (it != registry.end() &&
-        it->second.width == width &&
-        it->second.height == height &&
-        it->second.pixelFormat == pixelFormat) {
-      texture = it->second.texture;
+    if (it != registry.end() && it->second &&
+        it->second->width == width &&
+        it->second->height == height &&
+        it->second->pixelFormat == pixelFormat &&
+        it->second->context == runtimeContext) {
+      texture = it->second->texture;
     }
   }
   if (texture == nil) {
-    texture = makeTextureFromIOSurface(ctx, surfaceId, width, height, pixelFormat, error);
-    if (texture == nil) return false;
+    if (error) *error = "plot-surface-clear-output-surface-missing";
+    return false;
   }
   @autoreleasepool {
     PlotSurfaceClearUniforms uniforms{r, g, b, a};
@@ -3984,11 +4822,6 @@ bool clearPlotSurface(uint32_t surfaceId,
                                options:MTLResourceStorageModeShared];
     if (uniformBuffer == nil) {
       if (error) *error = "plot-surface-clear-uniform-allocation-failed";
-      return false;
-    }
-    id<MTLCommandBuffer> commandBuffer = [ctx.queue commandBuffer];
-    if (commandBuffer == nil) {
-      if (error) *error = "plot-surface-clear-command-buffer-failed";
       return false;
     }
     id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
@@ -4009,15 +4842,1279 @@ bool clearPlotSurface(uint32_t surfaceId,
                                          1);
     [encoder dispatchThreads:threadsPerGrid threadsPerThreadgroup:threadsPerGroup];
     [encoder endEncoding];
-    [commandBuffer commit];
-    [commandBuffer waitUntilCompleted];
-    NSError* cbError = commandBuffer.error;
-    if (cbError != nil) {
-      if (error) *error = [[cbError localizedDescription] UTF8String];
-      return false;
-    }
     return true;
   }
+}
+
+#if !defined(CHROMASPACE_METAL_NATIVE_ONLY)
+bool clearPlotSurface(uint32_t surfaceId,
+                      int width,
+                      int height,
+                      int pixelFormat,
+                      float r,
+                      float g,
+                      float b,
+                      float a,
+                      std::string* error) {
+  std::string localError;
+  if (!ensureContext(&localError)) {
+    if (error) *error = localError.empty() ? "metal-context-unavailable" : localError;
+    return false;
+  }
+  id<MTLCommandBuffer> commandBuffer = [context().queue commandBuffer];
+  if (commandBuffer == nil) {
+    if (error) *error = "plot-surface-clear-command-buffer-failed";
+    return false;
+  }
+  if (!encodePlotSurfaceClearOnCommandBuffer(
+          commandBuffer, surfaceId, width, height, pixelFormat, r, g, b, a, error)) {
+    return false;
+  }
+  [commandBuffer commit];
+  [commandBuffer waitUntilCompleted];
+  NSError* cbError = commandBuffer.error;
+  if (cbError != nil) {
+    if (error) *error = [[cbError localizedDescription] UTF8String];
+    return false;
+  }
+  return true;
+}
+#endif
+
+bool encodePlotSurfaceClear(const FrameSubmission& submission,
+                            uint32_t surfaceId,
+                            int width,
+                            int height,
+                            int pixelFormat,
+                            float r,
+                            float g,
+                            float b,
+                            float a,
+                            std::string* error) {
+  if (!retainPlotSurfaceForSubmission(submission, surfaceId, nullptr, error)) {
+    return false;
+  }
+  id<MTLCommandBuffer> commandBuffer = nil;
+  if (!commandBufferForFrameSubmission(submission, &commandBuffer, error)) {
+    return false;
+  }
+  if (!validatePlotSurfaceOwnerForSubmission(submission, surfaceId, error)) {
+    return false;
+  }
+  return encodePlotSurfaceClearOnCommandBuffer(
+      commandBuffer, surfaceId, width, height, pixelFormat, r, g, b, a, error);
+}
+
+static bool encodePlotSurfaceVectorPrimitivesOnCommandBuffer(
+    id<MTLCommandBuffer> commandBuffer,
+    uint32_t surfaceId,
+    int width,
+    int height,
+    int pixelFormat,
+    const FrameVectorVertex* vertices,
+    size_t vertexCount,
+    bool clearBeforeDraw,
+    float clearR,
+    float clearG,
+    float clearB,
+    float clearA,
+    std::string* error) {
+  if (error) error->clear();
+  if (commandBuffer == nil) {
+    if (error) *error = "plot-surface-vector-command-buffer-unavailable";
+    return false;
+  }
+  if (surfaceId == 0 || width <= 0 || height <= 0) {
+    if (error) *error = "invalid-plot-surface-vector-request";
+    return false;
+  }
+  if (pixelFormat != 0 && pixelFormat != 1) {
+    if (error) *error = "unsupported-plot-surface-vector-format";
+    return false;
+  }
+  if (vertexCount > 0 && vertices == nullptr) {
+    if (error) *error = "missing-plot-surface-vector-vertices";
+    return false;
+  }
+  std::shared_ptr<MetalContext> runtimeContext;
+  MetalContext* contextPointer = nullptr;
+  if (!contextForCommandBuffer(commandBuffer, &runtimeContext,
+                               &contextPointer, error) ||
+      contextPointer == nullptr) {
+    return false;
+  }
+  MetalContext& ctx = *contextPointer;
+  id<MTLRenderPipelineState> pipeline =
+      pixelFormat == 1 ? ctx.plotSurfaceVectorPipeline32 : ctx.plotSurfaceVectorPipeline16;
+  if (pipeline == nil) {
+    if (error) {
+      *error = residentPipelineUnavailableReason(ctx, "plot-surface-vector");
+    }
+    return false;
+  }
+  id<MTLTexture> texture = nil;
+  {
+    std::lock_guard<std::mutex> lock(plotSurfaceMutex());
+    auto& registry = plotSurfaceRegistry();
+    auto it = registry.find(surfaceId);
+    if (it != registry.end() && it->second &&
+        it->second->width == width &&
+        it->second->height == height &&
+        it->second->pixelFormat == pixelFormat &&
+        it->second->context == runtimeContext) {
+      texture = it->second->texture;
+    }
+  }
+  if (texture == nil) {
+    if (error) *error = "plot-surface-vector-output-surface-missing";
+    return false;
+  }
+  @autoreleasepool {
+    id<MTLBuffer> vertexBuffer = nil;
+    if (vertexCount > 0) {
+      const size_t vertexBytes = vertexCount * sizeof(FrameVectorVertex);
+      vertexBuffer = [ctx.device newBufferWithBytes:vertices
+                                             length:static_cast<NSUInteger>(vertexBytes)
+                                            options:MTLResourceStorageModeShared];
+      if (vertexBuffer == nil) {
+        if (error) *error = "plot-surface-vector-vertex-buffer-failed";
+        return false;
+      }
+    }
+    MTLRenderPassDescriptor* pass = [MTLRenderPassDescriptor renderPassDescriptor];
+    pass.colorAttachments[0].texture = texture;
+    pass.colorAttachments[0].loadAction = clearBeforeDraw ? MTLLoadActionClear : MTLLoadActionLoad;
+    pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+    pass.colorAttachments[0].clearColor =
+        MTLClearColorMake(static_cast<double>(clearR),
+                          static_cast<double>(clearG),
+                          static_cast<double>(clearB),
+                          static_cast<double>(clearA));
+    id<MTLRenderCommandEncoder> encoder = [commandBuffer renderCommandEncoderWithDescriptor:pass];
+    if (encoder == nil) {
+      if (error) *error = "plot-surface-vector-render-encoder-failed";
+      return false;
+    }
+    if (vertexBuffer != nil && vertexCount > 0) {
+      FrameUiVectorUniforms uniforms{};
+      uniforms.drawableW = static_cast<float>(std::max(width, 1));
+      uniforms.drawableH = static_cast<float>(std::max(height, 1));
+      [encoder setRenderPipelineState:pipeline];
+      [encoder setVertexBuffer:vertexBuffer offset:0 atIndex:0];
+      [encoder setVertexBytes:&uniforms length:sizeof(uniforms) atIndex:1];
+      [encoder drawPrimitives:MTLPrimitiveTypeTriangle
+                  vertexStart:0
+                  vertexCount:static_cast<NSUInteger>(vertexCount)];
+    }
+    [encoder endEncoding];
+    return true;
+  }
+}
+
+#if !defined(CHROMASPACE_METAL_NATIVE_ONLY)
+bool renderPlotSurfaceVectorPrimitives(uint32_t surfaceId,
+                                       int width,
+                                       int height,
+                                       int pixelFormat,
+                                       const FrameVectorVertex* vertices,
+                                       size_t vertexCount,
+                                       bool clearBeforeDraw,
+                                       float clearR,
+                                       float clearG,
+                                       float clearB,
+                                       float clearA,
+                                       std::string* error) {
+  std::string localError;
+  if (!ensureContext(&localError)) {
+    if (error) *error = localError.empty() ? "metal-context-unavailable" : localError;
+    return false;
+  }
+  id<MTLCommandBuffer> commandBuffer = [context().queue commandBuffer];
+  if (commandBuffer == nil) {
+    if (error) *error = "plot-surface-vector-command-buffer-failed";
+    return false;
+  }
+  if (!encodePlotSurfaceVectorPrimitivesOnCommandBuffer(commandBuffer,
+                                                        surfaceId,
+                                                        width,
+                                                        height,
+                                                        pixelFormat,
+                                                        vertices,
+                                                        vertexCount,
+                                                        clearBeforeDraw,
+                                                        clearR,
+                                                        clearG,
+                                                        clearB,
+                                                        clearA,
+                                                        error)) {
+    return false;
+  }
+  [commandBuffer commit];
+  [commandBuffer waitUntilCompleted];
+  NSError* cbError = commandBuffer.error;
+  if (cbError != nil) {
+    if (error) *error = [[cbError localizedDescription] UTF8String];
+    return false;
+  }
+  return true;
+}
+#endif
+
+bool encodePlotSurfaceVectorPrimitives(const FrameSubmission& submission,
+                                       uint32_t surfaceId,
+                                       int width,
+                                       int height,
+                                       int pixelFormat,
+                                       const FrameVectorVertex* vertices,
+                                       size_t vertexCount,
+                                       bool clearBeforeDraw,
+                                       float clearR,
+                                       float clearG,
+                                       float clearB,
+                                       float clearA,
+                                       std::string* error) {
+  if (!retainPlotSurfaceForSubmission(submission, surfaceId, nullptr, error)) {
+    return false;
+  }
+  id<MTLCommandBuffer> commandBuffer = nil;
+  if (!commandBufferForFrameSubmission(submission, &commandBuffer, error)) {
+    return false;
+  }
+  if (!validatePlotSurfaceOwnerForSubmission(submission, surfaceId, error)) {
+    return false;
+  }
+  return encodePlotSurfaceVectorPrimitivesOnCommandBuffer(commandBuffer,
+                                                          surfaceId,
+                                                          width,
+                                                          height,
+                                                          pixelFormat,
+                                                          vertices,
+                                                          vertexCount,
+                                                          clearBeforeDraw,
+                                                          clearR,
+                                                          clearG,
+                                                          clearB,
+                                                          clearA,
+                                                          error);
+}
+
+static bool encodeSourceSignalSurfaceFromTextureOnCommandBuffer(
+    id<MTLCommandBuffer> commandBuffer,
+    id<MTLTexture> sourceTexture,
+    int sourceSurfaceWidth,
+    int sourceSurfaceHeight,
+    int sourceSurfacePixelFormat,
+    uint32_t outputSurfaceId,
+    int outputSurfaceWidth,
+    int outputSurfaceHeight,
+    int outputSurfacePixelFormat,
+    std::string* error) {
+  if (error) error->clear();
+  if (commandBuffer == nil) {
+    if (error) *error = "source-signal-surface-command-buffer-unavailable";
+    return false;
+  }
+  if (sourceTexture == nil || outputSurfaceId == 0 ||
+      sourceSurfaceWidth <= 0 || sourceSurfaceHeight <= 0 ||
+      outputSurfaceWidth <= 0 || outputSurfaceHeight <= 0) {
+    if (error) *error = "invalid-source-signal-surface-request";
+    return false;
+  }
+  if ((sourceSurfacePixelFormat != 0 && sourceSurfacePixelFormat != 1) ||
+      (outputSurfacePixelFormat != 0 && outputSurfacePixelFormat != 1)) {
+    if (error) *error = "unsupported-source-signal-surface-format";
+    return false;
+  }
+  std::shared_ptr<MetalContext> runtimeContext;
+  MetalContext* contextPointer = nullptr;
+  if (!contextForCommandBuffer(commandBuffer, &runtimeContext,
+                               &contextPointer, error) ||
+      contextPointer == nullptr) {
+    return false;
+  }
+  MetalContext& ctx = *contextPointer;
+  if (ctx.sourceSignalSurfacePipeline == nil) {
+    if (error) {
+      *error = residentPipelineUnavailableReason(ctx, "source-signal-surface");
+    }
+    return false;
+  }
+  id<MTLTexture> outputTexture = nil;
+  {
+    std::lock_guard<std::mutex> lock(plotSurfaceMutex());
+    auto& registry = plotSurfaceRegistry();
+    auto it = registry.find(outputSurfaceId);
+    if (it != registry.end() && it->second &&
+        it->second->width == outputSurfaceWidth &&
+        it->second->height == outputSurfaceHeight &&
+        it->second->pixelFormat == outputSurfacePixelFormat &&
+        it->second->context == runtimeContext) {
+      outputTexture = it->second->texture;
+    }
+  }
+  if (outputTexture == nil) {
+    if (error) *error = "source-signal-output-surface-missing";
+    return false;
+  }
+  @autoreleasepool {
+    SourceSignalSurfaceUniforms uniforms{};
+    uniforms.sourceWidth = sourceSurfaceWidth;
+    uniforms.sourceHeight = sourceSurfaceHeight;
+    uniforms.outputWidth = outputSurfaceWidth;
+    uniforms.outputHeight = outputSurfaceHeight;
+    uniforms.backgroundR = 0.010f;
+    uniforms.backgroundG = 0.011f;
+    uniforms.backgroundB = 0.013f;
+    id<MTLBuffer> uniformBuffer = makeSharedBuffer(ctx, &uniforms, 1u);
+    if (uniformBuffer == nil) {
+      if (error) *error = "source-signal-surface-uniform-allocation-failed";
+      return false;
+    }
+    id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
+    if (encoder == nil) {
+      if (error) *error = "source-signal-surface-encoder-failed";
+      return false;
+    }
+    [encoder setComputePipelineState:ctx.sourceSignalSurfacePipeline];
+    [encoder setTexture:sourceTexture atIndex:0];
+    [encoder setTexture:outputTexture atIndex:1];
+    [encoder setBuffer:uniformBuffer offset:0 atIndex:0];
+    NSUInteger groupWidth = ctx.sourceSignalSurfacePipeline.threadExecutionWidth;
+    if (groupWidth == 0) groupWidth = 16;
+    NSUInteger groupHeight = std::max<NSUInteger>(
+        1, std::min<NSUInteger>(16, ctx.sourceSignalSurfacePipeline.maxTotalThreadsPerThreadgroup / groupWidth));
+    MTLSize threadsPerGroup = MTLSizeMake(groupWidth, groupHeight, 1);
+    MTLSize threadsPerGrid = MTLSizeMake(static_cast<NSUInteger>(outputSurfaceWidth),
+                                         static_cast<NSUInteger>(outputSurfaceHeight),
+                                         1);
+    [encoder dispatchThreads:threadsPerGrid threadsPerThreadgroup:threadsPerGroup];
+    [encoder endEncoding];
+    return true;
+  }
+}
+
+#if !defined(CHROMASPACE_METAL_NATIVE_ONLY)
+static bool encodeSourceSignalSurfaceFromIOSurfaceOnCommandBuffer(
+    id<MTLCommandBuffer> commandBuffer,
+    uint32_t sourceSurfaceId,
+    int sourceSurfaceWidth,
+    int sourceSurfaceHeight,
+    int sourceSurfacePixelFormat,
+    uint32_t outputSurfaceId,
+    int outputSurfaceWidth,
+    int outputSurfaceHeight,
+    int outputSurfacePixelFormat,
+    std::string* error) {
+  std::string localError;
+  if (!ensureContext(&localError)) {
+    if (error) {
+      *error =
+          localError.empty() ? "metal-context-unavailable" : localError;
+    }
+    return false;
+  }
+  id<MTLTexture> sourceTexture =
+      makeTextureFromIOSurface(context(),
+                               sourceSurfaceId,
+                               sourceSurfaceWidth,
+                               sourceSurfaceHeight,
+                               sourceSurfacePixelFormat,
+                               &localError);
+  if (sourceTexture == nil) {
+    if (error) {
+      *error = localError.empty() ? "source-signal-iosurface-import-failed"
+                                  : localError;
+    }
+    return false;
+  }
+  return encodeSourceSignalSurfaceFromTextureOnCommandBuffer(
+      commandBuffer,
+      sourceTexture,
+      sourceSurfaceWidth,
+      sourceSurfaceHeight,
+      sourceSurfacePixelFormat,
+      outputSurfaceId,
+      outputSurfaceWidth,
+      outputSurfaceHeight,
+      outputSurfacePixelFormat,
+      error);
+}
+
+bool renderSourceSignalSurfaceFromIOSurface(uint32_t sourceSurfaceId,
+                                            int sourceSurfaceWidth,
+                                            int sourceSurfaceHeight,
+                                            int sourceSurfacePixelFormat,
+                                            uint32_t outputSurfaceId,
+                                            int outputSurfaceWidth,
+                                            int outputSurfaceHeight,
+                                            int outputSurfacePixelFormat,
+                                            std::string* error) {
+  std::string localError;
+  if (!ensureContext(&localError)) {
+    if (error) *error = localError.empty() ? "metal-context-unavailable" : localError;
+    return false;
+  }
+  id<MTLCommandBuffer> commandBuffer = [context().queue commandBuffer];
+  if (commandBuffer == nil) {
+    if (error) *error = "source-signal-surface-command-buffer-failed";
+    return false;
+  }
+  if (!encodeSourceSignalSurfaceFromIOSurfaceOnCommandBuffer(commandBuffer,
+                                                             sourceSurfaceId,
+                                                             sourceSurfaceWidth,
+                                                             sourceSurfaceHeight,
+                                                             sourceSurfacePixelFormat,
+                                                             outputSurfaceId,
+                                                             outputSurfaceWidth,
+                                                             outputSurfaceHeight,
+                                                             outputSurfacePixelFormat,
+                                                             error)) {
+    return false;
+  }
+  [commandBuffer commit];
+  [commandBuffer waitUntilCompleted];
+  NSError* cbError = commandBuffer.error;
+  if (cbError != nil) {
+    if (error) *error = [[cbError localizedDescription] UTF8String];
+    return false;
+  }
+  return true;
+}
+
+bool encodeSourceSignalSurfaceFromIOSurface(
+    const FrameSubmission& submission,
+    uint32_t sourceSurfaceId,
+    int sourceSurfaceWidth,
+    int sourceSurfaceHeight,
+    int sourceSurfacePixelFormat,
+    uint32_t outputSurfaceId,
+    int outputSurfaceWidth,
+    int outputSurfaceHeight,
+    int outputSurfacePixelFormat,
+    std::string* error) {
+  if (!retainPlotSurfaceForSubmission(
+          submission, outputSurfaceId, nullptr, error)) {
+    return false;
+  }
+  id<MTLCommandBuffer> commandBuffer = nil;
+  if (!commandBufferForFrameSubmission(submission, &commandBuffer, error)) {
+    return false;
+  }
+  if (!validatePlotSurfaceOwnerForSubmission(
+          submission, outputSurfaceId, error)) {
+    return false;
+  }
+  return encodeSourceSignalSurfaceFromIOSurfaceOnCommandBuffer(commandBuffer,
+                                                               sourceSurfaceId,
+                                                               sourceSurfaceWidth,
+                                                               sourceSurfaceHeight,
+                                                               sourceSurfacePixelFormat,
+                                                               outputSurfaceId,
+                                                               outputSurfaceWidth,
+                                                               outputSurfaceHeight,
+                                                               outputSurfacePixelFormat,
+                                                               error);
+}
+#endif
+
+bool encodeSourceSignalSurfaceFromImportedTexture(
+    const FrameSubmission& submission,
+    uint64_t sourceId,
+    uint32_t outputSurfaceId,
+    int outputSurfaceWidth,
+    int outputSurfaceHeight,
+    int outputSurfacePixelFormat,
+    std::string* error) {
+  if (!retainPlotSurfaceForSubmission(
+          submission, outputSurfaceId, nullptr, error)) {
+    return false;
+  }
+  id<MTLCommandBuffer> commandBuffer = nil;
+  if (!commandBufferForFrameSubmission(submission, &commandBuffer, error)) {
+    return false;
+  }
+  if (!validatePlotSurfaceOwnerForSubmission(
+          submission, outputSurfaceId, error)) {
+    return false;
+  }
+  std::shared_ptr<ImportedSourceRecord> source;
+  if (!importedSourceForFrameSubmission(
+          submission, sourceId, &source, error)) {
+    return false;
+  }
+  return encodeSourceSignalSurfaceFromTextureOnCommandBuffer(
+      commandBuffer,
+      source->texture,
+      source->descriptor.width,
+      source->descriptor.height,
+      source->descriptor.pixelFormat,
+      outputSurfaceId,
+      outputSurfaceWidth,
+      outputSurfaceHeight,
+      outputSurfacePixelFormat,
+      error);
+}
+
+static bool encodeStableRasterPointCompaction(
+    id<MTLCommandBuffer> commandBuffer,
+    id<MTLBuffer> sourceVertices,
+    id<MTLBuffer> sourceColors,
+    NSUInteger pointCount,
+    id<MTLBuffer> compactVertices,
+    id<MTLBuffer> compactColors,
+    id<MTLBuffer> indirectArguments,
+    std::string* error) {
+  constexpr NSUInteger kBlockWidth = 256u;
+  constexpr size_t kMaximumHierarchyLevels = 8u;
+  if (commandBuffer == nil || sourceVertices == nil || sourceColors == nil ||
+      compactVertices == nil || compactColors == nil ||
+      indirectArguments == nil || pointCount == 0u ||
+      pointCount > static_cast<NSUInteger>(std::numeric_limits<uint32_t>::max())) {
+    if (error) *error = "raster-point-compaction-request-invalid";
+    return false;
+  }
+  std::shared_ptr<MetalContext> runtimeContext;
+  MetalContext* contextPointer = nullptr;
+  if (!contextForCommandBuffer(commandBuffer,
+                               &runtimeContext,
+                               &contextPointer,
+                               error) ||
+      contextPointer == nullptr) {
+    return false;
+  }
+  MetalContext& ctx = *contextPointer;
+  if (ctx.rasterPointCompactLocalScanPipeline == nil ||
+      ctx.rasterPointScanBlockSumsPipeline == nil ||
+      ctx.rasterPointAddBlockOffsetsPipeline == nil ||
+      ctx.rasterPointCompactScatterPipeline == nil ||
+      ctx.rasterPointFinalizeIndirectArgsPipeline == nil ||
+      ctx.rasterPointCompactLocalScanPipeline.maxTotalThreadsPerThreadgroup <
+          kBlockWidth ||
+      ctx.rasterPointScanBlockSumsPipeline.maxTotalThreadsPerThreadgroup <
+          kBlockWidth ||
+      ctx.rasterPointAddBlockOffsetsPipeline.maxTotalThreadsPerThreadgroup <
+          kBlockWidth ||
+      ctx.rasterPointCompactScatterPipeline.maxTotalThreadsPerThreadgroup <
+          kBlockWidth) {
+    if (error) *error = "raster-point-compaction-pipeline-unavailable";
+    return false;
+  }
+
+  const uint32_t pointCount32 = static_cast<uint32_t>(pointCount);
+  const NSUInteger firstBlockCount =
+      (pointCount + kBlockWidth - 1u) / kBlockWidth;
+  if (pointCount > std::numeric_limits<NSUInteger>::max() / sizeof(uint32_t) ||
+      firstBlockCount >
+          std::numeric_limits<NSUInteger>::max() / sizeof(uint32_t)) {
+    if (error) *error = "raster-point-compaction-size-overflow";
+    return false;
+  }
+
+  id<MTLBuffer> pointLocalOffsets =
+      makeSubmissionTransientPrivateBuffer(
+          commandBuffer, pointCount * sizeof(uint32_t), error);
+  id<MTLBuffer> firstBlockSums =
+      makeSubmissionTransientPrivateBuffer(
+          commandBuffer, firstBlockCount * sizeof(uint32_t), error);
+  if (pointLocalOffsets == nil || firstBlockSums == nil) {
+    if (error && error->empty()) {
+      *error = "raster-point-compaction-scratch-allocation-failed";
+    }
+    return false;
+  }
+
+  id<MTLComputeCommandEncoder> localScanEncoder =
+      [commandBuffer computeCommandEncoder];
+  if (localScanEncoder == nil) {
+    if (error) *error = "raster-point-compaction-local-scan-encoder-failed";
+    return false;
+  }
+  [localScanEncoder
+      setComputePipelineState:ctx.rasterPointCompactLocalScanPipeline];
+  [localScanEncoder setBuffer:sourceColors offset:0 atIndex:0];
+  [localScanEncoder setBuffer:pointLocalOffsets offset:0 atIndex:1];
+  [localScanEncoder setBuffer:firstBlockSums offset:0 atIndex:2];
+  [localScanEncoder setBytes:&pointCount32
+                       length:sizeof(pointCount32)
+                      atIndex:3];
+  [localScanEncoder dispatchThreadgroups:MTLSizeMake(firstBlockCount, 1, 1)
+                       threadsPerThreadgroup:MTLSizeMake(kBlockWidth, 1, 1)];
+  [localScanEncoder endEncoding];
+
+  std::array<id<MTLBuffer>, kMaximumHierarchyLevels> blockSums{};
+  std::array<id<MTLBuffer>, kMaximumHierarchyLevels> blockOffsets{};
+  std::array<NSUInteger, kMaximumHierarchyLevels> blockCounts{};
+  blockSums[0] = firstBlockSums;
+  blockCounts[0] = firstBlockCount;
+  size_t hierarchyLevels = 0u;
+  for (size_t level = 0u; level < kMaximumHierarchyLevels; ++level) {
+    const NSUInteger count = blockCounts[level];
+    const NSUInteger nextCount =
+        (count + kBlockWidth - 1u) / kBlockWidth;
+    if (count == 0u ||
+        count > std::numeric_limits<NSUInteger>::max() / sizeof(uint32_t) ||
+        nextCount >
+            std::numeric_limits<NSUInteger>::max() / sizeof(uint32_t)) {
+      if (error) *error = "raster-point-compaction-hierarchy-size-invalid";
+      return false;
+    }
+    blockOffsets[level] =
+        makeSubmissionTransientPrivateBuffer(
+            commandBuffer, count * sizeof(uint32_t), error);
+    id<MTLBuffer> nextBlockSums =
+        makeSubmissionTransientPrivateBuffer(
+            commandBuffer, nextCount * sizeof(uint32_t), error);
+    if (blockOffsets[level] == nil || nextBlockSums == nil) {
+      if (error && error->empty()) {
+        *error = "raster-point-compaction-hierarchy-allocation-failed";
+      }
+      return false;
+    }
+    const uint32_t count32 = static_cast<uint32_t>(count);
+    id<MTLComputeCommandEncoder> scanEncoder =
+        [commandBuffer computeCommandEncoder];
+    if (scanEncoder == nil) {
+      if (error) *error = "raster-point-compaction-block-scan-encoder-failed";
+      return false;
+    }
+    [scanEncoder setComputePipelineState:ctx.rasterPointScanBlockSumsPipeline];
+    [scanEncoder setBuffer:blockSums[level] offset:0 atIndex:0];
+    [scanEncoder setBuffer:blockOffsets[level] offset:0 atIndex:1];
+    [scanEncoder setBuffer:nextBlockSums offset:0 atIndex:2];
+    [scanEncoder setBytes:&count32 length:sizeof(count32) atIndex:3];
+    [scanEncoder dispatchThreadgroups:MTLSizeMake(nextCount, 1, 1)
+                     threadsPerThreadgroup:MTLSizeMake(kBlockWidth, 1, 1)];
+    [scanEncoder endEncoding];
+    hierarchyLevels = level + 1u;
+    if (nextCount == 1u) break;
+    if (level + 1u >= kMaximumHierarchyLevels) {
+      if (error) *error = "raster-point-compaction-hierarchy-too-deep";
+      return false;
+    }
+    blockSums[level + 1u] = nextBlockSums;
+    blockCounts[level + 1u] = nextCount;
+  }
+  if (hierarchyLevels == 0u) {
+    if (error) *error = "raster-point-compaction-hierarchy-empty";
+    return false;
+  }
+
+  // The top scan is globally complete. Propagate its offsets down one level
+  // at a time so the first-level block offsets address the entire point set.
+  for (size_t level = hierarchyLevels; level > 1u; --level) {
+    const size_t childLevel = level - 2u;
+    const uint32_t count32 =
+        static_cast<uint32_t>(blockCounts[childLevel]);
+    id<MTLComputeCommandEncoder> addEncoder =
+        [commandBuffer computeCommandEncoder];
+    if (addEncoder == nil) {
+      if (error) *error = "raster-point-compaction-offset-add-encoder-failed";
+      return false;
+    }
+    [addEncoder setComputePipelineState:ctx.rasterPointAddBlockOffsetsPipeline];
+    [addEncoder setBuffer:blockOffsets[childLevel] offset:0 atIndex:0];
+    [addEncoder setBuffer:blockOffsets[childLevel + 1u] offset:0 atIndex:1];
+    [addEncoder setBytes:&count32 length:sizeof(count32) atIndex:2];
+    [addEncoder dispatchThreads:MTLSizeMake(blockCounts[childLevel], 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(kBlockWidth, 1, 1)];
+    [addEncoder endEncoding];
+  }
+
+  id<MTLComputeCommandEncoder> scatterEncoder =
+      [commandBuffer computeCommandEncoder];
+  if (scatterEncoder == nil) {
+    if (error) *error = "raster-point-compaction-scatter-encoder-failed";
+    return false;
+  }
+  [scatterEncoder setComputePipelineState:ctx.rasterPointCompactScatterPipeline];
+  [scatterEncoder setBuffer:sourceVertices offset:0 atIndex:0];
+  [scatterEncoder setBuffer:sourceColors offset:0 atIndex:1];
+  [scatterEncoder setBuffer:pointLocalOffsets offset:0 atIndex:2];
+  [scatterEncoder setBuffer:blockOffsets[0] offset:0 atIndex:3];
+  [scatterEncoder setBuffer:compactVertices offset:0 atIndex:4];
+  [scatterEncoder setBuffer:compactColors offset:0 atIndex:5];
+  [scatterEncoder setBytes:&pointCount32
+                     length:sizeof(pointCount32)
+                    atIndex:6];
+  [scatterEncoder dispatchThreads:MTLSizeMake(pointCount, 1, 1)
+           threadsPerThreadgroup:MTLSizeMake(kBlockWidth, 1, 1)];
+  [scatterEncoder endEncoding];
+
+  const uint32_t firstBlockCount32 =
+      static_cast<uint32_t>(firstBlockCount);
+  id<MTLComputeCommandEncoder> finalizeEncoder =
+      [commandBuffer computeCommandEncoder];
+  if (finalizeEncoder == nil) {
+    if (error) *error = "raster-point-compaction-finalize-encoder-failed";
+    return false;
+  }
+  [finalizeEncoder
+      setComputePipelineState:ctx.rasterPointFinalizeIndirectArgsPipeline];
+  [finalizeEncoder setBuffer:firstBlockSums offset:0 atIndex:0];
+  [finalizeEncoder setBuffer:blockOffsets[0] offset:0 atIndex:1];
+  [finalizeEncoder setBytes:&firstBlockCount32
+                      length:sizeof(firstBlockCount32)
+                     atIndex:2];
+  [finalizeEncoder setBuffer:indirectArguments offset:0 atIndex:3];
+  [finalizeEncoder dispatchThreads:MTLSizeMake(1, 1, 1)
+              threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+  [finalizeEncoder endEncoding];
+  return true;
+}
+
+static bool encodeRasterPointSurfaceFromTextureSourceOnCommandBuffer(
+    id<MTLCommandBuffer> commandBuffer,
+    id<MTLTexture> importedSourceTexture,
+    const RasterSourceRequest& rasterRequest,
+    const RasterPointSurfaceRequest& pointRequest,
+    uint32_t sourceSurfaceId,
+    int sourceSurfaceWidth,
+    int sourceSurfaceHeight,
+    int sourceSurfacePixelFormat,
+    uint32_t outputSurfaceId,
+    int outputSurfaceWidth,
+    int outputSurfaceHeight,
+    int outputSurfacePixelFormat,
+    std::string* error,
+    const ScopeDerivedResidentRecord* residentRecord = nullptr,
+    ScopeDerivedResidentRecord* outRecord = nullptr,
+    uint64_t buildSerial = 0) {
+  if (error) error->clear();
+  const NSUInteger pointCount = static_cast<NSUInteger>(std::max(rasterRequest.pointCount, 0));
+  const bool useResidentRecord =
+      residentRecord != nullptr &&
+      residentRecord->family == ScopeDerivedFamily::RasterPointCloud &&
+      residentRecord->pointVertices != nil && residentRecord->pointColors != nil &&
+      residentRecord->pointIndirectArguments != nil &&
+      residentRecord->pointCount == pointCount && residentRecord->byteSize != 0u;
+  if (residentRecord != nullptr && !useResidentRecord) {
+    if (error) *error = "raster-point-resident-record-invalid";
+    return false;
+  }
+  if (outRecord != nullptr && buildSerial == 0u) {
+    if (error) *error = "raster-point-build-serial-invalid";
+    return false;
+  }
+#if defined(CHROMASPACE_METAL_NATIVE_ONLY)
+  if ((!useResidentRecord && importedSourceTexture == nil) ||
+#else
+  if ((!useResidentRecord && importedSourceTexture == nil && sourceSurfaceId == 0) ||
+#endif
+      outputSurfaceId == 0 ||
+      sourceSurfaceWidth <= 0 || sourceSurfaceHeight <= 0 ||
+      outputSurfaceWidth <= 0 || outputSurfaceHeight <= 0 ||
+      rasterRequest.sourceWidth <= 0 || rasterRequest.sourceHeight <= 0 ||
+      rasterRequest.sampleCountX <= 0 || pointCount == 0) {
+    if (error) *error = "invalid-raster-point-surface-request";
+    return false;
+  }
+  if ((sourceSurfacePixelFormat != 0 && sourceSurfacePixelFormat != 1) ||
+      (outputSurfacePixelFormat != 0 && outputSurfacePixelFormat != 1)) {
+    if (error) *error = "unsupported-raster-point-surface-format";
+    return false;
+  }
+  if (!useResidentRecord &&
+      (sourceSurfaceWidth < rasterRequest.sourceWidth ||
+       sourceSurfaceHeight < rasterRequest.sourceHeight)) {
+    if (error) *error = "raster-point-source-surface-too-small";
+    return false;
+  }
+  std::string localError;
+  std::shared_ptr<MetalContext> runtimeContext;
+  MetalContext* contextPointer = nullptr;
+  if (!contextForCommandBuffer(commandBuffer,
+                               &runtimeContext,
+                               &contextPointer,
+                               &localError) ||
+      contextPointer == nullptr) {
+    if (error) {
+      *error = localError.empty() ? "raster-point-command-buffer-missing"
+                                  : localError;
+    }
+    return false;
+  }
+  MetalContext& ctx = *contextPointer;
+  if ((!useResidentRecord &&
+       (ctx.rasterSourceTexturePipeline == nil ||
+        ctx.rasterPointCompactLocalScanPipeline == nil ||
+        ctx.rasterPointScanBlockSumsPipeline == nil ||
+        ctx.rasterPointAddBlockOffsetsPipeline == nil ||
+        ctx.rasterPointCompactScatterPipeline == nil ||
+        ctx.rasterPointFinalizeIndirectArgsPipeline == nil)) ||
+      ctx.rasterPointSurfacePipeline16 == nil) {
+    if (error) {
+      *error = residentPipelineUnavailableReason(ctx, "raster-point-surface");
+    }
+    return false;
+  }
+  if (!useResidentRecord && rasterRequest.occupancyFill != 0 &&
+      rasterRequest.occupancyAppendCount > 0 &&
+      (ctx.rasterOccupancyTextureCountPipeline == nil ||
+       ctx.rasterOccupancyThresholdPipeline == nil)) {
+    if (error) {
+      *error = residentPipelineUnavailableReason(ctx, "raster-occupancy-texture");
+    }
+    return false;
+  }
+  id<MTLRenderPipelineState> renderPipeline =
+      outputSurfacePixelFormat == 1 ? ctx.rasterPointSurfacePipeline32 : ctx.rasterPointSurfacePipeline16;
+  if (renderPipeline == nil) {
+    if (error) *error = "raster-point-surface-output-format-unavailable";
+    return false;
+  }
+
+  id<MTLTexture> outputTexture = nil;
+  {
+    std::lock_guard<std::mutex> lock(plotSurfaceMutex());
+    auto& registry = plotSurfaceRegistry();
+    auto it = registry.find(outputSurfaceId);
+    if (it != registry.end() && it->second &&
+        it->second->width == outputSurfaceWidth &&
+        it->second->height == outputSurfaceHeight &&
+        it->second->pixelFormat == outputSurfacePixelFormat &&
+        it->second->context == runtimeContext) {
+      outputTexture = it->second->texture;
+    }
+  }
+  if (outputTexture == nil) {
+    if (error) *error = "raster-point-output-surface-missing";
+    return false;
+  }
+
+  RasterSourceUniforms rasterUniforms{};
+  fillRasterSourceUniforms(rasterRequest, &rasterUniforms);
+  rasterUniforms.pixelFormat = sourceSurfacePixelFormat;
+
+  RasterPointSurfaceUniforms pointUniforms{};
+  std::copy(pointRequest.modelView, pointRequest.modelView + 16, pointUniforms.modelView);
+  std::copy(pointRequest.projection, pointRequest.projection + 16, pointUniforms.projection);
+  pointUniforms.pointRadiusPixels = std::max(0.5f, pointRequest.pointRadiusPixels);
+  pointUniforms.surfaceWidth = static_cast<float>(std::max(outputSurfaceWidth, 1));
+  pointUniforms.surfaceHeight = static_cast<float>(std::max(outputSurfaceHeight, 1));
+
+  @autoreleasepool {
+    if (pointCount > std::numeric_limits<size_t>::max() /
+                         sizeof(PackedFloat3) ||
+        pointCount > std::numeric_limits<size_t>::max() /
+                         sizeof(simd_float4)) {
+      if (error) *error = "raster-point-buffer-size-overflow";
+      return false;
+    }
+    const size_t vertexBytes =
+        static_cast<size_t>(pointCount) * sizeof(PackedFloat3);
+    const size_t colorBytes =
+        static_cast<size_t>(pointCount) * sizeof(simd_float4);
+    constexpr size_t kIndirectArgumentBytes = 4u * sizeof(uint32_t);
+    if (vertexBytes > std::numeric_limits<size_t>::max() - colorBytes ||
+        vertexBytes + colorBytes >
+            std::numeric_limits<size_t>::max() - kIndirectArgumentBytes) {
+      if (error) *error = "raster-point-cache-size-overflow";
+      return false;
+    }
+    const size_t residentBytes =
+        vertexBytes + colorBytes + kIndirectArgumentBytes;
+    if (useResidentRecord &&
+        (residentRecord->byteSize != residentBytes ||
+         [residentRecord->pointVertices length] != vertexBytes ||
+         [residentRecord->pointColors length] != colorBytes ||
+         [residentRecord->pointIndirectArguments length] !=
+             kIndirectArgumentBytes)) {
+      if (error) *error = "raster-point-resident-record-size-mismatch";
+      return false;
+    }
+
+    id<MTLBuffer> vertBuffer =
+        useResidentRecord ? residentRecord->pointVertices : nil;
+    id<MTLBuffer> colorBuffer =
+        useResidentRecord ? residentRecord->pointColors : nil;
+    id<MTLBuffer> indirectArguments =
+        useResidentRecord ? residentRecord->pointIndirectArguments : nil;
+    id<MTLBuffer> pointUniformBuffer =
+        makeSharedBuffer(ctx, &pointUniforms, 1u);
+    if (pointUniformBuffer == nil) {
+      if (error) *error = "raster-point-uniform-allocation-failed";
+      return false;
+    }
+
+    if (!useResidentRecord) {
+      id<MTLTexture> sourceTexture = importedSourceTexture;
+#if !defined(CHROMASPACE_METAL_NATIVE_ONLY)
+      if (sourceTexture == nil) {
+        sourceTexture = makeTextureFromIOSurface(ctx,
+                                                 sourceSurfaceId,
+                                                 sourceSurfaceWidth,
+                                                 sourceSurfaceHeight,
+                                                 sourceSurfacePixelFormat,
+                                                 &localError);
+      }
+#endif
+      id<MTLBuffer> derivedVertBuffer =
+          makeSubmissionTransientPrivateBuffer(
+              commandBuffer, vertexBytes, &localError);
+      id<MTLBuffer> derivedColorBuffer =
+          makeSubmissionTransientPrivateBuffer(
+              commandBuffer, colorBytes, &localError);
+      vertBuffer = makeEmptyPrivateBuffer(ctx, vertexBytes);
+      colorBuffer = makeEmptyPrivateBuffer(ctx, colorBytes);
+      indirectArguments = makeEmptyPrivateBuffer(ctx, kIndirectArgumentBytes);
+      constexpr NSUInteger kRasterOccupancyBinCount = 18u * 18u * 18u;
+      id<MTLBuffer> occupancyBuffer =
+          makeSubmissionTransientPrivateBuffer(
+              commandBuffer,
+              kRasterOccupancyBinCount * sizeof(uint32_t),
+              &localError);
+      const bool useOccupancyThreshold =
+          rasterRequest.occupancyFill != 0 &&
+          rasterRequest.occupancyAppendCount > 0 &&
+          rasterUniforms.basePointCount > 0;
+      id<MTLBuffer> visibleCountBuffer =
+          useOccupancyThreshold
+              ? makeSubmissionTransientPrivateBuffer(
+                    commandBuffer, sizeof(uint32_t), &localError)
+              : nil;
+      id<MTLBuffer> rasterUniformBuffer =
+          makeSharedBuffer(ctx, &rasterUniforms, 1u);
+      if (sourceTexture == nil || derivedVertBuffer == nil ||
+          derivedColorBuffer == nil || vertBuffer == nil ||
+          colorBuffer == nil || indirectArguments == nil ||
+          occupancyBuffer == nil || rasterUniformBuffer == nil ||
+          (useOccupancyThreshold && visibleCountBuffer == nil)) {
+        if (error) {
+          *error = localError.empty() ? "raster-point-buffer-allocation-failed"
+                                      : localError;
+        }
+        return false;
+      }
+      id<MTLBlitCommandEncoder> clearEncoder =
+          [commandBuffer blitCommandEncoder];
+      if (clearEncoder == nil) {
+        if (error) *error = "raster-point-occupancy-clear-encoder-failed";
+        return false;
+      }
+      [clearEncoder fillBuffer:occupancyBuffer
+                         range:NSMakeRange(0, [occupancyBuffer length])
+                         value:0];
+      if (visibleCountBuffer != nil) {
+        [clearEncoder fillBuffer:visibleCountBuffer
+                           range:NSMakeRange(0, [visibleCountBuffer length])
+                           value:0];
+      }
+      [clearEncoder endEncoding];
+
+      if (useOccupancyThreshold) {
+        id<MTLComputeCommandEncoder> countEncoder =
+            [commandBuffer computeCommandEncoder];
+        if (countEncoder == nil) {
+          if (error) *error = "raster-point-occupancy-encoder-failed";
+          return false;
+        }
+        [countEncoder setComputePipelineState:ctx.rasterOccupancyTextureCountPipeline];
+        [countEncoder setTexture:sourceTexture atIndex:0];
+        [countEncoder setBuffer:occupancyBuffer offset:0 atIndex:0];
+        [countEncoder setBuffer:visibleCountBuffer offset:0 atIndex:1];
+        [countEncoder setBuffer:rasterUniformBuffer offset:0 atIndex:2];
+        NSUInteger countWidth =
+            ctx.rasterOccupancyTextureCountPipeline.maxTotalThreadsPerThreadgroup;
+        if (countWidth == 0) countWidth = 64;
+        countWidth = std::min<NSUInteger>(countWidth, 256);
+        [countEncoder dispatchThreads:MTLSizeMake(
+                                          static_cast<NSUInteger>(std::max(
+                                              rasterUniforms.basePointCount, 0)),
+                                          1,
+                                          1)
+                 threadsPerThreadgroup:MTLSizeMake(countWidth, 1, 1)];
+        [countEncoder endEncoding];
+
+        id<MTLComputeCommandEncoder> thresholdEncoder =
+            [commandBuffer computeCommandEncoder];
+        if (thresholdEncoder == nil) {
+          if (error) *error = "raster-point-occupancy-threshold-encoder-failed";
+          return false;
+        }
+        [thresholdEncoder setComputePipelineState:ctx.rasterOccupancyThresholdPipeline];
+        [thresholdEncoder setBuffer:visibleCountBuffer offset:0 atIndex:0];
+        [thresholdEncoder setBuffer:rasterUniformBuffer offset:0 atIndex:1];
+        [thresholdEncoder dispatchThreads:MTLSizeMake(1, 1, 1)
+                     threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+        [thresholdEncoder endEncoding];
+      }
+
+      id<MTLComputeCommandEncoder> computeEncoder =
+          [commandBuffer computeCommandEncoder];
+      if (computeEncoder == nil) {
+        if (error) *error = "raster-point-compute-encoder-failed";
+        return false;
+      }
+      [computeEncoder setComputePipelineState:ctx.rasterSourceTexturePipeline];
+      [computeEncoder setTexture:sourceTexture atIndex:0];
+      [computeEncoder setBuffer:derivedVertBuffer offset:0 atIndex:0];
+      [computeEncoder setBuffer:derivedColorBuffer offset:0 atIndex:1];
+      [computeEncoder setBuffer:occupancyBuffer offset:0 atIndex:2];
+      [computeEncoder setBuffer:rasterUniformBuffer offset:0 atIndex:3];
+      NSUInteger computeWidth =
+          ctx.rasterSourceTexturePipeline.maxTotalThreadsPerThreadgroup;
+      if (computeWidth == 0) computeWidth = 64;
+      computeWidth = std::min<NSUInteger>(computeWidth, 256);
+      [computeEncoder dispatchThreads:MTLSizeMake(pointCount, 1, 1)
+                 threadsPerThreadgroup:MTLSizeMake(computeWidth, 1, 1)];
+      [computeEncoder endEncoding];
+      if (!encodeStableRasterPointCompaction(commandBuffer,
+                                              derivedVertBuffer,
+                                              derivedColorBuffer,
+                                              pointCount,
+                                              vertBuffer,
+                                              colorBuffer,
+                                              indirectArguments,
+                                              error)) {
+        return false;
+      }
+    }
+
+    MTLRenderPassDescriptor* pass = [MTLRenderPassDescriptor renderPassDescriptor];
+    pass.colorAttachments[0].texture = outputTexture;
+    pass.colorAttachments[0].loadAction = MTLLoadActionClear;
+    pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+    pass.colorAttachments[0].clearColor =
+        MTLClearColorMake(static_cast<double>(pointRequest.backgroundR),
+                          static_cast<double>(pointRequest.backgroundG),
+                          static_cast<double>(pointRequest.backgroundB),
+                          static_cast<double>(pointRequest.backgroundA));
+    id<MTLRenderCommandEncoder> renderEncoder = [commandBuffer renderCommandEncoderWithDescriptor:pass];
+    if (renderEncoder == nil) {
+      if (error) *error = "raster-point-render-encoder-failed";
+      return false;
+    }
+    [renderEncoder setRenderPipelineState:renderPipeline];
+    [renderEncoder setVertexBuffer:vertBuffer offset:0 atIndex:0];
+    [renderEncoder setVertexBuffer:colorBuffer offset:0 atIndex:1];
+    [renderEncoder setVertexBuffer:pointUniformBuffer offset:0 atIndex:2];
+    [renderEncoder drawPrimitives:MTLPrimitiveTypePoint
+                   indirectBuffer:indirectArguments
+             indirectBufferOffset:0];
+    [renderEncoder endEncoding];
+
+    if (outRecord != nullptr) {
+      ScopeDerivedResidentRecord encoded{};
+      encoded.family = ScopeDerivedFamily::RasterPointCloud;
+      encoded.builtSerial = buildSerial;
+      encoded.byteSize = residentBytes;
+      encoded.pointVertices = vertBuffer;
+      encoded.pointColors = colorBuffer;
+      encoded.pointIndirectArguments = indirectArguments;
+      encoded.pointCount = pointCount;
+      *outRecord = std::move(encoded);
+    }
+  }
+  return true;
+}
+
+#if !defined(CHROMASPACE_METAL_NATIVE_ONLY)
+bool renderRasterPointSurfaceFromIOSurface(const RasterSourceRequest& rasterRequest,
+                                           const RasterPointSurfaceRequest& pointRequest,
+                                           uint32_t sourceSurfaceId,
+                                           int sourceSurfaceWidth,
+                                           int sourceSurfaceHeight,
+                                           int sourceSurfacePixelFormat,
+                                           uint32_t outputSurfaceId,
+                                           int outputSurfaceWidth,
+                                           int outputSurfaceHeight,
+                                           int outputSurfacePixelFormat,
+                                           std::string* error) {
+  std::string localError;
+  if (!ensureContext(&localError)) {
+    if (error) *error = localError.empty() ? "metal-context-unavailable" : localError;
+    return false;
+  }
+  id<MTLCommandBuffer> commandBuffer = [context().queue commandBuffer];
+  if (commandBuffer == nil) {
+    if (error) *error = "raster-point-command-buffer-failed";
+    return false;
+  }
+  if (!encodeRasterPointSurfaceFromTextureSourceOnCommandBuffer(
+          commandBuffer,
+          nil,
+          rasterRequest,
+          pointRequest,
+          sourceSurfaceId,
+          sourceSurfaceWidth,
+          sourceSurfaceHeight,
+          sourceSurfacePixelFormat,
+          outputSurfaceId,
+          outputSurfaceWidth,
+          outputSurfaceHeight,
+          outputSurfacePixelFormat,
+          error)) {
+    return false;
+  }
+  [commandBuffer commit];
+  [commandBuffer waitUntilCompleted];
+  NSError* cbError = commandBuffer.error;
+  if (cbError != nil) {
+    if (error) *error = [[cbError localizedDescription] UTF8String];
+    return false;
+  }
+  return true;
+}
+
+bool encodeRasterPointSurfaceFromIOSurface(const FrameSubmission& submission,
+                                           const RasterSourceRequest& rasterRequest,
+                                           const RasterPointSurfaceRequest& pointRequest,
+                                           uint32_t sourceSurfaceId,
+                                           int sourceSurfaceWidth,
+                                           int sourceSurfaceHeight,
+                                           int sourceSurfacePixelFormat,
+                                           uint32_t outputSurfaceId,
+                                           int outputSurfaceWidth,
+                                           int outputSurfaceHeight,
+                                           int outputSurfacePixelFormat,
+                                           std::string* error) {
+  id<MTLCommandBuffer> commandBuffer = nil;
+  if (!commandBufferForFrameSubmission(submission, &commandBuffer, error)) {
+    return false;
+  }
+  if (!validatePlotSurfaceOwnerForSubmission(
+          submission, outputSurfaceId, error)) {
+    return false;
+  }
+  return encodeRasterPointSurfaceFromTextureSourceOnCommandBuffer(
+      commandBuffer,
+      nil,
+      rasterRequest,
+      pointRequest,
+      sourceSurfaceId,
+      sourceSurfaceWidth,
+      sourceSurfaceHeight,
+      sourceSurfacePixelFormat,
+      outputSurfaceId,
+      outputSurfaceWidth,
+      outputSurfaceHeight,
+      outputSurfacePixelFormat,
+          error);
+}
+#endif
+
+bool encodeRasterPointSurfaceFromImportedTexture(
+    const FrameSubmission& submission,
+    const RasterSourceRequest& rasterRequest,
+    const RasterPointSurfaceRequest& pointRequest,
+    uint64_t sourceId,
+    uint32_t outputSurfaceId,
+    int outputSurfaceWidth,
+    int outputSurfaceHeight,
+    int outputSurfacePixelFormat,
+    std::string* error) {
+  id<MTLCommandBuffer> commandBuffer = nil;
+  if (!commandBufferForFrameSubmission(submission, &commandBuffer, error)) {
+    return false;
+  }
+  if (!validatePlotSurfaceOwnerForSubmission(
+          submission, outputSurfaceId, error)) {
+    return false;
+  }
+  std::shared_ptr<ImportedSourceRecord> source;
+  if (!importedSourceForFrameSubmission(
+          submission, sourceId, &source, error)) {
+    return false;
+  }
+  return encodeRasterPointSurfaceFromTextureSourceOnCommandBuffer(
+      commandBuffer,
+      source->texture,
+      rasterRequest,
+      pointRequest,
+      0,
+      source->descriptor.width,
+      source->descriptor.height,
+      source->descriptor.pixelFormat,
+      outputSurfaceId,
+      outputSurfaceWidth,
+      outputSurfaceHeight,
+      outputSurfacePixelFormat,
+      error);
+}
+
+bool encodeRasterPointSurfaceFromImportedTextureCached(
+    const FrameSubmission& submission,
+    ResidentDerivedCache* cache,
+    const RasterSourceRequest& rasterRequest,
+    const RasterPointSurfaceRequest& pointRequest,
+    uint64_t sourceId,
+    uint64_t buildSerial,
+    uint32_t outputSurfaceId,
+    int outputSurfaceWidth,
+    int outputSurfaceHeight,
+    int outputSurfacePixelFormat,
+    std::string* error) {
+  if (!cache) {
+    if (error) *error = "metal-raster-point-cache-missing";
+    return false;
+  }
+  if (!validateResidentDerivedOwnerForSubmission(
+          submission, cache->cacheId, cache->ownerCompositorId, error)) {
+    return false;
+  }
+  id<MTLCommandBuffer> commandBuffer = nil;
+  if (!commandBufferForFrameSubmission(submission, &commandBuffer, error) ||
+      !validatePlotSurfaceOwnerForSubmission(
+          submission, outputSurfaceId, error)) {
+    return false;
+  }
+
+  ScopeDerivedResidentRecord residentRecord{};
+  std::string residentError;
+  if (resolveScopeDerivedRecordForSubmission(
+          submission, *cache, true, &residentRecord, &residentError)) {
+    if (residentRecord.family != ScopeDerivedFamily::RasterPointCloud) {
+      if (error) *error = "metal-raster-point-cache-family-mismatch";
+      return false;
+    }
+    return encodeRasterPointSurfaceFromTextureSourceOnCommandBuffer(
+        commandBuffer,
+        nil,
+        rasterRequest,
+        pointRequest,
+        0,
+        rasterRequest.sourceWidth,
+        rasterRequest.sourceHeight,
+        rasterRequest.pixelFormat,
+        outputSurfaceId,
+        outputSurfaceWidth,
+        outputSurfaceHeight,
+        outputSurfacePixelFormat,
+        error,
+        &residentRecord);
+  }
+  if (!residentError.empty()) {
+    if (error) *error = residentError;
+    return false;
+  }
+
+  std::shared_ptr<ImportedSourceRecord> source;
+  if (!importedSourceForFrameSubmission(
+          submission, sourceId, &source, error)) {
+    return false;
+  }
+  ScopeDerivedResidentRecord encodedRecord{};
+  if (!encodeRasterPointSurfaceFromTextureSourceOnCommandBuffer(
+          commandBuffer,
+          source->texture,
+          rasterRequest,
+          pointRequest,
+          0,
+          source->descriptor.width,
+          source->descriptor.height,
+          source->descriptor.pixelFormat,
+          outputSurfaceId,
+          outputSurfaceWidth,
+          outputSurfaceHeight,
+          outputSurfacePixelFormat,
+          error,
+          nullptr,
+          &encodedRecord,
+          buildSerial)) {
+    return false;
+  }
+  return registerPendingScopeDerivedRecord(
+      submission, cache, std::move(encodedRecord), error);
 }
 
 void releasePlotSurface(uint32_t surfaceId) {
@@ -4025,18 +6122,117 @@ void releasePlotSurface(uint32_t surfaceId) {
   std::lock_guard<std::mutex> lock(plotSurfaceMutex());
   auto& registry = plotSurfaceRegistry();
   auto it = registry.find(surfaceId);
-  if (it == registry.end()) return;
-  if (it->second.surface) CFRelease(it->second.surface);
+  if (it == registry.end() || !it->second ||
+      it->second->ownerCompositorId != 0) return;
+  registry.erase(it);
+}
+
+void releasePrivatePlotSurface(uint64_t compositorId, uint32_t surfaceId) {
+  if (compositorId == 0 || surfaceId == 0) return;
+  std::lock_guard<std::mutex> lock(plotSurfaceMutex());
+  auto& registry = plotSurfaceRegistry();
+  auto it = registry.find(surfaceId);
+  if (it == registry.end() ||
+      !it->second || it->second->ownerCompositorId != compositorId) {
+    return;
+  }
   registry.erase(it);
 }
 
 void releaseGlossFieldCache(GlossFieldCache* cache) {
   if (!cache) return;
-  if (cache->cacheId != 0) {
-    std::lock_guard<std::mutex> lock(glossFieldRegistryMutex());
-    glossFieldRegistry().erase(cache->cacheId);
-  }
+  ScopeDerivedCache derived = glossDerivedCache(*cache);
+  releaseResidentDerivedCache(&derived);
   *cache = GlossFieldCache{};
+}
+
+ResidentDerivedCacheState residentDerivedCacheState(
+    const ResidentDerivedCache& cache) {
+  if (cache.cacheId == 0 || cache.byteSize == 0 || !cache.available) {
+    return ResidentDerivedCacheState::Missing;
+  }
+  std::lock_guard<std::mutex> lock(scopeDerivedRegistryMutex());
+  auto entryIt = scopeDerivedRegistry().find(cache.cacheId);
+  if (entryIt == scopeDerivedRegistry().end() ||
+      entryIt->second.ownerCompositorId != cache.ownerCompositorId) {
+    return ResidentDerivedCacheState::Missing;
+  }
+  for (const auto& version : entryIt->second.inFlight) {
+    if (version.state == ScopeDerivedResidentVersionState::Pending &&
+        version.record &&
+        scopeDerivedRecordMatchesCache(*version.record, cache)) {
+      return ResidentDerivedCacheState::Pending;
+    }
+  }
+  return resolveScopeDerivedRecordLocked(cache.cacheId,
+                                         0,
+                                         false,
+                                         cache,
+                                         nullptr)
+             ? ResidentDerivedCacheState::Ready
+             : ResidentDerivedCacheState::Missing;
+}
+
+void releaseResidentDerivedCache(ResidentDerivedCache* cache) {
+  if (!cache) return;
+  if (cache->cacheId != 0) {
+    std::lock_guard<std::mutex> lock(scopeDerivedRegistryMutex());
+    const auto entryIt = scopeDerivedRegistry().find(cache->cacheId);
+    if (entryIt != scopeDerivedRegistry().end() &&
+        entryIt->second.ownerCompositorId == cache->ownerCompositorId) {
+      scopeDerivedRegistry().erase(entryIt);
+    }
+  }
+  *cache = ResidentDerivedCache{};
+}
+
+ScopeDerivedCacheState scopeDerivedCacheState(
+    const ScopeDerivedCache& cache) {
+  return residentDerivedCacheState(cache);
+}
+
+void releaseScopeDerivedCache(ScopeDerivedCache* cache) {
+  releaseResidentDerivedCache(cache);
+}
+
+#if !defined(CHROMASPACE_METAL_NATIVE_ONLY)
+static bool bindIOSurfaceRefToOpenGLTexture(IOSurfaceRef surface,
+                                            int width,
+                                            int height,
+                                            int pixelFormat,
+                                            uint32_t glTexture,
+                                            std::string* error) {
+  if (surface == nullptr) {
+    if (error) *error = "missing-iosurface-for-opengl-bind";
+    return false;
+  }
+  CGLContextObj cgl = CGLGetCurrentContext();
+  if (cgl == nullptr) {
+    if (error) *error = "no-current-cgl-context";
+    return false;
+  }
+  glBindTexture(GL_TEXTURE_RECTANGLE, static_cast<GLuint>(glTexture));
+  glTexParameteri(GL_TEXTURE_RECTANGLE, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+  glTexParameteri(GL_TEXTURE_RECTANGLE, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+  glTexParameteri(GL_TEXTURE_RECTANGLE, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+  glTexParameteri(GL_TEXTURE_RECTANGLE, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+  const GLenum internalFormat = pixelFormat == 1 ? GL_RGBA32F : GL_RGBA16F;
+  const GLenum type = pixelFormat == 1 ? GL_FLOAT : GL_HALF_FLOAT;
+  const CGLError cgError = CGLTexImageIOSurface2D(cgl,
+                                                 GL_TEXTURE_RECTANGLE,
+                                                 internalFormat,
+                                                 static_cast<GLsizei>(width),
+                                                 static_cast<GLsizei>(height),
+                                                 GL_RGBA,
+                                                 type,
+                                                 surface,
+                                                 0);
+  glBindTexture(GL_TEXTURE_RECTANGLE, 0);
+  if (cgError != kCGLNoError) {
+    if (error) *error = std::string("CGLTexImageIOSurface2D failed error=") + std::to_string(cgError);
+    return false;
+  }
+  return true;
 }
 
 bool bindIOSurfaceToOpenGLTexture(uint32_t surfaceId,
@@ -4060,38 +6256,62 @@ bool bindIOSurfaceToOpenGLTexture(uint32_t surfaceId,
       if (error) *error = "iosurface-lookup-failed";
       return false;
     }
-    CGLContextObj cgl = CGLGetCurrentContext();
-    if (cgl == nullptr) {
-      CFRelease(surface);
-      if (error) *error = "no-current-cgl-context";
-      return false;
-    }
-    glBindTexture(GL_TEXTURE_RECTANGLE, static_cast<GLuint>(glTexture));
-    glTexParameteri(GL_TEXTURE_RECTANGLE, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_RECTANGLE, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_RECTANGLE, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_RECTANGLE, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    const GLenum internalFormat = pixelFormat == 1 ? GL_RGBA32F : GL_RGBA16F;
-    const GLenum type = pixelFormat == 1 ? GL_FLOAT : GL_HALF_FLOAT;
-    const CGLError cgError = CGLTexImageIOSurface2D(cgl,
-                                                   GL_TEXTURE_RECTANGLE,
-                                                   internalFormat,
-                                                   static_cast<GLsizei>(width),
-                                                   static_cast<GLsizei>(height),
-                                                   GL_RGBA,
-                                                   type,
-                                                   surface,
-                                                   0);
-    glBindTexture(GL_TEXTURE_RECTANGLE, 0);
+    const bool bound =
+        bindIOSurfaceRefToOpenGLTexture(surface, width, height, pixelFormat, glTexture, error);
     CFRelease(surface);
-    if (cgError != kCGLNoError) {
-      if (error) *error = std::string("CGLTexImageIOSurface2D failed error=") + std::to_string(cgError);
-      return false;
-    }
-    return true;
+    return bound;
   }
 }
 
+bool bindPlotSurfaceToOpenGLTexture(uint32_t surfaceId,
+                                   int width,
+                                   int height,
+                                   int pixelFormat,
+                                   uint32_t glTexture,
+                                   std::string* error) {
+  if (error) error->clear();
+  if (surfaceId == 0 || width <= 0 || height <= 0 || glTexture == 0) {
+    if (error) *error = "invalid-plot-surface-gl-texture-request";
+    return false;
+  }
+  if (pixelFormat != 0 && pixelFormat != 1) {
+    if (error) *error = "unsupported-plot-surface-pixel-format";
+    return false;
+  }
+
+  IOSurfaceRef surface = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(plotSurfaceMutex());
+    auto& registry = plotSurfaceRegistry();
+    auto it = registry.find(surfaceId);
+    if (it == registry.end()) {
+      if (error) *error = "plot-surface-handle-not-found";
+      return false;
+    }
+    if (!it->second || it->second->width != width ||
+        it->second->height != height ||
+        it->second->pixelFormat != pixelFormat) {
+      if (error) *error = "plot-surface-metadata-mismatch";
+      return false;
+    }
+    if (it->second->surface == nullptr) {
+      if (error) *error = "plot-surface-not-iosurface-backed";
+      return false;
+    }
+    CFRetain(it->second->surface);
+    surface = it->second->surface;
+  }
+
+  @autoreleasepool {
+    const bool bound =
+        bindIOSurfaceRefToOpenGLTexture(surface, width, height, pixelFormat, glTexture, error);
+    CFRelease(surface);
+    return bound;
+  }
+}
+#endif
+
+#if !defined(CHROMASPACE_METAL_NATIVE_ONLY)
 bool buildOverlayMesh(const OverlayRequest& request,
                       const std::vector<float>& inputPoints,
                       std::vector<float>* outVerts,
@@ -4161,6 +6381,7 @@ bool buildOverlayMesh(const OverlayRequest& request,
   copySharedBuffer<simd_float4>(colorBuffer, totalPoints, outColors);
   return true;
 }
+#endif
 
 void fillInputUniforms(const InputRequest& request, InputUniforms* uniforms) {
   if (!uniforms) return;
@@ -4257,6 +6478,7 @@ void fillRasterSourceUniforms(const RasterSourceRequest& request, RasterSourceUn
   uniforms->cubeSliceMagenta = request.cubeSliceMagenta;
 }
 
+#if !defined(CHROMASPACE_METAL_NATIVE_ONLY)
 bool buildInputMesh(const InputRequest& request,
                     const std::vector<float>& rawPoints,
                     std::vector<float>* outVerts,
@@ -4335,7 +6557,7 @@ bool buildRasterSourceMesh(const RasterSourceRequest& request,
                                                         options:MTLResourceStorageModeShared];
     id<MTLBuffer> vertBuffer = makeEmptySharedBuffer(pointCount * sizeof(PackedFloat3));
     id<MTLBuffer> colorBuffer = makeEmptySharedBuffer(pointCount * sizeof(simd_float4));
-    id<MTLBuffer> uniformBuffer = makeSharedBuffer(&uniforms, 1u);
+    id<MTLBuffer> uniformBuffer = makeSharedBuffer(ctx, &uniforms, 1u);
     constexpr NSUInteger kRasterOccupancyBinCount = 18u * 18u * 18u;
     id<MTLBuffer> occupancyBuffer =
         makeEmptySharedBuffer(kRasterOccupancyBinCount * sizeof(uint32_t));
@@ -4429,7 +6651,9 @@ bool buildRasterSourceMesh(const RasterSourceRequest& request,
   }
   return true;
 }
+#endif
 
+#if !defined(CHROMASPACE_METAL_NATIVE_ONLY)
 bool buildRasterSourceMeshFromIOSurface(const RasterSourceRequest& request,
                                         uint32_t surfaceId,
                                         int surfaceWidth,
@@ -4562,7 +6786,9 @@ bool buildRasterSourceMeshFromIOSurface(const RasterSourceRequest& request,
   }
   return true;
 }
+#endif
 
+#if !defined(CHROMASPACE_METAL_NATIVE_ONLY)
 bool buildInputSampledMesh(const InputSampleRequest& request,
                            const std::vector<float>& fullVerts,
                            const std::vector<float>& fullColors,
@@ -4603,7 +6829,9 @@ bool buildInputSampledMesh(const InputSampleRequest& request,
   }
   return true;
 }
+#endif
 
+#if !defined(CHROMASPACE_METAL_NATIVE_ONLY)
 bool buildScopeDensity(const ScopeDensityRequest& request,
                        const std::vector<float>& packedSamples,
                        bool allowReadback,
@@ -4679,7 +6907,9 @@ bool buildScopeDensity(const ScopeDensityRequest& request,
   }
   return true;
 }
+#endif
 
+#if !defined(CHROMASPACE_METAL_NATIVE_ONLY)
 bool buildScopeDensityFromIOSurface(const RasterSourceRequest& rasterRequest,
                                     const ScopeDensityRequest& scopeRequest,
                                     uint32_t surfaceId,
@@ -4800,64 +7030,50 @@ bool buildScopeDensityFromIOSurface(const RasterSourceRequest& rasterRequest,
   }
   return true;
 }
+#endif
 
-bool buildScopeRangeFromIOSurface(const RasterSourceRequest& rasterRequest,
-                                  const ScopeRangeRequest& rangeRequest,
-                                  uint32_t surfaceId,
-                                  int surfaceWidth,
-                                  int surfaceHeight,
-                                  int surfacePixelFormat,
-                                  ScopeRangeResult* outRange,
-                                  std::string* error) {
-  std::string localError;
-  if (!outRange) {
-    if (error) *error = "Missing Metal IOSurface scope range output.";
+static bool encodeScopeRangeOnCommandBuffer(
+    id<MTLCommandBuffer> commandBuffer,
+    id<MTLTexture> sourceTexture,
+    id<MTLBuffer> rasterUniformBuffer,
+    int pointCount,
+    const ScopeRangeRequest& rangeRequest,
+    id<MTLBuffer>* outFinalRangeBuffer,
+    std::string* error) {
+  if (outFinalRangeBuffer) *outFinalRangeBuffer = nil;
+  if (error) error->clear();
+  if (commandBuffer == nil || sourceTexture == nil || rasterUniformBuffer == nil ||
+      pointCount <= 0 || outFinalRangeBuffer == nullptr) {
+    if (error) *error = "invalid-metal-scope-range-encode-request";
     return false;
   }
-  *outRange = ScopeRangeResult{};
-  if (!ensureContext(&localError)) {
-    if (error) *error = localError;
+  std::shared_ptr<MetalContext> runtimeContext;
+  MetalContext* contextPointer = nullptr;
+  if (!contextForCommandBuffer(commandBuffer,
+                               &runtimeContext,
+                               &contextPointer,
+                               error) ||
+      contextPointer == nullptr) {
     return false;
   }
-  const int pointCount = std::max(rasterRequest.pointCount, 0);
-  constexpr uint32_t kRangeHistogramBins = 2048u;
-  if (pointCount <= 0 || surfaceId == 0 || surfaceWidth <= 0 || surfaceHeight <= 0 ||
-      rasterRequest.sourceWidth <= 0 || rasterRequest.sourceHeight <= 0 ||
-      rasterRequest.sampleCountX <= 0 || surfaceWidth < rasterRequest.sourceWidth ||
-      surfaceHeight < rasterRequest.sourceHeight) {
-    if (error) *error = "Invalid Metal IOSurface scope range request.";
-    return false;
-  }
-  if (surfacePixelFormat != 0 && surfacePixelFormat != 1) {
-    if (error) *error = "Unsupported Metal IOSurface scope range format.";
-    return false;
-  }
-
-  MetalContext& ctx = context();
+  MetalContext& ctx = *contextPointer;
   if (ctx.rasterScopeRangeTexturePipeline == nil ||
       ctx.rasterScopeRangeHistogramTexturePipeline == nil ||
       ctx.scopeRangeHistogramPercentilePipeline == nil ||
       ctx.scopeRangeFinalizePipeline == nil) {
-    if (error) *error = residentPipelineUnavailableReason("metal-iosurface-scope-range");
+    if (error) {
+      *error = residentPipelineUnavailableReason(
+          ctx, "metal-iosurface-scope-range");
+    }
     return false;
   }
 
+  constexpr uint32_t kRangeHistogramBins = 2048u;
   const auto orderedUintFromFloatHost = [](float value) {
     uint32_t bits = 0u;
     std::memcpy(&bits, &value, sizeof(bits));
     return (bits & 0x80000000u) != 0u ? ~bits : (bits ^ 0x80000000u);
   };
-  const auto floatFromOrderedUintHost = [](uint32_t value) {
-    uint32_t bits = (value & 0x80000000u) != 0u ? (value ^ 0x80000000u) : ~value;
-    float result = 0.0f;
-    std::memcpy(&result, &bits, sizeof(result));
-    return result;
-  };
-
-  RasterSourceUniforms rasterUniforms{};
-  fillRasterSourceUniforms(rasterRequest, &rasterUniforms);
-  rasterUniforms.pixelFormat = surfacePixelFormat;
-  rasterUniforms.input.pointCount = pointCount;
 
   ScopeRangeUniforms rangeUniforms{};
   rangeUniforms.pointCount = pointCount;
@@ -4889,94 +7105,179 @@ bool buildScopeRangeFromIOSurface(const RasterSourceRequest& rasterRequest,
       0u,
   };
 
+  id<MTLBuffer> rangeBitsBuffer =
+      makeSharedBuffer(ctx, initRangeBits, 3u);
+  id<MTLBuffer> histogramBuffer =
+      makeEmptySharedBuffer(
+          ctx,
+          static_cast<NSUInteger>(kRangeHistogramBins * sizeof(uint32_t)));
+  id<MTLBuffer> percentileBuffer =
+      makeSharedBuffer(ctx, initPercentiles, 2u);
+  id<MTLBuffer> finalRangeBuffer =
+      makeSharedBuffer(ctx, initFinalRange, 3u);
+  id<MTLBuffer> rangeUniformBuffer =
+      makeSharedBuffer(ctx, &rangeUniforms, 1u);
+  if (rangeBitsBuffer == nil || histogramBuffer == nil || percentileBuffer == nil ||
+      finalRangeBuffer == nil || rangeUniformBuffer == nil) {
+    if (error) *error = "metal-scope-range-resource-allocation-failed";
+    return false;
+  }
+  clearSharedBuffer(histogramBuffer);
+
+  const auto dispatchPointKernel = [&](id<MTLComputePipelineState> pipeline,
+                                       void (^bind)(id<MTLComputeCommandEncoder>)) -> bool {
+    id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
+    if (encoder == nil) return false;
+    [encoder setComputePipelineState:pipeline];
+    bind(encoder);
+    NSUInteger threads = pipeline.maxTotalThreadsPerThreadgroup;
+    if (threads == 0) threads = 64;
+    threads = std::min<NSUInteger>(threads, 256);
+    [encoder dispatchThreads:MTLSizeMake(static_cast<NSUInteger>(pointCount), 1, 1)
+       threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
+    [encoder endEncoding];
+    return true;
+  };
+  if (!dispatchPointKernel(ctx.rasterScopeRangeTexturePipeline,
+                           ^(id<MTLComputeCommandEncoder> encoder) {
+                             [encoder setTexture:sourceTexture atIndex:0];
+                             [encoder setBuffer:rangeBitsBuffer offset:0 atIndex:0];
+                             [encoder setBuffer:rasterUniformBuffer offset:0 atIndex:1];
+                             [encoder setBuffer:rangeUniformBuffer offset:0 atIndex:2];
+                           })) {
+    if (error) *error = "metal-scope-range-encoder-failed";
+    return false;
+  }
+  if (!dispatchPointKernel(ctx.rasterScopeRangeHistogramTexturePipeline,
+                           ^(id<MTLComputeCommandEncoder> encoder) {
+                             [encoder setTexture:sourceTexture atIndex:0];
+                             [encoder setBuffer:histogramBuffer offset:0 atIndex:0];
+                             [encoder setBuffer:rangeBitsBuffer offset:0 atIndex:1];
+                             [encoder setBuffer:rasterUniformBuffer offset:0 atIndex:2];
+                             [encoder setBuffer:rangeUniformBuffer offset:0 atIndex:3];
+                           })) {
+    if (error) *error = "metal-scope-range-histogram-encoder-failed";
+    return false;
+  }
+
+  id<MTLComputeCommandEncoder> percentileEncoder = [commandBuffer computeCommandEncoder];
+  if (percentileEncoder == nil) {
+    if (error) *error = "metal-scope-range-percentile-encoder-failed";
+    return false;
+  }
+  [percentileEncoder setComputePipelineState:ctx.scopeRangeHistogramPercentilePipeline];
+  [percentileEncoder setBuffer:histogramBuffer offset:0 atIndex:0];
+  [percentileEncoder setBuffer:rangeBitsBuffer offset:0 atIndex:1];
+  [percentileEncoder setBuffer:percentileBuffer offset:0 atIndex:2];
+  [percentileEncoder setBuffer:rangeUniformBuffer offset:0 atIndex:3];
+  [percentileEncoder dispatchThreads:MTLSizeMake(1, 1, 1)
+               threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+  [percentileEncoder endEncoding];
+
+  id<MTLComputeCommandEncoder> finalizeEncoder = [commandBuffer computeCommandEncoder];
+  if (finalizeEncoder == nil) {
+    if (error) *error = "metal-scope-range-finalize-encoder-failed";
+    return false;
+  }
+  [finalizeEncoder setComputePipelineState:ctx.scopeRangeFinalizePipeline];
+  [finalizeEncoder setBuffer:percentileBuffer offset:0 atIndex:0];
+  [finalizeEncoder setBuffer:rangeBitsBuffer offset:0 atIndex:1];
+  [finalizeEncoder setBuffer:finalRangeBuffer offset:0 atIndex:2];
+  [finalizeEncoder setBuffer:rangeUniformBuffer offset:0 atIndex:3];
+  [finalizeEncoder dispatchThreads:MTLSizeMake(1, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+  [finalizeEncoder endEncoding];
+
+  *outFinalRangeBuffer = finalRangeBuffer;
+  return true;
+}
+
+#if !defined(CHROMASPACE_METAL_NATIVE_ONLY)
+bool buildScopeRangeFromIOSurface(const RasterSourceRequest& rasterRequest,
+                                  const ScopeRangeRequest& rangeRequest,
+                                  uint32_t surfaceId,
+                                  int surfaceWidth,
+                                  int surfaceHeight,
+                                  int surfacePixelFormat,
+                                  ScopeRangeResult* outRange,
+                                  std::string* error) {
+  std::string localError;
+  if (!outRange) {
+    if (error) *error = "Missing Metal IOSurface scope range output.";
+    return false;
+  }
+  *outRange = ScopeRangeResult{};
+  if (!ensureContext(&localError)) {
+    if (error) *error = localError;
+    return false;
+  }
+  const int pointCount = std::max(rasterRequest.pointCount, 0);
+  if (pointCount <= 0 || surfaceId == 0 || surfaceWidth <= 0 || surfaceHeight <= 0 ||
+      rasterRequest.sourceWidth <= 0 || rasterRequest.sourceHeight <= 0 ||
+      rasterRequest.sampleCountX <= 0 || surfaceWidth < rasterRequest.sourceWidth ||
+      surfaceHeight < rasterRequest.sourceHeight) {
+    if (error) *error = "Invalid Metal IOSurface scope range request.";
+    return false;
+  }
+  if (surfacePixelFormat != 0 && surfacePixelFormat != 1) {
+    if (error) *error = "Unsupported Metal IOSurface scope range format.";
+    return false;
+  }
+
+  MetalContext& ctx = context();
+  const auto orderedUintFromFloatHost = [](float value) {
+    uint32_t bits = 0u;
+    std::memcpy(&bits, &value, sizeof(bits));
+    return (bits & 0x80000000u) != 0u ? ~bits : (bits ^ 0x80000000u);
+  };
+  const auto floatFromOrderedUintHost = [](uint32_t value) {
+    uint32_t bits = (value & 0x80000000u) != 0u ? (value ^ 0x80000000u) : ~value;
+    float result = 0.0f;
+    std::memcpy(&result, &bits, sizeof(result));
+    return result;
+  };
+
+  RasterSourceUniforms rasterUniforms{};
+  fillRasterSourceUniforms(rasterRequest, &rasterUniforms);
+  rasterUniforms.pixelFormat = surfacePixelFormat;
+  rasterUniforms.input.pointCount = pointCount;
+  const uint32_t initFinalRange[3] = {
+      orderedUintFromFloatHost(0.0f),
+      orderedUintFromFloatHost(1.0f),
+      0u,
+  };
+
   @autoreleasepool {
     id<MTLTexture> sourceTexture =
         makeTextureFromIOSurface(ctx, surfaceId, surfaceWidth, surfaceHeight, surfacePixelFormat, &localError);
-    id<MTLBuffer> rangeBitsBuffer = makeSharedBuffer(initRangeBits, 3u);
-    id<MTLBuffer> histogramBuffer =
-        makeEmptySharedBuffer(static_cast<NSUInteger>(kRangeHistogramBins * sizeof(uint32_t)));
-    id<MTLBuffer> percentileBuffer = makeSharedBuffer(initPercentiles, 2u);
-    id<MTLBuffer> finalRangeBuffer = makeSharedBuffer(initFinalRange, 3u);
     id<MTLBuffer> rasterUniformBuffer = makeSharedBuffer(&rasterUniforms, 1u);
-    id<MTLBuffer> rangeUniformBuffer = makeSharedBuffer(&rangeUniforms, 1u);
-    if (sourceTexture == nil || rangeBitsBuffer == nil || histogramBuffer == nil ||
-        percentileBuffer == nil || finalRangeBuffer == nil || rasterUniformBuffer == nil ||
-        rangeUniformBuffer == nil) {
+    if (sourceTexture == nil || rasterUniformBuffer == nil) {
       if (error) {
         *error = localError.empty() ? "Failed to allocate Metal IOSurface scope range resources."
                                     : localError;
       }
       return false;
     }
-    clearSharedBuffer(histogramBuffer);
 
     id<MTLCommandBuffer> commandBuffer = [ctx.queue commandBuffer];
     if (commandBuffer == nil) {
       if (error) *error = "Failed to create Metal IOSurface scope range command buffer.";
       return false;
     }
-    const auto dispatchPointKernel = [&](id<MTLComputePipelineState> pipeline,
-                                         void (^bind)(id<MTLComputeCommandEncoder>)) -> bool {
-      id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
-      if (encoder == nil) return false;
-      [encoder setComputePipelineState:pipeline];
-      bind(encoder);
-      NSUInteger threads = pipeline.maxTotalThreadsPerThreadgroup;
-      if (threads == 0) threads = 64;
-      threads = std::min<NSUInteger>(threads, 256);
-      [encoder dispatchThreads:MTLSizeMake(static_cast<NSUInteger>(pointCount), 1, 1)
-         threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
-      [encoder endEncoding];
-      return true;
-    };
-    if (!dispatchPointKernel(ctx.rasterScopeRangeTexturePipeline,
-                             ^(id<MTLComputeCommandEncoder> encoder) {
-                               [encoder setTexture:sourceTexture atIndex:0];
-                               [encoder setBuffer:rangeBitsBuffer offset:0 atIndex:0];
-                               [encoder setBuffer:rasterUniformBuffer offset:0 atIndex:1];
-                               [encoder setBuffer:rangeUniformBuffer offset:0 atIndex:2];
-                             })) {
-      if (error) *error = "Failed to create Metal IOSurface scope range encoder.";
+    id<MTLBuffer> finalRangeBuffer = nil;
+    if (!encodeScopeRangeOnCommandBuffer(commandBuffer,
+                                         sourceTexture,
+                                         rasterUniformBuffer,
+                                         pointCount,
+                                         rangeRequest,
+                                         &finalRangeBuffer,
+                                         &localError)) {
+      if (error) {
+        *error = localError.empty() ? "Failed to encode Metal IOSurface scope range."
+                                    : localError;
+      }
       return false;
     }
-    if (!dispatchPointKernel(ctx.rasterScopeRangeHistogramTexturePipeline,
-                             ^(id<MTLComputeCommandEncoder> encoder) {
-                               [encoder setTexture:sourceTexture atIndex:0];
-                               [encoder setBuffer:histogramBuffer offset:0 atIndex:0];
-                               [encoder setBuffer:rangeBitsBuffer offset:0 atIndex:1];
-                               [encoder setBuffer:rasterUniformBuffer offset:0 atIndex:2];
-                               [encoder setBuffer:rangeUniformBuffer offset:0 atIndex:3];
-                             })) {
-      if (error) *error = "Failed to create Metal IOSurface scope range histogram encoder.";
-      return false;
-    }
-    id<MTLComputeCommandEncoder> percentileEncoder = [commandBuffer computeCommandEncoder];
-    if (percentileEncoder == nil) {
-      if (error) *error = "Failed to create Metal IOSurface scope range percentile encoder.";
-      return false;
-    }
-    [percentileEncoder setComputePipelineState:ctx.scopeRangeHistogramPercentilePipeline];
-    [percentileEncoder setBuffer:histogramBuffer offset:0 atIndex:0];
-    [percentileEncoder setBuffer:rangeBitsBuffer offset:0 atIndex:1];
-    [percentileEncoder setBuffer:percentileBuffer offset:0 atIndex:2];
-    [percentileEncoder setBuffer:rangeUniformBuffer offset:0 atIndex:3];
-    [percentileEncoder dispatchThreads:MTLSizeMake(1, 1, 1)
-                 threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
-    [percentileEncoder endEncoding];
-
-    id<MTLComputeCommandEncoder> finalizeEncoder = [commandBuffer computeCommandEncoder];
-    if (finalizeEncoder == nil) {
-      if (error) *error = "Failed to create Metal IOSurface scope range finalize encoder.";
-      return false;
-    }
-    [finalizeEncoder setComputePipelineState:ctx.scopeRangeFinalizePipeline];
-    [finalizeEncoder setBuffer:percentileBuffer offset:0 atIndex:0];
-    [finalizeEncoder setBuffer:rangeBitsBuffer offset:0 atIndex:1];
-    [finalizeEncoder setBuffer:finalRangeBuffer offset:0 atIndex:2];
-    [finalizeEncoder setBuffer:rangeUniformBuffer offset:0 atIndex:3];
-    [finalizeEncoder dispatchThreads:MTLSizeMake(1, 1, 1)
-               threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
-    [finalizeEncoder endEncoding];
 
     [commandBuffer commit];
     [commandBuffer waitUntilCompleted];
@@ -4994,29 +7295,39 @@ bool buildScopeRangeFromIOSurface(const RasterSourceRequest& rasterRequest,
   }
   return true;
 }
+#endif
 
-bool renderHistogramSurfaceFromIOSurface(const RasterSourceRequest& rasterRequest,
-                                         const HistogramSurfaceRequest& histogramRequest,
-                                         uint32_t sourceSurfaceId,
-                                         int sourceSurfaceWidth,
-                                         int sourceSurfaceHeight,
-                                         int sourceSurfacePixelFormat,
-                                         uint32_t outputSurfaceId,
-                                         int outputSurfaceWidth,
-                                         int outputSurfaceHeight,
-                                         int outputSurfacePixelFormat,
-                                         std::string* error) {
+static bool encodeHistogramSurfaceFromTextureSourceOnCommandBuffer(
+    id<MTLCommandBuffer> commandBuffer,
+    id<MTLTexture> importedSourceTexture,
+    const RasterSourceRequest& rasterRequest,
+    const HistogramSurfaceRequest& histogramRequest,
+    uint32_t sourceSurfaceId,
+    int sourceSurfaceWidth,
+    int sourceSurfaceHeight,
+    int sourceSurfacePixelFormat,
+    uint32_t outputSurfaceId,
+    int outputSurfaceWidth,
+    int outputSurfaceHeight,
+    int outputSurfacePixelFormat,
+    std::string* error,
+    const ScopeDerivedResidentRecord* residentRecord = nullptr,
+    ScopeDerivedResidentRecord* outEncodedRecord = nullptr,
+    uint64_t buildSerial = 0) {
   if (error) error->clear();
   std::string localError;
-  if (!ensureContext(&localError)) {
-    if (error) *error = localError.empty() ? "metal-context-unavailable" : localError;
-    return false;
-  }
   const int pointCount = std::max(rasterRequest.pointCount, 0);
   const int binCount = std::max(histogramRequest.width, 1);
   const int channelCount = histogramRequest.scopeMode == 1 ? 1 : 3;
   const size_t densityCount = static_cast<size_t>(binCount) * static_cast<size_t>(channelCount);
-  if (pointCount <= 0 || sourceSurfaceId == 0 || outputSurfaceId == 0 ||
+  const bool useResidentRecord = residentRecord != nullptr;
+#if defined(CHROMASPACE_METAL_NATIVE_ONLY)
+  if (pointCount <= 0 || (!useResidentRecord && importedSourceTexture == nil) ||
+#else
+  if (pointCount <= 0 ||
+      (!useResidentRecord && importedSourceTexture == nil && sourceSurfaceId == 0) ||
+#endif
+      outputSurfaceId == 0 ||
       sourceSurfaceWidth <= 0 || sourceSurfaceHeight <= 0 ||
       outputSurfaceWidth <= 0 || outputSurfaceHeight <= 0 ||
       rasterRequest.sourceWidth <= 0 || rasterRequest.sourceHeight <= 0 ||
@@ -5030,11 +7341,29 @@ bool renderHistogramSurfaceFromIOSurface(const RasterSourceRequest& rasterReques
     if (error) *error = "unsupported-metal-histogram-surface-format";
     return false;
   }
-  MetalContext& ctx = context();
-  if (ctx.rasterScopeDensityTexturePipeline == nil ||
-      ctx.histogramMaxPipeline == nil ||
-      ctx.histogramSurfaceRenderPipeline == nil) {
-    if (error) *error = residentPipelineUnavailableReason("metal-histogram-surface");
+  std::shared_ptr<MetalContext> runtimeContext;
+  MetalContext* contextPointer = nullptr;
+  if (!contextForCommandBuffer(commandBuffer,
+                               &runtimeContext,
+                               &contextPointer,
+                               &localError) ||
+      contextPointer == nullptr) {
+    if (error) {
+      *error = localError.empty() ? "metal-histogram-command-buffer-invalid"
+                                  : localError;
+    }
+    return false;
+  }
+  MetalContext& ctx = *contextPointer;
+  if (ctx.histogramSurfaceRenderPipeline == nil ||
+      (histogramRequest.useGpuAutoRange != 0 &&
+       ctx.histogramApplyRangePipeline == nil) ||
+      (!useResidentRecord &&
+       (ctx.rasterScopeDensityTexturePipeline == nil ||
+        ctx.histogramMaxPipeline == nil))) {
+    if (error) {
+      *error = residentPipelineUnavailableReason(ctx, "metal-histogram-surface");
+    }
     return false;
   }
 
@@ -5055,6 +7384,9 @@ bool renderHistogramSurfaceFromIOSurface(const RasterSourceRequest& rasterReques
   densityUniforms.onlyOverflow = 0;
   densityUniforms.channelCount = channelCount;
   densityUniforms.lumaMethod = std::clamp(histogramRequest.lumaMethod, 0, 3);
+  ScopeDensityUniforms overflowUniforms = densityUniforms;
+  overflowUniforms.excludeOverflow = 0;
+  overflowUniforms.onlyOverflow = 1;
 
   HistogramSurfaceUniforms surfaceUniforms{};
   surfaceUniforms.pointCount = pointCount;
@@ -5073,11 +7405,12 @@ bool renderHistogramSurfaceFromIOSurface(const RasterSourceRequest& rasterReques
     std::lock_guard<std::mutex> lock(plotSurfaceMutex());
     auto& registry = plotSurfaceRegistry();
     auto it = registry.find(outputSurfaceId);
-    if (it != registry.end() &&
-        it->second.width == outputSurfaceWidth &&
-        it->second.height == outputSurfaceHeight &&
-        it->second.pixelFormat == outputSurfacePixelFormat) {
-      outputTexture = it->second.texture;
+    if (it != registry.end() && it->second &&
+        it->second->width == outputSurfaceWidth &&
+        it->second->height == outputSurfaceHeight &&
+        it->second->pixelFormat == outputSurfacePixelFormat &&
+        it->second->context == runtimeContext) {
+      outputTexture = it->second->texture;
     }
   }
   if (outputTexture == nil) {
@@ -5087,44 +7420,112 @@ bool renderHistogramSurfaceFromIOSurface(const RasterSourceRequest& rasterReques
 
   @autoreleasepool {
     id<MTLTexture> sourceTexture =
-        makeTextureFromIOSurface(ctx,
-                                 sourceSurfaceId,
-                                 sourceSurfaceWidth,
-                                 sourceSurfaceHeight,
-                                 sourceSurfacePixelFormat,
-                                 &localError);
+        importedSourceTexture;
+#if !defined(CHROMASPACE_METAL_NATIVE_ONLY)
+    if (!useResidentRecord && sourceTexture == nil) {
+      sourceTexture = makeTextureFromIOSurface(ctx,
+                                               sourceSurfaceId,
+                                               sourceSurfaceWidth,
+                                               sourceSurfaceHeight,
+                                               sourceSurfacePixelFormat,
+                                               &localError);
+    }
+#endif
     id<MTLBuffer> densityBuffer =
-        makeEmptySharedBuffer(static_cast<NSUInteger>(densityCount * sizeof(uint32_t)));
+        useResidentRecord
+            ? residentRecord->density
+            : makeEmptySharedBuffer(
+                  ctx,
+                  static_cast<NSUInteger>(densityCount * sizeof(uint32_t)));
     id<MTLBuffer> overflowDensityBuffer =
-        surfaceUniforms.showOverflow != 0
-            ? makeEmptySharedBuffer(static_cast<NSUInteger>(densityCount * sizeof(uint32_t)))
+        useResidentRecord
+            ? residentRecord->overflowDensity
+            : (surfaceUniforms.showOverflow != 0
+            ? makeEmptySharedBuffer(
+                  ctx,
+                  static_cast<NSUInteger>(densityCount * sizeof(uint32_t)))
+            : nil);
+    id<MTLBuffer> maxDensityBuffer =
+        useResidentRecord ? residentRecord->maxDensity
+                          : makeEmptySharedBuffer(ctx, sizeof(uint32_t));
+    id<MTLBuffer> rasterUniformBuffer =
+        useResidentRecord ? nil : makeSharedBuffer(ctx, &rasterUniforms, 1u);
+    id<MTLBuffer> densityUniformBuffer =
+        (!useResidentRecord || histogramRequest.useGpuAutoRange != 0)
+            ? makeSharedBuffer(ctx, &densityUniforms, 1u)
             : nil;
-    id<MTLBuffer> maxDensityBuffer = makeEmptySharedBuffer(sizeof(uint32_t));
-    id<MTLBuffer> rasterUniformBuffer = makeSharedBuffer(&rasterUniforms, 1u);
-    id<MTLBuffer> densityUniformBuffer = makeSharedBuffer(&densityUniforms, 1u);
-    id<MTLBuffer> surfaceUniformBuffer = makeSharedBuffer(&surfaceUniforms, 1u);
-    if (sourceTexture == nil || densityBuffer == nil || maxDensityBuffer == nil ||
-        rasterUniformBuffer == nil || densityUniformBuffer == nil ||
+    id<MTLBuffer> overflowUniformBuffer =
+        (!useResidentRecord || histogramRequest.useGpuAutoRange != 0)
+            ? makeSharedBuffer(ctx, &overflowUniforms, 1u)
+            : nil;
+    id<MTLBuffer> surfaceUniformBuffer =
+        makeSharedBuffer(ctx, &surfaceUniforms, 1u);
+    if ((!useResidentRecord &&
+         (sourceTexture == nil || rasterUniformBuffer == nil)) ||
+        (histogramRequest.useGpuAutoRange != 0 &&
+         (densityUniformBuffer == nil || overflowUniformBuffer == nil)) ||
+        densityBuffer == nil || maxDensityBuffer == nil ||
         surfaceUniformBuffer == nil ||
+        (useResidentRecord && histogramRequest.useGpuAutoRange != 0 &&
+         residentRecord->finalRange == nil) ||
         (surfaceUniforms.showOverflow != 0 && overflowDensityBuffer == nil)) {
       if (error) {
         *error = localError.empty() ? "metal-histogram-surface-allocation-failed" : localError;
       }
       return false;
     }
-    clearSharedBuffer(densityBuffer);
-    clearSharedBuffer(maxDensityBuffer);
-    if (overflowDensityBuffer != nil) clearSharedBuffer(overflowDensityBuffer);
+    if (!useResidentRecord) {
+      clearSharedBuffer(densityBuffer);
+      clearSharedBuffer(maxDensityBuffer);
+      if (overflowDensityBuffer != nil) clearSharedBuffer(overflowDensityBuffer);
+    }
 
-    id<MTLCommandBuffer> commandBuffer = [ctx.queue commandBuffer];
     if (commandBuffer == nil) {
       if (error) *error = "metal-histogram-surface-command-buffer-failed";
       return false;
     }
+    id<MTLBuffer> finalRangeBuffer =
+        useResidentRecord ? residentRecord->finalRange : nil;
+    if (histogramRequest.useGpuAutoRange != 0) {
+      if (!useResidentRecord) {
+        ScopeRangeRequest autoRangeRequest = histogramRequest.autoRange;
+        autoRangeRequest.pointCount = pointCount;
+        autoRangeRequest.waveform = 0;
+        autoRangeRequest.scopeMode = histogramRequest.scopeMode;
+        autoRangeRequest.includeOverflow = histogramRequest.showOverflow != 0 ? 1 : 0;
+        autoRangeRequest.lumaMethod = std::clamp(histogramRequest.lumaMethod, 0, 3);
+        if (!encodeScopeRangeOnCommandBuffer(commandBuffer,
+                                             sourceTexture,
+                                             rasterUniformBuffer,
+                                             pointCount,
+                                             autoRangeRequest,
+                                             &finalRangeBuffer,
+                                             &localError)) {
+          if (error) {
+            *error = localError.empty()
+                         ? "metal-histogram-auto-range-encode-failed"
+                         : localError;
+          }
+          return false;
+        }
+      }
+      id<MTLComputeCommandEncoder> applyRangeEncoder = [commandBuffer computeCommandEncoder];
+      if (applyRangeEncoder == nil) {
+        if (error) *error = "metal-histogram-apply-range-encoder-failed";
+        return false;
+      }
+      [applyRangeEncoder setComputePipelineState:ctx.histogramApplyRangePipeline];
+      [applyRangeEncoder setBuffer:finalRangeBuffer offset:0 atIndex:0];
+      [applyRangeEncoder setBuffer:densityUniformBuffer offset:0 atIndex:1];
+      [applyRangeEncoder setBuffer:overflowUniformBuffer offset:0 atIndex:2];
+      [applyRangeEncoder setBuffer:surfaceUniformBuffer offset:0 atIndex:3];
+      [applyRangeEncoder dispatchThreads:MTLSizeMake(1, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+      [applyRangeEncoder endEncoding];
+    }
     auto dispatchPointKernel = [&](id<MTLComputePipelineState> pipeline,
                                    id<MTLBuffer> targetDensity,
-                                   const ScopeDensityUniforms& uniforms) -> bool {
-      id<MTLBuffer> uniformsBuffer = makeSharedBuffer(&uniforms, 1u);
+                                   id<MTLBuffer> uniformsBuffer) -> bool {
       if (uniformsBuffer == nil) return false;
       id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
       if (encoder == nil) return false;
@@ -5142,39 +7543,61 @@ bool renderHistogramSurfaceFromIOSurface(const RasterSourceRequest& rasterReques
       return true;
     };
 
-    if (!dispatchPointKernel(ctx.rasterScopeDensityTexturePipeline,
-                             densityBuffer,
-                             densityUniforms)) {
-      if (error) *error = "metal-histogram-density-encoder-failed";
-      return false;
-    }
-    if (overflowDensityBuffer != nil) {
-      ScopeDensityUniforms overflowUniforms = densityUniforms;
-      overflowUniforms.excludeOverflow = 0;
-      overflowUniforms.onlyOverflow = 1;
+    if (!useResidentRecord) {
       if (!dispatchPointKernel(ctx.rasterScopeDensityTexturePipeline,
-                               overflowDensityBuffer,
-                               overflowUniforms)) {
-        if (error) *error = "metal-histogram-overflow-density-encoder-failed";
+                               densityBuffer,
+                               densityUniformBuffer)) {
+        if (error) *error = "metal-histogram-density-encoder-failed";
         return false;
       }
-    }
+      if (overflowDensityBuffer != nil) {
+        if (!dispatchPointKernel(ctx.rasterScopeDensityTexturePipeline,
+                                 overflowDensityBuffer,
+                                 overflowUniformBuffer)) {
+          if (error) *error = "metal-histogram-overflow-density-encoder-failed";
+          return false;
+        }
+      }
 
-    id<MTLComputeCommandEncoder> maxEncoder = [commandBuffer computeCommandEncoder];
-    if (maxEncoder == nil) {
-      if (error) *error = "metal-histogram-max-encoder-failed";
-      return false;
+      id<MTLComputeCommandEncoder> maxEncoder = [commandBuffer computeCommandEncoder];
+      if (maxEncoder == nil) {
+        if (error) *error = "metal-histogram-max-encoder-failed";
+        return false;
+      }
+      [maxEncoder setComputePipelineState:ctx.histogramMaxPipeline];
+      [maxEncoder setBuffer:densityBuffer offset:0 atIndex:0];
+      [maxEncoder setBuffer:maxDensityBuffer offset:0 atIndex:1];
+      [maxEncoder setBuffer:surfaceUniformBuffer offset:0 atIndex:2];
+      NSUInteger maxThreads = ctx.histogramMaxPipeline.maxTotalThreadsPerThreadgroup;
+      if (maxThreads == 0) maxThreads = 64;
+      maxThreads = std::min<NSUInteger>(maxThreads, 256);
+      [maxEncoder dispatchThreads:MTLSizeMake(static_cast<NSUInteger>(densityCount), 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(maxThreads, 1, 1)];
+      [maxEncoder endEncoding];
+
+      if (outEncodedRecord != nullptr) {
+        if (buildSerial == 0) {
+          if (error) *error = "metal-histogram-cache-build-serial-invalid";
+          return false;
+        }
+        ScopeDerivedResidentRecord record{};
+        record.family = ScopeDerivedFamily::Histogram;
+        record.builtSerial = buildSerial;
+        record.density = densityBuffer;
+        record.overflowDensity = overflowDensityBuffer;
+        record.maxDensity = maxDensityBuffer;
+        record.finalRange = finalRangeBuffer;
+        record.byteSize = static_cast<size_t>([densityBuffer length]) +
+                          static_cast<size_t>([maxDensityBuffer length]) +
+                          (overflowDensityBuffer != nil
+                               ? static_cast<size_t>([overflowDensityBuffer length])
+                               : 0u) +
+                          (finalRangeBuffer != nil
+                               ? static_cast<size_t>([finalRangeBuffer length])
+                               : 0u);
+        *outEncodedRecord = std::move(record);
+      }
     }
-    [maxEncoder setComputePipelineState:ctx.histogramMaxPipeline];
-    [maxEncoder setBuffer:densityBuffer offset:0 atIndex:0];
-    [maxEncoder setBuffer:maxDensityBuffer offset:0 atIndex:1];
-    [maxEncoder setBuffer:surfaceUniformBuffer offset:0 atIndex:2];
-    NSUInteger maxThreads = ctx.histogramMaxPipeline.maxTotalThreadsPerThreadgroup;
-    if (maxThreads == 0) maxThreads = 64;
-    maxThreads = std::min<NSUInteger>(maxThreads, 256);
-    [maxEncoder dispatchThreads:MTLSizeMake(static_cast<NSUInteger>(densityCount), 1, 1)
-           threadsPerThreadgroup:MTLSizeMake(maxThreads, 1, 1)];
-    [maxEncoder endEncoding];
 
     id<MTLComputeCommandEncoder> renderEncoder = [commandBuffer computeCommandEncoder];
     if (renderEncoder == nil) {
@@ -5197,17 +7620,769 @@ bool renderHistogramSurfaceFromIOSurface(const RasterSourceRequest& rasterReques
               threadsPerThreadgroup:MTLSizeMake(groupWidth, groupHeight, 1)];
     [renderEncoder endEncoding];
 
-    [commandBuffer commit];
-    [commandBuffer waitUntilCompleted];
-    NSError* cbError = commandBuffer.error;
-    if (cbError != nil) {
-      if (error) *error = [[cbError localizedDescription] UTF8String];
-      return false;
-    }
   }
   return true;
 }
 
+#if !defined(CHROMASPACE_METAL_NATIVE_ONLY)
+bool renderHistogramSurfaceFromIOSurface(const RasterSourceRequest& rasterRequest,
+                                         const HistogramSurfaceRequest& histogramRequest,
+                                         uint32_t sourceSurfaceId,
+                                         int sourceSurfaceWidth,
+                                         int sourceSurfaceHeight,
+                                         int sourceSurfacePixelFormat,
+                                         uint32_t outputSurfaceId,
+                                         int outputSurfaceWidth,
+                                         int outputSurfaceHeight,
+                                         int outputSurfacePixelFormat,
+                                         std::string* error) {
+  std::string localError;
+  if (!ensureContext(&localError)) {
+    if (error) *error = localError.empty() ? "metal-context-unavailable" : localError;
+    return false;
+  }
+  id<MTLCommandBuffer> commandBuffer = [context().queue commandBuffer];
+  if (commandBuffer == nil) {
+    if (error) *error = "metal-histogram-surface-command-buffer-failed";
+    return false;
+  }
+  if (!encodeHistogramSurfaceFromTextureSourceOnCommandBuffer(
+          commandBuffer,
+          nil,
+          rasterRequest,
+          histogramRequest,
+          sourceSurfaceId,
+          sourceSurfaceWidth,
+          sourceSurfaceHeight,
+          sourceSurfacePixelFormat,
+          outputSurfaceId,
+          outputSurfaceWidth,
+          outputSurfaceHeight,
+          outputSurfacePixelFormat,
+          error)) {
+    return false;
+  }
+  [commandBuffer commit];
+  [commandBuffer waitUntilCompleted];
+  NSError* cbError = commandBuffer.error;
+  if (cbError != nil) {
+    if (error) *error = [[cbError localizedDescription] UTF8String];
+    return false;
+  }
+  return true;
+}
+
+bool encodeHistogramSurfaceFromIOSurface(const FrameSubmission& submission,
+                                         const RasterSourceRequest& rasterRequest,
+                                         const HistogramSurfaceRequest& histogramRequest,
+                                         uint32_t sourceSurfaceId,
+                                         int sourceSurfaceWidth,
+                                         int sourceSurfaceHeight,
+                                         int sourceSurfacePixelFormat,
+                                         uint32_t outputSurfaceId,
+                                         int outputSurfaceWidth,
+                                         int outputSurfaceHeight,
+                                         int outputSurfacePixelFormat,
+                                         std::string* error) {
+  id<MTLCommandBuffer> commandBuffer = nil;
+  if (!commandBufferForFrameSubmission(submission, &commandBuffer, error)) {
+    return false;
+  }
+  if (!validatePlotSurfaceOwnerForSubmission(
+          submission, outputSurfaceId, error)) {
+    return false;
+  }
+  return encodeHistogramSurfaceFromTextureSourceOnCommandBuffer(
+      commandBuffer,
+      nil,
+      rasterRequest,
+      histogramRequest,
+      sourceSurfaceId,
+      sourceSurfaceWidth,
+      sourceSurfaceHeight,
+      sourceSurfacePixelFormat,
+      outputSurfaceId,
+      outputSurfaceWidth,
+      outputSurfaceHeight,
+      outputSurfacePixelFormat,
+      error);
+}
+#endif
+
+bool encodeHistogramSurfaceFromImportedTexture(
+    const FrameSubmission& submission,
+    const RasterSourceRequest& rasterRequest,
+    const HistogramSurfaceRequest& histogramRequest,
+    uint64_t sourceId,
+    uint32_t outputSurfaceId,
+    int outputSurfaceWidth,
+    int outputSurfaceHeight,
+    int outputSurfacePixelFormat,
+    std::string* error) {
+  id<MTLCommandBuffer> commandBuffer = nil;
+  if (!commandBufferForFrameSubmission(submission, &commandBuffer, error)) {
+    return false;
+  }
+  if (!validatePlotSurfaceOwnerForSubmission(
+          submission, outputSurfaceId, error)) {
+    return false;
+  }
+  std::shared_ptr<ImportedSourceRecord> source;
+  if (!importedSourceForFrameSubmission(
+          submission, sourceId, &source, error)) {
+    return false;
+  }
+  return encodeHistogramSurfaceFromTextureSourceOnCommandBuffer(
+      commandBuffer,
+      source->texture,
+      rasterRequest,
+      histogramRequest,
+      0,
+      source->descriptor.width,
+      source->descriptor.height,
+      source->descriptor.pixelFormat,
+      outputSurfaceId,
+      outputSurfaceWidth,
+      outputSurfaceHeight,
+      outputSurfacePixelFormat,
+      error);
+}
+
+bool encodeHistogramSurfaceFromImportedTextureCached(
+    const FrameSubmission& submission,
+    ScopeDerivedCache* cache,
+    const RasterSourceRequest& rasterRequest,
+    const HistogramSurfaceRequest& histogramRequest,
+    uint64_t sourceId,
+    uint64_t buildSerial,
+    uint32_t outputSurfaceId,
+    int outputSurfaceWidth,
+    int outputSurfaceHeight,
+    int outputSurfacePixelFormat,
+    std::string* error) {
+  if (error) error->clear();
+  if (!cache || buildSerial == 0) {
+    if (error) *error = "invalid-metal-histogram-scope-cache-request";
+    return false;
+  }
+  if (!validateResidentDerivedOwnerForSubmission(
+          submission, cache->cacheId, cache->ownerCompositorId, error)) {
+    return false;
+  }
+  id<MTLCommandBuffer> commandBuffer = nil;
+  if (!commandBufferForFrameSubmission(submission, &commandBuffer, error) ||
+      !validatePlotSurfaceOwnerForSubmission(
+          submission, outputSurfaceId, error)) {
+    return false;
+  }
+
+  ScopeDerivedResidentRecord residentRecord{};
+  std::string residentError;
+  if (resolveScopeDerivedRecordForSubmission(
+          submission, *cache, true, &residentRecord, &residentError)) {
+    if (residentRecord.family != ScopeDerivedFamily::Histogram) {
+      if (error) *error = "metal-histogram-scope-cache-family-mismatch";
+      return false;
+    }
+    return encodeHistogramSurfaceFromTextureSourceOnCommandBuffer(
+        commandBuffer,
+        nil,
+        rasterRequest,
+        histogramRequest,
+        0,
+        rasterRequest.sourceWidth,
+        rasterRequest.sourceHeight,
+        rasterRequest.pixelFormat,
+        outputSurfaceId,
+        outputSurfaceWidth,
+        outputSurfaceHeight,
+        outputSurfacePixelFormat,
+        error,
+        &residentRecord,
+        nullptr,
+        buildSerial);
+  }
+  if (!residentError.empty()) {
+    if (error) *error = residentError;
+    return false;
+  }
+
+  std::shared_ptr<ImportedSourceRecord> source;
+  if (!importedSourceForFrameSubmission(
+          submission, sourceId, &source, error)) {
+    return false;
+  }
+  ScopeDerivedResidentRecord encodedRecord{};
+  if (!encodeHistogramSurfaceFromTextureSourceOnCommandBuffer(
+          commandBuffer,
+          source->texture,
+          rasterRequest,
+          histogramRequest,
+          0,
+          source->descriptor.width,
+          source->descriptor.height,
+          source->descriptor.pixelFormat,
+          outputSurfaceId,
+          outputSurfaceWidth,
+          outputSurfaceHeight,
+          outputSurfacePixelFormat,
+          error,
+          nullptr,
+          &encodedRecord,
+          buildSerial)) {
+    return false;
+  }
+  return registerPendingScopeDerivedRecord(
+      submission, cache, std::move(encodedRecord), error);
+}
+
+static bool encodeWaveformSurfaceFromTextureSourceOnCommandBuffer(
+    id<MTLCommandBuffer> commandBuffer,
+    id<MTLTexture> importedSourceTexture,
+    const RasterSourceRequest& rasterRequest,
+    const WaveformSurfaceRequest& waveformRequest,
+    uint32_t sourceSurfaceId,
+    int sourceSurfaceWidth,
+    int sourceSurfaceHeight,
+    int sourceSurfacePixelFormat,
+    uint32_t outputSurfaceId,
+    int outputSurfaceWidth,
+    int outputSurfaceHeight,
+    int outputSurfacePixelFormat,
+    std::string* error,
+    const ScopeDerivedResidentRecord* residentRecord = nullptr,
+    ScopeDerivedResidentRecord* outEncodedRecord = nullptr,
+    uint64_t buildSerial = 0) {
+  if (error) error->clear();
+  std::string localError;
+  const int pointCount = std::max(rasterRequest.pointCount, 0);
+  const int width = std::max(waveformRequest.width, 1);
+  const int height = std::max(waveformRequest.height, 1);
+  const bool lumaOnly = waveformRequest.scopeMode == 2;
+  const bool paradeLuma = waveformRequest.scopeMode == 1 && waveformRequest.includeLuma != 0;
+  const int channelCount = lumaOnly ? 1 : (paradeLuma ? 4 : 3);
+  const size_t densityCount = static_cast<size_t>(width) *
+                              static_cast<size_t>(height) *
+                              static_cast<size_t>(channelCount);
+  const bool useResidentRecord = residentRecord != nullptr;
+#if defined(CHROMASPACE_METAL_NATIVE_ONLY)
+  if (pointCount <= 0 || (!useResidentRecord && importedSourceTexture == nil) ||
+#else
+  if (pointCount <= 0 ||
+      (!useResidentRecord && importedSourceTexture == nil && sourceSurfaceId == 0) ||
+#endif
+      outputSurfaceId == 0 ||
+      sourceSurfaceWidth <= 0 || sourceSurfaceHeight <= 0 ||
+      outputSurfaceWidth <= 0 || outputSurfaceHeight <= 0 ||
+      rasterRequest.sourceWidth <= 0 || rasterRequest.sourceHeight <= 0 ||
+      rasterRequest.sampleCountX <= 0 || sourceSurfaceWidth < rasterRequest.sourceWidth ||
+      sourceSurfaceHeight < rasterRequest.sourceHeight || densityCount == 0u) {
+    if (error) *error = "invalid-metal-waveform-surface-request";
+    return false;
+  }
+  if ((sourceSurfacePixelFormat != 0 && sourceSurfacePixelFormat != 1) ||
+      (outputSurfacePixelFormat != 0 && outputSurfacePixelFormat != 1)) {
+    if (error) *error = "unsupported-metal-waveform-surface-format";
+    return false;
+  }
+  std::shared_ptr<MetalContext> runtimeContext;
+  MetalContext* contextPointer = nullptr;
+  if (!contextForCommandBuffer(commandBuffer,
+                               &runtimeContext,
+                               &contextPointer,
+                               &localError) ||
+      contextPointer == nullptr) {
+    if (error) {
+      *error = localError.empty() ? "metal-waveform-command-buffer-invalid"
+                                  : localError;
+    }
+    return false;
+  }
+  MetalContext& ctx = *contextPointer;
+  if (ctx.waveformSurfaceRenderPipeline == nil ||
+      (waveformRequest.useGpuAutoRange != 0 &&
+       ctx.waveformApplyRangePipeline == nil) ||
+      (!useResidentRecord &&
+       (ctx.rasterScopeDensityTexturePipeline == nil ||
+        ctx.waveformMaxPipeline == nil))) {
+    if (error) {
+      *error = residentPipelineUnavailableReason(ctx, "metal-waveform-surface");
+    }
+    return false;
+  }
+
+  RasterSourceUniforms rasterUniforms{};
+  fillRasterSourceUniforms(rasterRequest, &rasterUniforms);
+  rasterUniforms.pixelFormat = sourceSurfacePixelFormat;
+  rasterUniforms.input.pointCount = pointCount;
+
+  ScopeDensityUniforms densityUniforms{};
+  densityUniforms.pointCount = pointCount;
+  densityUniforms.waveform = 1;
+  densityUniforms.scopeMode = waveformRequest.scopeMode;
+  densityUniforms.width = width;
+  densityUniforms.height = height;
+  densityUniforms.rangeMin = waveformRequest.rangeMin;
+  densityUniforms.invRange = waveformRequest.invRange;
+  densityUniforms.excludeOverflow = 1;
+  densityUniforms.onlyOverflow = 0;
+  densityUniforms.channelCount = channelCount;
+  densityUniforms.lumaMethod = std::clamp(waveformRequest.lumaMethod, 0, 3);
+  ScopeDensityUniforms overflowUniforms = densityUniforms;
+  overflowUniforms.excludeOverflow = 0;
+  overflowUniforms.onlyOverflow = 1;
+
+  WaveformSurfaceUniforms surfaceUniforms{};
+  surfaceUniforms.pointCount = pointCount;
+  surfaceUniforms.scopeMode = waveformRequest.scopeMode;
+  surfaceUniforms.width = width;
+  surfaceUniforms.height = height;
+  surfaceUniforms.rangeMin = waveformRequest.rangeMin;
+  surfaceUniforms.invRange = waveformRequest.invRange;
+  surfaceUniforms.showOverflow = waveformRequest.showOverflow != 0 ? 1 : 0;
+  surfaceUniforms.highlightOverflow = waveformRequest.highlightOverflow != 0 ? 1 : 0;
+  surfaceUniforms.lumaMethod = std::clamp(waveformRequest.lumaMethod, 0, 3);
+  surfaceUniforms.channelCount = channelCount;
+  surfaceUniforms.includeRed = waveformRequest.includeRed != 0 ? 1 : 0;
+  surfaceUniforms.includeGreen = waveformRequest.includeGreen != 0 ? 1 : 0;
+  surfaceUniforms.includeBlue = waveformRequest.includeBlue != 0 ? 1 : 0;
+  surfaceUniforms.includeLuma = waveformRequest.includeLuma != 0 ? 1 : 0;
+  surfaceUniforms.pointBrightness = std::max(0.0f, waveformRequest.pointBrightness);
+  surfaceUniforms.colorSaturation = std::max(0.0f, waveformRequest.colorSaturation);
+  surfaceUniforms.coverageAlpha = std::clamp(waveformRequest.coverageAlpha, 0.0f, 1.0f);
+
+  id<MTLTexture> outputTexture = nil;
+  {
+    std::lock_guard<std::mutex> lock(plotSurfaceMutex());
+    auto& registry = plotSurfaceRegistry();
+    auto it = registry.find(outputSurfaceId);
+    if (it != registry.end() && it->second &&
+        it->second->width == outputSurfaceWidth &&
+        it->second->height == outputSurfaceHeight &&
+        it->second->pixelFormat == outputSurfacePixelFormat &&
+        it->second->context == runtimeContext) {
+      outputTexture = it->second->texture;
+    }
+  }
+  if (outputTexture == nil) {
+    if (error) *error = "metal-waveform-output-surface-missing";
+    return false;
+  }
+
+  @autoreleasepool {
+    id<MTLTexture> sourceTexture =
+        importedSourceTexture;
+#if !defined(CHROMASPACE_METAL_NATIVE_ONLY)
+    if (!useResidentRecord && sourceTexture == nil) {
+      sourceTexture = makeTextureFromIOSurface(ctx,
+                                               sourceSurfaceId,
+                                               sourceSurfaceWidth,
+                                               sourceSurfaceHeight,
+                                               sourceSurfacePixelFormat,
+                                               &localError);
+    }
+#endif
+    id<MTLBuffer> densityBuffer =
+        useResidentRecord
+            ? residentRecord->density
+            : makeEmptySharedBuffer(
+                  ctx,
+                  static_cast<NSUInteger>(densityCount * sizeof(uint32_t)));
+    id<MTLBuffer> overflowDensityBuffer =
+        useResidentRecord
+            ? residentRecord->overflowDensity
+            : (surfaceUniforms.showOverflow != 0
+                   ? makeEmptySharedBuffer(
+                         ctx,
+                         static_cast<NSUInteger>(densityCount * sizeof(uint32_t)))
+                   : nil);
+    id<MTLBuffer> maxDensityBuffer =
+        useResidentRecord ? residentRecord->maxDensity
+                          : makeEmptySharedBuffer(ctx, sizeof(uint32_t));
+    id<MTLBuffer> rasterUniformBuffer =
+        useResidentRecord ? nil : makeSharedBuffer(ctx, &rasterUniforms, 1u);
+    id<MTLBuffer> densityUniformBuffer =
+        (!useResidentRecord || waveformRequest.useGpuAutoRange != 0)
+            ? makeSharedBuffer(ctx, &densityUniforms, 1u)
+            : nil;
+    id<MTLBuffer> overflowUniformBuffer =
+        (!useResidentRecord || waveformRequest.useGpuAutoRange != 0)
+            ? makeSharedBuffer(ctx, &overflowUniforms, 1u)
+            : nil;
+    id<MTLBuffer> surfaceUniformBuffer =
+        makeSharedBuffer(ctx, &surfaceUniforms, 1u);
+    if ((!useResidentRecord &&
+         (sourceTexture == nil || rasterUniformBuffer == nil)) ||
+        (waveformRequest.useGpuAutoRange != 0 &&
+         (densityUniformBuffer == nil || overflowUniformBuffer == nil)) ||
+        densityBuffer == nil || maxDensityBuffer == nil ||
+        surfaceUniformBuffer == nil ||
+        (useResidentRecord && waveformRequest.useGpuAutoRange != 0 &&
+         residentRecord->finalRange == nil) ||
+        (surfaceUniforms.showOverflow != 0 && overflowDensityBuffer == nil)) {
+      if (error) {
+        *error = localError.empty() ? "metal-waveform-surface-allocation-failed" : localError;
+      }
+      return false;
+    }
+    if (!useResidentRecord) {
+      clearSharedBuffer(densityBuffer);
+      clearSharedBuffer(maxDensityBuffer);
+      if (overflowDensityBuffer != nil) clearSharedBuffer(overflowDensityBuffer);
+    }
+
+    if (commandBuffer == nil) {
+      if (error) *error = "metal-waveform-surface-command-buffer-failed";
+      return false;
+    }
+    id<MTLBuffer> finalRangeBuffer =
+        useResidentRecord ? residentRecord->finalRange : nil;
+    if (waveformRequest.useGpuAutoRange != 0) {
+      if (!useResidentRecord) {
+        ScopeRangeRequest autoRangeRequest = waveformRequest.autoRange;
+        autoRangeRequest.pointCount = pointCount;
+        autoRangeRequest.waveform = 1;
+        autoRangeRequest.scopeMode = waveformRequest.scopeMode;
+        autoRangeRequest.includeOverflow = waveformRequest.showOverflow != 0 ? 1 : 0;
+        autoRangeRequest.lumaMethod = std::clamp(waveformRequest.lumaMethod, 0, 3);
+        if (!encodeScopeRangeOnCommandBuffer(commandBuffer,
+                                             sourceTexture,
+                                             rasterUniformBuffer,
+                                             pointCount,
+                                             autoRangeRequest,
+                                             &finalRangeBuffer,
+                                             &localError)) {
+          if (error) {
+            *error = localError.empty()
+                         ? "metal-waveform-auto-range-encode-failed"
+                         : localError;
+          }
+          return false;
+        }
+      }
+      id<MTLComputeCommandEncoder> applyRangeEncoder = [commandBuffer computeCommandEncoder];
+      if (applyRangeEncoder == nil) {
+        if (error) *error = "metal-waveform-apply-range-encoder-failed";
+        return false;
+      }
+      [applyRangeEncoder setComputePipelineState:ctx.waveformApplyRangePipeline];
+      [applyRangeEncoder setBuffer:finalRangeBuffer offset:0 atIndex:0];
+      [applyRangeEncoder setBuffer:densityUniformBuffer offset:0 atIndex:1];
+      [applyRangeEncoder setBuffer:overflowUniformBuffer offset:0 atIndex:2];
+      [applyRangeEncoder setBuffer:surfaceUniformBuffer offset:0 atIndex:3];
+      [applyRangeEncoder dispatchThreads:MTLSizeMake(1, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+      [applyRangeEncoder endEncoding];
+    }
+    auto dispatchPointKernel = [&](id<MTLBuffer> targetDensity,
+                                   id<MTLBuffer> uniformsBuffer) -> bool {
+      if (uniformsBuffer == nil) return false;
+      id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
+      if (encoder == nil) return false;
+      [encoder setComputePipelineState:ctx.rasterScopeDensityTexturePipeline];
+      [encoder setTexture:sourceTexture atIndex:0];
+      [encoder setBuffer:targetDensity offset:0 atIndex:0];
+      [encoder setBuffer:rasterUniformBuffer offset:0 atIndex:1];
+      [encoder setBuffer:uniformsBuffer offset:0 atIndex:2];
+      NSUInteger threads = ctx.rasterScopeDensityTexturePipeline.maxTotalThreadsPerThreadgroup;
+      if (threads == 0) threads = 64;
+      threads = std::min<NSUInteger>(threads, 256);
+      [encoder dispatchThreads:MTLSizeMake(static_cast<NSUInteger>(pointCount), 1, 1)
+         threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
+      [encoder endEncoding];
+      return true;
+    };
+
+    if (!useResidentRecord) {
+      if (!dispatchPointKernel(densityBuffer, densityUniformBuffer)) {
+        if (error) *error = "metal-waveform-density-encoder-failed";
+        return false;
+      }
+      if (overflowDensityBuffer != nil) {
+        if (!dispatchPointKernel(overflowDensityBuffer, overflowUniformBuffer)) {
+          if (error) *error = "metal-waveform-overflow-density-encoder-failed";
+          return false;
+        }
+      }
+
+      id<MTLComputeCommandEncoder> maxEncoder = [commandBuffer computeCommandEncoder];
+      if (maxEncoder == nil) {
+        if (error) *error = "metal-waveform-max-encoder-failed";
+        return false;
+      }
+      [maxEncoder setComputePipelineState:ctx.waveformMaxPipeline];
+      [maxEncoder setBuffer:densityBuffer offset:0 atIndex:0];
+      [maxEncoder setBuffer:maxDensityBuffer offset:0 atIndex:1];
+      [maxEncoder setBuffer:surfaceUniformBuffer offset:0 atIndex:2];
+      NSUInteger maxThreads = ctx.waveformMaxPipeline.maxTotalThreadsPerThreadgroup;
+      if (maxThreads == 0) maxThreads = 64;
+      maxThreads = std::min<NSUInteger>(maxThreads, 256);
+      [maxEncoder dispatchThreads:MTLSizeMake(static_cast<NSUInteger>(densityCount), 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(maxThreads, 1, 1)];
+      [maxEncoder endEncoding];
+
+      if (outEncodedRecord != nullptr) {
+        if (buildSerial == 0) {
+          if (error) *error = "metal-waveform-cache-build-serial-invalid";
+          return false;
+        }
+        ScopeDerivedResidentRecord record{};
+        record.family = ScopeDerivedFamily::Waveform;
+        record.builtSerial = buildSerial;
+        record.density = densityBuffer;
+        record.overflowDensity = overflowDensityBuffer;
+        record.maxDensity = maxDensityBuffer;
+        record.finalRange = finalRangeBuffer;
+        record.byteSize = static_cast<size_t>([densityBuffer length]) +
+                          static_cast<size_t>([maxDensityBuffer length]) +
+                          (overflowDensityBuffer != nil
+                               ? static_cast<size_t>([overflowDensityBuffer length])
+                               : 0u) +
+                          (finalRangeBuffer != nil
+                               ? static_cast<size_t>([finalRangeBuffer length])
+                               : 0u);
+        *outEncodedRecord = std::move(record);
+      }
+    }
+
+    id<MTLComputeCommandEncoder> renderEncoder = [commandBuffer computeCommandEncoder];
+    if (renderEncoder == nil) {
+      if (error) *error = "metal-waveform-render-encoder-failed";
+      return false;
+    }
+    [renderEncoder setComputePipelineState:ctx.waveformSurfaceRenderPipeline];
+    [renderEncoder setTexture:outputTexture atIndex:0];
+    [renderEncoder setBuffer:densityBuffer offset:0 atIndex:0];
+    [renderEncoder setBuffer:overflowDensityBuffer offset:0 atIndex:1];
+    [renderEncoder setBuffer:maxDensityBuffer offset:0 atIndex:2];
+    [renderEncoder setBuffer:surfaceUniformBuffer offset:0 atIndex:3];
+    NSUInteger groupWidth = ctx.waveformSurfaceRenderPipeline.threadExecutionWidth;
+    if (groupWidth == 0) groupWidth = 16;
+    NSUInteger groupHeight = std::max<NSUInteger>(
+        1, std::min<NSUInteger>(16, ctx.waveformSurfaceRenderPipeline.maxTotalThreadsPerThreadgroup / groupWidth));
+    [renderEncoder dispatchThreads:MTLSizeMake(static_cast<NSUInteger>(outputSurfaceWidth),
+                                               static_cast<NSUInteger>(outputSurfaceHeight),
+                                               1)
+              threadsPerThreadgroup:MTLSizeMake(groupWidth, groupHeight, 1)];
+    [renderEncoder endEncoding];
+
+  }
+  return true;
+}
+
+#if !defined(CHROMASPACE_METAL_NATIVE_ONLY)
+bool renderWaveformSurfaceFromIOSurface(const RasterSourceRequest& rasterRequest,
+                                        const WaveformSurfaceRequest& waveformRequest,
+                                        uint32_t sourceSurfaceId,
+                                        int sourceSurfaceWidth,
+                                        int sourceSurfaceHeight,
+                                        int sourceSurfacePixelFormat,
+                                        uint32_t outputSurfaceId,
+                                        int outputSurfaceWidth,
+                                        int outputSurfaceHeight,
+                                        int outputSurfacePixelFormat,
+                                        std::string* error) {
+  std::string localError;
+  if (!ensureContext(&localError)) {
+    if (error) *error = localError.empty() ? "metal-context-unavailable" : localError;
+    return false;
+  }
+  id<MTLCommandBuffer> commandBuffer = [context().queue commandBuffer];
+  if (commandBuffer == nil) {
+    if (error) *error = "metal-waveform-surface-command-buffer-failed";
+    return false;
+  }
+  if (!encodeWaveformSurfaceFromTextureSourceOnCommandBuffer(
+          commandBuffer,
+          nil,
+          rasterRequest,
+          waveformRequest,
+          sourceSurfaceId,
+          sourceSurfaceWidth,
+          sourceSurfaceHeight,
+          sourceSurfacePixelFormat,
+          outputSurfaceId,
+          outputSurfaceWidth,
+          outputSurfaceHeight,
+          outputSurfacePixelFormat,
+          error)) {
+    return false;
+  }
+  [commandBuffer commit];
+  [commandBuffer waitUntilCompleted];
+  NSError* cbError = commandBuffer.error;
+  if (cbError != nil) {
+    if (error) *error = [[cbError localizedDescription] UTF8String];
+    return false;
+  }
+  return true;
+}
+
+bool encodeWaveformSurfaceFromIOSurface(const FrameSubmission& submission,
+                                        const RasterSourceRequest& rasterRequest,
+                                        const WaveformSurfaceRequest& waveformRequest,
+                                        uint32_t sourceSurfaceId,
+                                        int sourceSurfaceWidth,
+                                        int sourceSurfaceHeight,
+                                        int sourceSurfacePixelFormat,
+                                        uint32_t outputSurfaceId,
+                                        int outputSurfaceWidth,
+                                        int outputSurfaceHeight,
+                                        int outputSurfacePixelFormat,
+                                        std::string* error) {
+  id<MTLCommandBuffer> commandBuffer = nil;
+  if (!commandBufferForFrameSubmission(submission, &commandBuffer, error)) {
+    return false;
+  }
+  if (!validatePlotSurfaceOwnerForSubmission(
+          submission, outputSurfaceId, error)) {
+    return false;
+  }
+  return encodeWaveformSurfaceFromTextureSourceOnCommandBuffer(
+      commandBuffer,
+      nil,
+      rasterRequest,
+      waveformRequest,
+      sourceSurfaceId,
+      sourceSurfaceWidth,
+      sourceSurfaceHeight,
+      sourceSurfacePixelFormat,
+      outputSurfaceId,
+      outputSurfaceWidth,
+      outputSurfaceHeight,
+      outputSurfacePixelFormat,
+      error);
+}
+#endif
+
+bool encodeWaveformSurfaceFromImportedTexture(
+    const FrameSubmission& submission,
+    const RasterSourceRequest& rasterRequest,
+    const WaveformSurfaceRequest& waveformRequest,
+    uint64_t sourceId,
+    uint32_t outputSurfaceId,
+    int outputSurfaceWidth,
+    int outputSurfaceHeight,
+    int outputSurfacePixelFormat,
+    std::string* error) {
+  id<MTLCommandBuffer> commandBuffer = nil;
+  if (!commandBufferForFrameSubmission(submission, &commandBuffer, error)) {
+    return false;
+  }
+  if (!validatePlotSurfaceOwnerForSubmission(
+          submission, outputSurfaceId, error)) {
+    return false;
+  }
+  std::shared_ptr<ImportedSourceRecord> source;
+  if (!importedSourceForFrameSubmission(
+          submission, sourceId, &source, error)) {
+    return false;
+  }
+  return encodeWaveformSurfaceFromTextureSourceOnCommandBuffer(
+      commandBuffer,
+      source->texture,
+      rasterRequest,
+      waveformRequest,
+      0,
+      source->descriptor.width,
+      source->descriptor.height,
+      source->descriptor.pixelFormat,
+      outputSurfaceId,
+      outputSurfaceWidth,
+      outputSurfaceHeight,
+      outputSurfacePixelFormat,
+      error);
+}
+
+bool encodeWaveformSurfaceFromImportedTextureCached(
+    const FrameSubmission& submission,
+    ScopeDerivedCache* cache,
+    const RasterSourceRequest& rasterRequest,
+    const WaveformSurfaceRequest& waveformRequest,
+    uint64_t sourceId,
+    uint64_t buildSerial,
+    uint32_t outputSurfaceId,
+    int outputSurfaceWidth,
+    int outputSurfaceHeight,
+    int outputSurfacePixelFormat,
+    std::string* error) {
+  if (error) error->clear();
+  if (!cache || buildSerial == 0) {
+    if (error) *error = "invalid-metal-waveform-scope-cache-request";
+    return false;
+  }
+  if (!validateResidentDerivedOwnerForSubmission(
+          submission, cache->cacheId, cache->ownerCompositorId, error)) {
+    return false;
+  }
+  id<MTLCommandBuffer> commandBuffer = nil;
+  if (!commandBufferForFrameSubmission(submission, &commandBuffer, error) ||
+      !validatePlotSurfaceOwnerForSubmission(
+          submission, outputSurfaceId, error)) {
+    return false;
+  }
+
+  ScopeDerivedResidentRecord residentRecord{};
+  std::string residentError;
+  if (resolveScopeDerivedRecordForSubmission(
+          submission, *cache, true, &residentRecord, &residentError)) {
+    if (residentRecord.family != ScopeDerivedFamily::Waveform) {
+      if (error) *error = "metal-waveform-scope-cache-family-mismatch";
+      return false;
+    }
+    return encodeWaveformSurfaceFromTextureSourceOnCommandBuffer(
+        commandBuffer,
+        nil,
+        rasterRequest,
+        waveformRequest,
+        0,
+        rasterRequest.sourceWidth,
+        rasterRequest.sourceHeight,
+        rasterRequest.pixelFormat,
+        outputSurfaceId,
+        outputSurfaceWidth,
+        outputSurfaceHeight,
+        outputSurfacePixelFormat,
+        error,
+        &residentRecord,
+        nullptr,
+        buildSerial);
+  }
+  if (!residentError.empty()) {
+    if (error) *error = residentError;
+    return false;
+  }
+
+  std::shared_ptr<ImportedSourceRecord> source;
+  if (!importedSourceForFrameSubmission(
+          submission, sourceId, &source, error)) {
+    return false;
+  }
+  ScopeDerivedResidentRecord encodedRecord{};
+  if (!encodeWaveformSurfaceFromTextureSourceOnCommandBuffer(
+          commandBuffer,
+          source->texture,
+          rasterRequest,
+          waveformRequest,
+          0,
+          source->descriptor.width,
+          source->descriptor.height,
+          source->descriptor.pixelFormat,
+          outputSurfaceId,
+          outputSurfaceWidth,
+          outputSurfaceHeight,
+          outputSurfacePixelFormat,
+          error,
+          nullptr,
+          &encodedRecord,
+          buildSerial)) {
+    return false;
+  }
+  return registerPendingScopeDerivedRecord(
+      submission, cache, std::move(encodedRecord), error);
+}
+
+#if !defined(CHROMASPACE_METAL_NATIVE_ONLY)
 bool buildGlossField(const GlossFieldRequest& request,
                      const std::vector<float>& packedPoints,
                      bool allowReadback,
@@ -5516,41 +8691,61 @@ bool buildGlossField(const GlossFieldRequest& request,
   }
   return true;
 }
+#endif
 
-bool buildGlossFieldFromIOSurface(GlossFieldCache* cache,
-                                  const RasterSourceRequest& rasterRequest,
-                                  const GlossFieldRequest& fieldRequest,
-                                  uint32_t surfaceId,
-                                  int surfaceWidth,
-                                  int surfaceHeight,
-                                  int surfacePixelFormat,
-                                  uint64_t buildSerial,
-                                  std::string* error) {
+static bool encodeGlossFieldFromTextureSourceOnCommandBuffer(
+    id<MTLCommandBuffer> commandBuffer,
+    id<MTLTexture> importedSourceTexture,
+    const RasterSourceRequest& rasterRequest,
+    const GlossFieldRequest& fieldRequest,
+    uint32_t surfaceId,
+    int surfaceWidth,
+    int surfaceHeight,
+    int surfacePixelFormat,
+    uint64_t buildSerial,
+    GlossFieldResidentRecord* outRecord,
+    std::string* error) {
   if (error) error->clear();
-  if (!cache) {
-    if (error) *error = "missing-metal-gloss-field-cache";
+  if (!outRecord) {
+    if (error) *error = "missing-metal-gloss-field-record";
     return false;
   }
+  *outRecord = GlossFieldResidentRecord{};
   std::string localError;
-  if (!ensureContext(&localError)) {
-    if (error) *error = localError.empty() ? "metal-context-unavailable" : localError;
-    return false;
-  }
   const int pointCount = std::max(rasterRequest.pointCount, 0);
   const int gridWidth = std::max(fieldRequest.gridWidth, 1);
   const int gridHeight = std::max(fieldRequest.gridHeight, 1);
   const NSUInteger cellCount =
       static_cast<NSUInteger>(gridWidth) * static_cast<NSUInteger>(gridHeight);
-  if (pointCount <= 0 || cellCount == 0u || surfaceId == 0 ||
+#if defined(CHROMASPACE_METAL_NATIVE_ONLY)
+  if (pointCount <= 0 || cellCount == 0u || importedSourceTexture == nil ||
+#else
+  if (pointCount <= 0 || cellCount == 0u ||
+      (importedSourceTexture == nil && surfaceId == 0) ||
+#endif
+      commandBuffer == nil ||
       surfaceWidth <= 0 || surfaceHeight <= 0 ||
       rasterRequest.sourceWidth <= 0 || rasterRequest.sourceHeight <= 0 ||
       rasterRequest.sampleCountX <= 0 || surfaceWidth < rasterRequest.sourceWidth ||
       surfaceHeight < rasterRequest.sourceHeight ||
       (surfacePixelFormat != 0 && surfacePixelFormat != 1)) {
-    if (error) *error = "invalid-metal-iosurface-gloss-field-request";
+    if (error) *error = "invalid-metal-texture-gloss-field-request";
     return false;
   }
-  MetalContext& ctx = context();
+  std::shared_ptr<MetalContext> runtimeContext;
+  MetalContext* contextPointer = nullptr;
+  if (!contextForCommandBuffer(commandBuffer,
+                               &runtimeContext,
+                               &contextPointer,
+                               &localError) ||
+      contextPointer == nullptr) {
+    if (error) {
+      *error = localError.empty() ? "metal-gloss-field-command-buffer-invalid"
+                                  : localError;
+    }
+    return false;
+  }
+  MetalContext& ctx = *contextPointer;
   if (ctx.rasterGlossFieldAccumulateTexturePipeline == nil ||
       ctx.glossFieldFinalizePipeline == nil ||
       ctx.glossFieldMaxPipeline == nil ||
@@ -5564,7 +8759,9 @@ bool buildGlossFieldFromIOSurface(GlossFieldCache* cache,
       ctx.glossFieldLocalPercentilePipeline == nil ||
       ctx.glossFieldCandidate2RawPipeline == nil ||
       ctx.glossFieldAssembleUnifiedPipeline == nil) {
-    if (error) *error = residentPipelineUnavailableReason("metal-iosurface-gloss-field");
+    if (error) {
+      *error = residentPipelineUnavailableReason(ctx, "metal-texture-gloss-field");
+    }
     return false;
   }
 
@@ -5592,59 +8789,107 @@ bool buildGlossFieldFromIOSurface(GlossFieldCache* cache,
 
   @autoreleasepool {
     id<MTLTexture> sourceTexture =
-        makeTextureFromIOSurface(ctx, surfaceId, surfaceWidth, surfaceHeight, surfacePixelFormat, &localError);
-    id<MTLBuffer> occupancyCountsBuffer = makeEmptyPrivateBuffer(cellCount * sizeof(uint32_t));
-    id<MTLBuffer> sumRBuffer = makeEmptyPrivateBuffer(cellCount * sizeof(uint32_t));
-    id<MTLBuffer> sumGBuffer = makeEmptyPrivateBuffer(cellCount * sizeof(uint32_t));
-    id<MTLBuffer> sumBBuffer = makeEmptyPrivateBuffer(cellCount * sizeof(uint32_t));
-    id<MTLBuffer> sumYBuffer = makeEmptyPrivateBuffer(cellCount * sizeof(uint32_t));
-    id<MTLBuffer> sumMaxBuffer = makeEmptyPrivateBuffer(cellCount * sizeof(uint32_t));
-    id<MTLBuffer> sumMinBuffer = makeEmptyPrivateBuffer(cellCount * sizeof(uint32_t));
-    id<MTLBuffer> sumNeutralityBuffer = makeEmptyPrivateBuffer(cellCount * sizeof(uint32_t));
-    id<MTLBuffer> occupancyBuffer = makeEmptyPrivateBuffer(cellCount * sizeof(float));
-    id<MTLBuffer> meanRBuffer = makeEmptyPrivateBuffer(cellCount * sizeof(float));
-    id<MTLBuffer> meanGBuffer = makeEmptyPrivateBuffer(cellCount * sizeof(float));
-    id<MTLBuffer> meanBBuffer = makeEmptyPrivateBuffer(cellCount * sizeof(float));
-    id<MTLBuffer> carrierYBuffer = makeEmptyPrivateBuffer(cellCount * sizeof(float));
-    id<MTLBuffer> carrierMaxBuffer = makeEmptyPrivateBuffer(cellCount * sizeof(float));
-    id<MTLBuffer> carrierMinBuffer = makeEmptyPrivateBuffer(cellCount * sizeof(float));
-    id<MTLBuffer> neutralityBuffer = makeEmptyPrivateBuffer(cellCount * sizeof(float));
-    id<MTLBuffer> occupancyNormBuffer = makeEmptyPrivateBuffer(cellCount * sizeof(float));
-    id<MTLBuffer> tempBuffer = makeEmptyPrivateBuffer(cellCount * sizeof(float));
-    id<MTLBuffer> bodyBuffer = makeEmptyPrivateBuffer(cellCount * sizeof(float));
-    id<MTLBuffer> viewerBodyRawBuffer = makeEmptyPrivateBuffer(cellCount * sizeof(float));
-    id<MTLBuffer> rawSignalBuffer = makeEmptyPrivateBuffer(cellCount * sizeof(float));
-    id<MTLBuffer> positiveBuffer = makeEmptyPrivateBuffer(cellCount * sizeof(float));
-    id<MTLBuffer> negativeBuffer = makeEmptyPrivateBuffer(cellCount * sizeof(float));
-    id<MTLBuffer> boundaryBuffer = makeEmptyPrivateBuffer(cellCount * sizeof(float));
-    id<MTLBuffer> congruenceBuffer = makeEmptyPrivateBuffer(cellCount * sizeof(float));
-    id<MTLBuffer> confidenceBuffer = makeEmptyPrivateBuffer(cellCount * sizeof(float));
-    id<MTLBuffer> signalBuffer = makeEmptyPrivateBuffer(cellCount * sizeof(float));
-    id<MTLBuffer> bodyCoreBuffer = makeEmptyPrivateBuffer(cellCount * sizeof(float));
-    id<MTLBuffer> bodyContextBuffer = makeEmptyPrivateBuffer(cellCount * sizeof(float));
-    id<MTLBuffer> retinexBodyBuffer = makeEmptyPrivateBuffer(cellCount * sizeof(float));
-    id<MTLBuffer> dogLowBuffer = makeEmptyPrivateBuffer(cellCount * sizeof(float));
-    id<MTLBuffer> body2RawBuffer = makeEmptyPrivateBuffer(cellCount * sizeof(float));
-    id<MTLBuffer> positive2RawBuffer = makeEmptyPrivateBuffer(cellCount * sizeof(float));
-    id<MTLBuffer> negative2RawBuffer = makeEmptyPrivateBuffer(cellCount * sizeof(float));
-    id<MTLBuffer> confidence2RawBuffer = makeEmptyPrivateBuffer(cellCount * sizeof(float));
-    id<MTLBuffer> agreement2RawBuffer = makeEmptyPrivateBuffer(cellCount * sizeof(float));
-    id<MTLBuffer> body2Buffer = makeEmptyPrivateBuffer(cellCount * sizeof(float));
-    id<MTLBuffer> positive2Buffer = makeEmptyPrivateBuffer(cellCount * sizeof(float));
-    id<MTLBuffer> negative2Buffer = makeEmptyPrivateBuffer(cellCount * sizeof(float));
-    id<MTLBuffer> boundary2Buffer = makeEmptyPrivateBuffer(cellCount * sizeof(float));
-    id<MTLBuffer> congruence2Buffer = makeEmptyPrivateBuffer(cellCount * sizeof(float));
-    id<MTLBuffer> confidence2Buffer = makeEmptyPrivateBuffer(cellCount * sizeof(float));
-    id<MTLBuffer> signal2Buffer = makeEmptyPrivateBuffer(cellCount * sizeof(float));
-    id<MTLBuffer> bodyReductionBuffer = makeEmptyPrivateBuffer(4u * sizeof(uint32_t));
-    id<MTLBuffer> weightedReductionBuffer = makeEmptyPrivateBuffer(4u * sizeof(uint32_t));
-    id<MTLBuffer> finalReductionBuffer = makeEmptyPrivateBuffer(4u * sizeof(uint32_t));
-    id<MTLBuffer> candidate2ReductionBuffer = makeEmptyPrivateBuffer(4u * sizeof(uint32_t));
-    id<MTLBuffer> rasterUniformBuffer = makeSharedBuffer(&rasterUniforms, 1u);
-    id<MTLBuffer> accumulateUniformBuffer = makeSharedBuffer(&accumulateUniforms, 1u);
-    id<MTLBuffer> cellUniformBuffer = makeSharedBuffer(&cellUniforms, 1u);
-    id<MTLBuffer> percentile50Buffer = makeSharedBuffer(&percentile50, 1u);
-    id<MTLBuffer> percentile35Buffer = makeSharedBuffer(&percentile35, 1u);
+        importedSourceTexture;
+#if !defined(CHROMASPACE_METAL_NATIVE_ONLY)
+    if (sourceTexture == nil) {
+      sourceTexture = makeTextureFromIOSurface(ctx,
+                                               surfaceId,
+                                               surfaceWidth,
+                                               surfaceHeight,
+                                               surfacePixelFormat,
+                                               &localError);
+    }
+#endif
+    const auto makeTransientCellUint = [&]() -> id<MTLBuffer> {
+      return makeSubmissionTransientPrivateBuffer(
+          commandBuffer, cellCount * sizeof(uint32_t), &localError);
+    };
+    const auto makeTransientCellFloat = [&]() -> id<MTLBuffer> {
+      return makeSubmissionTransientPrivateBuffer(
+          commandBuffer, cellCount * sizeof(float), &localError);
+    };
+    const auto makeTransientReduction = [&]() -> id<MTLBuffer> {
+      return makeSubmissionTransientPrivateBuffer(
+          commandBuffer, 4u * sizeof(uint32_t), &localError);
+    };
+    id<MTLBuffer> occupancyCountsBuffer = makeTransientCellUint();
+    id<MTLBuffer> sumRBuffer = makeTransientCellUint();
+    id<MTLBuffer> sumGBuffer = makeTransientCellUint();
+    id<MTLBuffer> sumBBuffer = makeTransientCellUint();
+    id<MTLBuffer> sumYBuffer = makeTransientCellUint();
+    id<MTLBuffer> sumMaxBuffer = makeTransientCellUint();
+    id<MTLBuffer> sumMinBuffer = makeTransientCellUint();
+    id<MTLBuffer> sumNeutralityBuffer = makeTransientCellUint();
+    id<MTLBuffer> occupancyBuffer = makeTransientCellFloat();
+    id<MTLBuffer> meanRBuffer =
+        makeEmptyPrivateBuffer(ctx, cellCount * sizeof(float));
+    id<MTLBuffer> meanGBuffer =
+        makeEmptyPrivateBuffer(ctx, cellCount * sizeof(float));
+    id<MTLBuffer> meanBBuffer =
+        makeEmptyPrivateBuffer(ctx, cellCount * sizeof(float));
+    id<MTLBuffer> carrierYBuffer =
+        makeEmptyPrivateBuffer(ctx, cellCount * sizeof(float));
+    id<MTLBuffer> carrierMaxBuffer =
+        makeEmptyPrivateBuffer(ctx, cellCount * sizeof(float));
+    id<MTLBuffer> carrierMinBuffer =
+        makeEmptyPrivateBuffer(ctx, cellCount * sizeof(float));
+    id<MTLBuffer> neutralityBuffer =
+        makeEmptyPrivateBuffer(ctx, cellCount * sizeof(float));
+    id<MTLBuffer> occupancyNormBuffer = makeTransientCellFloat();
+    id<MTLBuffer> tempBuffer = makeTransientCellFloat();
+    id<MTLBuffer> bodyBuffer =
+        makeEmptyPrivateBuffer(ctx, cellCount * sizeof(float));
+    id<MTLBuffer> viewerBodyRawBuffer = makeTransientCellFloat();
+    id<MTLBuffer> rawSignalBuffer = makeTransientCellFloat();
+    id<MTLBuffer> positiveBuffer =
+        makeEmptyPrivateBuffer(ctx, cellCount * sizeof(float));
+    id<MTLBuffer> negativeBuffer =
+        makeEmptyPrivateBuffer(ctx, cellCount * sizeof(float));
+    id<MTLBuffer> boundaryBuffer =
+        makeEmptyPrivateBuffer(ctx, cellCount * sizeof(float));
+    id<MTLBuffer> congruenceBuffer =
+        makeEmptyPrivateBuffer(ctx, cellCount * sizeof(float));
+    id<MTLBuffer> confidenceBuffer =
+        makeEmptyPrivateBuffer(ctx, cellCount * sizeof(float));
+    id<MTLBuffer> signalBuffer =
+        makeEmptyPrivateBuffer(ctx, cellCount * sizeof(float));
+    id<MTLBuffer> bodyCoreBuffer = makeTransientCellFloat();
+    id<MTLBuffer> bodyContextBuffer = makeTransientCellFloat();
+    id<MTLBuffer> retinexBodyBuffer = makeTransientCellFloat();
+    id<MTLBuffer> dogLowBuffer = makeTransientCellFloat();
+    id<MTLBuffer> body2RawBuffer = makeTransientCellFloat();
+    id<MTLBuffer> positive2RawBuffer = makeTransientCellFloat();
+    id<MTLBuffer> negative2RawBuffer = makeTransientCellFloat();
+    id<MTLBuffer> confidence2RawBuffer = makeTransientCellFloat();
+    id<MTLBuffer> agreement2RawBuffer = makeTransientCellFloat();
+    id<MTLBuffer> body2Buffer =
+        makeEmptyPrivateBuffer(ctx, cellCount * sizeof(float));
+    id<MTLBuffer> positive2Buffer =
+        makeEmptyPrivateBuffer(ctx, cellCount * sizeof(float));
+    id<MTLBuffer> negative2Buffer =
+        makeEmptyPrivateBuffer(ctx, cellCount * sizeof(float));
+    id<MTLBuffer> boundary2Buffer =
+        makeEmptyPrivateBuffer(ctx, cellCount * sizeof(float));
+    id<MTLBuffer> congruence2Buffer =
+        makeEmptyPrivateBuffer(ctx, cellCount * sizeof(float));
+    id<MTLBuffer> confidence2Buffer =
+        makeEmptyPrivateBuffer(ctx, cellCount * sizeof(float));
+    id<MTLBuffer> signal2Buffer =
+        makeEmptyPrivateBuffer(ctx, cellCount * sizeof(float));
+    id<MTLBuffer> bodyReductionBuffer = makeTransientReduction();
+    id<MTLBuffer> weightedReductionBuffer = makeTransientReduction();
+    id<MTLBuffer> finalReductionBuffer = makeTransientReduction();
+    id<MTLBuffer> candidate2ReductionBuffer = makeTransientReduction();
+    id<MTLBuffer> rasterUniformBuffer =
+        makeSharedBuffer(ctx, &rasterUniforms, 1u);
+    id<MTLBuffer> accumulateUniformBuffer =
+        makeSharedBuffer(ctx, &accumulateUniforms, 1u);
+    id<MTLBuffer> cellUniformBuffer =
+        makeSharedBuffer(ctx, &cellUniforms, 1u);
+    id<MTLBuffer> percentile50Buffer =
+        makeSharedBuffer(ctx, &percentile50, 1u);
+    id<MTLBuffer> percentile35Buffer =
+        makeSharedBuffer(ctx, &percentile35, 1u);
     if (sourceTexture == nil || occupancyCountsBuffer == nil || sumRBuffer == nil ||
         sumGBuffer == nil || sumBBuffer == nil || sumYBuffer == nil || sumMaxBuffer == nil ||
         sumMinBuffer == nil || sumNeutralityBuffer == nil || occupancyBuffer == nil ||
@@ -5666,6 +8911,32 @@ bool buildGlossFieldFromIOSurface(GlossFieldCache* cache,
       if (error) *error = localError.empty() ? "metal-iosurface-gloss-field-allocation-failed" : localError;
       return false;
     }
+    const auto encodeCompute =
+        [&](id<MTLComputePipelineState> pipeline,
+            const auto& buffers,
+            NSUInteger threadCount,
+            std::string* encodeError) -> bool {
+      return encodeComputeBuffersOnCommandBuffer(commandBuffer,
+                                                  pipeline,
+                                                  buffers,
+                                                  threadCount,
+                                                  encodeError);
+    };
+    const auto encodeClear =
+        [&](id<MTLBuffer> buffer, std::string* encodeError) -> bool {
+      return encodeBufferClearOnCommandBuffer(commandBuffer, buffer, encodeError);
+    };
+    const auto encodeCopy =
+        [&](id<MTLBuffer> src,
+            id<MTLBuffer> dst,
+            NSUInteger bytes,
+            std::string* encodeError) -> bool {
+      return encodeBufferCopyOnCommandBuffer(commandBuffer,
+                                              src,
+                                              dst,
+                                              bytes,
+                                              encodeError);
+    };
     const std::array<id<MTLBuffer>, 47> buffersToClear = {
         occupancyCountsBuffer, sumRBuffer, sumGBuffer, sumBBuffer, sumYBuffer,
         sumMaxBuffer, sumMinBuffer, sumNeutralityBuffer, occupancyBuffer, meanRBuffer,
@@ -5677,18 +8948,21 @@ bool buildGlossFieldFromIOSurface(GlossFieldCache* cache,
         agreement2RawBuffer, body2Buffer, positive2Buffer, negative2Buffer, boundary2Buffer,
         congruence2Buffer, confidence2Buffer, signal2Buffer, bodyReductionBuffer,
         weightedReductionBuffer, finalReductionBuffer, candidate2ReductionBuffer};
-    for (id<MTLBuffer> buffer : buffersToClear) {
-      if (buffer != nil && !clearBufferOnDevice(buffer, &localError)) {
-        if (error) *error = localError;
-        return false;
-      }
-    }
-
-    id<MTLCommandBuffer> commandBuffer = [ctx.queue commandBuffer];
-    if (commandBuffer == nil) {
-      if (error) *error = "metal-iosurface-gloss-field-command-buffer-failed";
+    id<MTLBlitCommandEncoder> initialClearEncoder =
+        [commandBuffer blitCommandEncoder];
+    if (initialClearEncoder == nil) {
+      if (error) *error = "metal-iosurface-gloss-field-clear-encoder-failed";
       return false;
     }
+    for (id<MTLBuffer> buffer : buffersToClear) {
+      if (buffer != nil) {
+        [initialClearEncoder fillBuffer:buffer
+                                  range:NSMakeRange(0, [buffer length])
+                                  value:0];
+      }
+    }
+    [initialClearEncoder endEncoding];
+
     id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
     if (encoder == nil) {
       if (error) *error = "metal-iosurface-gloss-field-accumulate-encoder-failed";
@@ -5712,24 +8986,23 @@ bool buildGlossFieldFromIOSurface(GlossFieldCache* cache,
     [encoder dispatchThreads:MTLSizeMake(static_cast<NSUInteger>(pointCount), 1, 1)
        threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
     [encoder endEncoding];
-    [commandBuffer commit];
-    [commandBuffer waitUntilCompleted];
-    NSError* cbError = commandBuffer.error;
-    if (cbError != nil) {
-      if (error) *error = [[cbError localizedDescription] UTF8String];
-      return false;
-    }
 
     const auto clearBodyReduction = [&]() -> bool {
-      return clearBufferOnDevice(bodyReductionBuffer, &localError);
+      return encodeBufferClearOnCommandBuffer(commandBuffer,
+                                               bodyReductionBuffer,
+                                               &localError);
     };
     const auto clearWeightedReduction = [&]() -> bool {
-      return clearBufferOnDevice(weightedReductionBuffer, &localError);
+      return encodeBufferClearOnCommandBuffer(commandBuffer,
+                                               weightedReductionBuffer,
+                                               &localError);
     };
     const auto clearFinalReduction = [&]() -> bool {
-      return clearBufferOnDevice(finalReductionBuffer, &localError);
+      return encodeBufferClearOnCommandBuffer(commandBuffer,
+                                               finalReductionBuffer,
+                                               &localError);
     };
-    if (!runComputeBuffers(ctx.glossFieldFinalizePipeline,
+    if (!encodeCompute(ctx.glossFieldFinalizePipeline,
                            std::array<id<MTLBuffer>, 17>{occupancyCountsBuffer,
                                                          sumRBuffer,
                                                          sumGBuffer,
@@ -5753,31 +9026,31 @@ bool buildGlossFieldFromIOSurface(GlossFieldCache* cache,
       return false;
     }
     if (!clearBodyReduction() ||
-        !runComputeBuffers(ctx.glossFieldMaxPipeline,
+        !encodeCompute(ctx.glossFieldMaxPipeline,
                            std::array<id<MTLBuffer>, 3>{occupancyBuffer, bodyReductionBuffer, cellUniformBuffer},
                            cellCount,
                            &localError) ||
-        !runComputeBuffers(ctx.glossFieldNormalizePipeline,
+        !encodeCompute(ctx.glossFieldNormalizePipeline,
                            std::array<id<MTLBuffer>, 4>{occupancyBuffer, occupancyNormBuffer, bodyReductionBuffer, cellUniformBuffer},
                            cellCount,
                            &localError) ||
-        !runComputeBuffers(ctx.glossFieldBlurPipeline,
+        !encodeCompute(ctx.glossFieldBlurPipeline,
                            std::array<id<MTLBuffer>, 3>{occupancyNormBuffer, tempBuffer, cellUniformBuffer},
                            cellCount,
                            &localError)) {
       if (error) *error = localError;
       return false;
     }
-    if (!copyBufferOnDevice(tempBuffer, occupancyNormBuffer, cellCount * sizeof(float), &localError)) {
+    if (!encodeCopy(tempBuffer, occupancyNormBuffer, cellCount * sizeof(float), &localError)) {
       if (error) *error = localError;
       return false;
     }
     if (!clearBodyReduction() ||
-        !runComputeBuffers(ctx.glossFieldMaxPipeline,
+        !encodeCompute(ctx.glossFieldMaxPipeline,
                            std::array<id<MTLBuffer>, 3>{occupancyNormBuffer, bodyReductionBuffer, cellUniformBuffer},
                            cellCount,
                            &localError) ||
-        !runComputeBuffers(ctx.glossFieldNormalizePipeline,
+        !encodeCompute(ctx.glossFieldNormalizePipeline,
                            std::array<id<MTLBuffer>, 4>{occupancyNormBuffer, occupancyNormBuffer, bodyReductionBuffer, cellUniformBuffer},
                            cellCount,
                            &localError)) {
@@ -5785,20 +9058,20 @@ bool buildGlossFieldFromIOSurface(GlossFieldCache* cache,
       return false;
     }
     const auto blurInPlace = [&](id<MTLBuffer> buffer) -> bool {
-      if (!runComputeBuffers(ctx.glossFieldBlurPipeline,
+      if (!encodeCompute(ctx.glossFieldBlurPipeline,
                              std::array<id<MTLBuffer>, 3>{buffer, tempBuffer, cellUniformBuffer},
                              cellCount,
                              &localError)) {
         return false;
       }
-      return copyBufferOnDevice(tempBuffer, buffer, cellCount * sizeof(float), &localError);
+      return encodeCopy(tempBuffer, buffer, cellCount * sizeof(float), &localError);
     };
     if (!blurInPlace(carrierYBuffer) || !blurInPlace(carrierMaxBuffer) ||
         !blurInPlace(carrierMinBuffer) || !blurInPlace(neutralityBuffer)) {
       if (error) *error = localError;
       return false;
     }
-    if (!runComputeBuffers(ctx.glossFieldBodyPipeline,
+    if (!encodeCompute(ctx.glossFieldBodyPipeline,
                            std::array<id<MTLBuffer>, 7>{occupancyBuffer,
                                                         meanRBuffer,
                                                         meanGBuffer,
@@ -5811,12 +9084,12 @@ bool buildGlossFieldFromIOSurface(GlossFieldCache* cache,
       if (error) *error = localError;
       return false;
     }
-    if (!copyBufferOnDevice(bodyBuffer, viewerBodyRawBuffer, cellCount * sizeof(float), &localError)) {
+    if (!encodeCopy(bodyBuffer, viewerBodyRawBuffer, cellCount * sizeof(float), &localError)) {
       if (error) *error = localError;
       return false;
     }
     if (!clearBodyReduction() ||
-        !runComputeBuffers(ctx.glossFieldRawSignalPipeline,
+        !encodeCompute(ctx.glossFieldRawSignalPipeline,
                            std::array<id<MTLBuffer>, 6>{occupancyBuffer,
                                                         carrierMaxBuffer,
                                                         bodyBuffer,
@@ -5829,7 +9102,7 @@ bool buildGlossFieldFromIOSurface(GlossFieldCache* cache,
       return false;
     }
     if (!clearWeightedReduction() ||
-        !runComputeBuffers(ctx.glossFieldWeightedSignalPipeline,
+        !encodeCompute(ctx.glossFieldWeightedSignalPipeline,
                            std::array<id<MTLBuffer>, 11>{occupancyNormBuffer,
                                                          bodyBuffer,
                                                          rawSignalBuffer,
@@ -5847,7 +9120,7 @@ bool buildGlossFieldFromIOSurface(GlossFieldCache* cache,
       return false;
     }
     if (!clearFinalReduction() ||
-        !runComputeBuffers(ctx.glossFieldMergeMaxBitsPipeline,
+        !encodeCompute(ctx.glossFieldMergeMaxBitsPipeline,
                            std::array<id<MTLBuffer>, 3>{bodyReductionBuffer,
                                                         weightedReductionBuffer,
                                                         finalReductionBuffer},
@@ -5856,7 +9129,7 @@ bool buildGlossFieldFromIOSurface(GlossFieldCache* cache,
       if (error) *error = localError;
       return false;
     }
-    if (!runComputeBuffers(ctx.glossFieldFinalNormalizePipeline,
+    if (!encodeCompute(ctx.glossFieldFinalNormalizePipeline,
                            std::array<id<MTLBuffer>, 7>{bodyBuffer,
                                                         signalBuffer,
                                                         positiveBuffer,
@@ -5870,7 +9143,7 @@ bool buildGlossFieldFromIOSurface(GlossFieldCache* cache,
       return false;
     }
 
-    if (!runComputeBuffers(ctx.glossFieldLocalPercentilePipeline,
+    if (!encodeCompute(ctx.glossFieldLocalPercentilePipeline,
                            std::array<id<MTLBuffer>, 5>{carrierYBuffer,
                                                         occupancyBuffer,
                                                         bodyCoreBuffer,
@@ -5881,7 +9154,7 @@ bool buildGlossFieldFromIOSurface(GlossFieldCache* cache,
       if (error) *error = localError;
       return false;
     }
-    if (!copyBufferOnDevice(carrierYBuffer, bodyContextBuffer, cellCount * sizeof(float), &localError)) {
+    if (!encodeCopy(carrierYBuffer, bodyContextBuffer, cellCount * sizeof(float), &localError)) {
       if (error) *error = localError;
       return false;
     }
@@ -5891,7 +9164,7 @@ bool buildGlossFieldFromIOSurface(GlossFieldCache* cache,
         return false;
       }
     }
-    if (!runComputeBuffers(ctx.glossFieldLocalPercentilePipeline,
+    if (!encodeCompute(ctx.glossFieldLocalPercentilePipeline,
                            std::array<id<MTLBuffer>, 5>{carrierYBuffer,
                                                         occupancyBuffer,
                                                         retinexBodyBuffer,
@@ -5902,7 +9175,7 @@ bool buildGlossFieldFromIOSurface(GlossFieldCache* cache,
       if (error) *error = localError;
       return false;
     }
-    if (!copyBufferOnDevice(carrierYBuffer, dogLowBuffer, cellCount * sizeof(float), &localError)) {
+    if (!encodeCopy(carrierYBuffer, dogLowBuffer, cellCount * sizeof(float), &localError)) {
       if (error) *error = localError;
       return false;
     }
@@ -5912,7 +9185,7 @@ bool buildGlossFieldFromIOSurface(GlossFieldCache* cache,
         return false;
       }
     }
-    if (!runComputeBuffers(ctx.glossFieldCandidate2RawPipeline,
+    if (!encodeCompute(ctx.glossFieldCandidate2RawPipeline,
                            std::array<id<MTLBuffer>, 18>{occupancyBuffer,
                                                          occupancyNormBuffer,
                                                          meanRBuffer,
@@ -5936,8 +9209,8 @@ bool buildGlossFieldFromIOSurface(GlossFieldCache* cache,
       if (error) *error = localError;
       return false;
     }
-    if (!clearBufferOnDevice(candidate2ReductionBuffer, &localError) ||
-        !runComputeBuffers(ctx.glossFieldAssembleUnifiedPipeline,
+    if (!encodeClear(candidate2ReductionBuffer, &localError) ||
+        !encodeCompute(ctx.glossFieldAssembleUnifiedPipeline,
                            std::array<id<MTLBuffer>, 14>{body2RawBuffer,
                                                          positive2RawBuffer,
                                                          negative2RawBuffer,
@@ -5957,7 +9230,7 @@ bool buildGlossFieldFromIOSurface(GlossFieldCache* cache,
       if (error) *error = localError;
       return false;
     }
-    if (!runComputeBuffers(ctx.glossFieldFinalNormalizePipeline,
+    if (!encodeCompute(ctx.glossFieldFinalNormalizePipeline,
                            std::array<id<MTLBuffer>, 7>{body2Buffer,
                                                         signal2Buffer,
                                                         positive2Buffer,
@@ -5971,11 +9244,22 @@ bool buildGlossFieldFromIOSurface(GlossFieldCache* cache,
       return false;
     }
 
+    constexpr size_t kGlossResidentCellBufferCount = 21u;
+    constexpr size_t kGlossResidentBytesPerCell =
+        kGlossResidentCellBufferCount * sizeof(float);
+    if (cellCount > std::numeric_limits<size_t>::max() /
+                        kGlossResidentBytesPerCell) {
+      if (error) *error = "metal-gloss-field-resident-size-overflow";
+      return false;
+    }
+    const size_t residentBytes =
+        static_cast<size_t>(cellCount) * kGlossResidentBytesPerCell;
+
     GlossFieldResidentRecord record{};
     record.gridWidth = gridWidth;
     record.gridHeight = gridHeight;
     record.builtSerial = buildSerial;
-    record.occupancy = occupancyBuffer;
+    record.byteSize = residentBytes;
     record.meanR = meanRBuffer;
     record.meanG = meanGBuffer;
     record.meanB = meanBBuffer;
@@ -5983,9 +9267,7 @@ bool buildGlossFieldFromIOSurface(GlossFieldCache* cache,
     record.carrierMax = carrierMaxBuffer;
     record.carrierMin = carrierMinBuffer;
     record.neutrality = neutralityBuffer;
-    record.occupancyNorm = occupancyNormBuffer;
     record.body = bodyBuffer;
-    record.rawSignal = rawSignalBuffer;
     record.positive = positiveBuffer;
     record.negative = negativeBuffer;
     record.boundary = boundaryBuffer;
@@ -5999,34 +9281,221 @@ bool buildGlossFieldFromIOSurface(GlossFieldCache* cache,
     record.congruence2 = congruence2Buffer;
     record.confidence2 = confidence2Buffer;
     record.signal2 = signal2Buffer;
-    record.temp = tempBuffer;
-    record.reduction = finalReductionBuffer;
-    {
-      std::lock_guard<std::mutex> lock(glossFieldRegistryMutex());
-      if (cache->cacheId == 0) cache->cacheId = nextGlossFieldCacheId();
-      glossFieldRegistry()[cache->cacheId] = record;
-    }
-    cache->gridWidth = gridWidth;
-    cache->gridHeight = gridHeight;
-    cache->builtSerial = buildSerial;
-    cache->available = true;
+    *outRecord = std::move(record);
   }
   return true;
 }
 
-bool renderGlossFieldSurfaceFromCache(const GlossFieldCache& cache,
-                                      const GlossFieldSurfaceRequest& surfaceRequest,
-                                      uint32_t outputSurfaceId,
-                                      int outputSurfaceWidth,
-                                      int outputSurfaceHeight,
-                                      int outputSurfacePixelFormat,
-                                      std::string* error) {
+#if !defined(CHROMASPACE_METAL_NATIVE_ONLY)
+bool buildGlossFieldFromIOSurface(GlossFieldCache* cache,
+                                  const RasterSourceRequest& rasterRequest,
+                                  const GlossFieldRequest& fieldRequest,
+                                  uint32_t surfaceId,
+                                  int surfaceWidth,
+                                  int surfaceHeight,
+                                  int surfacePixelFormat,
+                                  uint64_t buildSerial,
+                                  std::string* error) {
   if (error) error->clear();
+  if (!cache) {
+    if (error) *error = "missing-metal-gloss-field-cache";
+    return false;
+  }
   std::string localError;
   if (!ensureContext(&localError)) {
     if (error) *error = localError.empty() ? "metal-context-unavailable" : localError;
     return false;
   }
+  id<MTLCommandBuffer> commandBuffer = [context().queue commandBuffer];
+  if (commandBuffer == nil) {
+    if (error) *error = "metal-iosurface-gloss-field-command-buffer-failed";
+    return false;
+  }
+  GlossFieldResidentRecord record{};
+  if (!encodeGlossFieldFromTextureSourceOnCommandBuffer(
+          commandBuffer,
+          nil,
+          rasterRequest,
+          fieldRequest,
+          surfaceId,
+          surfaceWidth,
+          surfaceHeight,
+          surfacePixelFormat,
+          buildSerial,
+          &record,
+          error)) {
+    return false;
+  }
+  [commandBuffer commit];
+  [commandBuffer waitUntilCompleted];
+  NSError* cbError = commandBuffer.error;
+  if (cbError != nil) {
+    if (error) *error = [[cbError localizedDescription] UTF8String];
+    return false;
+  }
+  ScopeDerivedResidentRecord derivedRecord{};
+  derivedRecord.family = ScopeDerivedFamily::GlossField;
+  derivedRecord.builtSerial = record.builtSerial;
+  derivedRecord.byteSize = record.byteSize;
+  try {
+    derivedRecord.glossField =
+        std::make_shared<GlossFieldResidentRecord>(std::move(record));
+  } catch (...) {
+    if (error) *error = "metal-gloss-field-cache-record-allocation-failed";
+    return false;
+  }
+  ScopeDerivedCache derivedCache = glossDerivedCache(*cache);
+  if (!registerCommittedScopeDerivedRecord(
+          &derivedCache, std::move(derivedRecord), error)) {
+    return false;
+  }
+  cache->cacheId = derivedCache.cacheId;
+  cache->ownerCompositorId = derivedCache.ownerCompositorId;
+  cache->byteSize = derivedCache.byteSize;
+  cache->gridWidth = std::max(fieldRequest.gridWidth, 1);
+  cache->gridHeight = std::max(fieldRequest.gridHeight, 1);
+  cache->builtSerial = buildSerial;
+  cache->available = true;
+  return true;
+}
+#endif
+
+static bool encodeGlossFieldFromTextureSourceForSubmission(
+    const FrameSubmission& submission,
+    GlossFieldCache* cache,
+    const RasterSourceRequest& rasterRequest,
+    const GlossFieldRequest& fieldRequest,
+    id<MTLTexture> importedSourceTexture,
+    uint32_t surfaceId,
+    int surfaceWidth,
+    int surfaceHeight,
+    int surfacePixelFormat,
+    uint64_t buildSerial,
+    std::string* error) {
+  if (error) error->clear();
+  if (!cache) {
+    if (error) *error = "missing-metal-gloss-field-cache";
+    return false;
+  }
+  if (!validateResidentDerivedOwnerForSubmission(
+          submission, cache->cacheId, cache->ownerCompositorId, error)) {
+    return false;
+  }
+  id<MTLCommandBuffer> commandBuffer = nil;
+  if (!commandBufferForFrameSubmission(submission, &commandBuffer, error)) {
+    return false;
+  }
+  GlossFieldResidentRecord encodedRecord{};
+  if (!encodeGlossFieldFromTextureSourceOnCommandBuffer(
+          commandBuffer,
+          importedSourceTexture,
+          rasterRequest,
+          fieldRequest,
+          surfaceId,
+          surfaceWidth,
+          surfaceHeight,
+          surfacePixelFormat,
+          buildSerial,
+          &encodedRecord,
+          error)) {
+    return false;
+  }
+  ScopeDerivedResidentRecord derivedRecord{};
+  derivedRecord.family = ScopeDerivedFamily::GlossField;
+  derivedRecord.builtSerial = encodedRecord.builtSerial;
+  derivedRecord.byteSize = encodedRecord.byteSize;
+  try {
+    derivedRecord.glossField =
+        std::make_shared<GlossFieldResidentRecord>(std::move(encodedRecord));
+  } catch (...) {
+    if (error) *error = "metal-gloss-field-cache-record-allocation-failed";
+    return false;
+  }
+  ScopeDerivedCache derivedCache = glossDerivedCache(*cache);
+  if (!registerPendingScopeDerivedRecord(
+          submission, &derivedCache, std::move(derivedRecord), error)) {
+    return false;
+  }
+  cache->cacheId = derivedCache.cacheId;
+  cache->ownerCompositorId = derivedCache.ownerCompositorId;
+  cache->byteSize = derivedCache.byteSize;
+  cache->gridWidth = std::max(fieldRequest.gridWidth, 1);
+  cache->gridHeight = std::max(fieldRequest.gridHeight, 1);
+  cache->builtSerial = buildSerial;
+  cache->available = true;
+  return true;
+}
+
+#if !defined(CHROMASPACE_METAL_NATIVE_ONLY)
+bool encodeGlossFieldFromIOSurface(const FrameSubmission& submission,
+                                   GlossFieldCache* cache,
+                                   const RasterSourceRequest& rasterRequest,
+                                   const GlossFieldRequest& fieldRequest,
+                                   uint32_t surfaceId,
+                                   int surfaceWidth,
+                                   int surfaceHeight,
+                                   int surfacePixelFormat,
+                                   uint64_t buildSerial,
+                                   std::string* error) {
+  return encodeGlossFieldFromTextureSourceForSubmission(
+      submission,
+      cache,
+      rasterRequest,
+      fieldRequest,
+      nil,
+      surfaceId,
+      surfaceWidth,
+      surfaceHeight,
+      surfacePixelFormat,
+      buildSerial,
+      error);
+}
+#endif
+
+bool encodeGlossFieldFromImportedTexture(
+    const FrameSubmission& submission,
+    GlossFieldCache* cache,
+    const RasterSourceRequest& rasterRequest,
+    const GlossFieldRequest& fieldRequest,
+    uint64_t sourceId,
+    uint64_t buildSerial,
+    std::string* error) {
+  if (error) error->clear();
+  if (!cache) {
+    if (error) *error = "missing-metal-gloss-field-cache";
+    return false;
+  }
+  std::shared_ptr<ImportedSourceRecord> source;
+  if (!importedSourceForFrameSubmission(
+          submission, sourceId, &source, error)) {
+    return false;
+  }
+  return encodeGlossFieldFromTextureSourceForSubmission(
+      submission,
+      cache,
+      rasterRequest,
+      fieldRequest,
+      source->texture,
+      0,
+      source->descriptor.width,
+      source->descriptor.height,
+      source->descriptor.pixelFormat,
+      buildSerial,
+      error);
+}
+
+static bool encodeGlossFieldSurfaceFromCacheOnCommandBuffer(
+    id<MTLCommandBuffer> commandBuffer,
+    const GlossFieldResidentRecord* stagedRecord,
+    const GlossFieldCache& cache,
+    const GlossFieldSurfaceRequest& surfaceRequest,
+    uint32_t outputSurfaceId,
+    int outputSurfaceWidth,
+    int outputSurfaceHeight,
+    int outputSurfacePixelFormat,
+    std::string* error) {
+  if (error) error->clear();
+  std::string localError;
   if (!cache.available || cache.cacheId == 0 || cache.gridWidth <= 0 || cache.gridHeight <= 0 ||
       outputSurfaceId == 0 || outputSurfaceWidth <= 0 || outputSurfaceHeight <= 0) {
     if (error) *error = "invalid-metal-gloss-field-surface-request";
@@ -6041,22 +9510,34 @@ bool renderGlossFieldSurfaceFromCache(const GlossFieldCache& cache,
     if (error) *error = "unsupported-metal-gloss-field-surface-format";
     return false;
   }
-  MetalContext& ctx = context();
+  std::shared_ptr<MetalContext> runtimeContext;
+  MetalContext* contextPointer = nullptr;
+  if (!contextForCommandBuffer(commandBuffer,
+                               &runtimeContext,
+                               &contextPointer,
+                               &localError) ||
+      contextPointer == nullptr) {
+    if (error) {
+      *error = localError.empty()
+                   ? "metal-gloss-field-surface-command-buffer-invalid"
+                   : localError;
+    }
+    return false;
+  }
+  MetalContext& ctx = *contextPointer;
   if (ctx.glossFieldSurfaceRenderPipeline == nil) {
-    if (error) *error = residentPipelineUnavailableReason("metal-gloss-field-surface");
+    if (error) {
+      *error = residentPipelineUnavailableReason(ctx, "metal-gloss-field-surface");
+    }
     return false;
   }
 
   GlossFieldResidentRecord record{};
-  {
-    std::lock_guard<std::mutex> lock(glossFieldRegistryMutex());
-    auto it = glossFieldRegistry().find(cache.cacheId);
-    if (it == glossFieldRegistry().end()) {
-      if (error) *error = "metal-gloss-field-cache-missing";
-      return false;
-    }
-    record = it->second;
+  if (stagedRecord == nullptr) {
+    if (error) *error = "metal-gloss-field-cache-missing";
+    return false;
   }
+  record = *stagedRecord;
   if (record.gridWidth != cache.gridWidth || record.gridHeight != cache.gridHeight ||
       record.meanR == nil || record.meanG == nil || record.meanB == nil ||
       record.carrierY == nil || record.carrierMax == nil || record.carrierMin == nil ||
@@ -6076,11 +9557,12 @@ bool renderGlossFieldSurfaceFromCache(const GlossFieldCache& cache,
     std::lock_guard<std::mutex> lock(plotSurfaceMutex());
     auto& registry = plotSurfaceRegistry();
     auto it = registry.find(outputSurfaceId);
-    if (it != registry.end() &&
-        it->second.width == outputSurfaceWidth &&
-        it->second.height == outputSurfaceHeight &&
-        it->second.pixelFormat == outputSurfacePixelFormat) {
-      outputTexture = it->second.texture;
+    if (it != registry.end() && it->second &&
+        it->second->width == outputSurfaceWidth &&
+        it->second->height == outputSurfaceHeight &&
+        it->second->pixelFormat == outputSurfacePixelFormat &&
+        it->second->context == runtimeContext) {
+      outputTexture = it->second->texture;
     }
   }
   if (outputTexture == nil) {
@@ -6103,12 +9585,11 @@ bool renderGlossFieldSurfaceFromCache(const GlossFieldCache& cache,
   uniforms.glossLiftScale = std::max(0.01f, surfaceRequest.glossLiftScale);
 
   @autoreleasepool {
-    id<MTLBuffer> uniformBuffer = makeSharedBuffer(&uniforms, 1u);
+    id<MTLBuffer> uniformBuffer = makeSharedBuffer(ctx, &uniforms, 1u);
     if (uniformBuffer == nil) {
       if (error) *error = "metal-gloss-field-surface-uniform-allocation-failed";
       return false;
     }
-    id<MTLCommandBuffer> commandBuffer = [ctx.queue commandBuffer];
     if (commandBuffer == nil) {
       if (error) *error = "metal-gloss-field-surface-command-buffer-failed";
       return false;
@@ -6145,30 +9626,109 @@ bool renderGlossFieldSurfaceFromCache(const GlossFieldCache& cache,
                                          1)
        threadsPerThreadgroup:MTLSizeMake(width, width, 1)];
     [encoder endEncoding];
-    [commandBuffer commit];
-    [commandBuffer waitUntilCompleted];
-    NSError* cbError = commandBuffer.error;
-    if (cbError != nil) {
-      if (error) *error = [[cbError localizedDescription] UTF8String];
-      return false;
-    }
   }
   return true;
 }
 
-bool renderGlossProjectionSurfaceFromCache(const GlossFieldCache& cache,
-                                           const GlossProjectionSurfaceRequest& projectionRequest,
-                                           uint32_t outputSurfaceId,
-                                           int outputSurfaceWidth,
-                                           int outputSurfaceHeight,
-                                           int outputSurfacePixelFormat,
-                                           std::string* error) {
-  if (error) error->clear();
+#if !defined(CHROMASPACE_METAL_NATIVE_ONLY)
+bool renderGlossFieldSurfaceFromCache(const GlossFieldCache& cache,
+                                      const GlossFieldSurfaceRequest& surfaceRequest,
+                                      uint32_t outputSurfaceId,
+                                      int outputSurfaceWidth,
+                                      int outputSurfaceHeight,
+                                      int outputSurfacePixelFormat,
+                                      std::string* error) {
   std::string localError;
   if (!ensureContext(&localError)) {
     if (error) *error = localError.empty() ? "metal-context-unavailable" : localError;
     return false;
   }
+  id<MTLCommandBuffer> commandBuffer = [context().queue commandBuffer];
+  if (commandBuffer == nil) {
+    if (error) *error = "metal-gloss-field-surface-command-buffer-failed";
+    return false;
+  }
+  GlossFieldResidentRecord record{};
+  if (!resolveGlossFieldRecord(cache, 0, 0, false, &record)) {
+    if (error) *error = "metal-gloss-field-cache-missing";
+    return false;
+  }
+  if (!encodeGlossFieldSurfaceFromCacheOnCommandBuffer(commandBuffer,
+                                                       &record,
+                                                       cache,
+                                                       surfaceRequest,
+                                                       outputSurfaceId,
+                                                       outputSurfaceWidth,
+                                                       outputSurfaceHeight,
+                                                       outputSurfacePixelFormat,
+                                                       error)) {
+    return false;
+  }
+  [commandBuffer commit];
+  [commandBuffer waitUntilCompleted];
+  NSError* cbError = commandBuffer.error;
+  if (cbError != nil) {
+    if (error) *error = [[cbError localizedDescription] UTF8String];
+    return false;
+  }
+  return true;
+}
+#endif
+
+bool encodeGlossFieldSurfaceFromCache(const FrameSubmission& submission,
+                                      const GlossFieldCache& cache,
+                                      const GlossFieldSurfaceRequest& surfaceRequest,
+                                      uint32_t outputSurfaceId,
+                                      int outputSurfaceWidth,
+                                      int outputSurfaceHeight,
+                                      int outputSurfacePixelFormat,
+                                      std::string* error) {
+  if (!validateResidentDerivedOwnerForSubmission(
+          submission, cache.cacheId, cache.ownerCompositorId, error)) {
+    return false;
+  }
+  id<MTLCommandBuffer> commandBuffer = nil;
+  if (!commandBufferForFrameSubmission(submission, &commandBuffer, error)) {
+    return false;
+  }
+  if (!validatePlotSurfaceOwnerForSubmission(
+          submission, outputSurfaceId, error)) {
+    return false;
+  }
+  GlossFieldResidentRecord stagedRecord{};
+  std::string residentError;
+  if (!resolveGlossFieldRecordForSubmission(
+          submission, cache, true, &stagedRecord, &residentError)) {
+    if (error) {
+      *error = residentError.empty()
+                   ? "metal-gloss-field-cache-missing"
+                   : residentError;
+    }
+    return false;
+  }
+  return encodeGlossFieldSurfaceFromCacheOnCommandBuffer(commandBuffer,
+                                                         &stagedRecord,
+                                                         cache,
+                                                         surfaceRequest,
+                                                         outputSurfaceId,
+                                                         outputSurfaceWidth,
+                                                         outputSurfaceHeight,
+                                                         outputSurfacePixelFormat,
+                                                         error);
+}
+
+static bool encodeGlossProjectionSurfaceFromCacheOnCommandBuffer(
+    id<MTLCommandBuffer> commandBuffer,
+    const GlossFieldResidentRecord* stagedRecord,
+    const GlossFieldCache& cache,
+    const GlossProjectionSurfaceRequest& projectionRequest,
+    uint32_t outputSurfaceId,
+    int outputSurfaceWidth,
+    int outputSurfaceHeight,
+    int outputSurfacePixelFormat,
+    std::string* error) {
+  if (error) error->clear();
+  std::string localError;
   if (!cache.available || cache.cacheId == 0 || cache.gridWidth <= 0 || cache.gridHeight <= 0 ||
       outputSurfaceId == 0 || outputSurfaceWidth <= 0 || outputSurfaceHeight <= 0) {
     if (error) *error = "invalid-metal-gloss-projection-surface-request";
@@ -6183,23 +9743,36 @@ bool renderGlossProjectionSurfaceFromCache(const GlossFieldCache& cache,
     if (error) *error = "unsupported-metal-gloss-projection-surface-format";
     return false;
   }
-  MetalContext& ctx = context();
+  std::shared_ptr<MetalContext> runtimeContext;
+  MetalContext* contextPointer = nullptr;
+  if (!contextForCommandBuffer(commandBuffer,
+                               &runtimeContext,
+                               &contextPointer,
+                               &localError) ||
+      contextPointer == nullptr) {
+    if (error) {
+      *error = localError.empty()
+                   ? "metal-gloss-projection-surface-command-buffer-invalid"
+                   : localError;
+    }
+    return false;
+  }
+  MetalContext& ctx = *contextPointer;
   if (ctx.glossProjectionSurfaceSelectPipeline == nil ||
       ctx.glossProjectionSurfaceShadePipeline == nil) {
-    if (error) *error = residentPipelineUnavailableReason("metal-gloss-projection-surface");
+    if (error) {
+      *error = residentPipelineUnavailableReason(
+          ctx, "metal-gloss-projection-surface");
+    }
     return false;
   }
 
   GlossFieldResidentRecord record{};
-  {
-    std::lock_guard<std::mutex> lock(glossFieldRegistryMutex());
-    auto it = glossFieldRegistry().find(cache.cacheId);
-    if (it == glossFieldRegistry().end()) {
-      if (error) *error = "metal-gloss-field-cache-missing";
-      return false;
-    }
-    record = it->second;
+  if (stagedRecord == nullptr) {
+    if (error) *error = "metal-gloss-field-cache-missing";
+    return false;
   }
+  record = *stagedRecord;
   if (record.gridWidth != cache.gridWidth || record.gridHeight != cache.gridHeight ||
       record.meanR == nil || record.meanG == nil || record.meanB == nil ||
       record.carrierY == nil || record.carrierMax == nil || record.carrierMin == nil ||
@@ -6219,26 +9792,28 @@ bool renderGlossProjectionSurfaceFromCache(const GlossFieldCache& cache,
     std::lock_guard<std::mutex> lock(plotSurfaceMutex());
     auto& registry = plotSurfaceRegistry();
     auto it = registry.find(outputSurfaceId);
-    if (it != registry.end() &&
-        it->second.width == outputSurfaceWidth &&
-        it->second.height == outputSurfaceHeight &&
-        it->second.pixelFormat == outputSurfacePixelFormat) {
-      outputTexture = it->second.texture;
+    if (it != registry.end() && it->second &&
+        it->second->width == outputSurfaceWidth &&
+        it->second->height == outputSurfaceHeight &&
+        it->second->pixelFormat == outputSurfacePixelFormat &&
+        it->second->context == runtimeContext) {
+      outputTexture = it->second->texture;
     }
   }
   if (outputTexture == nil) {
     if (error) *error = "metal-gloss-projection-output-surface-missing";
     return false;
   }
-  if (!clearPlotSurface(outputSurfaceId,
-                        outputSurfaceWidth,
-                        outputSurfaceHeight,
-                        outputSurfacePixelFormat,
-                        0.0f,
-                        0.0f,
-                        0.0f,
-                        0.0f,
-                        &localError)) {
+  if (!encodePlotSurfaceClearOnCommandBuffer(commandBuffer,
+                                             outputSurfaceId,
+                                             outputSurfaceWidth,
+                                             outputSurfaceHeight,
+                                             outputSurfacePixelFormat,
+                                             0.0f,
+                                             0.0f,
+                                             0.0f,
+                                             0.0f,
+                                             &localError)) {
     if (error) *error = localError.empty() ? "metal-gloss-projection-clear-failed" : localError;
     return false;
   }
@@ -6262,25 +9837,30 @@ bool renderGlossProjectionSurfaceFromCache(const GlossFieldCache& cache,
   std::copy(projectionRequest.projection, projectionRequest.projection + 16, uniforms.projection);
 
   @autoreleasepool {
-    id<MTLBuffer> uniformBuffer = makeSharedBuffer(&uniforms, 1u);
+    id<MTLBuffer> uniformBuffer = makeSharedBuffer(ctx, &uniforms, 1u);
     const size_t selectionBytes =
         static_cast<size_t>(std::max(outputSurfaceWidth, 0)) *
         static_cast<size_t>(std::max(outputSurfaceHeight, 0)) *
         sizeof(uint32_t);
-    id<MTLBuffer> selectionBuffer = makeEmptyPrivateBuffer(selectionBytes);
+    id<MTLBuffer> selectionBuffer = makeSubmissionTransientPrivateBuffer(
+        commandBuffer, selectionBytes, &localError);
     if (uniformBuffer == nil || selectionBuffer == nil) {
       if (error) *error = "metal-gloss-projection-surface-allocation-failed";
       return false;
     }
-    if (!clearBufferOnDevice(selectionBuffer, &localError)) {
-      if (error) *error = localError.empty() ? "metal-gloss-projection-selection-clear-failed" : localError;
-      return false;
-    }
-    id<MTLCommandBuffer> commandBuffer = [ctx.queue commandBuffer];
     if (commandBuffer == nil) {
       if (error) *error = "metal-gloss-projection-surface-command-buffer-failed";
       return false;
     }
+    id<MTLBlitCommandEncoder> clearEncoder = [commandBuffer blitCommandEncoder];
+    if (clearEncoder == nil) {
+      if (error) *error = "metal-gloss-projection-selection-clear-encoder-failed";
+      return false;
+    }
+    [clearEncoder fillBuffer:selectionBuffer
+                       range:NSMakeRange(0, selectionBytes)
+                       value:0];
+    [clearEncoder endEncoding];
     id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
     if (encoder == nil) {
       if (error) *error = "metal-gloss-projection-surface-encoder-failed";
@@ -6341,15 +9921,97 @@ bool renderGlossProjectionSurfaceFromCache(const GlossFieldCache& cache,
                                          1)
        threadsPerThreadgroup:MTLSizeMake(shadeWidth, shadeWidth, 1)];
     [encoder endEncoding];
-    [commandBuffer commit];
-    [commandBuffer waitUntilCompleted];
-    NSError* cbError = commandBuffer.error;
-    if (cbError != nil) {
-      if (error) *error = [[cbError localizedDescription] UTF8String];
-      return false;
-    }
   }
   return true;
+}
+
+#if !defined(CHROMASPACE_METAL_NATIVE_ONLY)
+bool renderGlossProjectionSurfaceFromCache(
+    const GlossFieldCache& cache,
+    const GlossProjectionSurfaceRequest& projectionRequest,
+    uint32_t outputSurfaceId,
+    int outputSurfaceWidth,
+    int outputSurfaceHeight,
+    int outputSurfacePixelFormat,
+    std::string* error) {
+  std::string localError;
+  if (!ensureContext(&localError)) {
+    if (error) *error = localError.empty() ? "metal-context-unavailable" : localError;
+    return false;
+  }
+  id<MTLCommandBuffer> commandBuffer = [context().queue commandBuffer];
+  if (commandBuffer == nil) {
+    if (error) *error = "metal-gloss-projection-surface-command-buffer-failed";
+    return false;
+  }
+  GlossFieldResidentRecord record{};
+  if (!resolveGlossFieldRecord(cache, 0, 0, false, &record)) {
+    if (error) *error = "metal-gloss-field-cache-missing";
+    return false;
+  }
+  if (!encodeGlossProjectionSurfaceFromCacheOnCommandBuffer(commandBuffer,
+                                                            &record,
+                                                            cache,
+                                                            projectionRequest,
+                                                            outputSurfaceId,
+                                                            outputSurfaceWidth,
+                                                            outputSurfaceHeight,
+                                                            outputSurfacePixelFormat,
+                                                            error)) {
+    return false;
+  }
+  [commandBuffer commit];
+  [commandBuffer waitUntilCompleted];
+  NSError* cbError = commandBuffer.error;
+  if (cbError != nil) {
+    if (error) *error = [[cbError localizedDescription] UTF8String];
+    return false;
+  }
+  return true;
+}
+#endif
+
+bool encodeGlossProjectionSurfaceFromCache(
+    const FrameSubmission& submission,
+    const GlossFieldCache& cache,
+    const GlossProjectionSurfaceRequest& projectionRequest,
+    uint32_t outputSurfaceId,
+    int outputSurfaceWidth,
+    int outputSurfaceHeight,
+    int outputSurfacePixelFormat,
+    std::string* error) {
+  if (!validateResidentDerivedOwnerForSubmission(
+          submission, cache.cacheId, cache.ownerCompositorId, error)) {
+    return false;
+  }
+  id<MTLCommandBuffer> commandBuffer = nil;
+  if (!commandBufferForFrameSubmission(submission, &commandBuffer, error)) {
+    return false;
+  }
+  if (!validatePlotSurfaceOwnerForSubmission(
+          submission, outputSurfaceId, error)) {
+    return false;
+  }
+  GlossFieldResidentRecord stagedRecord{};
+  std::string residentError;
+  if (!resolveGlossFieldRecordForSubmission(
+          submission, cache, true, &stagedRecord, &residentError)) {
+    if (error) {
+      *error = residentError.empty()
+                   ? "metal-gloss-field-cache-missing"
+                   : residentError;
+    }
+    return false;
+  }
+  return encodeGlossProjectionSurfaceFromCacheOnCommandBuffer(commandBuffer,
+                                                              &stagedRecord,
+                                                              cache,
+                                                              projectionRequest,
+                                                              outputSurfaceId,
+                                                              outputSurfaceWidth,
+                                                              outputSurfaceHeight,
+                                                              outputSurfacePixelFormat,
+                                                              error);
 }
 
 }  // namespace ChromaspaceMetal

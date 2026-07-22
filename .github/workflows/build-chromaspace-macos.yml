@@ -2,7 +2,19 @@ name: Build Chromaspace macOS
 
 on:
   workflow_call:
+    inputs:
+      run_native_metal_qualification:
+        description: Run the resident Metal qualification on a GPU-backed larger runner
+        required: false
+        default: false
+        type: boolean
   workflow_dispatch:
+    inputs:
+      run_native_metal_qualification:
+        description: Run the resident Metal qualification on a GPU-backed larger runner
+        required: false
+        default: false
+        type: boolean
   push:
     tags:
       - "v*"
@@ -11,7 +23,12 @@ jobs:
   build-macos:
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
-    runs-on: macos-14
+    runs-on: macos-15
+    outputs:
+      package_version: ${{ steps.version.outputs.package_version }}
+      archive_name: ${{ steps.version.outputs.archive_name }}
+      release_artifact_name: ${{ steps.version.outputs.release_artifact_name }}
+      qualification_artifact_name: ${{ steps.version.outputs.qualification_artifact_name }}
 
     defaults:
       run:
@@ -25,6 +42,7 @@ jobs:
       - name: Resolve package version
         id: version
         run: |
+          set -euo pipefail
           version="$(grep -Eo 'set\(CHROMASPACE_PACKAGE_VERSION "[^"]+"\)' CMakeLists.txt | sed -E 's/.*"([^"]+)".*/\1/' | head -n1 || true)"
           if [ -z "${version}" ]; then
             version="$(grep -Eo 'set\(CUBE_DISPLAY_VERSION "[^"]+"\)' CMakeLists.txt | sed -E 's/.*"([^"]+)".*/\1/' | head -n1 || true)"
@@ -37,18 +55,21 @@ jobs:
             exit 1
           fi
           echo "package_version=${version}" >> "$GITHUB_OUTPUT"
-          echo "zip_name=Chromaspace_v${version}_macOS_universal_portable.zip" >> "$GITHUB_OUTPUT"
-          echo "artifact_name=Chromaspace-v${version}-macos-universal" >> "$GITHUB_OUTPUT"
+          echo "archive_name=Chromaspace_v${version}_macOS_universal_portable.zip" >> "$GITHUB_OUTPUT"
+          echo "release_artifact_name=Chromaspace-v${version}-macos-universal" >> "$GITHUB_OUTPUT"
+          echo "qualification_artifact_name=Chromaspace-v${version}-macos-qualification-tools" >> "$GITHUB_OUTPUT"
 
       - name: Ensure local OFX SDK is available
         run: |
+          set -euo pipefail
           if [ ! -f "ofx-sdk/include/ofxImageEffect.h" ]; then
             rm -rf ofx-sdk
             git clone --depth 1 https://github.com/AcademySoftwareFoundation/openfx.git ofx-sdk
           fi
 
-      - name: Ensure build tools are available
+      - name: Ensure Ninja is available
         run: |
+          set -euo pipefail
           if command -v ninja >/dev/null 2>&1; then
             ninja --version
           else
@@ -57,6 +78,7 @@ jobs:
 
       - name: Prepare Meson virtualenv
         run: |
+          set -euo pipefail
           python3 -m venv .meson-venv
           source .meson-venv/bin/activate
           python -m pip install --upgrade pip
@@ -64,52 +86,224 @@ jobs:
           echo "PYTHON_EXE=${PWD}/.meson-venv/bin/python" >> "$GITHUB_ENV"
           echo "${PWD}/.meson-venv/bin" >> "$GITHUB_PATH"
 
-      - name: Configure
-        run: |
-          cmake -S . -B build-mac -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DPython3_EXECUTABLE="${PYTHON_EXE}" \
-            -DCMAKE_OSX_ARCHITECTURES="x86_64;arm64" \
-            -DCMAKE_OSX_DEPLOYMENT_TARGET=13.0 \
-            -DCHROMASPACE_FORCE_BUNDLED_GLFW=ON \
-            -DCHROMASPACE_USE_BUNDLED_TEXT_DEPS=ON
+      - name: Verify native macOS source policy
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: python tools/validation/verify_macos_metal_viewer_cutover.py --root .
 
-      - name: Build
-        run: cmake --build build-mac --config Release
+      - name: Configure arm64 release
+        run: cmake --preset macos-arm64-release -DPython3_EXECUTABLE="${PYTHON_EXE}"
 
-      - name: Verify bundle outputs
-        run: |
-          grep -q "CHROMASPACE_TEXT_DEPS_PROVIDER:INTERNAL=bundled" build-mac/CMakeCache.txt
-          test -f bundle/Chromaspace.ofx.bundle/Contents/MacOS/Chromaspace.ofx
-          test -f bundle/Chromaspace.ofx.bundle/Contents/MacOS/Chromaspace_CubeViewer
-          test -f bundle/Chromaspace.ofx.bundle/Contents/MacOS/Chromaspace_ResolveBridge
-          test -f bundle/Chromaspace.ofx.bundle/Contents/MacOS/OpenSans-Regular.ttf
-          test -f bundle/Chromaspace.ofx.bundle/Contents/Resources/com.moazelgabry.chromaspace.png
-          test -f bundle/Chromaspace.ofx.bundle/Contents/Resources/chromaspace_resolve_bridge.py
-          lipo -archs bundle/Chromaspace.ofx.bundle/Contents/MacOS/Chromaspace.ofx | grep -q "x86_64 arm64"
-          lipo -archs bundle/Chromaspace.ofx.bundle/Contents/MacOS/Chromaspace_CubeViewer | grep -q "x86_64 arm64"
-          lipo -archs bundle/Chromaspace.ofx.bundle/Contents/MacOS/Chromaspace_ResolveBridge | grep -q "x86_64 arm64"
-          otool -l bundle/Chromaspace.ofx.bundle/Contents/MacOS/Chromaspace.ofx | grep -A3 LC_BUILD_VERSION | grep -q "minos 13.0"
-          otool -l bundle/Chromaspace.ofx.bundle/Contents/MacOS/Chromaspace_CubeViewer | grep -A3 LC_BUILD_VERSION | grep -q "minos 13.0"
-          otool -l bundle/Chromaspace.ofx.bundle/Contents/MacOS/Chromaspace_ResolveBridge | grep -A3 LC_BUILD_VERSION | grep -q "minos 13.0"
+      - name: Build arm64 release graph
+        run: cmake --build --preset macos-arm64-release-build --parallel 3
 
-      - name: Package macOS portable bundle
+      - name: Test arm64 release graph
+        run: ctest --preset macos-arm64-release-test
+
+      - name: Configure universal release
+        run: cmake --preset macos-universal-release -DPython3_EXECUTABLE="${PYTHON_EXE}"
+
+      - name: Build universal release graph
+        run: cmake --build --preset macos-universal-release-build --parallel 3
+
+      - name: Test universal release graph
+        run: ctest --preset macos-universal-release-test
+
+      - name: Verify universal bundle and helper outputs
         run: |
-          zip_name="${{ steps.version.outputs.zip_name }}"
-          package_path="${GITHUB_WORKSPACE}/${zip_name}"
+          set -euo pipefail
+          manager_app="build-mac-universal/artifacts/source-exchange/Chromaspace SourceExchange Manager.app"
+          manager_macos="${manager_app}/Contents/MacOS"
+          ofx_macos="bundle/Chromaspace.ofx.bundle/Contents/MacOS"
+          ofx_resources="bundle/Chromaspace.ofx.bundle/Contents/Resources"
+
+          grep -q "CHROMASPACE_TEXT_DEPS_PROVIDER:INTERNAL=bundled" build-mac-universal/CMakeCache.txt
+          test -f "${ofx_macos}/Chromaspace.ofx"
+          test -f "${ofx_macos}/Chromaspace_CubeViewer"
+          test -f "${ofx_macos}/Chromaspace_ResolveBridge"
+          test -f "${ofx_macos}/Chromaspace_SourceExchangeProducerRelay"
+          test -f "${ofx_macos}/ChromaspaceViewer.metallib"
+          test -f "${ofx_macos}/OpenSans-Regular.ttf"
+          test -f "${ofx_resources}/com.moazelgabry.chromaspace.png"
+          test -f "${ofx_resources}/chromaspace_resolve_bridge.py"
+          test ! -e "${ofx_macos}/com.chromaspace.SourceExchangeBroker"
+          test ! -e "${ofx_resources}/com.chromaspace.SourceExchangeBroker.plist.template"
+
+          test -f "${manager_app}/Contents/Info.plist"
+          test -f "${manager_macos}/Chromaspace SourceExchange Manager"
+          test -f "${manager_macos}/com.chromaspace.SourceExchangeBroker"
+          test -f "${manager_app}/Contents/Library/LaunchAgents/com.chromaspace.SourceExchangeBroker.plist"
+
+          test -f "build-mac-universal/artifacts/validation/Chromaspace_RuntimeV2MetalProbe"
+          test -f "build-mac-universal/artifacts/metal-native-cutover/Chromaspace_MetalViewerCutover"
+          test -f "build-mac-universal/artifacts/metal-native-cutover/ChromaspaceViewer.metallib"
+
+          binaries=(
+            "${ofx_macos}/Chromaspace.ofx"
+            "${ofx_macos}/Chromaspace_CubeViewer"
+            "${ofx_macos}/Chromaspace_ResolveBridge"
+            "${ofx_macos}/Chromaspace_SourceExchangeProducerRelay"
+            "${manager_macos}/Chromaspace SourceExchange Manager"
+            "${manager_macos}/com.chromaspace.SourceExchangeBroker"
+            "build-mac-universal/artifacts/validation/Chromaspace_RuntimeV2MetalProbe"
+            "build-mac-universal/artifacts/metal-native-cutover/Chromaspace_MetalViewerCutover"
+          )
+          for binary in "${binaries[@]}"; do
+            lipo -verify_arch arm64 x86_64 "${binary}"
+            for architecture in arm64 x86_64; do
+              minos="$(otool -arch "${architecture}" -l "${binary}" | awk '
+                $1 == "cmd" && $2 == "LC_BUILD_VERSION" { in_build_version = 1; next }
+                in_build_version && $1 == "minos" { print $2; exit }
+              ')"
+              if [ "${minos}" != "13.0" ]; then
+                echo "${binary} (${architecture}) has minos=${minos:-missing}; expected 13.0"
+                exit 1
+              fi
+            done
+          done
+
+      - name: Validate unsigned native release structure
+        run: |
+          set -euo pipefail
+          python tools/validation/validate_chromaspace_macos_runtime.py \
+            --mode cutover \
+            --manager-app "build-mac-universal/artifacts/source-exchange/Chromaspace SourceExchange Manager.app" \
+            --ofx-bundle "bundle/Chromaspace.ofx.bundle" \
+            --skip-manager-execution \
+            --service-action none \
+            --report-json "build-mac-universal/artifacts/validation/macos-runtime-v2-static-report.json"
+
+      - name: Package universal macOS release payloads
+        run: |
+          set -euo pipefail
+          package_root="${GITHUB_WORKSPACE}/Chromaspace_v${{ steps.version.outputs.package_version }}_macOS"
+          package_path="${GITHUB_WORKSPACE}/${{ steps.version.outputs.archive_name }}"
+          rm -rf "${package_root}"
           rm -f "${package_path}"
+          mkdir -p "${package_root}"
+          ditto \
+            "bundle/Chromaspace.ofx.bundle" \
+            "${package_root}/Chromaspace.ofx.bundle"
+          ditto \
+            "build-mac-universal/artifacts/source-exchange/Chromaspace SourceExchange Manager.app" \
+            "${package_root}/Chromaspace SourceExchange Manager.app"
           ditto -c -k --sequesterRsrc --keepParent \
-            bundle/Chromaspace.ofx.bundle \
+            "${package_root}" \
             "${package_path}"
 
       - name: Verify packaged macOS archive
         run: |
-          package_path="${GITHUB_WORKSPACE}/${{ steps.version.outputs.zip_name }}"
+          set -euo pipefail
+          package_path="${GITHUB_WORKSPACE}/${{ steps.version.outputs.archive_name }}"
+          verify_root="${RUNNER_TEMP}/chromaspace-package-verify"
+          release_root="${verify_root}/Chromaspace_v${{ steps.version.outputs.package_version }}_macOS"
+          rm -rf "${verify_root}"
+          mkdir -p "${verify_root}"
           test -f "${package_path}"
+          ditto -x -k "${package_path}" "${verify_root}"
+          test -d "${release_root}/Chromaspace.ofx.bundle"
+          test -d "${release_root}/Chromaspace SourceExchange Manager.app"
+          payload_count="$(find "${release_root}" -mindepth 1 -maxdepth 1 -print | wc -l | tr -d '[:space:]')"
+          test "${payload_count}" = "2"
 
-      - name: Upload artifact
+      - name: Upload macOS release artifact
         uses: actions/upload-artifact@v6
         with:
-          name: ${{ steps.version.outputs.artifact_name }}
-          path: ${{ github.workspace }}/${{ steps.version.outputs.zip_name }}
+          name: ${{ steps.version.outputs.release_artifact_name }}
+          path: |
+            ${{ github.workspace }}/${{ steps.version.outputs.archive_name }}
+            ${{ github.workspace }}/source/build-mac-universal/artifacts/validation/macos-runtime-v2-static-report.json
           if-no-files-found: error
+
+      - name: Upload CI-only Metal qualification tools
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ steps.version.outputs.qualification_artifact_name }}
+          path: |
+            ${{ github.workspace }}/source/build-mac-universal/artifacts/validation/Chromaspace_RuntimeV2MetalProbe
+            ${{ github.workspace }}/source/build-mac-universal/artifacts/metal-native-cutover/Chromaspace_MetalViewerCutover
+            ${{ github.workspace }}/source/build-mac-universal/artifacts/metal-native-cutover/ChromaspaceViewer.metallib
+          if-no-files-found: error
+
+  qualify-native-metal:
+    name: Qualify resident Metal runtime
+    needs: build-macos
+    if: ${{ inputs.run_native_metal_qualification == true }}
+    runs-on: macos-15-xlarge
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+    defaults:
+      run:
+        shell: bash
+        working-directory: source
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Download exact macOS release artifact
+        uses: actions/download-artifact@v5
+        with:
+          name: ${{ needs.build-macos.outputs.release_artifact_name }}
+          path: downloads/release
+
+      - name: Download CI-only Metal qualification tools
+        uses: actions/download-artifact@v5
+        with:
+          name: ${{ needs.build-macos.outputs.qualification_artifact_name }}
+          path: downloads/qualification-tools
+
+      - name: Restore qualification inputs
+        run: |
+          set -euo pipefail
+          archive="$(find "${GITHUB_WORKSPACE}/downloads/release" -type f -name '${{ needs.build-macos.outputs.archive_name }}' -print -quit)"
+          probe="$(find "${GITHUB_WORKSPACE}/downloads/qualification-tools" -type f -name Chromaspace_RuntimeV2MetalProbe -print -quit)"
+          canary="$(find "${GITHUB_WORKSPACE}/downloads/qualification-tools" -type f -name Chromaspace_MetalViewerCutover -print -quit)"
+          metallib="$(find "${GITHUB_WORKSPACE}/downloads/qualification-tools" -type f -name ChromaspaceViewer.metallib -print -quit)"
+          test -n "${archive}"
+          test -n "${probe}"
+          test -n "${canary}"
+          test -n "${metallib}"
+
+          release_extract_root="${RUNNER_TEMP}/chromaspace-native-qualification"
+          release_root="${release_extract_root}/Chromaspace_v${{ needs.build-macos.outputs.package_version }}_macOS"
+          rm -rf "${release_extract_root}"
+          mkdir -p "${release_extract_root}"
+          ditto -x -k "${archive}" "${release_extract_root}"
+          test -d "${release_root}/Chromaspace.ofx.bundle"
+          test -d "${release_root}/Chromaspace SourceExchange Manager.app"
+
+          chmod +x "${probe}" "${canary}"
+          if [ "$(dirname "${metallib}")" != "$(dirname "${canary}")" ]; then
+            ditto "${metallib}" "$(dirname "${canary}")/ChromaspaceViewer.metallib"
+          fi
+          test -f "$(dirname "${canary}")/ChromaspaceViewer.metallib"
+
+          echo "QUALIFICATION_RELEASE_ROOT=${release_root}" >> "$GITHUB_ENV"
+          echo "QUALIFICATION_PROBE=${probe}" >> "$GITHUB_ENV"
+          echo "QUALIFICATION_CANARY=${canary}" >> "$GITHUB_ENV"
+
+      - name: Run full resident Metal qualification
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          set -euo pipefail
+          python tools/validation/validate_chromaspace_macos_runtime.py \
+            --mode cutover \
+            --manager-app "${QUALIFICATION_RELEASE_ROOT}/Chromaspace SourceExchange Manager.app" \
+            --ofx-bundle "${QUALIFICATION_RELEASE_ROOT}/Chromaspace.ofx.bundle" \
+            --metal-probe "${QUALIFICATION_PROBE}" \
+            --viewer-canary "${QUALIFICATION_CANARY}" \
+            --viewer-frames 300 \
+            --viewer-timeout-seconds 120 \
+            --service-action status \
+            --report-json "macos-runtime-v2-native-report.json"
+
+      - name: Upload native Metal qualification report
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: Chromaspace-v${{ needs.build-macos.outputs.package_version }}-macos-metal-qualification-report
+          path: ${{ github.workspace }}/source/macos-runtime-v2-native-report.json
+          if-no-files-found: warn

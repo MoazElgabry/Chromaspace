@@ -49,8 +49,10 @@ extern char **environ;
 #endif
 
 #if defined(__APPLE__)
+#if defined(CHROMASPACE_MACOS_LEGACY_IOSURFACE_COMPAT)
 #include <CoreFoundation/CoreFoundation.h>
 #include <OpenGL/gl.h>
+#endif
 #else
 #include <GL/gl.h>
 #endif
@@ -61,6 +63,7 @@ extern char **environ;
 #include "ofxsMultiThread.h"
 #include "ofxsParam.h"
 #include "ChromaspaceViewerState.h"
+#include "ChromaspaceViewerIpcEndpoint.h"
 #include "color/ColorManagement.h"
 
 #if defined(CHROMASPACE_HAS_CUDA)
@@ -83,6 +86,7 @@ extern char **environ;
 
 #if defined(__APPLE__)
 #include "metal/ChromaspaceMetal.h"
+#include "metal/ChromaspaceSourceProducerClient.h"
 #endif
 
 namespace {
@@ -570,7 +574,7 @@ struct ViewerCloudTransportBlob {
   void* cudaDevicePtr = nullptr;
   std::shared_ptr<CudaIpcExportSlot> cudaExportSlot;
 #endif
-#if defined(__APPLE__)
+#if defined(__APPLE__) && defined(CHROMASPACE_MACOS_LEGACY_IOSURFACE_COMPAT)
   void* retainedIOSurface = nullptr;
 #endif
 #if defined(_WIN32)
@@ -597,7 +601,7 @@ struct ViewerCloudTransportBlob {
       std::error_code ec;
       std::filesystem::remove(filePath, ec);
     }
-#if defined(__APPLE__)
+#if defined(__APPLE__) && defined(CHROMASPACE_MACOS_LEGACY_IOSURFACE_COMPAT)
     if (retainedIOSurface != nullptr) {
       CFRelease(static_cast<CFTypeRef>(retainedIOSurface));
       retainedIOSurface = nullptr;
@@ -1888,13 +1892,7 @@ bool extractJsonStringField(const std::string& json, const std::string& key, std
 }
 
 std::string cubeViewerPipeName() {
-  const char* env = std::getenv("CHROMASPACE_PIPE");
-  if (env && env[0] != '\0') return std::string(env);
-#if defined(_WIN32)
-  return "\\\\.\\pipe\\Chromaspace";
-#else
-  return "/tmp/chromaspace.sock";
-#endif
+  return ChromaspaceViewer::viewerIpcEndpointFromEnvironment().path;
 }
 
 std::string viewerExecutableName() {
@@ -2848,7 +2846,9 @@ std::map<std::string, ChromaspaceEffect*> gSharedViewerInstancesBySender;
 
 class ChromaspaceEffect : public ImageEffect {
  public:
+#if defined(CHROMASPACE_MACOS_LEGACY_IOSURFACE_COMPAT) || !defined(__APPLE__)
   friend class ChromaspaceOverlayInteract;
+#endif
 
   explicit ChromaspaceEffect(OfxImageEffectHandle handle)
       : ImageEffect(handle) {
@@ -2863,6 +2863,16 @@ class ChromaspaceEffect : public ImageEffect {
     cubeViewerConnected_ = false;
     cubeViewerWindowUsable_ = false;
     senderId_ = buildSenderId();
+#if defined(__APPLE__)
+    ChromaspaceSourceExchange::SourceProducerClientConfiguration producerConfiguration{};
+    producerConfiguration.senderId = senderId_;
+    producerConfiguration.senderGeneration = fnv1a64(senderId_);
+    if (producerConfiguration.senderGeneration == 0) {
+      producerConfiguration.senderGeneration = 1;
+    }
+    sourceProducerClient_ =
+        ChromaspaceSourceExchange::createSourceProducerClient(producerConfiguration);
+#endif
     registerSharedViewerInstance();
     setStatusLabel("Disconnected");
     flushStatusLabelToHost();
@@ -2875,6 +2885,10 @@ class ChromaspaceEffect : public ImageEffect {
   }
 
   ~ChromaspaceEffect() override {
+#if defined(__APPLE__)
+    ChromaspaceSourceExchange::destroySourceProducerClient(sourceProducerClient_);
+    sourceProducerClient_ = nullptr;
+#endif
     clearPublishedGeneratedIdentityStrip("instance-destroyed");
     stopStatusThread();
     destroyViewerCommandWindow();
@@ -4289,6 +4303,10 @@ class ChromaspaceEffect : public ImageEffect {
  private:
   Clip* dstClip_ = nullptr;
   Clip* srcClip_ = nullptr;
+#if defined(__APPLE__)
+  ChromaspaceSourceExchange::SourceProducerClient* sourceProducerClient_ = nullptr;
+  std::atomic<uint64_t> sourceProducerPreparedShapeKey_{0};
+#endif
 
   std::mutex stateMutex_;
   mutable std::mutex viewerRuntimeStateMutex_;
@@ -8248,6 +8266,9 @@ class ChromaspaceEffect : public ImageEffect {
   }
 
   bool sourceSignalOnlyPublicationEnabled() const {
+#if !defined(CHROMASPACE_MACOS_LEGACY_IOSURFACE_COMPAT) && defined(__APPLE__)
+    return true;
+#else
     const char* env = std::getenv("CHROMASPACE_LEGACY_CLOUD_PUBLISH");
     if (!env || env[0] == '\0') return true;
     std::string value(env);
@@ -8255,6 +8276,7 @@ class ChromaspaceEffect : public ImageEffect {
                    [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
     return !(value == "1" || value == "true" || value == "on" || value == "yes" ||
              value == "legacy" || value == "cloud");
+#endif
   }
 
   bool sourceSignalCudaCpuFallbackEnabled() const {
@@ -8267,13 +8289,207 @@ class ChromaspaceEffect : public ImageEffect {
   }
 
   bool sourceSignalMetalCpuFallbackEnabled() const {
+#if !defined(CHROMASPACE_MACOS_LEGACY_IOSURFACE_COMPAT) && defined(__APPLE__)
+    return false;
+#else
     const char* env = std::getenv("CHROMASPACE_METAL_SOURCE_CPU_FALLBACK");
     if (!env || env[0] == '\0') return false;
     std::string value(env);
     std::transform(value.begin(), value.end(), value.begin(),
                    [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
     return value == "1" || value == "true" || value == "on" || value == "yes";
+#endif
   }
+
+#if defined(__APPLE__)
+  bool buildResidentSourceSemantics(
+      const CloudFootprintInfo& footprint,
+      ChromaspaceSourceExchange::SourceSemanticMetadata* out) {
+    if (!out || footprint.fullWidth <= 0 || footprint.fullHeight <= 0 ||
+        footprint.sampledWidth <= 0 || footprint.sampledHeight <= 0) {
+      return false;
+    }
+
+    ChromaspaceSourceExchange::SourceSemanticMetadata semantics{};
+    semantics.sourceX = footprint.fullX1;
+    semantics.sourceY = footprint.fullY1;
+    semantics.sourceWidth = static_cast<uint32_t>(footprint.fullWidth);
+    semantics.sourceHeight = static_cast<uint32_t>(footprint.fullHeight);
+    semantics.sampledX = footprint.sampledX1;
+    semantics.sampledY = footprint.sampledY1;
+    semantics.sampledWidth = static_cast<uint32_t>(footprint.sampledWidth);
+    semantics.sampledHeight = static_cast<uint32_t>(footprint.sampledHeight);
+    const bool fullCoverage = footprint.coverageKind == CloudCoverageKind::Full;
+    semantics.coverage =
+        fullCoverage
+            ? ChromaspaceSourceExchange::SourceCoverage::FullSource
+            : ChromaspaceSourceExchange::SourceCoverage::PartialSource;
+    semantics.authoritative = fullCoverage && footprint.authoritative;
+
+    {
+      std::lock_guard<std::mutex> ownerLock(gSharedGeneratedIdentityStripOwnerMutex);
+      const int resolution =
+          gSharedGeneratedIdentityStripResolution.load(std::memory_order_relaxed);
+      const bool drawCube =
+          gSharedGeneratedIdentityStripDrawCube.load(std::memory_order_relaxed) != 0;
+      const bool drawRamp =
+          gSharedGeneratedIdentityStripDrawRamp.load(std::memory_order_relaxed) != 0;
+      int bandHeight = 0;
+      int cubeY1 = 0;
+      int cubeY2 = 0;
+      int rampY1 = 0;
+      int rampY2 = 0;
+      const OfxRectI sourceBounds{
+          footprint.fullX1,
+          footprint.fullY1,
+          footprint.fullX1 + footprint.fullWidth,
+          footprint.fullY1 + footprint.fullHeight};
+      const bool validLayout =
+          resolution > 0 && (drawCube || drawRamp) &&
+          computeIdentityStripLayout(sourceBounds,
+                                     resolution,
+                                     drawCube,
+                                     drawRamp,
+                                     &bandHeight,
+                                     &cubeY1,
+                                     &cubeY2,
+                                     &rampY1,
+                                     &rampY2) &&
+          (!drawCube || cubeY2 - cubeY1 == bandHeight) &&
+          (!drawRamp || rampY2 - rampY1 == bandHeight);
+      if (validLayout) {
+        semantics.identityStripPresent = true;
+        semantics.identityCube = drawCube;
+        semantics.identityRamp = drawRamp;
+        semantics.identityResolution = static_cast<uint32_t>(resolution);
+        semantics.identityBandHeight = static_cast<uint32_t>(bandHeight);
+        if (drawCube) {
+          semantics.identityCubeY1 = cubeY1;
+          semantics.identityCubeY2 = cubeY2;
+        }
+        if (drawRamp) {
+          semantics.identityRampY1 = rampY1;
+          semantics.identityRampY2 = rampY2;
+        }
+      }
+    }
+
+    const auto viewerState = currentViewerRuntimeState();
+    const int primariesChoice =
+        std::clamp(viewerState.chromaticityInputPrimaries,
+                   0,
+                   static_cast<int>(WorkshopColor::primariesCount()) - 1);
+    const int transferChoice =
+        std::clamp(viewerState.chromaticityInputTransfer,
+                   0,
+                   static_cast<int>(WorkshopColor::transferFunctionCount()) - 1);
+    const char* primaries =
+        WorkshopColor::primariesDefinition(static_cast<std::size_t>(primariesChoice)).key;
+    const char* transfer =
+        WorkshopColor::transferFunctionDefinition(static_cast<std::size_t>(transferChoice)).key;
+    semantics.colorPrimaries =
+        primaries && primaries[0] != '\0' ? primaries : "unspecified";
+    semantics.transferFunction =
+        transfer && transfer[0] != '\0' ? transfer : "unspecified";
+    if (!ChromaspaceSourceExchange::validSourceSemanticMetadata(semantics)) {
+      return false;
+    }
+    *out = std::move(semantics);
+    return true;
+  }
+
+  uint64_t residentSourceGenerationHash(
+      const std::string& sourceId,
+      uint64_t sequence,
+      const CloudFootprintInfo& footprint,
+      int proxyWidth,
+      int proxyHeight,
+      int pixelFormat) const {
+    uint64_t hash = fnv1a64(sourceId);
+    const auto mix = [&hash](uint64_t value) {
+      for (int byte = 0; byte < 8; ++byte) {
+        hash ^= (value >> (byte * 8)) & 0xffu;
+        hash *= 1099511628211ull;
+      }
+    };
+    mix(sequence);
+    mix(static_cast<uint64_t>(static_cast<int64_t>(footprint.fullX1)));
+    mix(static_cast<uint64_t>(static_cast<int64_t>(footprint.fullY1)));
+    mix(static_cast<uint64_t>(footprint.fullWidth));
+    mix(static_cast<uint64_t>(footprint.fullHeight));
+    mix(static_cast<uint64_t>(static_cast<int64_t>(footprint.sampledX1)));
+    mix(static_cast<uint64_t>(static_cast<int64_t>(footprint.sampledY1)));
+    mix(static_cast<uint64_t>(footprint.sampledWidth));
+    mix(static_cast<uint64_t>(footprint.sampledHeight));
+    mix(static_cast<uint64_t>(proxyWidth));
+    mix(static_cast<uint64_t>(proxyHeight));
+    mix(static_cast<uint64_t>(pixelFormat));
+    return hash == 0 ? 1 : hash;
+  }
+
+  ChromaspaceSourceExchange::SourceProducerSubmitResult
+  submitResidentMetalSource(
+      Image* src,
+      const RenderArguments& args,
+      const CloudFootprintInfo& footprint,
+      int sourceWidth,
+      int sourceHeight,
+      int sourceOriginX,
+      int sourceOriginY,
+      int proxyWidth,
+      int proxyHeight,
+      int pixelFormat,
+      uint64_t sequence,
+      uint64_t contentHash) {
+    using namespace ChromaspaceSourceExchange;
+    if (!sourceProducerClient_ || !src || !args.pMetalCmdQ ||
+        src->getPixelData() == nullptr || src->getRowBytes() <= 0 ||
+        sourceWidth != footprint.sampledWidth ||
+        sourceHeight != footprint.sampledHeight ||
+        sourceOriginX != footprint.sampledX1 ||
+        sourceOriginY != footprint.sampledY1) {
+      return SourceProducerSubmitResult::InvalidRequest;
+    }
+    SourceSemanticMetadata semantics{};
+    if (!buildResidentSourceSemantics(footprint, &semantics)) {
+      return SourceProducerSubmitResult::InvalidRequest;
+    }
+    const SourceProducerBindResult bindResult =
+        bindSourceProducerMetalCommandQueue(sourceProducerClient_,
+                                            args.pMetalCmdQ);
+    if (bindResult != SourceProducerBindResult::Bound &&
+        bindResult != SourceProducerBindResult::AlreadyBound) {
+      return SourceProducerSubmitResult::NotReady;
+    }
+
+    SourceProducerResourceShape shape{};
+    shape.width = static_cast<uint32_t>(proxyWidth);
+    shape.height = static_cast<uint32_t>(proxyHeight);
+    shape.pixelFormat = static_cast<uint32_t>(pixelFormat);
+    const uint64_t shapeKey =
+        (static_cast<uint64_t>(shape.width) << 33u) |
+        (static_cast<uint64_t>(shape.height) << 1u) |
+        static_cast<uint64_t>(shape.pixelFormat);
+    if (sourceProducerPreparedShapeKey_.exchange(
+            shapeKey, std::memory_order_acq_rel) != shapeKey) {
+      prepareSourceProducerResources(sourceProducerClient_, shape);
+    }
+
+    SourceProducerFrameRequest request{};
+    request.sequence = sequence;
+    request.semantics = std::move(semantics);
+    request.metalCommandQueue = args.pMetalCmdQ;
+    request.sourceMetalBuffer = src->getPixelData();
+    request.sourceWidth = sourceWidth;
+    request.sourceHeight = sourceHeight;
+    request.sourceRowBytes = static_cast<size_t>(src->getRowBytes());
+    request.sourceOriginX = sourceOriginX;
+    request.sourceOriginY = sourceOriginY;
+    request.output = shape;
+    request.contentHash = contentHash;
+    return tryEnqueueSourceProducerFrame(sourceProducerClient_, request);
+  }
+#endif
 
   bool cudaLegacyInputCloudCpuStagingAllowed() const {
     // Legacy input_cloud packets serialize CPU-readable point samples. In CUDA
@@ -8469,7 +8685,7 @@ class ChromaspaceEffect : public ImageEffect {
     return out;
   }
 
-#if defined(__APPLE__)
+#if defined(__APPLE__) && defined(CHROMASPACE_MACOS_LEGACY_IOSURFACE_COMPAT)
   SourceSignalBuildResult buildSourceSignalPayloadFromSharedSurface(
       const ChromaspaceMetal::SharedSourceSignalSurface& surface,
       int sampledWidthForMetadata,
@@ -8479,7 +8695,9 @@ class ChromaspaceEffect : public ImageEffect {
       const std::string& sourceId,
       const std::string& backendName,
       bool nativeTier,
-      int proxyLongEdge) {
+      int proxyLongEdge,
+      uint64_t sequence,
+      uint64_t contentHash) {
     (void)time;
     SourceSignalBuildResult out{};
     if (surface.surfaceId == 0 || surface.width <= 0 || surface.height <= 0 ||
@@ -8490,15 +8708,6 @@ class ChromaspaceEffect : public ImageEffect {
 
     const int sourceWidth = footprint.fullWidth > 0 ? footprint.fullWidth : sampledWidthForMetadata;
     const int sourceHeight = footprint.fullHeight > 0 ? footprint.fullHeight : sampledHeightForMetadata;
-    const uint64_t seq = gSharedCubeViewerSeqCounter.fetch_add(1, std::memory_order_relaxed);
-    std::ostringstream hashKey;
-    hashKey << sourceId << "|seq=" << seq
-            << "|surface=" << surface.surfaceId
-            << "|source=" << sourceWidth << "x" << sourceHeight
-            << "|proxy=" << surface.width << "x" << surface.height
-            << "|format=" << surface.pixelFormat;
-    const uint64_t contentHash = fnv1a64(hashKey.str());
-
     auto blob = std::make_shared<ViewerCloudTransportBlob>();
     blob->transport = "iosurface_metal";
     blob->byteSize = surface.byteSize;
@@ -8527,7 +8736,7 @@ class ChromaspaceEffect : public ImageEffect {
 
     const char* pixelFormat = surface.pixelFormat == 1 ? "rgba32f" : "rgba16f";
     std::ostringstream os;
-    os << "{\"type\":\"source_signal\",\"seq\":" << seq
+    os << "{\"type\":\"source_signal\",\"seq\":" << sequence
        << ",\"senderId\":\"" << jsonEscape(senderId_) << "\""
        << ",\"sourceWidth\":" << sourceWidth
        << ",\"sourceHeight\":" << sourceHeight
@@ -8543,6 +8752,8 @@ class ChromaspaceEffect : public ImageEffect {
        << ",\"surfaceWidth\":" << surface.width
        << ",\"surfaceHeight\":" << surface.height
        << ",\"surfacePixelFormat\":" << surface.pixelFormat
+       << ",\"surfaceGlobal\":" << (surface.global ? 1 : 0)
+       << ",\"surfaceSelfLookup\":" << (surface.selfLookupOk ? 1 : 0)
        << ",\"coverage\":\"" << coverage << "\""
        << ",\"tier\":\"" << jsonEscape(sourceSignalTierLabel(nativeTier, proxyLongEdge)) << "\""
        << ",\"backend\":\"" << jsonEscape(backendName) << "\""
@@ -12047,7 +12258,11 @@ class ChromaspaceEffect : public ImageEffect {
         src->getPixelData() == nullptr) {
       return out;
     }
+#if defined(CHROMASPACE_MACOS_LEGACY_IOSURFACE_COMPAT)
     const bool allowMetalCpuFallback = sourceSignalMetalCpuFallbackEnabled();
+#else
+    constexpr bool allowMetalCpuFallback = false;
+#endif
     int width = 0;
     int height = 0;
     int x1 = 0;
@@ -12068,9 +12283,43 @@ class ChromaspaceEffect : public ImageEffect {
                                     &proxyHeight,
                                     &proxyLongEdge,
                                     &nativeTier)) {
+#if defined(CHROMASPACE_MACOS_LEGACY_IOSURFACE_COMPAT)
       ChromaspaceMetal::SharedSourceSignalSurface surface{};
       std::string surfaceError;
+#endif
       const int surfacePixelFormat = sourceSignalUsesRgba32f() ? 1 : 0;
+      uint64_t sequence =
+          gSharedCubeViewerSeqCounter.fetch_add(1, std::memory_order_relaxed);
+      if (sequence == 0) {
+        sequence =
+            gSharedCubeViewerSeqCounter.fetch_add(1, std::memory_order_relaxed);
+      }
+      const uint64_t contentHash =
+          residentSourceGenerationHash(sourceId,
+                                       sequence,
+                                       footprint,
+                                       proxyWidth,
+                                       proxyHeight,
+                                       surfacePixelFormat);
+      const auto residentResult =
+          submitResidentMetalSource(src,
+                                    args,
+                                    footprint,
+                                    width,
+                                    height,
+                                    x1,
+                                    y1,
+                                    proxyWidth,
+                                    proxyHeight,
+                                    surfacePixelFormat,
+                                    sequence,
+                                    contentHash);
+      if (residentResult ==
+          ChromaspaceSourceExchange::SourceProducerSubmitResult::Enqueued) {
+        cubeViewerDebugLog(
+            "Source Signal resident Metal publication enqueued.");
+      }
+#if defined(CHROMASPACE_MACOS_LEGACY_IOSURFACE_COMPAT)
       if (ChromaspaceMetal::copySourceProxyToIOSurface(src->getPixelData(),
                                                        width,
                                                        height,
@@ -12089,7 +12338,9 @@ class ChromaspaceEffect : public ImageEffect {
                            std::to_string(surface.height) +
                            " source=" + std::to_string(width) + "x" + std::to_string(height) +
                            " bytes=" + std::to_string(surface.byteSize) +
-                           " format=" + std::to_string(surface.pixelFormat));
+                           " format=" + std::to_string(surface.pixelFormat) +
+                           " global=" + std::to_string(surface.global ? 1 : 0) +
+                           " selfLookup=" + std::to_string(surface.selfLookupOk ? 1 : 0));
         SourceSignalBuildResult surfacePayload =
             buildSourceSignalPayloadFromSharedSurface(surface,
                                                       width,
@@ -12099,7 +12350,9 @@ class ChromaspaceEffect : public ImageEffect {
                                                       sourceId,
                                                       "GPU-surface/Metal",
                                                       nativeTier,
-                                                      proxyLongEdge);
+                                                      proxyLongEdge,
+                                                      sequence,
+                                                      contentHash);
         if (surfacePayload.success) return surfacePayload;
         if (surface.retainedSurface) {
           CFRelease(static_cast<CFTypeRef>(surface.retainedSurface));
@@ -12124,6 +12377,7 @@ class ChromaspaceEffect : public ImageEffect {
                            (surfaceError.empty() ? "unknown" : surfaceError) +
                            "; falling back to proxy readback for diagnostics.");
       }
+#endif
       const size_t proxyPackedRowBytes = static_cast<size_t>(proxyWidth) * 4u * sizeof(float);
       if (ensureStageBuffer(static_cast<size_t>(proxyWidth) * static_cast<size_t>(proxyHeight))) {
         float* proxyReadback = stageSrcPtr();
@@ -14014,6 +14268,7 @@ class ChromaspaceEffect : public ImageEffect {
   }
 };
 
+#if defined(CHROMASPACE_MACOS_LEGACY_IOSURFACE_COMPAT) || !defined(__APPLE__)
 class ChromaspaceOverlayInteract : public OFX::OverlayInteract {
  public:
   ChromaspaceOverlayInteract(OfxInteractHandle handle, OFX::ImageEffect* effect)
@@ -14231,6 +14486,7 @@ class ChromaspaceOverlayInteract : public OFX::OverlayInteract {
 
 class ChromaspaceOverlayDescriptor
     : public OFX::DefaultEffectOverlayDescriptor<ChromaspaceOverlayDescriptor, ChromaspaceOverlayInteract> {};
+#endif
 
 class ChromaspaceFactory : public PluginFactoryHelper<ChromaspaceFactory> {
  public:
@@ -14253,7 +14509,9 @@ class ChromaspaceFactory : public PluginFactoryHelper<ChromaspaceFactory> {
     d.setSupportsTiles(false);
     d.setSupportsMultiResolution(false);
     d.setTemporalClipAccess(false);
+#if defined(CHROMASPACE_MACOS_LEGACY_IOSURFACE_COMPAT) || !defined(__APPLE__)
     d.setOverlayInteractDescriptor(new ChromaspaceOverlayDescriptor);
+#endif
 #if defined(CHROMASPACE_HAS_CUDA)
     d.setSupportsCudaRender(true);
     d.setSupportsCudaStream(true);
