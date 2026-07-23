@@ -758,6 +758,23 @@ class ViewerQualificationTelemetryTests(unittest.TestCase):
                 self.assertFalse(passed)
                 self.assertIn("presented_cpu", finding.detail)
 
+    def test_command_runner_replaces_invalid_utf8_without_losing_markers(self):
+        result = qualification.CommandRunner().run(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import os; "
+                    "os.write(1, b'stdout-before\\xffstdout-after'); "
+                    "os.write(2, b'stderr-before\\xc3stderr-after')"
+                ),
+            ]
+        )
+
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "stdout-before\ufffdstdout-after")
+        self.assertEqual(result.stderr, "stderr-before\ufffdstderr-after")
+
     def test_timeout_preserves_partial_output_and_fails(self):
         timeout = subprocess.TimeoutExpired(
             ["fixture"], 1, output="qualification=pass frames=3", stderr="partial"
