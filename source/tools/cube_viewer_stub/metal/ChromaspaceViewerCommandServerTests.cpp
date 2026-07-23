@@ -162,8 +162,6 @@ int main() {
 
   // A second launch must preserve the active listener inode and leave the
   // first server usable.  The endpoint probe runs before any stale unlink.
-  const uint64_t acceptedBeforeDuplicate =
-      server.snapshot().acceptedConnections;
   ViewerCommandServer duplicateServer(&reducer, options);
   assert(!duplicateServer.start());
   assert(duplicateServer.state() == ViewerCommandServerState::Failed);
@@ -175,10 +173,21 @@ int main() {
   assert(activeEndpointStat.st_dev == endpointBeforeDuplicate.st_dev);
   assert(activeEndpointStat.st_ino == endpointBeforeDuplicate.st_ino);
   assert(server.snapshot().listenerReady);
+  const auto beforeDuplicateSync = server.snapshot();
+  int duplicateSyncClient = -1;
+  assert(connectSocket(path, &duplicateSyncClient));
+  const std::string duplicateSyncParams =
+      "{\"type\":\"params\",\"seq\":1,\"senderId\":\"duplicate-sync\"}\n";
+  assert(::send(duplicateSyncClient, duplicateSyncParams.data(),
+                duplicateSyncParams.size(), 0) ==
+         static_cast<ssize_t>(duplicateSyncParams.size()));
+  assert(waitForParams(&reducer, 1u));
+  ::close(duplicateSyncClient);
   assert(waitForServerSnapshot(
-      &server,
-      [acceptedBeforeDuplicate](const ViewerCommandServerSnapshot& value) {
-        return value.acceptedConnections > acceptedBeforeDuplicate &&
+      &server, [beforeDuplicateSync](const ViewerCommandServerSnapshot& value) {
+        return value.acceptedConnections >
+                   beforeDuplicateSync.acceptedConnections &&
+               value.closedConnections > beforeDuplicateSync.closedConnections &&
                value.activeConnections == 0u;
       }));
 
