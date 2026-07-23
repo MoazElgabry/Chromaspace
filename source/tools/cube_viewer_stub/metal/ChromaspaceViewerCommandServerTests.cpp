@@ -238,6 +238,12 @@ int main() {
   const auto beforeIncomplete = server.snapshot();
   int incomplete = -1;
   assert(connectSocket(path, &incomplete));
+  assert(waitForServerSnapshot(
+      &server, [beforeIncomplete](const ViewerCommandServerSnapshot& value) {
+        return value.acceptedConnections >
+                   beforeIncomplete.acceptedConnections &&
+               value.activeConnections >= 1u;
+      }));
   const std::string partial =
       "{\"type\":\"heartbeat\",\"seq\":99,\"senderId\":\"partial\"}";
   assert(::send(incomplete, partial.data(), partial.size(), 0) ==
@@ -246,9 +252,7 @@ int main() {
   assert(waitForServerSnapshot(
       &server,
       [beforeIncomplete](const ViewerCommandServerSnapshot& value) {
-        return value.acceptedConnections >
-                   beforeIncomplete.acceptedConnections &&
-               value.closedConnections > beforeIncomplete.closedConnections &&
+        return value.closedConnections > beforeIncomplete.closedConnections &&
                value.incompleteLines > beforeIncomplete.incompleteLines &&
                value.activeConnections == 0u;
       }));
