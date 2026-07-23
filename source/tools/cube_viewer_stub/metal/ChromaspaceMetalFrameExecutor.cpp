@@ -96,7 +96,7 @@ bool hasAnyIdentity(const ChromaspaceMetal::FrameSubmission& submission) noexcep
          submission.deviceRegistryId != 0u;
 }
 
-#if !defined(__APPLE__)
+#if !defined(CHROMASPACE_METAL_EXTERNAL_DEFAULT_BACKENDS)
 bool unavailableCreate(void*,
                        void*,
                        int,
@@ -160,7 +160,7 @@ const FrameExecutorBackend kUnavailableBackend{
 
 }  // namespace
 
-#if !defined(__APPLE__)
+#if !defined(CHROMASPACE_METAL_EXTERNAL_DEFAULT_BACKENDS)
 const FrameExecutorBackend* defaultFrameExecutorBackend() noexcept {
   return &kUnavailableBackend;
 }

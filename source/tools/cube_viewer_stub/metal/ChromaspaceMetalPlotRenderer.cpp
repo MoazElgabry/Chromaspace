@@ -751,7 +751,7 @@ bool validCommand(const PlotCommand& command,
   return true;
 }
 
-#if !defined(__APPLE__)
+#if !defined(CHROMASPACE_METAL_EXTERNAL_DEFAULT_BACKENDS)
 bool unavailableCreate(void*, uint64_t, int, int, int,
                        ChromaspaceMetal::PlotSurface*, std::string* error) noexcept {
   setErrorNoThrow(error, "metal-plot-renderer-backend-unavailable");
@@ -1020,7 +1020,7 @@ bool FrameRequest::appendScaffoldVertices(
   return appendVectorVertices(vertices, vertexCount, command);
 }
 
- #if !defined(__APPLE__)
+#if !defined(CHROMASPACE_METAL_EXTERNAL_DEFAULT_BACKENDS)
 const RendererBackend* defaultRendererBackend() noexcept {
   return &kUnavailableBackend;
 }

@@ -18,6 +18,9 @@ from typing import Iterable
 
 
 NATIVE_ONLY_MACRO = "CHROMASPACE_METAL_NATIVE_ONLY"
+EXTERNAL_DEFAULT_BACKENDS_MACRO = (
+    "CHROMASPACE_METAL_EXTERNAL_DEFAULT_BACKENDS"
+)
 TARGET_MUTATION_COMMANDS = (
     "add_executable",
     "target_link_libraries",
@@ -389,6 +392,55 @@ def _cmake_arguments(body: str) -> tuple[list[str], str | None]:
         return [], f"cannot parse CMake command arguments: {exc}"
 
 
+def _metal_default_backend_linkage_findings(
+    cmake: str, sources: dict[str, str]
+) -> list[str]:
+    """Keep portable cores independent from the host operating system."""
+
+    findings: list[str] = []
+    external_guard = f"#if !defined({EXTERNAL_DEFAULT_BACKENDS_MACRO})"
+    for label, source in sources.items():
+        if "#if !defined(__APPLE__)" in source:
+            findings.append(
+                f"{label} selects fallback defaults from __APPLE__"
+            )
+        if external_guard not in source:
+            findings.append(
+                f"{label} does not guard fallback defaults with "
+                f"{EXTERNAL_DEFAULT_BACKENDS_MACRO}"
+            )
+
+    definitions, errors = _parse_cmake_commands(
+        cmake, "target_compile_definitions"
+    )
+    findings.extend(
+        f"target_compile_definitions: {error}" for error in errors
+    )
+    parsed_definitions: list[list[str]] = []
+    for body in definitions:
+        arguments, error = _cmake_arguments(body)
+        if error:
+            findings.append(f"target_compile_definitions: {error}")
+        else:
+            parsed_definitions.append(arguments)
+
+    for target in (
+        "Chromaspace_CubeViewer",
+        "Chromaspace_MetalViewerCutover",
+    ):
+        if not any(
+            arguments
+            and arguments[0] == target
+            and EXTERNAL_DEFAULT_BACKENDS_MACRO in arguments[1:]
+            for arguments in parsed_definitions
+        ):
+            findings.append(
+                f"{target} does not declare "
+                f"{EXTERNAL_DEFAULT_BACKENDS_MACRO}"
+            )
+    return findings
+
+
 def _cmake_source_closure_findings(
     cmake: str,
     target: str,
@@ -670,6 +722,15 @@ def verify(root: Path) -> list[str]:
         source_exchange_v2_tests = _read(
             root, manifest["source_exchange_v2_tests"]
         )
+        frame_executor_source = _read(
+            root, manifest["frame_executor_source"]
+        )
+        plot_renderer_source = _read(
+            root, manifest["plot_renderer_source"]
+        )
+        viewer_runtime_source = _read(
+            root, manifest["viewer_runtime_source"]
+        )
         cmake = _read(root, manifest["cmake"])
     except (KeyError, RuntimeError) as exc:
         return [str(exc)]
@@ -716,6 +777,17 @@ def verify(root: Path) -> list[str]:
         f"Source Exchange Objective-C API contract: {finding}"
         for finding in _source_exchange_objc_api_findings(
             source_exchange_v2_tests
+        )
+    )
+    findings.extend(
+        f"Metal default-backend linkage contract: {finding}"
+        for finding in _metal_default_backend_linkage_findings(
+            cmake,
+            {
+                manifest["frame_executor_source"]: frame_executor_source,
+                manifest["plot_renderer_source"]: plot_renderer_source,
+                manifest["viewer_runtime_source"]: viewer_runtime_source,
+            },
         )
     )
     for token in manifest.get("cmake_global_required", []):

@@ -46,7 +46,7 @@ bool encodePlotPass(
                                         error);
 }
 
-#if !defined(__APPLE__)
+#if !defined(CHROMASPACE_METAL_EXTERNAL_DEFAULT_BACKENDS)
 bool unavailableAtlasCreate(void*,
                             uint64_t,
                             int,
@@ -67,7 +67,7 @@ const RuntimeResourceBackend kUnavailableResourceBackend{
 
 }  // namespace
 
-#if !defined(__APPLE__)
+#if !defined(CHROMASPACE_METAL_EXTERNAL_DEFAULT_BACKENDS)
 const RuntimeResourceBackend* defaultRuntimeResourceBackend() noexcept {
   return &kUnavailableResourceBackend;
 }

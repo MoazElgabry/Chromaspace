@@ -15,6 +15,9 @@
   "qualification_native_source": "tools/cube_viewer_stub/metal/ChromaspaceMetalQualificationNativeSourceBackend.mm",
   "qualification_campaign": "tools/cube_viewer_stub/metal/ChromaspaceMetalQualificationCampaign.cpp",
   "source_exchange_v2_tests": "tools/cube_viewer_stub/metal/ChromaspaceSourceExchangeV2Tests.mm",
+  "frame_executor_source": "tools/cube_viewer_stub/metal/ChromaspaceMetalFrameExecutor.cpp",
+  "plot_renderer_source": "tools/cube_viewer_stub/metal/ChromaspaceMetalPlotRenderer.cpp",
+  "viewer_runtime_source": "tools/cube_viewer_stub/metal/ChromaspaceMetalViewerRuntime.cpp",
   "cmake": "CMakeLists.txt",
   "cmake_global_required": [
     "set(WORKSHOP_COLOR_SOURCES",

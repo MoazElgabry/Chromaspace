@@ -497,7 +497,8 @@ if(APPLE)
   target_include_directories(Chromaspace_CubeViewer PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/tools/cube_viewer_stub")
   target_compile_definitions(Chromaspace_CubeViewer PRIVATE
-    CHROMASPACE_METAL_NATIVE_ONLY)
+    CHROMASPACE_METAL_NATIVE_ONLY
+    CHROMASPACE_METAL_EXTERNAL_DEFAULT_BACKENDS)
   target_compile_options(Chromaspace_CubeViewer PRIVATE
     $<$<COMPILE_LANGUAGE:OBJCXX>:-fobjc-arc>)
 endif()
@@ -584,7 +585,8 @@ if(APPLE)
   target_compile_features(Chromaspace_MetalViewerCutover PRIVATE cxx_std_17)
   target_compile_definitions(Chromaspace_MetalViewerCutover PRIVATE
     CHROMASPACE_METAL_NATIVE_ONLY
-    CHROMASPACE_METAL_QUALIFICATION)
+    CHROMASPACE_METAL_QUALIFICATION
+    CHROMASPACE_METAL_EXTERNAL_DEFAULT_BACKENDS)
   target_compile_options(Chromaspace_MetalViewerCutover PRIVATE
     $<$<COMPILE_LANGUAGE:OBJCXX>:-fobjc-arc>)
   target_include_directories(Chromaspace_MetalViewerCutover PRIVATE

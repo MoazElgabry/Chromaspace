@@ -213,6 +213,49 @@ NSData* token = [NSMutableData dataWithLength:8];
             [], policy._source_exchange_objc_api_findings(fixture)
         )
 
+    def test_metal_default_backend_linkage_rejects_os_inferred_defaults(
+        self,
+    ) -> None:
+        source = """
+#if !defined(__APPLE__)
+const Backend* defaultBackend() noexcept { return &fallback; }
+#endif
+"""
+        cmake = """
+target_compile_definitions(Chromaspace_CubeViewer PRIVATE
+  CHROMASPACE_METAL_NATIVE_ONLY)
+target_compile_definitions(Chromaspace_MetalViewerCutover PRIVATE
+  CHROMASPACE_METAL_NATIVE_ONLY)
+"""
+        findings = policy._metal_default_backend_linkage_findings(
+            cmake, {"frame": source, "plot": source, "runtime": source}
+        )
+        self.assertEqual(8, len(findings))
+
+    def test_metal_default_backend_linkage_accepts_explicit_capability(
+        self,
+    ) -> None:
+        macro = policy.EXTERNAL_DEFAULT_BACKENDS_MACRO
+        source = f"""
+#if !defined({macro})
+const Backend* defaultBackend() noexcept {{ return &fallback; }}
+#endif
+"""
+        cmake = f"""
+target_compile_definitions(Chromaspace_CubeViewer PRIVATE
+  CHROMASPACE_METAL_NATIVE_ONLY
+  {macro})
+target_compile_definitions(Chromaspace_MetalViewerCutover PRIVATE
+  CHROMASPACE_METAL_NATIVE_ONLY
+  {macro})
+"""
+        self.assertEqual(
+            [],
+            policy._metal_default_backend_linkage_findings(
+                cmake, {"frame": source, "plot": source, "runtime": source}
+            ),
+        )
+
     def test_forbidden_token_in_executor_source_is_reported(self) -> None:
         root = Path(__file__).resolve().parents[2]
         original_read = policy._read
