@@ -58,6 +58,41 @@ bool initializeMetalContext(MetalContext* context, std::string* error) {
             [], policy._initialize_metal_context_return_findings(fixture)
         )
 
+    def test_command_buffer_context_definition_rejects_external_scope(self) -> None:
+        fixture = """
+namespace ChromaspaceMetal {
+namespace {
+bool contextForCommandBuffer(int commandBuffer);
+}  // namespace
+
+bool contextForCommandBuffer(int commandBuffer) {
+  return commandBuffer != 0;
+}
+}  // namespace ChromaspaceMetal
+"""
+        findings = policy._command_buffer_context_namespace_findings(fixture)
+        self.assertTrue(
+            any("outside the anonymous namespace" in item for item in findings)
+        )
+
+    def test_command_buffer_context_definition_accepts_anonymous_scope(self) -> None:
+        fixture = """
+namespace ChromaspaceMetal {
+namespace {
+bool contextForCommandBuffer(int commandBuffer);
+}  // namespace
+
+namespace {
+bool contextForCommandBuffer(int commandBuffer) {
+  return commandBuffer != 0;
+}
+}  // namespace
+}  // namespace ChromaspaceMetal
+"""
+        self.assertEqual(
+            [], policy._command_buffer_context_namespace_findings(fixture)
+        )
+
     def test_forbidden_token_in_executor_source_is_reported(self) -> None:
         root = Path(__file__).resolve().parents[2]
         original_read = policy._read

@@ -3194,6 +3194,8 @@ ResidentReadiness residentReadiness(uint64_t compositorId) {
   return residentReadinessFromContext(*runtimeContext, {});
 }
 
+namespace {
+
 bool contextForCommandBuffer(id<MTLCommandBuffer> commandBuffer,
                              std::shared_ptr<MetalContext>* outOwnedContext,
                              MetalContext** outContext,
@@ -3242,6 +3244,8 @@ bool contextForCommandBuffer(id<MTLCommandBuffer> commandBuffer,
   return false;
 #endif
 }
+
+}  // namespace
 
 std::string residentPipelineUnavailableReason(const char* stage) {
   ResidentReadiness readiness = residentReadiness();

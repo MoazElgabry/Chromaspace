@@ -130,6 +130,42 @@ def _initialize_metal_context_return_findings(text: str) -> list[str]:
     return findings
 
 
+def _command_buffer_context_namespace_findings(text: str) -> list[str]:
+    """Require the command-buffer context helper to remain file-private."""
+
+    definition = re.search(
+        r"(?s)\bbool\s+contextForCommandBuffer\s*\([^;{}]*\)\s*\{",
+        text,
+    )
+    if definition is None:
+        return ["contextForCommandBuffer definition not found"]
+
+    anonymous_ranges: list[tuple[int, int]] = []
+    openings = list(re.finditer(r"(?m)^[ \t]*namespace[ \t]*\{[ \t]*$", text))
+    closings = list(
+        re.finditer(r"(?m)^[ \t]*\}[ \t]*//[ \t]*namespace[ \t]*$", text)
+    )
+    closing_index = 0
+    for opening in openings:
+        while (
+            closing_index < len(closings)
+            and closings[closing_index].start() < opening.end()
+        ):
+            closing_index += 1
+        if closing_index >= len(closings):
+            break
+        anonymous_ranges.append((opening.start(), closings[closing_index].end()))
+        closing_index += 1
+
+    if any(start <= definition.start() < end for start, end in anonymous_ranges):
+        return []
+    line_number = text.count("\n", 0, definition.start()) + 1
+    return [
+        f"line {line_number}: contextForCommandBuffer definition is outside "
+        "the anonymous namespace"
+    ]
+
+
 def _target_block(cmake: str, target: str) -> str:
     marker = f"add_executable({target}"
     start = cmake.find(marker)
@@ -536,6 +572,10 @@ def verify(root: Path) -> list[str]:
     findings.extend(
         f"Metal source initialization return policy: {finding}"
         for finding in _initialize_metal_context_return_findings(metal_source)
+    )
+    findings.extend(
+        f"Metal source command-buffer context policy: {finding}"
+        for finding in _command_buffer_context_namespace_findings(metal_source)
     )
     for token in manifest.get("cmake_global_required", []):
         if token not in cmake:
