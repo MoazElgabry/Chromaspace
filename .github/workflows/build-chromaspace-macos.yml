@@ -149,7 +149,7 @@ jobs:
             "build-mac-universal/artifacts/metal-native-cutover/Chromaspace_MetalViewerCutover"
           )
           for binary in "${binaries[@]}"; do
-            lipo -verify_arch arm64 x86_64 "${binary}"
+            lipo "${binary}" -verify_arch arm64 x86_64
             for architecture in arm64 x86_64; do
               minos="$(otool -arch "${architecture}" -l "${binary}" | awk '
                 $1 == "cmd" && $2 == "LC_BUILD_VERSION" { in_build_version = 1; next }
