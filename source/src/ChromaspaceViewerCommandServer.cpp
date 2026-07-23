@@ -832,10 +832,12 @@ void ViewerCommandServer::run() noexcept {
         const short events = pollDescriptors[clientIndex + 2u].revents;
         if (events == 0) continue;
         ClientConnection& client = clients[clientIndex];
-        bool closeConnection =
-            (events & (POLLERR | POLLHUP | POLLNVAL)) != 0;
+        const bool invalidDescriptor = (events & POLLNVAL) != 0;
+        const bool terminalSocketEvent = (events & (POLLERR | POLLHUP)) != 0;
+        bool closeConnection = invalidDescriptor;
 
-        if ((events & POLLOUT) != 0 && !client.pendingOutput.empty()) {
+        if (!closeConnection && (events & POLLOUT) != 0 &&
+            !client.pendingOutput.empty()) {
           ssize_t sent = 0;
           const bool sentResult = sendNoSignal(
               client.fd, client.pendingOutput.data(), client.pendingOutput.size(),
@@ -849,20 +851,38 @@ void ViewerCommandServer::run() noexcept {
           }
         }
 
-        if (!closeConnection && (events & POLLIN) != 0) {
-          char bytes[kSocketReadChunkBytes];
-          const ssize_t count =
-              ::recv(client.fd, bytes, sizeof(bytes), MSG_DONTWAIT);
-          if (count > 0) {
-            client.lastActivity = std::chrono::steady_clock::now();
-            consumeBytes(&client, bytes, static_cast<std::size_t>(count));
-          } else if (count == 0) {
-            closeConnection = true;
-          } else if (errno != EAGAIN && errno != EWOULDBLOCK &&
-                     errno != EINTR) {
-            closeConnection = true;
+        // A peer that writes and immediately closes may surface POLLIN and
+        // POLLHUP together (notably on macOS).  Drain bytes already queued by
+        // the kernel before honoring the terminal event, otherwise complete
+        // commands and transport diagnostics can be silently lost.  A
+        // terminal socket has a finite receive queue, so continue to EOF or
+        // EAGAIN; ordinary readable sockets keep the one-chunk fairness bound.
+        const bool shouldRead =
+            !invalidDescriptor &&
+            (events & (POLLIN | POLLERR | POLLHUP)) != 0;
+        if (shouldRead) {
+          for (;;) {
+            char bytes[kSocketReadChunkBytes];
+            const ssize_t count =
+                ::recv(client.fd, bytes, sizeof(bytes), MSG_DONTWAIT);
+            if (count > 0) {
+              client.lastActivity = std::chrono::steady_clock::now();
+              consumeBytes(&client, bytes, static_cast<std::size_t>(count));
+              if (!terminalSocketEvent) break;
+              continue;
+            }
+            if (count == 0) {
+              closeConnection = true;
+              break;
+            }
+            if (errno == EINTR) continue;
+            if (errno != EAGAIN && errno != EWOULDBLOCK) {
+              closeConnection = true;
+            }
+            break;
           }
         }
+        if (terminalSocketEvent) closeConnection = true;
 
         if (closeConnection) {
           closeClient(&client);
