@@ -1867,7 +1867,7 @@ bool initializeMetalContext(MetalContext* context, std::string* error) {
     return c.ready;
   }
   c.initAttempted = true;
-  try {
+  auto initializeResources = [&]() {
     @autoreleasepool {
       c.device = MTLCreateSystemDefaultDevice();
       if (c.device == nil) {
@@ -2395,6 +2395,9 @@ bool initializeMetalContext(MetalContext* context, std::string* error) {
       }
       c.ready = true;
     }
+  };
+  try {
+    initializeResources();
   } catch (...) {
     c.ready = false;
     if (c.initError.empty()) {

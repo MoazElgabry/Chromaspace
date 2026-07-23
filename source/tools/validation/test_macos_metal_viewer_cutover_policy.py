@@ -20,6 +20,44 @@ class NativeViewerCutoverPolicyTests(unittest.TestCase):
         root = Path(__file__).resolve().parents[2]
         self.assertEqual([], policy.verify(root))
 
+    def test_non_void_metal_initializer_rejects_unwrapped_bare_return(self) -> None:
+        fixture = """
+bool initializeMetalContext(MetalContext* context, std::string* error) {
+  try {
+    @autoreleasepool {
+      return;
+    }
+  } catch (...) {
+  }
+  return false;
+}
+
+#if !defined(CHROMASPACE_METAL_NATIVE_ONLY)
+"""
+        findings = policy._initialize_metal_context_return_findings(fixture)
+        self.assertTrue(any("bare return escapes" in item for item in findings))
+
+    def test_non_void_metal_initializer_allows_void_lambda_failure_exit(self) -> None:
+        fixture = """
+bool initializeMetalContext(MetalContext* context, std::string* error) {
+  auto initializeResources = [&]() {
+    @autoreleasepool {
+      return;
+    }
+  };
+  try {
+    initializeResources();
+  } catch (...) {
+  }
+  return false;
+}
+
+#if !defined(CHROMASPACE_METAL_NATIVE_ONLY)
+"""
+        self.assertEqual(
+            [], policy._initialize_metal_context_return_findings(fixture)
+        )
+
     def test_forbidden_token_in_executor_source_is_reported(self) -> None:
         root = Path(__file__).resolve().parents[2]
         original_read = policy._read

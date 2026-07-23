@@ -93,6 +93,43 @@ def _guarded_token_violations(text: str, tokens: Iterable[str]) -> list[str]:
     return violations
 
 
+def _initialize_metal_context_return_findings(text: str) -> list[str]:
+    """Reject bare returns that escape the non-void Metal initializer."""
+
+    signature = (
+        "bool initializeMetalContext(MetalContext* context, std::string* error)"
+    )
+    start = text.find(signature)
+    if start < 0:
+        return ["initializeMetalContext definition not found"]
+    end = text.find("\n#if !defined(CHROMASPACE_METAL_NATIVE_ONLY)", start)
+    if end < 0:
+        return ["initializeMetalContext end marker not found"]
+
+    region = text[start:end]
+    bare_returns = list(
+        re.finditer(r"(?m)^[ \t]*return;[ \t]*(?://.*)?$", region)
+    )
+    if not bare_returns:
+        return []
+
+    wrapper = re.search(
+        r"(?s)auto\s+initializeResources\s*=\s*\[&\]\(\)\s*\{"
+        r"\s*@autoreleasepool\s*\{.*?\n[ \t]*\}\s*\n[ \t]*\};"
+        r"\s*try\s*\{\s*initializeResources\(\);",
+        region,
+    )
+    findings: list[str] = []
+    for match in bare_returns:
+        if wrapper is not None and wrapper.start() <= match.start() < wrapper.end():
+            continue
+        line_number = text.count("\n", 0, start + match.start()) + 1
+        findings.append(
+            f"line {line_number}: bare return escapes non-void initializeMetalContext"
+        )
+    return findings
+
+
 def _target_block(cmake: str, target: str) -> str:
     marker = f"add_executable({target}"
     start = cmake.find(marker)
@@ -496,6 +533,10 @@ def verify(root: Path) -> list[str]:
         findings.append(f"Metal source missing required token: {token}")
     for token in _forbidden(metal_source, manifest.get("metal_forbidden", [])):
         findings.append(f"Metal source contains forbidden token: {token}")
+    findings.extend(
+        f"Metal source initialization return policy: {finding}"
+        for finding in _initialize_metal_context_return_findings(metal_source)
+    )
     for token in manifest.get("cmake_global_required", []):
         if token not in cmake:
             findings.append(f"CMake global missing required token: {token}")
