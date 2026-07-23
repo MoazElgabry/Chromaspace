@@ -211,6 +211,56 @@ def _metal_apple_compile_contract_findings(text: str) -> list[str]:
     return findings
 
 
+def _native_source_exception_contract_findings(
+    header: str, source: str
+) -> list[str]:
+    """Keep Objective-C++ definitions aligned with their C++ declarations."""
+
+    findings: list[str] = []
+    for name in ("createCallback", "createInternal"):
+        declaration = re.search(
+            rf"\b{name}\s*\((?:(?!;).)*?\)\s*(noexcept)?\s*;",
+            header,
+            re.DOTALL,
+        )
+        definition = re.search(
+            rf"\bNativeSourceFixtureBackend::{name}\s*"
+            rf"\((?:(?!\{{).)*?\)\s*(noexcept)?\s*\{{",
+            source,
+            re.DOTALL,
+        )
+        if declaration is None:
+            findings.append(f"{name} declaration not found")
+            continue
+        if definition is None:
+            findings.append(f"{name} definition not found")
+            continue
+        declaration_noexcept = declaration.group(1) is not None
+        definition_noexcept = definition.group(1) is not None
+        if declaration_noexcept != definition_noexcept:
+            findings.append(
+                f"{name} declaration and definition disagree on noexcept"
+            )
+    return findings
+
+
+def _qualification_campaign_switch_findings(text: str) -> list[str]:
+    """Keep Scenario switching exhaustive without hiding future enum additions."""
+
+    start = text.find("bool Campaign::next(")
+    end = text.find("\nbool Campaign::acknowledgePending(", start)
+    if start < 0 or end < 0:
+        return ["Campaign::next definition not found"]
+    tick = text[start:end]
+    marker = "switch (config_.scenario)"
+    switch_start = tick.find(marker)
+    if switch_start < 0:
+        return ["Campaign::next scenario switch not found"]
+    if "case Scenario::Soak:" not in tick[switch_start:]:
+        return ["Campaign::next scenario switch does not handle Scenario::Soak"]
+    return []
+
+
 def _target_block(cmake: str, target: str) -> str:
     marker = f"add_executable({target}"
     start = cmake.find(marker)
@@ -596,6 +646,15 @@ def verify(root: Path) -> list[str]:
         )
         metal_source = _read(root, manifest["metal_source"])
         metal_header = _read(root, manifest["metal_header"])
+        qualification_native_source_header = _read(
+            root, manifest["qualification_native_source_header"]
+        )
+        qualification_native_source = _read(
+            root, manifest["qualification_native_source"]
+        )
+        qualification_campaign = _read(
+            root, manifest["qualification_campaign"]
+        )
         cmake = _read(root, manifest["cmake"])
     except (KeyError, RuntimeError) as exc:
         return [str(exc)]
@@ -625,6 +684,18 @@ def verify(root: Path) -> list[str]:
     findings.extend(
         f"Metal source Apple compile contract: {finding}"
         for finding in _metal_apple_compile_contract_findings(metal_source)
+    )
+    findings.extend(
+        f"qualification native-source exception contract: {finding}"
+        for finding in _native_source_exception_contract_findings(
+            qualification_native_source_header, qualification_native_source
+        )
+    )
+    findings.extend(
+        f"qualification campaign switch contract: {finding}"
+        for finding in _qualification_campaign_switch_findings(
+            qualification_campaign
+        )
     )
     for token in manifest.get("cmake_global_required", []):
         if token not in cmake:

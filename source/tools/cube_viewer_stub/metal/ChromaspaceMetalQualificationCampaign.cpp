@@ -633,6 +633,9 @@ bool Campaign::next(uint32_t presentedFrames,
       case Scenario::MemoryPressure:
         hasCandidate = candidateMemoryPressure(presentedFrames, candidate);
         break;
+      case Scenario::Soak:
+        // Handled by candidateForSoak above.
+        break;
       case Scenario::Steady:
       case Scenario::Count:
         break;

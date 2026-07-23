@@ -130,6 +130,69 @@ static bool encodeRasterPointSurfaceFromTextureSourceOnCommandBuffer() {
             [], policy._metal_apple_compile_contract_findings(fixture)
         )
 
+    def test_native_source_exception_contract_rejects_mismatched_definitions(
+        self,
+    ) -> None:
+        header = """
+static bool createCallback(int value) noexcept;
+bool createInternal(int value);
+"""
+        source = """
+bool NativeSourceFixtureBackend::createCallback(int value) {
+  return value != 0;
+}
+bool NativeSourceFixtureBackend::createInternal(int value) noexcept {
+  return value != 0;
+}
+"""
+        findings = policy._native_source_exception_contract_findings(
+            header, source
+        )
+        self.assertEqual(2, len(findings))
+
+    def test_native_source_exception_contract_accepts_callback_boundary(
+        self,
+    ) -> None:
+        header = """
+static bool createCallback(int value) noexcept;
+bool createInternal(int value);
+"""
+        source = """
+bool NativeSourceFixtureBackend::createCallback(int value) noexcept {
+  return value != 0;
+}
+bool NativeSourceFixtureBackend::createInternal(int value) {
+  return value != 0;
+}
+"""
+        self.assertEqual(
+            [],
+            policy._native_source_exception_contract_findings(header, source),
+        )
+
+    def test_qualification_campaign_switch_requires_explicit_soak_case(
+        self,
+    ) -> None:
+        fixture = """
+bool Campaign::next() {
+  if (config_.scenario == Scenario::Soak) {
+    candidateForSoak();
+  } else {
+    switch (config_.scenario) {
+      case Scenario::Steady:
+      case Scenario::Count:
+        break;
+    }
+  }
+}
+
+bool Campaign::acknowledgePending() {
+  return true;
+}
+"""
+        findings = policy._qualification_campaign_switch_findings(fixture)
+        self.assertTrue(any("Scenario::Soak" in item for item in findings))
+
     def test_forbidden_token_in_executor_source_is_reported(self) -> None:
         root = Path(__file__).resolve().parents[2]
         original_read = policy._read

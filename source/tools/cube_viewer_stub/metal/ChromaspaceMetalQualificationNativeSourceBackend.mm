@@ -213,7 +213,7 @@ bool NativeSourceFixtureBackend::createCallback(
     uint64_t deviceRegistryId,
     uint64_t sourceGeneration,
     ChromaspaceMetal::ImportedSourceTexture* outSource,
-    std::string* error) {
+    std::string* error) noexcept {
   auto* self = static_cast<NativeSourceFixtureBackend*>(context);
   if (self == nullptr) {
     clearSource(outSource);
@@ -254,7 +254,7 @@ bool NativeSourceFixtureBackend::createInternal(
     uint64_t deviceRegistryId,
     uint64_t sourceGeneration,
     ChromaspaceMetal::ImportedSourceTexture* outSource,
-    std::string* error) noexcept {
+    std::string* error) {
   clearSource(outSource);
   if (impl_ == nullptr || !ready()) {
     return fail(impl_ != nullptr ? impl_->diagnostic.load(std::memory_order_acquire)
