@@ -112,6 +112,20 @@ bool waitForParams(ChromaspaceViewer::ViewerLiveCommandReducer* reducer,
   return false;
 }
 
+template <typename Predicate>
+bool waitForServerSnapshot(
+    ChromaspaceViewer::ViewerCommandServer* server, Predicate predicate,
+    std::chrono::milliseconds timeout = std::chrono::seconds(1)) {
+  if (!server) return false;
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  for (;;) {
+    if (predicate(server->snapshot())) return true;
+    if (std::chrono::steady_clock::now() >= deadline) break;
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+  }
+  return predicate(server->snapshot());
+}
+
 #endif
 
 }  // namespace
@@ -148,6 +162,8 @@ int main() {
 
   // A second launch must preserve the active listener inode and leave the
   // first server usable.  The endpoint probe runs before any stale unlink.
+  const uint64_t acceptedBeforeDuplicate =
+      server.snapshot().acceptedConnections;
   ViewerCommandServer duplicateServer(&reducer, options);
   assert(!duplicateServer.start());
   assert(duplicateServer.state() == ViewerCommandServerState::Failed);
@@ -159,6 +175,12 @@ int main() {
   assert(activeEndpointStat.st_dev == endpointBeforeDuplicate.st_dev);
   assert(activeEndpointStat.st_ino == endpointBeforeDuplicate.st_ino);
   assert(server.snapshot().listenerReady);
+  assert(waitForServerSnapshot(
+      &server,
+      [acceptedBeforeDuplicate](const ViewerCommandServerSnapshot& value) {
+        return value.acceptedConnections > acceptedBeforeDuplicate &&
+               value.activeConnections == 0u;
+      }));
 
   struct stat directoryStat {};
   const std::string directory = path.substr(0u, path.rfind('/'));
@@ -199,7 +221,12 @@ int main() {
   const char newline = '\n';
   assert(::send(client, &newline, 1u, 0) == 1);
   ::close(client);
+  assert(waitForServerSnapshot(
+      &server, [](const ViewerCommandServerSnapshot& value) {
+        return value.oversizedLines >= 1u && value.activeConnections == 0u;
+      }));
 
+  const auto beforeIncomplete = server.snapshot();
   int incomplete = -1;
   assert(connectSocket(path, &incomplete));
   const std::string partial =
@@ -207,12 +234,15 @@ int main() {
   assert(::send(incomplete, partial.data(), partial.size(), 0) ==
          static_cast<ssize_t>(partial.size()));
   ::close(incomplete);
-
-  for (int attempt = 0; attempt != 100; ++attempt) {
-    const auto current = server.snapshot();
-    if (current.oversizedLines >= 1u && current.incompleteLines >= 1u) break;
-    std::this_thread::sleep_for(std::chrono::milliseconds(2));
-  }
+  assert(waitForServerSnapshot(
+      &server,
+      [beforeIncomplete](const ViewerCommandServerSnapshot& value) {
+        return value.acceptedConnections >
+                   beforeIncomplete.acceptedConnections &&
+               value.closedConnections > beforeIncomplete.closedConnections &&
+               value.incompleteLines > beforeIncomplete.incompleteLines &&
+               value.activeConnections == 0u;
+      }));
   const auto beforeStop = server.snapshot();
   assert(beforeStop.submittedLines >= 2u);
   assert(beforeStop.oversizedLines >= 1u);
@@ -220,19 +250,23 @@ int main() {
   assert(beforeStop.heartbeatCount == 1u);
   assert(beforeStop.heartbeatAckCount == 1u);
 
+  const auto beforeIdle = server.snapshot();
   int idle = -1;
   assert(connectSocket(path, &idle));
-  const auto idleDeadline = std::chrono::steady_clock::now() +
-                            std::chrono::seconds(1);
-  for (;;) {
-    const auto current = server.snapshot();
-    if (current.activeConnections == 0u) break;
-    if (std::chrono::steady_clock::now() >= idleDeadline) break;
-    std::this_thread::sleep_for(std::chrono::milliseconds(5));
-  }
+  assert(waitForServerSnapshot(
+      &server, [beforeIdle](const ViewerCommandServerSnapshot& value) {
+        return value.acceptedConnections > beforeIdle.acceptedConnections &&
+               value.activeConnections >= 1u;
+      }));
+  assert(waitForServerSnapshot(
+      &server, [beforeIdle](const ViewerCommandServerSnapshot& value) {
+        return value.closedConnections > beforeIdle.closedConnections &&
+               value.activeConnections == 0u;
+      }));
   const auto afterIdle = server.snapshot();
   assert(afterIdle.activeConnections == 0u);
-  assert(afterIdle.closedConnections >= 3u);
+  assert(afterIdle.acceptedConnections > beforeIdle.acceptedConnections);
+  assert(afterIdle.closedConnections > beforeIdle.closedConnections);
   if (idle >= 0) ::close(idle);
 
   const auto stopStart = std::chrono::steady_clock::now();
