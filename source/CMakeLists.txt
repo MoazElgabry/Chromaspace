@@ -375,6 +375,8 @@ endif()
 set(CHROMASPACE_METAL_NATIVE_VIEWER_SOURCES
   tools/cube_viewer_metal_native/main.mm
   src/ChromaspaceViewerFrameCoordinator.cpp
+  src/ChromaspaceViewerDomain.cpp
+  src/ChromaspaceViewerCamera.cpp
   src/ChromaspaceViewerCameraInteraction.cpp
   src/ChromaspaceViewerLassoInteraction.cpp
   src/ChromaspaceViewerUiProjection.cpp

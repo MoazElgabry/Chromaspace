@@ -187,6 +187,8 @@
   "source_closure": [
     "tools/cube_viewer_metal_native/main.mm",
     "src/ChromaspaceViewerFrameCoordinator.cpp",
+    "src/ChromaspaceViewerDomain.cpp",
+    "src/ChromaspaceViewerCamera.cpp",
     "src/ChromaspaceViewerCameraInteraction.cpp",
     "src/ChromaspaceViewerLassoInteraction.cpp",
     "src/ChromaspaceViewerUiProjection.cpp",
