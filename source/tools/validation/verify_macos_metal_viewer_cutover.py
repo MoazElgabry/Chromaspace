@@ -261,6 +261,18 @@ def _qualification_campaign_switch_findings(text: str) -> list[str]:
     return []
 
 
+def _source_exchange_objc_api_findings(text: str) -> list[str]:
+    """Reject Objective-C selectors that are not declared by their receiver."""
+
+    findings: list[str] = []
+    for match in re.finditer(r"\[\s*NSData\s+dataWithLength\s*:", text):
+        line_number = text.count("\n", 0, match.start()) + 1
+        findings.append(
+            f"line {line_number}: NSData does not declare +dataWithLength:"
+        )
+    return findings
+
+
 def _target_block(cmake: str, target: str) -> str:
     marker = f"add_executable({target}"
     start = cmake.find(marker)
@@ -655,6 +667,9 @@ def verify(root: Path) -> list[str]:
         qualification_campaign = _read(
             root, manifest["qualification_campaign"]
         )
+        source_exchange_v2_tests = _read(
+            root, manifest["source_exchange_v2_tests"]
+        )
         cmake = _read(root, manifest["cmake"])
     except (KeyError, RuntimeError) as exc:
         return [str(exc)]
@@ -695,6 +710,12 @@ def verify(root: Path) -> list[str]:
         f"qualification campaign switch contract: {finding}"
         for finding in _qualification_campaign_switch_findings(
             qualification_campaign
+        )
+    )
+    findings.extend(
+        f"Source Exchange Objective-C API contract: {finding}"
+        for finding in _source_exchange_objc_api_findings(
+            source_exchange_v2_tests
         )
     )
     for token in manifest.get("cmake_global_required", []):

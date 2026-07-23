@@ -14,6 +14,7 @@
   "qualification_native_source_header": "tools/cube_viewer_stub/metal/ChromaspaceMetalQualificationNativeSourceBackend.h",
   "qualification_native_source": "tools/cube_viewer_stub/metal/ChromaspaceMetalQualificationNativeSourceBackend.mm",
   "qualification_campaign": "tools/cube_viewer_stub/metal/ChromaspaceMetalQualificationCampaign.cpp",
+  "source_exchange_v2_tests": "tools/cube_viewer_stub/metal/ChromaspaceSourceExchangeV2Tests.mm",
   "cmake": "CMakeLists.txt",
   "cmake_global_required": [
     "set(WORKSHOP_COLOR_SOURCES",

@@ -193,6 +193,26 @@ bool Campaign::acknowledgePending() {
         findings = policy._qualification_campaign_switch_findings(fixture)
         self.assertTrue(any("Scenario::Soak" in item for item in findings))
 
+    def test_source_exchange_objc_api_rejects_data_length_on_nsdata(
+        self,
+    ) -> None:
+        fixture = """
+NSData* token = [NSData dataWithLength:8];
+"""
+        findings = policy._source_exchange_objc_api_findings(fixture)
+        self.assertEqual(1, len(findings))
+        self.assertIn("NSData does not declare +dataWithLength:", findings[0])
+
+    def test_source_exchange_objc_api_accepts_mutable_data_length(
+        self,
+    ) -> None:
+        fixture = """
+NSData* token = [NSMutableData dataWithLength:8];
+"""
+        self.assertEqual(
+            [], policy._source_exchange_objc_api_findings(fixture)
+        )
+
     def test_forbidden_token_in_executor_source_is_reported(self) -> None:
         root = Path(__file__).resolve().parents[2]
         original_read = policy._read

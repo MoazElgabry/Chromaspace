@@ -264,7 +264,7 @@ int main() {
         [[ChromaspaceSourceExchangeRelayBootstrapRegistration alloc]
             initWithProtocolMajor:ChromaspaceSourceExchangeProtocolMajor
                     protocolMinor:ChromaspaceSourceExchangeProtocolMinor
-                   bootstrapToken:[NSData dataWithLength:8]
+                   bootstrapToken:[NSMutableData dataWithLength:8]
             producerRelayEndpoint:bootstrapListener.endpoint];
     error = nil;
     require(![invalidBootstrap validate:&error] &&
