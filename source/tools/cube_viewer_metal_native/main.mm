@@ -912,7 +912,7 @@ void consumeCocoaViewerSessionResult(
     const auto result = applyCocoaViewerSessionEvent(
         _session,
         ChromaspaceViewer::ViewerSessionKeyChanged{
-            key, true, [event isARepeat],
+            key, true, static_cast<bool>([event isARepeat]),
             cocoaViewerSessionModifiers([event modifierFlags])});
     if (!result.accepted()) return;
     consumeCocoaViewerSessionResult(_interaction, result);
@@ -1930,9 +1930,9 @@ int main(int argc, char** argv) {
     const auto initializeResult = applyCocoaViewerSessionEvent(
         &viewerSession,
         ChromaspaceViewer::ViewerSessionInitialize{
-            initialViewport, [window isKeyWindow],
+            initialViewport, static_cast<bool>([window isKeyWindow]),
             cocoaViewerSessionVisible(window),
-            [window isMiniaturized]});
+            static_cast<bool>([window isMiniaturized])});
     if (!initializeResult.accepted()) {
       reportError("could not initialize viewer session", {});
       [window close];
@@ -1975,7 +1975,8 @@ int main(int argc, char** argv) {
             cocoaViewerSessionVisible(window)});
     applyCocoaViewerSessionEvent(
         &viewerSession,
-        ChromaspaceViewer::ViewerSessionFocusChanged{[window isKeyWindow]});
+        ChromaspaceViewer::ViewerSessionFocusChanged{
+            static_cast<bool>([window isKeyWindow])});
     if (!updateCocoaViewerSessionViewport(window, &viewerSession).accepted()) {
       reportError("could not query visible viewport", {});
       [window close];
