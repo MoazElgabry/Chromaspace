@@ -1,5 +1,6 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
+#import <Security/Security.h>
 
 #import "ChromaspaceSourceExchangeV2.h"
 

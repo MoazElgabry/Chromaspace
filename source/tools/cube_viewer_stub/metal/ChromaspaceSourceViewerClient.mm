@@ -1,4 +1,5 @@
 #import <Foundation/Foundation.h>
+#import <Security/Security.h>
 
 #import "../../../src/metal/ChromaspaceSourceExchangeV2.h"
 #include "../../../src/metal/ChromaspaceSourceViewerClientState.h"

@@ -540,11 +540,13 @@ if(WIN32)
 endif()
 
 if(APPLE)
+  find_library(CHROMASPACE_SECURITY_FRAMEWORK Security REQUIRED)
   target_link_libraries(Chromaspace_CubeViewer PRIVATE
     "-framework Cocoa"
     "-framework Foundation"
     "-framework Metal"
     "-framework QuartzCore"
+    ${CHROMASPACE_SECURITY_FRAMEWORK}
     Threads::Threads)
   set(VIEWER_OUTPUT_DIR "${BUILD_VIEWER_DIR}")
 else()
@@ -593,6 +595,7 @@ if(APPLE)
     "-framework Foundation"
     "-framework Metal"
     "-framework QuartzCore"
+    ${CHROMASPACE_SECURITY_FRAMEWORK}
     Threads::Threads)
   if(CHROMASPACE_TEXT_DEPS_EXTERNAL_TARGET)
     add_dependencies(Chromaspace_MetalViewerCutover
@@ -1142,7 +1145,8 @@ if(APPLE)
     ${CMAKE_CURRENT_SOURCE_DIR}/src/metal)
   target_link_libraries(Chromaspace_SourceExchangeProducerRelay PRIVATE
     "-framework Foundation"
-    "-framework Metal")
+    "-framework Metal"
+    ${CHROMASPACE_SECURITY_FRAMEWORK})
   set_target_properties(Chromaspace_SourceExchangeProducerRelay PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${BUILD_VIEWER_DIR}"
     XCODE_ATTRIBUTE_PRODUCT_BUNDLE_IDENTIFIER
