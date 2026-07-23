@@ -201,7 +201,7 @@ struct FrameSubmissionRecord {
   std::shared_ptr<FrameTransientArenaState> transientArena;
   NSMutableArray<id<MTLHeap>>* transientHeaps = nil;
   std::vector<FrameSubmissionTransactionRecord> transactions;
-  SubmissionRetention retainedResources;
+  SubmissionRetention retainedResources{};
   std::unordered_map<uint64_t, std::shared_ptr<ImportedSourceRecord>>
       retainedImportedSources;
 };
@@ -737,6 +737,11 @@ bool contextForCommandBuffer(id<MTLCommandBuffer> commandBuffer,
                              std::shared_ptr<MetalContext>* outOwnedContext,
                              MetalContext** outContext,
                              std::string* error);
+
+std::mutex& frameTextAtlasMutex();
+
+std::unordered_map<uint64_t, std::shared_ptr<FrameTextAtlasRecord>>&
+frameTextAtlasRegistry();
 
 std::mutex& importedSourceMutex() {
   static std::mutex mutex;
@@ -2858,6 +2863,9 @@ void copySharedBuffer(id<MTLBuffer> buffer, size_t count, std::vector<float>* ou
 #endif
 
 }  // namespace
+
+void fillRasterSourceUniforms(const RasterSourceRequest& request,
+                              RasterSourceUniforms* uniforms);
 
 bool importSharedSourceTexture(const SharedSourceImportRequest& request,
                                ImportedSourceTexture* outSource,

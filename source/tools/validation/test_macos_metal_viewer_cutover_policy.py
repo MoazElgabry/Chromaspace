@@ -93,6 +93,43 @@ bool contextForCommandBuffer(int commandBuffer) {
             [], policy._command_buffer_context_namespace_findings(fixture)
         )
 
+    def test_apple_compile_contract_rejects_late_helpers_and_implicit_member(self) -> None:
+        fixture = """
+struct FrameSubmissionRecord {
+  SubmissionRetention retainedResources;
+};
+bool retainFrameTextAtlasForSubmission() { return true; }
+std::mutex& frameTextAtlasMutex();
+std::unordered_map<uint64_t, std::shared_ptr<FrameTextAtlasRecord>>&
+frameTextAtlasRegistry();
+static bool encodeRasterPointSurfaceFromTextureSourceOnCommandBuffer() {
+  return true;
+}
+void fillRasterSourceUniforms(const RasterSourceRequest& request,
+                              RasterSourceUniforms* uniforms);
+"""
+        findings = policy._metal_apple_compile_contract_findings(fixture)
+        self.assertEqual(4, len(findings))
+
+    def test_apple_compile_contract_accepts_declared_helpers_and_member_init(self) -> None:
+        fixture = """
+struct FrameSubmissionRecord {
+  SubmissionRetention retainedResources{};
+};
+std::mutex& frameTextAtlasMutex();
+std::unordered_map<uint64_t, std::shared_ptr<FrameTextAtlasRecord>>&
+frameTextAtlasRegistry();
+bool retainFrameTextAtlasForSubmission() { return true; }
+void fillRasterSourceUniforms(const RasterSourceRequest& request,
+                              RasterSourceUniforms* uniforms);
+static bool encodeRasterPointSurfaceFromTextureSourceOnCommandBuffer() {
+  return true;
+}
+"""
+        self.assertEqual(
+            [], policy._metal_apple_compile_contract_findings(fixture)
+        )
+
     def test_forbidden_token_in_executor_source_is_reported(self) -> None:
         root = Path(__file__).resolve().parents[2]
         original_read = policy._read

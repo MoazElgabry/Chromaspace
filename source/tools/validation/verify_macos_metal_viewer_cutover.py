@@ -166,6 +166,51 @@ def _command_buffer_context_namespace_findings(text: str) -> list[str]:
     ]
 
 
+def _metal_apple_compile_contract_findings(text: str) -> list[str]:
+    """Enforce declaration order and direct initialization for Apple Clang."""
+
+    findings: list[str] = []
+    required_declarations = (
+        (
+            "frameTextAtlasMutex",
+            r"std::mutex&\s+frameTextAtlasMutex\(\)\s*(?:;|\{)",
+            "bool retainFrameTextAtlasForSubmission(",
+        ),
+        (
+            "frameTextAtlasRegistry",
+            r"std::unordered_map<uint64_t,\s*std::shared_ptr<FrameTextAtlasRecord>>&\s*"
+            r"frameTextAtlasRegistry\(\)\s*(?:;|\{)",
+            "bool retainFrameTextAtlasForSubmission(",
+        ),
+        (
+            "fillRasterSourceUniforms",
+            r"void\s+fillRasterSourceUniforms\(\s*"
+            r"const RasterSourceRequest&\s+request,\s*"
+            r"RasterSourceUniforms\*\s+uniforms\s*\)\s*(?:;|\{)",
+            "static bool encodeRasterPointSurfaceFromTextureSourceOnCommandBuffer(",
+        ),
+    )
+    for name, declaration_pattern, first_user in required_declarations:
+        user_offset = text.find(first_user)
+        declaration = re.search(declaration_pattern, text, re.DOTALL)
+        if user_offset < 0:
+            findings.append(f"{name} first-use marker not found")
+        elif declaration is None or declaration.start() >= user_offset:
+            findings.append(f"{name} requires a declaration before first use")
+
+    record_start = text.find("struct FrameSubmissionRecord {")
+    record_end = text.find("\n};", record_start)
+    if record_start < 0 or record_end < 0:
+        findings.append("FrameSubmissionRecord definition not found")
+    else:
+        record = text[record_start:record_end]
+        if "SubmissionRetention retainedResources{};" not in record:
+            findings.append(
+                "FrameSubmissionRecord.retainedResources requires direct initialization"
+            )
+    return findings
+
+
 def _target_block(cmake: str, target: str) -> str:
     marker = f"add_executable({target}"
     start = cmake.find(marker)
@@ -576,6 +621,10 @@ def verify(root: Path) -> list[str]:
     findings.extend(
         f"Metal source command-buffer context policy: {finding}"
         for finding in _command_buffer_context_namespace_findings(metal_source)
+    )
+    findings.extend(
+        f"Metal source Apple compile contract: {finding}"
+        for finding in _metal_apple_compile_contract_findings(metal_source)
     )
     for token in manifest.get("cmake_global_required", []):
         if token not in cmake:
