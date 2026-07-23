@@ -175,7 +175,6 @@
   "forbidden_cutover_strings": [
     "CHROMASPACE_MAC_OPENGL_FALLBACK",
     "gl-vertex-iosurface",
-    "iosurface_metal",
     "SMAppService",
     "setCodeSigningRequirement",
     "TeamIdentifier",

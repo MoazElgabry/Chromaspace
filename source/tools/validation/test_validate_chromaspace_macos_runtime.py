@@ -381,6 +381,32 @@ class QualificationStructureTests(unittest.TestCase):
         self.assertIn("fixture.no-forbidden-dependencies", failed)
         self.assertIn("fixture.no-forbidden-cutover-strings", failed)
 
+    def test_cutover_contract_allows_resident_iosurface_transport_marker(
+        self,
+    ) -> None:
+        report = qualification.Report(mode="cutover")
+        contract = qualification._load_contract(
+            qualification.QualificationConfig.contract_path,
+            report,
+        )
+        forbidden_strings = qualification._contract_string_list(
+            contract,
+            "forbidden_cutover_strings",
+            report,
+        )
+
+        qualification._verify_native_binary(
+            report,
+            FakeNativeRunner(strings_stdout="iosurface_metal"),
+            "fixture",
+            Path("fixture"),
+            ["arm64"],
+            forbidden_strings,
+            [],
+        )
+
+        self.assertTrue(report.passed, report.to_dict())
+
     def test_native_binary_gate_accepts_identity_free_ad_hoc_without_entitlements(
         self,
     ) -> None:
