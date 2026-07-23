@@ -289,6 +289,9 @@ function(chromaspace_configure_text_deps)
     add_dependencies(ChromaspaceTextDepsExternal chromaspace_harfbuzz_ep)
 
     add_library(ChromaspaceTextDeps INTERFACE)
+    # Propagate the external install ordering to every consumer so generated
+    # FreeType/HarfBuzz headers exist before any dependent source compiles.
+    add_dependencies(ChromaspaceTextDeps ChromaspaceTextDepsExternal)
     target_link_libraries(ChromaspaceTextDeps INTERFACE chromaspace_harfbuzz chromaspace_freetype)
     target_include_directories(ChromaspaceTextDeps INTERFACE
       "${_text_install_prefix}/include/freetype2"
