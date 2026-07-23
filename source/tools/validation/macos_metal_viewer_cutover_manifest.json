@@ -18,6 +18,7 @@
   "frame_executor_source": "tools/cube_viewer_stub/metal/ChromaspaceMetalFrameExecutor.cpp",
   "plot_renderer_source": "tools/cube_viewer_stub/metal/ChromaspaceMetalPlotRenderer.cpp",
   "viewer_runtime_source": "tools/cube_viewer_stub/metal/ChromaspaceMetalViewerRuntime.cpp",
+  "resident_source_session_source": "tools/cube_viewer_stub/metal/ChromaspaceResidentSourceSession.cpp",
   "cmake": "CMakeLists.txt",
   "cmake_global_required": [
     "set(WORKSHOP_COLOR_SOURCES",

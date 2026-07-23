@@ -228,9 +228,15 @@ target_compile_definitions(Chromaspace_MetalViewerCutover PRIVATE
   CHROMASPACE_METAL_NATIVE_ONLY)
 """
         findings = policy._metal_default_backend_linkage_findings(
-            cmake, {"frame": source, "plot": source, "runtime": source}
+            cmake,
+            {
+                "frame": source,
+                "plot": source,
+                "runtime": source,
+                "resident-source": source,
+            },
         )
-        self.assertEqual(8, len(findings))
+        self.assertEqual(10, len(findings))
 
     def test_metal_default_backend_linkage_accepts_explicit_capability(
         self,
@@ -252,7 +258,13 @@ target_compile_definitions(Chromaspace_MetalViewerCutover PRIVATE
         self.assertEqual(
             [],
             policy._metal_default_backend_linkage_findings(
-                cmake, {"frame": source, "plot": source, "runtime": source}
+                cmake,
+                {
+                    "frame": source,
+                    "plot": source,
+                    "runtime": source,
+                    "resident-source": source,
+                },
             ),
         )
 

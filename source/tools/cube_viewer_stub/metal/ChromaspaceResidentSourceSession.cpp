@@ -30,7 +30,7 @@ void copyDiagnosticNoThrow(std::array<char, kMaxDiagnosticBytes>* destination,
   }
 }
 
-#if !defined(__APPLE__)
+#if !defined(CHROMASPACE_METAL_EXTERNAL_DEFAULT_BACKENDS)
 void* unavailableCreate(void*,
                         const std::string&,
                         uint64_t,
@@ -85,7 +85,7 @@ const ClientAdapter kUnavailableClientAdapter{
 
 }  // namespace
 
-#if !defined(__APPLE__)
+#if !defined(CHROMASPACE_METAL_EXTERNAL_DEFAULT_BACKENDS)
 const ClientAdapter* defaultResidentSourceClientAdapter() noexcept {
   return &kUnavailableClientAdapter;
 }

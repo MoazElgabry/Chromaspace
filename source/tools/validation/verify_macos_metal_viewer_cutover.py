@@ -731,6 +731,9 @@ def verify(root: Path) -> list[str]:
         viewer_runtime_source = _read(
             root, manifest["viewer_runtime_source"]
         )
+        resident_source_session_source = _read(
+            root, manifest["resident_source_session_source"]
+        )
         cmake = _read(root, manifest["cmake"])
     except (KeyError, RuntimeError) as exc:
         return [str(exc)]
@@ -787,6 +790,8 @@ def verify(root: Path) -> list[str]:
                 manifest["frame_executor_source"]: frame_executor_source,
                 manifest["plot_renderer_source"]: plot_renderer_source,
                 manifest["viewer_runtime_source"]: viewer_runtime_source,
+                manifest["resident_source_session_source"]:
+                    resident_source_session_source,
             },
         )
     )
