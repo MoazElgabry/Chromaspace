@@ -29,7 +29,7 @@
       "assetPattern": "^Chromaspace_.*windows.*portable\\.zip$",
       "packageType": "zip",
       "bundleName": "Chromaspace.ofx.bundle",
-      "bundleIdentifier": "com.moazelgabry.Chromaspace",
+      "bundleIdentifier": "com.moazelgabry.chromaspace",
       "installPath": "C:\\Program Files\\Common Files\\OFX\\Plugins"
     },
     {
@@ -39,7 +39,7 @@
       "assetPattern": "^Chromaspace_.*macOS.*portable\\.zip$",
       "packageType": "zip",
       "bundleName": "Chromaspace.ofx.bundle",
-      "bundleIdentifier": "com.moazelgabry.Chromaspace",
+      "bundleIdentifier": "com.moazelgabry.chromaspace",
       "installPath": "/Library/OFX/Plugins"
     },
     {
@@ -49,7 +49,7 @@
       "assetPattern": "^Chromaspace_.*linux.*portable\\.(?:tar\\.gz|zip)$",
       "packageType": "tar.gz",
       "bundleName": "Chromaspace.ofx.bundle",
-      "bundleIdentifier": "com.moazelgabry.Chromaspace",
+      "bundleIdentifier": "com.moazelgabry.chromaspace",
       "installPath": "/usr/OFX/Plugins"
     }
   ]
