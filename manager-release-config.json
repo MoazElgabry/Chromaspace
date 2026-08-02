@@ -21,6 +21,10 @@
   ],
   "availableStableMarker": "manager-available-stable",
   "versionPattern": "(?:^|-)v(?<version>.+)$",
+  "channelBundleIdentifiers": {
+    "stable": "com.moazelgabry.Chromaspace",
+    "beta": "com.moazelgabry.chromaspace"
+  },
   "assetRules": [
     {
       "family": "windows",
